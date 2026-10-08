@@ -51,6 +51,8 @@ Name: "everything"; Description: "Install Everything for Search (free, voidtools
 
 [Files]
 Source: "{#AppExeSrc}"; DestDir: "{app}"; DestName: "{#AppExe}"; Flags: ignoreversion
+; Order 049: the transform that leaves out the Everything MSI's all-users start at sign-in (crates/search/src/real/host.rs NO_STARTUP_MST)
+Source: "{#SrcRoot}\crates\search\assets\everything-no-startup.mst"; Flags: dontcopy
 
 [Icons]
 Name: "{autoprograms}\{#AppName}"; Filename: "{app}\{#AppExe}"
@@ -79,6 +81,7 @@ const
   MSI_URL = 'https://{#MsiHost}{#MsiPath}';
   MSI_SHA256 = '{#MsiSha256}';
   MSI_NAME = 'Everything.x64.msi';
+  MST_NAME = 'everything-no-startup.mst';
 
 var
   DownloadPage: TDownloadWizardPage;
@@ -140,8 +143,11 @@ procedure InstallEverything;
 var
   Code: Integer;
 begin
+  { Order 049: with our transform - the MSI's all-users "start Everything at sign-in" is left out }
+  ExtractTemporaryFile(MST_NAME);
   if not ShellExec('runas', ExpandConstant('{sys}\msiexec.exe'),
-    '/i "' + ExpandConstant('{tmp}\') + MSI_NAME + '" /qn /norestart', '', SW_HIDE, ewWaitUntilTerminated, Code) then begin
+    '/i "' + ExpandConstant('{tmp}\') + MSI_NAME + '" TRANSFORMS="' + ExpandConstant('{tmp}\') + MST_NAME + '" /qn /norestart',
+    '', SW_HIDE, ewWaitUntilTerminated, Code) then begin
     Log('Everything: msiexec did not start (' + SysErrorMessage(Code) + ')');
     SuppressibleMsgBox('Everything was not installed (' + SysErrorMessage(Code) + ').' + #13#10#13#10 +
       'The Search tab can install it later.', mbInformation, MB_OK, IDOK);

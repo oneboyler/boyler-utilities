@@ -917,3 +917,22 @@ impl Page for Notifications {
 fn m_is_value_list(m: Option<&Menu>) -> bool {
     m.is_some_and(|m| m.of != K_ADD)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Order 047: at rest the tab asks for no frames; the preview's animation (after an Animation change) is its only
+    /// motion, and it ends.
+    #[test]
+    fn at_rest_the_tab_asks_for_no_frames() {
+        let mut p = Notifications::default();
+        p.open(&Env { test: true, ..Env::default() }, 0.0);
+        assert!(!p.tick(1.0), "nothing moves");
+        assert_eq!(p.wake_at(1.0), None);
+        p.prev_t0 = Some(10.0);
+        assert!(p.tick(10.0), "the preview plays its animation");
+        assert!(!p.tick(5000.0), "and stops");
+        assert!(p.prev_t0.is_none());
+    }
+}

@@ -1,6 +1,7 @@
 //! Settings › About › Check for updates: the page's side of `bu-updater` (Order 017). `check()` and `update()` block (network,
 //! disk), so each runs on its own short-lived thread started by the user's click (TEMP until the job runner of Order 014 item 2
-//! is merged: `cx.start_job`); what it finds comes back through a channel the page reads every frame while it waits.
+//! is merged: `cx.start_job`); what it finds comes back through a channel the page reads in its `tick` - each message wakes
+//! the menu (Order 047: no frames while it only waits).
 //!
 //! Real: the app's own repo on GitHub (`REPO`, Order 044); with an empty repo `check()` answers `NotSetUp` WITHOUT touching the network.
 //! Test copies: a FAKE release server in memory (`FakeHttp`: a v0.2.0 release of 31.8 MB, paced like a real download) and a
@@ -130,6 +131,8 @@ impl Driver {
         let hold = self.fake.as_ref().map(|f| f.1.clone());
         std::thread::spawn(move || {
             let _ = tx.send(Msg::Checked(up.check()));
+            // Order 047: the answer wakes the menu (the page no longer asks every frame while it waits)
+            crate::services::Waker.wake();
             drop(hold);
         });
         true
@@ -155,6 +158,7 @@ impl Driver {
             let tx2 = tx.clone();
             let r = up.update(&rel, &mut |p: &Progress| {
                 let _ = tx2.send(Msg::Progress(p.clone()));
+                crate::services::Waker.wake();
             });
             let ok = r.is_ok();
             if ok {
@@ -162,6 +166,7 @@ impl Driver {
                 spent.store(true, Ordering::SeqCst);
             }
             let _ = tx.send(Msg::Done(r));
+            crate::services::Waker.wake();
             drop(hold);
             // the install step waits for this app to end: it ends even if the menu (or the Settings tab) was closed
             // meanwhile - after the page's own "Installing… / Restarting…" (1.6 + 1.3 s) when it is shown. A fake never

@@ -173,9 +173,118 @@ impl PicJobs {
     }
 }
 
+/// Order 047: the monitors as the page's worker read them (`read_now`): every monitor with its modes, and the change
+/// waiting for Keep (its deadline, the first monitor it changed).
+#[derive(Clone)]
+struct Read {
+    mons: Vec<MonitorInfo>,
+    modes: Vec<Vec<VideoMode>>,
+    pending: Option<(Instant, Option<MonitorId>)>,
+}
+
+/// What a read does to the page's fields when it lands.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum How {
+    /// the tab's open read (a change waiting for Keep brings its bar back)
+    Open,
+    /// the fields go back to the monitor's mode (the old `reload`)
+    Fields,
+    /// the fields stay what the user set (the old `reload_keep_fields`)
+    KeepFields,
+    /// the countdown went back by itself (a note): the bar goes when no change waits any more
+    AfterNote,
+}
+
+/// One change-log line made on the worker (written by the page when the answer lands, or by the worker itself when the
+/// page has closed meanwhile).
+type Log = (String, String, crate::undo::Val, crate::undo::Val);
+
+/// Order 047: what the page's worker answers. Mode changes (SetDisplayConfig, 0.5 - 3 s), the monitors' read
+/// (QueryDisplayConfig, EDID, DXGI mode lists) and every other wait on the shared service (which a DDC/CI write may hold
+/// ~50 ms per value) run there - the menu's thread never waits for the service.
+enum Ans {
+    Read { how: How, read: Read },
+    /// Apply: the error, else the countdown is armed
+    Applied { r: Result<(), String>, read: Read },
+    /// Keep: the toast's mode text, or the error; the kept modes' change-log lines
+    Kept { r: Result<Option<String>, String>, logs: Vec<Log> },
+    /// Revert: the restored mode's text, or the error
+    Reverted { r: Result<Option<String>, String>, read: Read },
+    /// Main display: moved (true) / was already (false), or the error
+    Main { r: Result<bool, String>, logs: Vec<Log>, read: Read },
+}
+
+type Job = Box<dyn FnOnce(&Arc<Rt>) -> Ans + Send>;
+
+/// A mode click (Apply, Keep, Revert, Main display) made while another mode change was on the worker.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Next {
+    Apply,
+    Keep,
+    Revert,
+    Main,
+}
+
+/// The last read the tab showed (`env.keep`): shown at once when the tab opens again, while the fresh one runs.
+const KEEP_READ: &str = "dsp.read";
+
+/// Monitors, modes and the waiting change, read now (worker).
+fn read_now(rt: &Rt) -> Read {
+    let s = rt.svc.lock().unwrap_or_else(|e| e.into_inner());
+    let mons = s.monitors().unwrap_or_default();
+    let modes = mons.iter().map(|m| s.modes(&m.id).unwrap_or_default()).collect();
+    let pending = s.pending().map(|p| (p.deadline, p.originals.first().map(|o| o.0.clone())));
+    Read { mons, modes, pending }
+}
+
+fn rec_logs(logs: &[Log]) {
+    for (item, label, old, new) in logs {
+        reset::rec(item, label, old, new);
+    }
+}
+
+/// The page's worker: one thread for the open page, its jobs one after another in click order. It ends when the page
+/// drops its sender (close); a change-log line the closed page can't write any more the worker writes itself.
+fn start_worker(rt: Arc<Rt>, slow: u64) -> (std::sync::mpsc::Sender<Job>, std::sync::mpsc::Receiver<Ans>) {
+    let (jtx, jrx) = std::sync::mpsc::channel::<Job>();
+    let (atx, arx) = std::sync::mpsc::channel::<Ans>();
+    let _ = std::thread::Builder::new().name("bu-display".into()).spawn(move || {
+        for job in jrx {
+            if slow > 0 {
+                // test copies only: a stand-in for a slow mode change
+                std::thread::sleep(std::time::Duration::from_millis(slow));
+            }
+            let a = job(&rt);
+            if let Err(e) = atx.send(a) {
+                if let Ans::Kept { logs, .. } | Ans::Main { logs, .. } = &e.0 {
+                    rec_logs(logs);
+                }
+            }
+            crate::services::Waker.wake();
+        }
+    });
+    (jtx, arx)
+}
+
 #[derive(Default)]
 pub struct Display {
     rt: Option<Arc<Rt>>,
+    /// Order 047: the worker's job line and its answers; jobs sent and not answered yet
+    work: Option<std::sync::mpsc::Sender<Job>>,
+    ans: Option<std::sync::mpsc::Receiver<Ans>>,
+    jobs: usize,
+    /// a mode change (Apply / Keep / Revert / Main display) is on the worker: another one waits for it
+    mode_busy: bool,
+    /// the last mode click made while one was on the worker: sent when its answer lands
+    next: Option<Next>,
+    /// a change waits for Keep (as last read)
+    pend: bool,
+    /// the app's store of last results (`env.keep`)
+    memo: crate::keep::Keep,
+    /// test copies only: every worker job first sleeps this long (ms) - a stand-in for a slow mode change
+    slow: u64,
+    /// a test copy's page state, put once the open read is in
+    state_due: Option<String>,
     frozen: bool,
     mons: Vec<MonitorInfo>,
     modes: Vec<Vec<VideoMode>>,
@@ -188,6 +297,8 @@ pub struct Display {
     snap: [Option<f64>; 3],
     pic: Vec<Option<PictureState>>,
     pic_rx: Option<std::sync::mpsc::Receiver<(usize, PictureState)>>,
+    /// the monitor whose values `pic_rx` brings
+    pic_at: usize,
     pic_jobs: Option<Arc<PicJobs>>,
     menu: Option<Menu>,
     /// the list the frame closed on this press (a press beside it) - read by the press that follows
@@ -251,19 +362,171 @@ impl Display {
         fl::rate_label(r, &self.rates())
     }
 
-    /// Reads monitors + modes (fast Windows calls; no DDC here) and resets the fields to the selected monitor.
-    fn reload(&mut self) {
-        let Some(rt) = self.rt.clone() else { return };
+    /// Order 047: hand a job to the page's worker (its answer lands in `tick`). False = no worker (a closed page).
+    fn run(&mut self, job: impl FnOnce(&Arc<Rt>) -> Ans + Send + 'static) -> bool {
+        let sent = self.work.as_ref().is_some_and(|w| w.send(Box::new(job)).is_ok());
+        if sent {
+            self.jobs += 1;
+        }
+        sent
+    }
+
+    /// Reads monitors + modes again (QueryDisplayConfig, EDID, every monitor's DXGI mode list: 30 - 150 ms - Order 047: on
+    /// the worker); `how` = what the fields do when it lands.
+    fn read_again(&mut self, how: How) {
+        self.run(move |rt| Ans::Read { how, read: read_now(rt) });
+    }
+
+    /// A read landed: the monitors and their modes, the selection kept by monitor; the fields back to the selected
+    /// monitor's mode, or (`keep_fields`) what the user set.
+    fn take_read(&mut self, r: Read, keep_fields: bool) {
+        let f = self.f;
         let keep_id = self.sel_id();
-        let Ok(svc) = rt.svc.lock() else { return };
-        self.mons = svc.monitors().unwrap_or_default();
-        self.modes = self.mons.iter().map(|m| svc.modes(&m.id).unwrap_or_default()).collect();
-        drop(svc);
+        self.mons = r.mons;
+        self.modes = r.modes;
         self.sel = keep_id.and_then(|id| self.mons.iter().position(|m| m.id == id)).unwrap_or(0);
         if self.pic.len() != self.mons.len() {
             self.pic = vec![None; self.mons.len()];
         }
         self.fields_from_monitor();
+        if keep_fields && f.is_some() {
+            self.f = f;
+        }
+        self.pend = r.pending.is_some();
+        self.bar_deadline = r.pending.as_ref().map(|p| p.0);
+        // the next open shows these at once (never the waiting change: its bar comes from the fresh read)
+        self.memo.put(KEEP_READ, Read { mons: self.mons.clone(), modes: self.modes.clone(), pending: None });
+    }
+
+    /// A worker's answer: the page shows it and says how it went (as it did when the call ran here).
+    fn landed(&mut self, a: Ans) {
+        match a {
+            Ans::Read { how, read } => match how {
+                How::Open => {
+                    let first = read.pending.as_ref().map(|p| p.1.clone());
+                    self.take_read(read, false);
+                    // a change still waiting for Keep (made before the menu was closed): its bar is up again
+                    if let Some(first) = first {
+                        if self.cfm_on.is_none() {
+                            self.cfm_on = Some(self.now - 400.0);
+                            self.cfm_off = None;
+                        }
+                        if let Some(i) = first.and_then(|id| self.mons.iter().position(|m| m.id == id)) {
+                            self.sel = i;
+                            self.fields_from_monitor();
+                        }
+                    }
+                    self.read_picture(self.sel);
+                    if let Some(s) = self.state_due.take() {
+                        self.test_state(&s);
+                    }
+                }
+                How::Fields => self.take_read(read, false),
+                How::KeepFields => self.take_read(read, true),
+                How::AfterNote => {
+                    let gone = read.pending.is_none();
+                    if self.cfm_on.is_some() && gone {
+                        self.hide_bar();
+                        self.take_read(read, false);
+                    } else {
+                        self.take_read(read, true);
+                    }
+                }
+            },
+            Ans::Applied { r, read } => {
+                self.mode_busy = false;
+                match r {
+                    Ok(()) => {
+                        self.cfm_on = Some(self.now);
+                        self.cfm_off = None;
+                        self.blink = Some(self.now);
+                        self.take_read(read, true);
+                    }
+                    Err(e) => {
+                        self.take_read(read, true);
+                        self.show_toast(format!("Couldn’t apply: {e}"));
+                    }
+                }
+            }
+            Ans::Kept { r, logs } => {
+                self.mode_busy = false;
+                match r {
+                    Ok(t) => {
+                        // a KEPT change goes into the change log (one the countdown / Revert took back never does)
+                        rec_logs(&logs);
+                        self.pend = false;
+                        self.bar_deadline = None;
+                        if let Some(t) = t {
+                            self.show_toast(format!("Kept {t}"));
+                        }
+                        self.hide_bar();
+                    }
+                    Err(e) => {
+                        self.show_toast(format!("Couldn’t keep: {e}"));
+                        self.bar_back();
+                    }
+                }
+            }
+            Ans::Reverted { r, read } => {
+                self.mode_busy = false;
+                match r {
+                    Ok(t) => {
+                        self.hide_bar();
+                        self.take_read(read, false);
+                        self.show_toast(format!("Back to {}", t.unwrap_or_default()));
+                    }
+                    Err(e) => {
+                        self.show_toast(format!("Couldn’t go back: {e}"));
+                        self.bar_back();
+                    }
+                }
+            }
+            Ans::Main { r, logs, read } => {
+                self.mode_busy = false;
+                match r {
+                    Ok(true) => {
+                        // into the change log: the monitor that was main
+                        rec_logs(&logs);
+                        self.take_read(read, true);
+                        if let Some(m) = self.mons.get(self.sel) {
+                            self.show_toast(format!("Main display: {} · {}", m.number, m.name));
+                        }
+                    }
+                    // one monitor is always the main one: it just stays on, with a small nudge
+                    Ok(false) => self.nudge(K_MAIN),
+                    Err(e) => self.show_toast(format!("Couldn’t change it: {e}")),
+                }
+            }
+        }
+        // Order 047: the mode click made meanwhile goes now (the last one wins)
+        if !self.mode_busy {
+            match self.next.take() {
+                Some(Next::Apply) => self.apply(),
+                Some(Next::Keep) => self.keep(),
+                Some(Next::Revert) => self.revert(),
+                Some(Next::Main) => self.set_main(),
+                None => {}
+            }
+        }
+    }
+
+    /// Keep / Revert didn't go through: the bar (hidden by the click) is back while the change still waits.
+    fn bar_back(&mut self) {
+        if self.pend && self.cfm_on.is_none() {
+            self.cfm_on = Some(self.now - 400.0);
+            self.cfm_off = None;
+        }
+    }
+
+    /// Test copies (and proof pictures): wait (5 s at most) until every worker job has answered and landed.
+    #[cfg(test)]
+    pub fn settle(&mut self, now: f64) {
+        let t0 = std::time::Instant::now();
+        while self.jobs > 0 && t0.elapsed().as_secs() < 5 {
+            self.tick(now);
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert!(self.jobs == 0, "a Display job never answered");
     }
 
     fn fields_from_monitor(&mut self) {
@@ -274,6 +537,10 @@ impl Display {
     fn read_picture(&mut self, i: usize) {
         let (Some(rt), Some(m)) = (self.rt.clone(), self.mons.get(i)) else { return };
         if self.pic.get(i).map(|p| p.is_some()).unwrap_or(false) {
+            return;
+        }
+        // (already on its way)
+        if self.pic_rx.is_some() && self.pic_at == i {
             return;
         }
         let id = m.id.clone();
@@ -287,11 +554,14 @@ impl Display {
         }
         let (tx, rx) = std::sync::mpsc::channel();
         self.pic_rx = Some(rx);
+        self.pic_at = i;
         std::thread::spawn(move || {
             let p = rt.svc.lock().ok().and_then(|mut s| s.picture(&id).ok());
             if let Some(p) = p {
                 let _ = tx.send((i, p));
             }
+            // Order 047: the menu draws the values when they are in (no frames while they are read)
+            crate::services::Waker.wake();
         });
     }
 
@@ -415,84 +685,121 @@ impl Display {
     }
 
     // ---------------------------------------------------------------- apply / keep / revert
+    /// Order 047: the mode change (SetDisplayConfig, 0.5 - 3 s) runs on the worker; the fields keep the user's values
+    /// meanwhile, the keep bar comes up (and its 10 s countdown starts) when Windows has answered.
     fn apply(&mut self) {
         self.commit_edit();
-        let (Some(rt), Some(id), Some(f)) = (self.rt.clone(), self.sel_id(), self.f) else { return };
-        let res = rt.svc.lock().map(|mut s| s.apply_fields(&id, f.w, f.h, f.hz.hz(), f.sc, Instant::now()));
-        match res {
-            Ok(Ok(_)) => {
-                rt.arm_keep();
-                self.cfm_on = Some(self.now);
-                self.cfm_off = None;
-                self.blink = Some(self.now);
-                self.reload_keep_fields();
-            }
-            Ok(Err(e)) => self.show_toast(format!("Couldn’t apply: {e}")),
-            Err(_) => {}
+        if self.mode_busy {
+            // Order 047: a second Apply (a preset) during a mode change is remembered and sent when its answer lands
+            self.next = Some(Next::Apply);
+            return;
         }
-    }
-
-    /// After a change Windows made: monitors read again, the fields stay what the user set.
-    fn reload_keep_fields(&mut self) {
-        let f = self.f;
-        self.reload();
-        if f.is_some() {
-            self.f = f;
+        let (Some(id), Some(f)) = (self.sel_id(), self.f) else { return };
+        if self.run(move |rt| {
+            let res = rt.svc.lock().map(|mut s| s.apply_fields(&id, f.w, f.h, f.hz.hz(), f.sc, Instant::now()));
+            let r = match res {
+                Ok(Ok(_)) => {
+                    rt.arm_keep();
+                    Ok(())
+                }
+                Ok(Err(e)) => Err(e.to_string()),
+                Err(e) => Err(e.to_string()),
+            };
+            Ans::Applied { r, read: read_now(rt) }
+        }) {
+            self.mode_busy = true;
         }
     }
 
     fn keep(&mut self) {
-        let Some(rt) = self.rt.clone() else { return };
-        rt.disarm_keep();
-        // (what each monitor showed before the first Apply: the change log's old value)
-        let kept = rt.svc.lock().map(|mut s| {
+        if self.mode_busy {
+            self.next = Some(Next::Keep);
+            return;
+        }
+        if self.rt.is_none() {
+            return;
+        }
+        // the monitors' names for the change log
+        let names: Vec<(MonitorId, String)> = self.mons.iter().map(|m| (m.id.clone(), reset::mon_name(m))).collect();
+        // Order 047: Windows' saved setting is written on the worker; the bar goes at once (the click), the toast comes
+        // with the answer
+        if self.run(move |rt| {
+            rt.disarm_keep();
+            // (what each monitor showed before the first Apply: the change log's old value)
+            let mut s = rt.svc.lock().unwrap_or_else(|e| e.into_inner());
             let before = s.pending().map(|p| p.originals.clone()).unwrap_or_default();
-            s.keep().map(|list| (before, list))
-        });
-        match kept {
-            Ok(Ok((before, list))) => {
-                if let (Ok(mut st), Ok(s)) = (rt.store.lock(), rt.svc.lock()) {
-                    let mut log = Vec::new();
-                    for (id, m) in &list {
-                        let modes = s.modes(id).unwrap_or_default();
-                        st.presets.note_kept(id, m, &modes);
-                        if let Some((_, old)) = before.iter().find(|(b, _)| b == id) {
-                            let name = self.mons.iter().find(|x| &x.id == id).map(reset::mon_name).unwrap_or_else(|| "Monitor".into());
-                            let it = reset::Item::Mode(id.clone());
-                            log.push((it.id(), it.label(&name), reset::mode_val(&s, id, old), reset::mode_val(&s, id, m)));
-                        }
-                    }
-                    // a KEPT change goes into the change log (one the countdown / Revert took back never does)
-                    for (item, label, old, new) in &log {
-                        reset::rec(item, label, old, new);
-                    }
-                    if let Some((id, m)) = list.first() {
-                        let t = rt::mode_text(&s, id, m);
-                        drop(s);
-                        drop(st);
-                        self.show_toast(format!("Kept {t}"));
-                    }
+            let list = match s.keep() {
+                Ok(l) => l,
+                Err(e) => return Ans::Kept { r: Err(e.to_string()), logs: Vec::new() },
+            };
+            let mut logs = Vec::new();
+            let mut kept = Vec::new();
+            for (id, m) in &list {
+                let modes = s.modes(id).unwrap_or_default();
+                if let Some((_, old)) = before.iter().find(|(b, _)| b == id) {
+                    let name = names.iter().find(|(x, _)| x == id).map(|(_, n)| n.clone()).unwrap_or_else(|| "Monitor".into());
+                    let it = reset::Item::Mode(id.clone());
+                    logs.push((it.id(), it.label(&name), reset::mode_val(&s, id, old), reset::mode_val(&s, id, m)));
                 }
-                rt.save();
-                self.hide_bar();
+                kept.push((id.clone(), *m, modes));
             }
-            Ok(Err(e)) => self.show_toast(format!("Couldn’t keep: {e}")),
-            Err(_) => {}
+            let t = list.first().map(|(id, m)| rt::mode_text(&s, id, m));
+            drop(s);
+            // (the store after the service: it is never held while waiting for the service)
+            if let Ok(mut st) = rt.store.lock() {
+                for (id, m, modes) in &kept {
+                    st.presets.note_kept(id, m, modes);
+                }
+            }
+            rt.save();
+            Ans::Kept { r: Ok(t), logs }
+        }) {
+            self.mode_busy = true;
+            self.hide_bar();
         }
     }
 
     fn revert(&mut self) {
-        let Some(rt) = self.rt.clone() else { return };
-        rt.disarm_keep();
-        let r = rt.svc.lock().map(|mut s| s.revert().map(|rv| rv.restored.first().map(|(id, m)| rt::mode_text(&s, id, m))));
-        match r {
-            Ok(Ok(t)) => {
-                self.hide_bar();
-                self.reload();
-                self.show_toast(format!("Back to {}", t.unwrap_or_default()));
+        if self.mode_busy {
+            self.next = Some(Next::Revert);
+            return;
+        }
+        if self.rt.is_none() {
+            return;
+        }
+        // Order 047: the mode change back on the worker; the bar goes at once (the click)
+        if self.run(move |rt| {
+            rt.disarm_keep();
+            let r = {
+                let mut s = rt.svc.lock().unwrap_or_else(|e| e.into_inner());
+                s.revert().map(|rv| rv.restored.first().map(|(id, m)| rt::mode_text(&s, id, m))).map_err(|e| e.to_string())
+            };
+            Ans::Reverted { r, read: read_now(rt) }
+        }) {
+            self.mode_busy = true;
+            self.hide_bar();
+        }
+    }
+
+    /// Main display: Windows moves it on the worker (Order 047).
+    fn set_main(&mut self) {
+        if self.mode_busy {
+            // (sent when the mode change on its way has answered)
+            self.next = Some(Next::Main);
+            return;
+        }
+        let Some(id) = self.sel_id() else { return };
+        let was = self.mons.iter().find(|m| m.is_main).map(|m| m.id.clone());
+        if self.run(move |rt| {
+            let r = rt.svc.lock().unwrap_or_else(|e| e.into_inner()).set_main(&id).map_err(|e| e.to_string());
+            let read = read_now(rt);
+            let mut logs = Vec::new();
+            if let (Ok(true), Some(was)) = (&r, was) {
+                logs.push((reset::MAIN.to_string(), "Main display".to_string(), reset::main_val(&read.mons, &was), reset::main_val(&read.mons, &id)));
             }
-            Ok(Err(e)) => self.show_toast(format!("Couldn’t go back: {e}")),
-            Err(_) => {}
+            Ans::Main { r, logs, read }
+        }) {
+            self.mode_busy = true;
         }
     }
 
@@ -515,6 +822,7 @@ impl Display {
     }
 
     fn apply_preset(&mut self, id: PresetId) {
+        // (a mode change on its way: the preset's Apply is sent when its answer lands - Order 047)
         let Some(p) = self.presets().into_iter().find(|p| p.id == id) else { return };
         let modes = self.modes.get(self.sel).cloned().unwrap_or_default();
         let hz = fl::snap_hz(p.refresh.hz(), &fl::rates_for(&modes, p.width, p.height)).unwrap_or(p.refresh);
@@ -550,7 +858,7 @@ impl Display {
             s.rules.forget_preset(id);
         }
         rt.save();
-        rt.sync_watcher();
+        rt.sync_watcher_soon();
         self.rules_logged(before);
     }
 
@@ -569,7 +877,7 @@ impl Display {
             }
         }
         rt.save();
-        rt.sync_watcher();
+        rt.sync_watcher_soon();
         self.rules_logged(before);
     }
 
@@ -600,7 +908,7 @@ impl Display {
             s.rules.remove_rule(id);
         }
         rt.save();
-        rt.sync_watcher();
+        rt.sync_watcher_soon();
         self.rules_logged(before);
     }
 
@@ -1003,7 +1311,10 @@ impl Display {
             if id == p.id {
                 let e = ease_t(self.now, t0, 160.0, BAR_OUT);
                 c = c.opacity(1.0 - e).scale(1.0 - 0.06 * e).no_hit();
-                cx.st.busy = true;
+                // Order 047: frames only while it fades (its end is `wake_at`)
+                if e < 1.0 {
+                    cx.st.busy = true;
+                }
             }
         }
         c
@@ -1144,7 +1455,9 @@ impl Display {
                     s.size.height = Dimension::length(46.0 * (1.0 - e));
                     s.min_size.height = LengthPercentageAuto::length(0.0);
                 });
-                cx.st.busy = true;
+                if e < 1.0 {
+                    cx.st.busy = true;
+                }
             }
         }
         row
@@ -1368,14 +1681,27 @@ impl Page for Display {
     }
 
     fn close(&mut self) {
+        // Order 047: answers already in but not taken still write their change-log lines; a job still running writes its
+        // own (its worker ends after it)
+        if let Some(rx) = &self.ans {
+            while let Ok(a) = rx.try_recv() {
+                if let Ans::Kept { r: Ok(_), logs } | Ans::Main { r: Ok(true), logs, .. } = &a {
+                    rec_logs(logs);
+                }
+            }
+        }
         // the runtime lives on (countdown, rules); the page keeps nothing
         *self = Display::default();
     }
 
-    /// The picked monitor's brightness / contrast / vibrance are read (DDC/CI, off the UI thread); the modes are read at open
+    /// The monitors are in (the last read or the fresh one) and the picked monitor's brightness / contrast / vibrance
+    /// are read (DDC/CI, off the UI thread)
     fn ready(&self) -> bool {
-        self.pic_rx.is_none() || self.pic.get(self.sel).is_some_and(|p| p.is_some())
+        !self.mons.is_empty() && (self.pic_rx.is_none() || self.pic.get(self.sel).is_some_and(|p| p.is_some()))
     }
+    /// Order 047: true only when something new came in or a nudge pulses; the keep bar, the chips' and rows' fades and
+    /// the fields' cues ask for their own frames while they move (`st.busy` in the build), the timed ends are `wake_at`.
+    /// (Identify's numbers are their own windows: the page needs no frames for them.)
     fn tick(&mut self, now: f64) -> bool {
         self.now = now;
         let mut busy = false;
@@ -1392,27 +1718,29 @@ impl Page for Display {
                 Err(_) => self.pic_rx = None,
             }
         }
+        // the worker's answers (it woke the menu)
+        while let Some(a) = self.ans.as_ref().and_then(|rx| rx.try_recv().ok()) {
+            self.jobs = self.jobs.saturating_sub(1);
+            self.landed(a);
+            busy = true;
+        }
         if let Some(rt) = self.rt.clone() {
             if rt.epoch() != self.epoch {
                 self.epoch = rt.epoch();
-                self.reload_keep_fields();
-                busy = true;
+                // (its answer draws)
+                self.read_again(How::KeepFields);
             }
             let notes = rt.take_notes();
             if !notes.is_empty() {
-                // the countdown went back by itself (or a rule left a note)
-                if self.cfm_on.is_some() && rt.svc.lock().map(|s| s.pending().is_none()).unwrap_or(false) {
-                    self.hide_bar();
-                    self.reload();
+                // the countdown went back by itself (or a rule left a note): read again, the bar goes when nothing waits
+                if self.cfm_on.is_some() {
+                    self.read_again(How::AfterNote);
                 }
                 if let Some(t) = notes.last() {
                     self.show_toast(t.clone());
                 }
                 busy = true;
             }
-        }
-        if self.cfm_on.is_some() || self.toast.as_ref().map(|t| now - t.1 < toast::SHOW_MS + 300.0).unwrap_or(false) {
-            busy = true;
         }
         self.nudges.retain(|(_, t)| now - t < 340.0);
         if !self.nudges.is_empty() {
@@ -1423,8 +1751,8 @@ impl Page for Display {
                 if let Some((id, _)) = self.pst_out.take() {
                     self.delete_preset(id);
                 }
+                busy = true;
             }
-            busy = true;
         }
         if let Some((_, t0)) = self.rule_out {
             if now - t0 >= 220.0 {
@@ -1433,10 +1761,14 @@ impl Page for Display {
                         self.remove_rule(i);
                     }
                 }
+                busy = true;
             }
-            busy = true;
         }
-        busy || identify::running()
+        busy
+    }
+    /// Order 047: a deleted chip / removed rule leaves the list when its fade has run (timed ends, no frames between).
+    fn wake_at(&self, now: f64) -> Option<f64> {
+        [self.pst_out.map(|(_, t)| t + 160.0), self.rule_out.map(|(_, t)| t + 220.0)].into_iter().flatten().map(|t| t.max(now + 1.0)).reduce(f64::min)
     }
 
     fn build(&mut self, cx: &mut Cx) -> Vec<El> {
@@ -1602,7 +1934,8 @@ impl Page for Display {
 
     fn describe(&self) -> String {
         let f = self.f.map(|f| format!("{}x{}@{} {:?}", f.w, f.h, f.hz.hz(), f.sc)).unwrap_or_default();
-        let pending = self.rt().and_then(|r| r.svc.lock().ok().map(|s| s.pending().is_some())).unwrap_or(false);
+        // (as last read: never waits for the service)
+        let pending = self.pend;
         format!("mon={} fields={} keepbar={} presets={} rules={}", self.sel, f, pending, self.presets().len(), self.rules().len())
     }
 
@@ -1618,24 +1951,24 @@ impl Display {
         self.now = now;
         self.frozen = env.frozen;
         self.rt = Some(rt.clone());
-        self.reload();
-        // a change still waiting for Keep (made before the menu was closed): its bar is up again
-        if rt.svc.lock().map(|s| s.pending().is_some()).unwrap_or(false) {
-            self.cfm_on = Some(now - 400.0);
-            if let Some(id) = rt.svc.lock().ok().and_then(|s| s.pending().and_then(|p| p.originals.first().map(|o| o.0.clone()))) {
-                if let Some(i) = self.mons.iter().position(|m| m.id == id) {
-                    self.sel = i;
-                    self.fields_from_monitor();
-                }
-            }
+        self.memo = env.keep.clone();
+        let (work, ans) = start_worker(rt.clone(), self.slow);
+        self.work = Some(work);
+        self.ans = Some(ans);
+        // Order 047: the last read at once (QueryDisplayConfig, EDID, every monitor's mode list: 30 - 150 ms), the fresh
+        // one from the worker - with a change still waiting for Keep (made before the menu was closed) its bar comes back
+        if let Some(r) = env.keep.get::<Read>(KEEP_READ) {
+            self.take_read(r, false);
+            self.read_picture(self.sel);
         }
-        self.read_picture(self.sel);
+        self.read_again(How::Open);
         // rules made before the change log existed get their line ("none" before the app)
         reset::seed_rules(&rt);
-        // test copies only: a state for the pixel proofs (the test hook's click can't reach El pages yet - PIECES_WANTED)
+        // test copies only: a state for the pixel proofs (the test hook's click can't reach El pages yet - PIECES_WANTED),
+        // put once the open read is in
         if env.test {
             if let Some(s) = crate::testmode::env("BU_TEST_PAGE_STATE") {
-                self.test_state(s.strip_prefix("dsp:").unwrap_or(""));
+                self.state_due = Some(s.strip_prefix("dsp:").unwrap_or("").to_string());
             }
         }
     }
@@ -1705,25 +2038,7 @@ impl Display {
             }
         }
         if k == K_MAIN {
-            let (Some(rt), Some(id)) = (self.rt.clone(), self.sel_id()) else { return };
-            let was = self.mons.iter().find(|m| m.is_main).map(|m| m.id.clone());
-            let r = rt.svc.lock().map(|mut s| s.set_main(&id));
-            match r {
-                Ok(Ok(true)) => {
-                    // into the change log: the monitor that was main
-                    if let Some(was) = was {
-                        reset::rec(reset::MAIN, "Main display", &reset::main_val(&self.mons, &was), &reset::main_val(&self.mons, &id));
-                    }
-                    self.reload_keep_fields();
-                    if let Some(m) = self.mons.get(self.sel) {
-                        self.show_toast(format!("Main display: {} · {}", m.number, m.name));
-                    }
-                }
-                // one monitor is always the main one: it just stays on, with a small nudge
-                Ok(Ok(false)) => self.nudge(K_MAIN),
-                Ok(Err(e)) => self.show_toast(format!("Couldn’t change it: {e}")),
-                Err(_) => {}
-            }
+            self.set_main();
             return;
         }
         if k == K_PNEW {

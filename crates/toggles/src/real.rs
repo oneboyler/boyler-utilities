@@ -408,8 +408,17 @@ impl TogglesOs for RealOs {
         use windows::Win32::UI::Accessibility::{FILTERKEYS, STICKYKEYS, STICKYKEYS_FLAGS, TOGGLEKEYS};
         use windows::Win32::UI::WindowsAndMessaging::*;
         let none = SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0);
-        let save = SPIF_UPDATEINIFILE | SPIF_SENDCHANGE;
-        unsafe {
+        // Order 050: no SPIF_SENDCHANGE - that broadcast waits for every window on the caller's (the UI) thread; the same
+        // WM_SETTINGCHANGE goes out on a worker with a short timeout (`broadcast_later`)
+        let save = SPIF_UPDATEINIFILE;
+        let action = match item {
+            SpiItem::StickyKeysFlags => SPI_SETSTICKYKEYS,
+            SpiItem::FilterKeysFlags => SPI_SETFILTERKEYS,
+            SpiItem::ToggleKeysFlags => SPI_SETTOGGLEKEYS,
+            SpiItem::ClientAreaAnimation => SPI_SETCLIENTAREAANIMATION,
+            SpiItem::MinimizeAnimation => SPI_SETANIMATION,
+        };
+        let r = unsafe {
             match item {
                 SpiItem::StickyKeysFlags => {
                     let mut s = STICKYKEYS { cbSize: std::mem::size_of::<STICKYKEYS>() as u32, ..Default::default() };
@@ -444,7 +453,11 @@ impl TogglesOs for RealOs {
                         .map_err(|e| hr("SPI_SETANIMATION", e))
                 }
             }
+        };
+        if r.is_ok() {
+            broadcast_later(action.0 as usize, None);
         }
+        r
     }
 
     fn reload_language_hotkeys(&mut self) -> Result<()> {
@@ -607,12 +620,7 @@ impl TogglesOs for RealOs {
         if !self.after_step(format!("broadcast:{}", area.unwrap_or("")))? {
             return Ok(());
         }
-        use windows::Win32::UI::WindowsAndMessaging::*;
-        let h = area.map(HSTRING::from);
-        let lp = h.as_ref().map(|h| LPARAM(h.as_ptr() as isize)).unwrap_or(LPARAM(0));
-        unsafe {
-            SendMessageTimeoutW(HWND_BROADCAST, WM_SETTINGCHANGE, WPARAM(0), lp, SMTO_ABORTIFHUNG, 1000, None);
-        }
+        broadcast_later(0, area.map(str::to_string));
         Ok(())
     }
 
@@ -765,6 +773,42 @@ fn shell_flags(hide_ext: Option<RegValue>, hidden: Option<RegValue>) -> (bool, b
     (matches!(hide_ext, Some(RegValue::Dword(0))), matches!(hidden, Some(RegValue::Dword(1))))
 }
 
+/// Order 050: WM_SETTINGCHANGE (`wparam` = the SPI_SET* code, or 0 with an `area` such as "Environment") to every window, on
+/// its own thread - never on the caller's (the menu's UI thread): SMTO_ABORTIFHUNG skips a hung window, 200 ms at most per
+/// window, so a slow app can't stall the change (it was SPIF_SENDCHANGE / a 1 s timeout on the UI thread).
+pub(crate) fn broadcast_later(wparam: usize, area: Option<String>) {
+    use std::sync::atomic::Ordering;
+    IN_FLIGHT.fetch_add(1, Ordering::AcqRel);
+    let spawned = std::thread::Builder::new().name("bu-toggles-broadcast".into()).spawn(move || {
+        use windows::Win32::UI::WindowsAndMessaging::*;
+        let h = area.as_deref().map(HSTRING::from);
+        let lp = h.as_ref().map(|h| LPARAM(h.as_ptr() as isize)).unwrap_or(LPARAM(0));
+        unsafe {
+            SendMessageTimeoutW(HWND_BROADCAST, WM_SETTINGCHANGE, WPARAM(wparam), lp, SMTO_ABORTIFHUNG | SMTO_NORMAL, 200, None);
+        }
+        IN_FLIGHT.fetch_sub(1, Ordering::AcqRel);
+    });
+    if spawned.is_err() {
+        IN_FLIGHT.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// Broadcasts handed to `broadcast_later` and not sent yet.
+static IN_FLIGHT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Order 050: wait (at most `max`) until every WM_SETTINGCHANGE handed to a worker went out - the app calls it before it
+/// ends (Quit, the uninstaller's `--undo-windows`), so the last change is still announced. true = all sent.
+pub fn wait_broadcasts(max: std::time::Duration) -> bool {
+    let end = std::time::Instant::now() + max;
+    while IN_FLIGHT.load(std::sync::atomic::Ordering::Acquire) > 0 {
+        if std::time::Instant::now() >= end {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    true
+}
+
 /// The shell's own refresh for "Show file extensions" / "Show hidden files" (Order 043: no Explorer restart, it blacked out
 /// the screen for ~30 s on a test PC). Runs on its own thread (see `refresh_shell`).
 /// 1. `SHGetSetSettings(SSF_SHOWEXTENSIONS | SSF_SHOWALLOBJECTS, set)` — the call Folder Options makes: updates the shell's
@@ -853,5 +897,33 @@ mod tests {
         assert_eq!(shell_flags(Some(RegValue::Dword(1)), Some(RegValue::Dword(2))), (false, false));
         // missing (an undo deleted the value): off, as the rows read it - never written back as "on"
         assert_eq!(shell_flags(None, None), (false, false));
+    }
+}
+
+#[cfg(test)]
+mod broadcast_050 {
+    /// Order 050 measuring (not a check; it sends one harmless WM_SETTINGCHANGE with a made-up area name that no app acts
+    /// on - no setting changes): the caller's time for a broadcast, the old way (on the caller, 1 s per window) vs
+    /// `broadcast_later`. `cargo test -p bu-toggles measure_050 -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn measure_050_broadcast_ms() {
+        use windows::core::HSTRING;
+        use windows::Win32::Foundation::{LPARAM, WPARAM};
+        use windows::Win32::UI::WindowsAndMessaging::*;
+        let area = HSTRING::from("BoylerUtilitiesProbe050");
+        let t = std::time::Instant::now();
+        unsafe {
+            SendMessageTimeoutW(HWND_BROADCAST, WM_SETTINGCHANGE, WPARAM(0), LPARAM(area.as_ptr() as isize), SMTO_ABORTIFHUNG, 1000, None);
+        }
+        println!("before (on the caller, SMTO_ABORTIFHUNG 1000 ms): {:.1} ms", t.elapsed().as_secs_f64() * 1000.0);
+        let t = std::time::Instant::now();
+        super::broadcast_later(0, Some("BoylerUtilitiesProbe050".into()));
+        println!("after (broadcast_later, the caller's part): {:.3} ms", t.elapsed().as_secs_f64() * 1000.0);
+        let t = std::time::Instant::now();
+        unsafe {
+            SendMessageTimeoutW(HWND_BROADCAST, WM_SETTINGCHANGE, WPARAM(0), LPARAM(area.as_ptr() as isize), SMTO_ABORTIFHUNG | SMTO_NORMAL, 200, None);
+        }
+        println!("the worker's own broadcast (200 ms per window): {:.1} ms", t.elapsed().as_secs_f64() * 1000.0);
     }
 }

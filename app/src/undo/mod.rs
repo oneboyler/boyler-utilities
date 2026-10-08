@@ -15,6 +15,9 @@
 //! - Order 036: every page that changes Windows records through [`note`] (any thread: a page's worker, a key handler, a
 //!   background part) or `Cx::record`; the main loop writes queued notes with [`flush`]. A page's `Resettable` methods
 //!   may run while the frame holds the services: they never call `services::with` (use `try_with`).
+//! - Order 047: the frame opens a review with [`Review::open`] and applies it with [`Review::start_apply`]: a page that
+//!   hands a Send copy ([`Resettable::detach`]) is read and put back on a worker thread (Defender / Steam / device reads,
+//!   an admin prompt, a display mode change never hold the menu); a page without one runs on the menu's thread as before.
 //! - the uninstaller's undo with no window = [`undo_everything`] (main.rs `--undo-windows`; `--undo-windows-count` only
 //!   counts).
 
@@ -22,6 +25,7 @@
 mod tests;
 
 use std::io;
+use std::sync::{Arc, Mutex};
 
 use crate::settings::{Scope, SettingsStore};
 
@@ -106,7 +110,22 @@ pub trait Resettable {
     }
     /// Put one item to this value. Err = the reason, shown to the user.
     fn apply(&mut self, item: &str, to: &Val) -> Result<(), String>;
+    /// Order 047: this page's reset as a copy that works on a worker thread (Send): its service handles (`Arc`s) and the
+    /// open page's last reads - nothing is read here (it runs on the menu's thread: it must be quick). With it the review's
+    /// reads (`current`, `windows_defaults`: a WMI / Steam / device read) and `apply` (an admin prompt, a mode change) never
+    /// hold the menu: the review opens when its lines are read, the toast comes when the apply has ended. None (the
+    /// default) = they run on the menu's thread. (Like every method here it may run while the frame holds the services;
+    /// the copy's own methods run on the worker, where `services::with` finds none and [`note`] queues.)
+    fn detach(&mut self) -> Option<Detached> {
+        None
+    }
+    /// Order 047: a reset applied through [`Resettable::detach`]'s copy has ended (the menu's thread): the open page reads
+    /// its new state (what `apply` did for the open page itself).
+    fn reset_done(&mut self) {}
 }
+
+/// Order 047: a page's reset copy for a worker thread ([`Resettable::detach`]).
+pub type Detached = Box<dyn Resettable + Send>;
 
 const SEP: char = '\u{1f}';
 
@@ -387,26 +406,210 @@ impl Review {
         // Order 039: every admin line of this reset (any page) goes to ONE elevated copy - one admin prompt for the whole
         // batch, started at the first admin line; a "No" leaves every admin line "Needs admin - not changed"
         let _admin = crate::admin::client::admin().scope(crate::admin::Purpose::Reset);
-        let mut out = Vec::new();
-        for l in self.lines.iter().filter(|l| l.ticked) {
-            let outcome = match pages.iter_mut().find(|p| p.page_id() == l.page) {
-                None => Outcome::Failed("The page isn't loaded".into()),
-                Some(p) => match p.apply(&l.item, &l.to) {
-                    Ok(()) => match rec(l) {
-                        Ok(()) => Outcome::Ok,
-                        Err(e) => Outcome::Failed(format!("Reset, but not saved: {e}")),
-                    },
-                    Err(why) => Outcome::Failed(why),
-                },
+        apply_lines(self.lines.iter().filter(|l| l.ticked), pages, rec)
+    }
+
+    /// Order 047: the review the frame opens (one tab's reset line, or Settings › Reset when `all`), read off the menu's
+    /// thread where it can be: each page that hands a [`Resettable::detach`] copy is read on a worker thread (its
+    /// records are taken here), the others here as before. `Ready` = nothing had to wait; `Reading` = the frame shows the
+    /// review when [`ReviewJob::take`] has it (the worker wakes the menu).
+    pub fn open(kind: Kind, all: bool, pages: &mut [&mut dyn Resettable], store: &SettingsStore) -> Opened {
+        let (page_title, defaults_name) = match pages.first() {
+            Some(p) if !all => (p.page_title().to_string(), p.defaults_name().map(String::from)),
+            _ => (String::new(), None),
+        };
+        let copies: Vec<Option<Detached>> = pages.iter_mut().map(|p| p.detach()).collect();
+        if copies.iter().all(Option::is_none) {
+            // nothing to wait for: read here, as before
+            let refs: Vec<&dyn Resettable> = pages.iter().map(|p| &**p).collect();
+            let r = match refs.first() {
+                Some(p) if !all => Review::for_page(kind, *p, store),
+                _ => Review { all, ..Review::for_all(kind, &refs, store) },
             };
-            out.push(LineResult { page: l.page.clone(), item: l.item.clone(), label: l.label.clone(), outcome });
+            return Opened::Ready(r);
         }
-        out
+        let head = Review { kind, all, page_title, defaults_name, lines: Vec::new() };
+        let mut parts: Vec<Option<Vec<Line>>> = Vec::new();
+        let mut away: Vec<(usize, Detached, Vec<Record>)> = Vec::new();
+        for (i, (p, copy)) in pages.iter().zip(copies).enumerate() {
+            match copy {
+                Some(d) => {
+                    away.push((i, d, page_records(kind, store, p.page_id())));
+                    parts.push(None);
+                }
+                None => parts.push(Some(lines_of(kind, &**p, store))),
+            }
+        }
+        let slot: Arc<Mutex<Option<Vec<(usize, Vec<Line>)>>>> = Arc::new(Mutex::new(None));
+        let out = slot.clone();
+        crate::offui::spawn("reset-read", move || {
+            let mut got = Vec::new();
+            for (i, d, recs) in away {
+                // (a page that panics gives no lines; the review still opens with the others)
+                let lines = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| lines_from(kind, &*d, recs))).unwrap_or_default();
+                got.push((i, lines));
+            }
+            if let Ok(mut s) = out.lock() {
+                *s = Some(got);
+            }
+        });
+        Opened::Reading(ReviewJob { head, parts, slot })
+    }
+
+    /// Order 047: Reset - the ticked lines put back like [`Review::apply_each`] (one admin prompt for the whole batch), each
+    /// ok line recorded through [`note`]; the lines of every page that hands a [`Resettable::detach`] copy are put back on
+    /// a worker thread (an admin prompt, a display mode change wait there, not on the menu's thread), the others here as
+    /// before. `Done` = nothing had to wait; `Running` = the frame says how it went when [`ApplyJob::take`] has it.
+    pub fn start_apply(&self, pages: &mut [&mut dyn Resettable]) -> Applied {
+        let hub = crate::admin::client::admin();
+        let _admin = hub.scope(crate::admin::Purpose::Reset);
+        let mut away: Vec<Detached> = Vec::new();
+        for p in pages.iter_mut() {
+            let has_line = self.lines.iter().any(|l| l.ticked && l.page == p.page_id());
+            if has_line {
+                if let Some(d) = p.detach() {
+                    away.push(d);
+                }
+            }
+        }
+        let away_ids: Vec<String> = away.iter().map(|d| d.page_id().to_string()).collect();
+        let (far, near): (Vec<Line>, Vec<Line>) = self.lines.iter().filter(|l| l.ticked).cloned().partition(|l| away_ids.contains(&l.page));
+        let mut rec = |l: &Line| -> io::Result<()> {
+            note(&l.page, &l.item, &l.label, &l.from, &l.to);
+            Ok(())
+        };
+        if far.is_empty() {
+            return Applied::Done(apply_lines(near.iter(), pages, &mut rec));
+        }
+        let slot: Arc<Mutex<Option<Vec<LineResult>>>> = Arc::new(Mutex::new(None));
+        let out = slot.clone();
+        // the worker holds the same Reset scope: its admin lines and these share ONE elevated copy (one prompt)
+        let scope = hub.scope(crate::admin::Purpose::Reset);
+        crate::offui::spawn("reset-apply", move || {
+            let _scope = scope;
+            let mut copies = away;
+            let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let mut refs: Vec<&mut dyn Resettable> = copies.iter_mut().map(|d| &mut **d as &mut dyn Resettable).collect();
+                apply_lines(far.iter(), &mut refs, &mut |l: &Line| -> io::Result<()> {
+                    note(&l.page, &l.item, &l.label, &l.from, &l.to);
+                    Ok(())
+                })
+            }));
+            let res = res.unwrap_or_else(|_| {
+                far.iter().map(|l| LineResult { page: l.page.clone(), item: l.item.clone(), label: l.label.clone(), outcome: Outcome::Failed("The page stopped".into()) }).collect()
+            });
+            if let Ok(mut s) = out.lock() {
+                *s = Some(res);
+            }
+        });
+        let here = apply_lines(near.iter(), pages, &mut rec);
+        Applied::Running(ApplyJob { here, slot, away: away_ids })
+    }
+}
+
+/// Put lines back through their pages; each ok line goes to `rec`. A line whose page isn't given fails.
+fn apply_lines<'l>(lines: impl Iterator<Item = &'l Line>, pages: &mut [&mut dyn Resettable], rec: &mut dyn FnMut(&Line) -> io::Result<()>) -> Vec<LineResult> {
+    let mut out = Vec::new();
+    for l in lines {
+        let outcome = match pages.iter_mut().find(|p| p.page_id() == l.page) {
+            None => Outcome::Failed("The page isn't loaded".into()),
+            Some(p) => match p.apply(&l.item, &l.to) {
+                Ok(()) => match rec(l) {
+                    Ok(()) => Outcome::Ok,
+                    Err(e) => Outcome::Failed(format!("Reset, but not saved: {e}")),
+                },
+                Err(why) => Outcome::Failed(why),
+            },
+        };
+        out.push(LineResult { page: l.page.clone(), item: l.item.clone(), label: l.label.clone(), outcome });
+    }
+    out
+}
+
+/// Order 047: what [`Review::open`] gave.
+pub enum Opened {
+    Ready(Review),
+    Reading(ReviewJob),
+}
+
+/// Order 047: a review whose detached pages are read on a worker thread.
+pub struct ReviewJob {
+    /// the review without its lines (title, kind)
+    head: Review,
+    /// each page's lines, in the given order (None = the worker reads them)
+    parts: Vec<Option<Vec<Line>>>,
+    slot: Arc<Mutex<Option<Vec<(usize, Vec<Line>)>>>>,
+}
+
+impl ReviewJob {
+    /// The review once the worker has read every detached page (None = still reading; once Some, the job is spent).
+    pub fn take(&mut self) -> Option<Review> {
+        let got = self.slot.lock().ok()?.take()?;
+        for (i, l) in got {
+            if let Some(p) = self.parts.get_mut(i) {
+                *p = Some(l);
+            }
+        }
+        let mut r = self.head.clone();
+        r.lines = std::mem::take(&mut self.parts).into_iter().flatten().flatten().collect();
+        Some(r)
+    }
+}
+
+/// Order 047: what [`Review::start_apply`] gave.
+pub enum Applied {
+    Done(Vec<LineResult>),
+    Running(ApplyJob),
+}
+
+/// Order 047: a reset whose detached pages are put back on a worker thread.
+pub struct ApplyJob {
+    /// the lines put back on the menu's thread
+    here: Vec<LineResult>,
+    slot: Arc<Mutex<Option<Vec<LineResult>>>>,
+    /// the pages put back through their detached copy (their [`Resettable::reset_done`] runs when it has ended)
+    pub away: Vec<String>,
+}
+
+impl ApplyJob {
+    /// Every line's result once the worker has ended (None = still running; once Some, the job is spent).
+    pub fn take(&mut self) -> Option<Vec<LineResult>> {
+        let mut far = self.slot.lock().ok()?.take()?;
+        let mut all = std::mem::take(&mut self.here);
+        all.append(&mut far);
+        Some(all)
+    }
+}
+
+/// The toast after a Reset: "Back to how it was · 2 settings reset", "1 of 3 reset · 2 could not be changed".
+pub fn reset_toast(kind: Kind, n: usize, results: &[LineResult]) -> String {
+    let failed = results.iter().filter(|r| matches!(r.outcome, Outcome::Failed(_))).count();
+    let what = if kind == Kind::HowItWas { "Back to how it was" } else { "Windows defaults" };
+    if n == 0 {
+        "Nothing to reset".to_string()
+    } else if failed == 0 {
+        format!("{} · {} {} reset", what, n, if n == 1 { "setting" } else { "settings" })
+    } else {
+        format!("{} of {} reset · {} could not be changed", n - failed, n, failed)
     }
 }
 
 fn lines_of(kind: Kind, page: &dyn Resettable, store: &SettingsStore) -> Vec<Line> {
-    let mk = |item: &str, label: &str, from: Val, to: Val| Line {
+    lines_from(kind, page, page_records(kind, store, page.page_id()))
+}
+
+/// The page's records a review needs (only "how your PC was" reads them).
+fn page_records(kind: Kind, store: &SettingsStore, page: &str) -> Vec<Record> {
+    if kind == Kind::HowItWas {
+        records(store, Some(page))
+    } else {
+        Vec::new()
+    }
+}
+
+/// One page's review lines from its records (any thread: Order 047's worker reads a detached page here).
+fn lines_from(kind: Kind, page: &dyn Resettable, recs: Vec<Record>) -> Vec<Line> {
+    let mk =|item: &str, label: &str, from: Val, to: Val| Line {
         page: page.page_id().into(),
         page_title: page.page_title().into(),
         item: item.into(),
@@ -416,7 +619,7 @@ fn lines_of(kind: Kind, page: &dyn Resettable, store: &SettingsStore) -> Vec<Lin
         ticked: true,
     };
     match kind {
-        Kind::HowItWas => records(store, Some(page.page_id()))
+        Kind::HowItWas => recs
             .into_iter()
             .filter(|r| page.has_item(&r.item))
             .map(|r| {

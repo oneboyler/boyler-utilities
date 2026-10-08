@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use bu_screenshot::fake::FakeOs;
 use bu_screenshot::gallery::{self, Shot};
 use bu_screenshot::naming::{self, days_from_civil, LocalTime};
-use bu_screenshot::{ScreenshotOs, Screenshots};
+use bu_screenshot::ScreenshotOs;
 
 // ---------------------------------------------------------------- selection
 /// The modifier keys held during a click.
@@ -179,7 +179,7 @@ fn unix_ms_of(t: &LocalTime) -> u64 {
 }
 
 /// The fake engine a test copy uses: the drawing's sample gallery, its clock, its folders.
-pub fn sample_engine() -> (FakeOs, Screenshots<FakeOs>) {
+pub(crate) fn sample_engine() -> (FakeOs, super::Eng<FakeOs>) {
     let os = FakeOs::two_monitors();
     {
         let mut s = os.state();
@@ -202,7 +202,7 @@ pub fn sample_engine() -> (FakeOs, Screenshots<FakeOs>) {
         shots.push(Shot { id, path, width: *w, height: *hh });
     }
     let _ = os.write_file(&data.join("index.txt"), gallery::render(&shots).as_bytes());
-    let eng = Screenshots::new(os.clone(), data);
+    let eng = super::Eng::new(os.clone(), data);
     (os, eng)
 }
 

@@ -284,7 +284,7 @@ fn a_closed_tab_resets_through_its_own_service() {
     let _s = Sv::start();
     let mut m = Mouse::default();
     assert!(m.resettable().is_some());
-    assert!(m.cold.borrow().is_none() && m.svc.is_none(), "nothing made by resettable()");
+    assert!(m.cold.lock().unwrap().is_none() && m.svc.is_none(), "nothing made by resettable()");
     crate::services::with(|s| crate::undo::record(&mut s.store, "cur", "speed", "Pointer speed", &Val::plain("8"), &Val::plain("12"))).unwrap().unwrap();
     let rv = review(&m, Kind::HowItWas);
     // its value now is read (the fake PC: 10), not the last recorded one
@@ -737,4 +737,85 @@ fn proof_042_mouse_dpi_2400() {
     let kids = m.build(&mut cx);
     let root = El::block().w(600.0).h(330.0).pad(2.0, 26.0, 18.0, 26.0).children(kids);
     crate::ui::lay::proof_png(root, 600.0, 330.0, 2.0, "mouse_dpi_2400.png");
+}
+
+/// Order 047 (idle cost): with the worker's answers in and nothing moving the tab asks for no frames - `tick` is false and
+/// a build does not ask for the next frame (an answer still on its way wakes the menu itself).
+#[test]
+fn nothing_moving_asks_for_no_frames() {
+    let mut m = opened();
+    assert!(!m.tick(10.0), "nothing new: no repaint");
+    assert_eq!(m.wake_at(10.0), None);
+    let g = Gfx::new(1.0);
+    let mut st = State::default();
+    let mut cx = Cx::new(20.0, false, &g, &mut st).for_page("cur");
+    let _ = m.build(&mut cx);
+    drop(cx);
+    assert!(!st.busy, "an idle tab asks for no frames");
+}
+
+/// Order 047: the frame's reset through the page's detached copy - the review opened and the Reset pressed each inside
+/// one frame (16 ms), the reads and the put-backs on the review's worker thread; then the page re-reads (`reset_done`).
+/// (The page's fake has no slow mode for these calls: the proof is that both run on the worker - `Reading` / `Running`.)
+fn reset_off_the_menu(p: &mut dyn Resettable, kind: Kind) -> (crate::undo::Review, Vec<crate::undo::LineResult>) {
+    fn wait<T>(mut f: impl FnMut() -> Option<T>) -> T {
+        let t0 = std::time::Instant::now();
+        loop {
+            if let Some(v) = f() {
+                return v;
+            }
+            assert!(t0.elapsed().as_secs() < 10, "the review's worker never answered");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+    let opened = crate::services::with(|s| {
+        crate::undo::flush(&mut s.store);
+        crate::offui::assert_quick("opening the review", || crate::undo::Review::open(kind, false, &mut [&mut *p], &s.store))
+    })
+    .unwrap();
+    let crate::undo::Opened::Reading(mut job) = opened else { panic!("the review is read on a worker thread") };
+    let rv = wait(|| job.take());
+    let applied = crate::offui::assert_quick("Reset", || rv.start_apply(&mut [&mut *p]));
+    let crate::undo::Applied::Running(mut job) = applied else { panic!("the reset is put back on a worker thread") };
+    let res = wait(|| job.take());
+    p.reset_done();
+    (rv, res)
+}
+
+/// Order 047: the Mouse tab's reset (Windows defaults) is read from the tab's last view and put back by its worker, asked
+/// from the review's worker thread - the menu's thread never waits for it; same lines, same results, the tab shows it.
+#[test]
+fn the_reset_review_reads_and_puts_back_off_the_menus_thread() {
+    let _s = Sv::start();
+    let mut m = opened();
+    drag(&mut m, K_SPEED, SPEED_BOX, 1.0);
+    assert_eq!(m.v.win.unwrap().pointer_speed, 20);
+    let (rv, res) = reset_off_the_menu(&mut m, Kind::WindowsDefaults);
+    let def: Vec<String> = rv.lines.iter().map(|l| format!("{}: {}", l.label, l.change_text())).collect();
+    assert_eq!(def, ["Pointer speed: 20  →  10", "Enhance pointer precision: Off  →  On"]);
+    assert!(res.iter().all(|r| r.outcome == Outcome::Ok), "{res:?}");
+    let t0 = std::time::Instant::now();
+    while !(m.v.win.unwrap().pointer_speed == 10 && m.v.win.unwrap().precision) && t0.elapsed().as_secs() < 5 {
+        m.tick(0.0);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    let w = m.v.win.unwrap();
+    assert_eq!((w.pointer_speed, w.precision), (10, true), "the tab shows its worker's answer");
+}
+
+/// Order 047: a setting change (Swap primary button: SystemParametersInfo + its broadcast) never holds the menu - the
+/// click only hands it to the tab's worker and returns within one frame; the tab shows the worker's answer.
+/// (The fake mouse layer has no slow mode: the proof is the click's own time and the answer from the worker.)
+#[test]
+fn a_setting_change_never_holds_the_menu() {
+    let mut m = opened();
+    assert!(!m.v.win.unwrap().buttons_swapped);
+    let g = Gfx::new(1.0);
+    let mut st = State::default();
+    let mut cx = Cx::new(1000.0, false, &g, &mut st).for_page("cur");
+    crate::offui::assert_quick("Swap primary button", || m.event(&Ev::Click(K_SWAP), &mut cx));
+    drop(cx);
+    settle(&mut m);
+    assert!(m.v.win.unwrap().buttons_swapped);
+    assert_eq!(toast(&m), Some("Right button is now your main button"));
 }

@@ -154,7 +154,7 @@ impl Rt {
             let store = path.as_deref().map(Store::load).unwrap_or_default();
             let rt = Arc::new(Rt::new(AnyOs::Win(os), store, path, false));
             if !real_read {
-                rt.sync_watcher();
+                rt.sync_watcher_soon();
             }
             rt
         })
@@ -247,6 +247,18 @@ impl Rt {
 
     #[cfg(not(windows))]
     pub fn sync_watcher(self: &Arc<Self>) {}
+
+    /// Order 047: `sync_watcher` off the caller's thread - starting the watcher waits for WMI's answer (0.1 - 1.5 s), which
+    /// held the menu when a rule was added / changed / removed. One at a time, each reading the rules as they are when it
+    /// runs, so the last one leaves the watcher matching the last change.
+    pub fn sync_watcher_soon(self: &Arc<Self>) {
+        static ONE: Mutex<()> = Mutex::new(());
+        let rt = self.clone();
+        crate::offui::spawn("display-watcher", move || {
+            let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
+            rt.sync_watcher();
+        });
+    }
 
     /// A watched game started / stopped: the rules switch (no prompt, no keep bar); their notes wait for the page.
     pub fn on_app_event(&self, ev: &AppEvent) {

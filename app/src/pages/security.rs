@@ -1373,6 +1373,48 @@ impl Security {
     }
 }
 
+// The reset's reads and writes, for the page itself and its detached copy (Order 047: `SecReset`, on the review's worker
+// thread) alike: the service + the open page's last read of Defender (None = closed).
+
+/// The open page's last read of Defender (a new read takes 1-2 s: closed = the last recorded value).
+fn rs_current(page: Option<&sec::SecurityPage>, item: &str) -> Option<Val> {
+    let id: i64 = item.strip_prefix("allow:")?.parse().ok()?;
+    let p = page?;
+    Some(allow_val(p.allowed.iter().any(|a| a.threat_id == id)))
+}
+
+/// Windows' own value: nothing allowed - every Allow Defender holds (also ones made before the app, the drawing's
+/// "Allowed in Defender · 1 file → none").
+fn rs_defaults(svc: impl FnOnce() -> Arc<sec::SecurityService>, page: Option<&sec::SecurityPage>) -> Vec<DefaultItem> {
+    let list = match page {
+        Some(p) if p.unreadable.is_none() => p.allowed.clone(),
+        _ => svc().allowed_in_defender().unwrap_or_default(),
+    };
+    list.into_iter()
+        .map(|a| {
+            let file = a.files.first().map(|f| split(f).1).unwrap_or_else(|| a.name.clone());
+            DefaultItem { item: allow_item(a.threat_id), label: allow_label(&file), now: allow_val(true), default: allow_val(false) }
+        })
+        .collect()
+}
+
+fn rs_apply(svc: &sec::SecurityService, item: &str, to: &Val) -> Result<(), String> {
+    if crate::testmode::real_read() {
+        return Err("A read-only test copy changes nothing".into());
+    }
+    let id: i64 = item.strip_prefix("allow:").and_then(|s| s.parse().ok()).ok_or("Unknown setting")?;
+    let r = if to.raw == "on" {
+        svc.add_allow(id)
+    } else {
+        match svc.remove_allow(id) {
+            // already not allowed: nothing to take away
+            Err(sec::SecurityError::NoSuchThreat(_)) => Ok(()),
+            r => r,
+        }
+    };
+    r.map_err(|e| Security::err_toast(&e))
+}
+
 impl Resettable for Security {
     fn page_id(&self) -> &str {
         "sec"
@@ -1380,47 +1422,50 @@ impl Resettable for Security {
     fn page_title(&self) -> &str {
         "Security"
     }
-    /// The open page's last read of Defender (a new read takes 1-2 s: closed = the last recorded value).
     fn current(&self, item: &str) -> Option<Val> {
-        let id: i64 = item.strip_prefix("allow:")?.parse().ok()?;
-        let p = self.page.as_ref()?;
-        Some(allow_val(p.allowed.iter().any(|a| a.threat_id == id)))
+        rs_current(self.page.as_ref(), item)
     }
-    /// Windows' own value: nothing allowed - every Allow Defender holds (also ones made before the app, the drawing's
-    /// "Allowed in Defender · 1 file → none").
     fn windows_defaults(&self) -> Vec<DefaultItem> {
-        let list = match self.page.as_ref() {
-            Some(p) if p.unreadable.is_none() => p.allowed.clone(),
-            _ => self.rs_service().allowed_in_defender().unwrap_or_default(),
-        };
-        list.into_iter()
-            .map(|a| {
-                let file = a.files.first().map(|f| split(f).1).unwrap_or_else(|| a.name.clone());
-                DefaultItem { item: allow_item(a.threat_id), label: allow_label(&file), now: allow_val(true), default: allow_val(false) }
-            })
-            .collect()
+        rs_defaults(|| self.rs_service(), self.page.as_ref())
     }
     fn apply(&mut self, item: &str, to: &Val) -> Result<(), String> {
-        if crate::testmode::real_read() {
-            return Err("A read-only test copy changes nothing".into());
-        }
-        let id: i64 = item.strip_prefix("allow:").and_then(|s| s.parse().ok()).ok_or("Unknown setting")?;
-        let svc = self.rs_service();
-        let r = if to.raw == "on" {
-            svc.add_allow(id)
-        } else {
-            match svc.remove_allow(id) {
-                // already not allowed: nothing to take away
-                Err(sec::SecurityError::NoSuchThreat(_)) => Ok(()),
-                r => r,
-            }
-        };
-        r.map_err(|e| Self::err_toast(&e))?;
+        rs_apply(&self.rs_service(), item, to)?;
         // the open page shows Defender's new list
+        self.reset_done();
+        Ok(())
+    }
+    /// Order 047: Defender's list (WMI, 1-2 s) and the Allow changes (an admin prompt) on the review's worker thread.
+    fn detach(&mut self) -> Option<crate::undo::Detached> {
+        Some(Box::new(SecReset { svc: self.rs_service(), page: self.page.clone() }))
+    }
+    fn reset_done(&mut self) {
         if self.tx.is_some() {
             self.read();
         }
-        Ok(())
+    }
+}
+
+/// Order 047: the Security page's reset as a copy for the review's worker thread.
+struct SecReset {
+    svc: Arc<sec::SecurityService>,
+    page: Option<sec::SecurityPage>,
+}
+
+impl Resettable for SecReset {
+    fn page_id(&self) -> &str {
+        "sec"
+    }
+    fn page_title(&self) -> &str {
+        "Security"
+    }
+    fn current(&self, item: &str) -> Option<Val> {
+        rs_current(self.page.as_ref(), item)
+    }
+    fn windows_defaults(&self) -> Vec<DefaultItem> {
+        rs_defaults(|| self.svc.clone(), self.page.as_ref())
+    }
+    fn apply(&mut self, item: &str, to: &Val) -> Result<(), String> {
+        rs_apply(&self.svc, item, to)
     }
 }
 
@@ -1790,6 +1835,55 @@ mod tests {
         let res = reset(&mut c, &rv);
         assert_eq!(res[0].outcome, crate::undo::Outcome::Failed(crate::admin::NOT_CHANGED.into()));
         assert!(c.rs_svc.get().is_some(), "made on first use");
+        crate::services::shutdown();
+    }
+
+    /// Order 047: the frame's reset through the page's detached copy - the review opened and the Reset pressed each inside
+    /// one frame (16 ms), the reads and the put-backs on the review's worker thread; then the page re-reads (`reset_done`).
+    /// (The page's fake has no slow mode for these calls: the proof is that both run on the worker - `Reading` / `Running`.)
+    fn reset_off_the_menu(p: &mut dyn Resettable, kind: crate::undo::Kind) -> (crate::undo::Review, Vec<crate::undo::LineResult>) {
+        fn wait<T>(mut f: impl FnMut() -> Option<T>) -> T {
+            let t0 = std::time::Instant::now();
+            loop {
+                if let Some(v) = f() {
+                    return v;
+                }
+                assert!(t0.elapsed().as_secs() < 10, "the review's worker never answered");
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }
+        let opened = crate::services::with(|s| {
+            crate::undo::flush(&mut s.store);
+            crate::offui::assert_quick("opening the review", || crate::undo::Review::open(kind, false, &mut [&mut *p], &s.store))
+        })
+        .unwrap();
+        let crate::undo::Opened::Reading(mut job) = opened else { panic!("the review is read on a worker thread") };
+        let rv = wait(|| job.take());
+        let applied = crate::offui::assert_quick("Reset", || rv.start_apply(&mut [&mut *p]));
+        let crate::undo::Applied::Running(mut job) = applied else { panic!("the reset is put back on a worker thread") };
+        let res = wait(|| job.take());
+        p.reset_done();
+        (rv, res)
+    }
+
+    /// Order 047: Security's reset (Windows defaults: nothing allowed) is read and put back on the review's worker thread -
+    /// Defender's list (WMI, 1-2 s) and the admin-proxied Allow change never hold the menu; same lines, same results.
+    #[test]
+    fn the_reset_review_reads_and_puts_back_off_the_menus_thread() {
+        use crate::undo::Kind;
+        crate::services::init(windows::Win32::Foundation::HWND::default(), true);
+        let mut p = page();
+        elevate(&p);
+        fake(&p).state().allowed.push(42);
+        p.read();
+        p.pump();
+        let (rv, res) = reset_off_the_menu(&mut p, Kind::WindowsDefaults);
+        assert_eq!(rv.lines.len(), 1, "{:?}", rv.lines);
+        assert_eq!(rv.lines[0].change_text(), "Allowed  →  Not allowed");
+        assert!(res.iter().all(|r| r.outcome == crate::undo::Outcome::Ok), "{res:?}");
+        assert!(fake(&p).state().allowed.is_empty(), "put back by the worker");
+        p.pump();
+        assert!(review(&p, Kind::WindowsDefaults).is_empty(), "the open page read Defender again");
         crate::services::shutdown();
     }
 }

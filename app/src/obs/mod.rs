@@ -671,15 +671,14 @@ pub fn preview_sound(e: usize) {
     });
 }
 
-/// Explorer on a folder ("Open folder").
+/// Explorer on a folder ("Open folder"). Order 047: the shell's open runs off the menu's thread (it can take seconds
+/// while Explorer starts; the menu kept painting nothing meanwhile).
 pub fn open_folder(p: &std::path::Path) {
-    use windows::core::HSTRING;
-    unsafe {
-        let _ = windows::Win32::UI::Shell::ShellExecuteW(None, &HSTRING::from("open"), &HSTRING::from(p.as_os_str()), None, None, SW_SHOWNORMAL);
-    }
+    crate::offui::shell_open(&p.to_string_lossy());
 }
 
 /// Windows' colour picker (Background › Custom…), owned by the menu. Test copies never open it.
+/// (Order 047: a modal dialog - it runs its own message loop on the menu's thread while it is up, so it stays here.)
 pub fn pick_color(initial: u32, test: bool) -> Option<u32> {
     use windows::Win32::Foundation::COLORREF;
     use windows::Win32::UI::Controls::Dialogs::{ChooseColorW, CC_FULLOPEN, CC_RGBINIT, CHOOSECOLORW};

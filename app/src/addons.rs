@@ -128,10 +128,23 @@ pub fn is_on(id: &str) -> bool {
 }
 
 /// Switch a page add-on on or off: saved, and the feature starts / stops now. `test` = a test copy (fake layers).
-/// Get of Notifications for OBS in a normal run first takes over the original NotificationsForOBS (Order 043): the
-/// line saying so is returned.
+/// Get of Notifications for OBS in a normal run first takes over the original NotificationsForOBS (Order 043).
+/// Order 047: that take-over closes the original (its own Quit gets up to 3 s, then 1 s more after ending it), so it
+/// runs off the menu's thread and the switch-on follows when it ends ([`poll_take_over`]); its line then comes as the
+/// page's notice (`take_notice`) - this returns None for it.
 pub fn set_for(id: &str, on: bool, test: bool) -> Option<String> {
-    let note = if id == "obs" && on && !test { take_over(&bu_startup::Startup::new(bu_startup::real::RealOs::new()), &mut bu_obs::real::RealOs::new()) } else { None };
+    if id == "obs" && on && !test {
+        if !taking_over() {
+            begin_take_over(false, || take_over_work(&bu_startup::Startup::new(bu_startup::real::RealOs::new()), &mut bu_obs::real::RealOs::new()));
+        }
+        return None;
+    }
+    switch_on_off(id, on, test);
+    None
+}
+
+/// Save the switch and start / stop the feature (the menu's thread: the store, the feature's window and keys live there).
+fn switch_on_off(id: &str, on: bool, test: bool) {
     crate::services::try_with(|s| {
         let _ = s.store.set_bool(Scope::App, &key(id), on);
     });
@@ -143,7 +156,6 @@ pub fn set_for(id: &str, on: bool, test: bool) -> Option<String> {
         }
     }
     bump();
-    note
 }
 
 /// The Add-ons page's switch (a normal run).
@@ -156,12 +168,115 @@ pub fn set(id: &str, on: bool) -> Option<String> {
 /// settings become the feature's, its startup entry goes off (a line in the change log), the running copy is closed.
 /// None = nothing to take over.
 pub fn take_over<S: bu_startup::StartupOs>(st: &bu_startup::Startup<S>, obs: &mut dyn bu_obs::os::ObsOs) -> Option<String> {
+    let t = take_over_work(st, obs)?;
+    save_taken(&t);
+    Some(t.line)
+}
+
+/// Order 047: what a take-over found and did, made on a worker thread; [`save_taken`] writes it on the menu's thread.
+pub struct Taken {
+    /// the original's settings (to import)
+    settings: Option<bu_obs::Settings>,
+    /// its change log lines: item, label, old, new (unit tests only - the app notes them on the worker, `take_over_work`)
+    notes: Vec<(String, String, crate::undo::Val, crate::undo::Val)>,
+    /// the line the page shows
+    line: String,
+}
+
+/// The take-over's slow part (any thread): find the original, switch its startup off, close it (waits for it to end).
+pub fn take_over_work<S: bu_startup::StartupOs>(st: &bu_startup::Startup<S>, obs: &mut dyn bu_obs::os::ObsOs) -> Option<Taken> {
     let f = crate::obs::takeover::find(st, obs).filter(|f| f.active())?;
-    if let Some(set) = &f.settings {
+    #[cfg_attr(not(test), allow(unused_mut))]
+    let mut notes = Vec::new();
+    let d = crate::obs::takeover::take_over(st, obs, &f, &mut |item, label, old, new| {
+        // the original's startup entry is off now: into the change log at once, from this thread (`note` takes any
+        // thread - a quit before the menu's poll still has it). Unit tests keep one queue per thread, so there the line
+        // goes back to the test's thread (`save_taken`).
+        #[cfg(not(test))]
+        crate::undo::note("sup", item, label, old, new);
+        #[cfg(test)]
+        notes.push((item.to_string(), label.to_string(), old.clone(), new.clone()));
+    });
+    Some(Taken { settings: f.settings.clone(), notes, line: d.line() })
+}
+
+/// The menu's thread: the imported settings into the store (or the running feature), the change log lines.
+fn save_taken(t: &Taken) {
+    if let Some(set) = &t.settings {
         crate::obs::save_imported(set);
     }
-    let d = crate::obs::takeover::take_over(st, obs, &f, &mut |item, label, old, new| crate::undo::note("sup", item, label, old, new));
-    Some(d.line())
+    for (item, label, old, new) in &t.notes {
+        crate::undo::note("sup", item, label, old, new);
+    }
+}
+
+/// A running take-over: its result once the worker has it (None inside = still running), and whether it is a test's.
+type TakeSlot = std::sync::Arc<Mutex<Option<Option<Taken>>>>;
+
+thread_local! {
+    /// Order 047: the take-over of the Get that runs now (the menu's thread only: one per UI thread, so each unit test
+    /// has its own)
+    static TAKING: std::cell::RefCell<Option<(TakeSlot, bool)>> = const { std::cell::RefCell::new(None) };
+}
+
+/// A Get of Notifications for OBS waits for its take-over (the tile stays as it is; another Get click does nothing).
+pub fn taking_over() -> bool {
+    TAKING.with(|t| t.borrow().is_some())
+}
+
+/// Start the take-over off the menu's thread (`crate::offui::spawn`, which wakes the menu when it ends); `test` = the
+/// feature then starts on its fake layers. The menu's thread finishes it in [`poll_take_over`]: the shown Add-ons page
+/// asks every tick, and (a normal run) a thread timer asks every 50 ms - also with the tab left or the menu closed.
+pub(crate) fn begin_take_over(test: bool, work: impl FnOnce() -> Option<Taken> + Send + 'static) {
+    let slot: TakeSlot = std::sync::Arc::new(Mutex::new(None));
+    let s2 = slot.clone();
+    TAKING.with(|t| *t.borrow_mut() = Some((slot, test)));
+    crate::offui::spawn("obs-takeover", move || {
+        let r = work();
+        if let Ok(mut g) = s2.lock() {
+            *g = Some(r);
+        }
+    });
+    #[cfg(not(test))]
+    unsafe {
+        use windows::Win32::UI::WindowsAndMessaging::SetTimer;
+        SetTimer(None, 0, 50, Some(take_over_timer));
+    }
+}
+
+/// The thread timer of a normal run (dispatched by the app's message loop on the menu's thread): ends with the take-over.
+#[cfg(not(test))]
+unsafe extern "system" fn take_over_timer(_: windows::Win32::Foundation::HWND, _: u32, id: usize, _: u32) {
+    // (a modal loop inside a services call dispatches it too: then the next round)
+    if crate::services::in_use() {
+        return;
+    }
+    poll_take_over();
+    if !taking_over() {
+        let _ = unsafe { windows::Win32::UI::WindowsAndMessaging::KillTimer(None, id) };
+    }
+}
+
+/// The menu's thread: the take-over has ended -> its settings and change log lines saved, the feature switched on, its
+/// line (or the usual "… is in the top row") as the page's notice. True = it ended now.
+pub fn poll_take_over() -> bool {
+    let done = TAKING.with(|t| {
+        let mut t = t.borrow_mut();
+        let r = t.as_ref().and_then(|(slot, test)| slot.lock().ok().and_then(|mut g| g.take()).map(|r| (r, *test)));
+        if r.is_some() {
+            *t = None;
+        }
+        r
+    });
+    let Some((taken, test)) = done else { return false };
+    if let Some(t) = &taken {
+        save_taken(t);
+    }
+    switch_on_off("obs", true, test);
+    let line = taken.map(|t| t.line).unwrap_or_else(|| format!("{} is in the top row", CATALOGUE[0].name));
+    *NOTICE.lock().unwrap() = Some((line, Instant::now()));
+    crate::services::Waker.wake();
+    true
 }
 
 /// Is this tab shown in the top row? (a tab of an add-on only while it is on)

@@ -15,6 +15,67 @@ use windows::Win32::Graphics::Dxgi::*;
 thread_local! {
     /// A Direct3D device made on tray hover and handed to the next open (see App::warm_up); None = make one per open.
     pub static KEPT_D3D: RefCell<Option<ID3D11Device>> = const { RefCell::new(None) };
+    /// Order 047 item 11: the worker making the next open's device (started on tray hover or at the open), with how long
+    /// it took (ms)
+    static D3D_WORKER: RefCell<Option<std::thread::JoinHandle<(Option<ID3D11Device>, f64)>>> = const { RefCell::new(None) };
+}
+
+/// Order 047 item 11: start making the Direct3D device on a worker thread (80-110 ms measured on the UI thread before;
+/// a D3D11 device is free-threaded, and its immediate context is only used by the UI thread once handed over). Nothing
+/// when a device is kept or already on its way. True = a worker was started.
+pub fn prepare_d3d() -> bool {
+    if KEPT_D3D.with(|k| k.borrow().is_some()) || D3D_WORKER.with(|w| w.borrow().is_some()) {
+        return false;
+    }
+    let h = std::thread::Builder::new().name("d3d device".into()).spawn(|| {
+        let t = crate::timing::now();
+        let d = new_d3d().ok();
+        (d, crate::timing::now() - t)
+    });
+    match h {
+        Ok(h) => {
+            D3D_WORKER.with(|w| *w.borrow_mut() = Some(h));
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+/// The device kept or made by `prepare_d3d` - waiting for its worker if it is still busy (never a second device made
+/// meanwhile), None = none on its way.
+pub fn take_d3d() -> Option<ID3D11Device> {
+    if let Some(d) = KEPT_D3D.with(|k| k.borrow_mut().take()) {
+        return Some(d);
+    }
+    let h = D3D_WORKER.with(|w| w.borrow_mut().take())?;
+    let t = crate::timing::now();
+    let (d, ms) = h.join().ok()?;
+    crate::timing::note(&format!("d3d worker {:.1} ms, open waited {:.1} ms", ms, crate::timing::now() - t));
+    d
+}
+
+/// The menu's device: the warm one (`take_d3d`, waited for if its worker is still busy), or a new one made here when none
+/// was on its way or it was lost meanwhile.
+pub fn take_or_make_device() -> Result<ID3D11Device> {
+    match take_d3d() {
+        Some(d) if unsafe { d.GetDeviceRemovedReason() }.is_ok() => Ok(d),
+        _ => new_d3d(),
+    }
+}
+
+/// Let the kept device go (the menu was not opened after a hover). A worker still busy is let go too: its device is
+/// dropped on its own thread when it ends. True = there was one.
+pub fn drop_d3d() -> bool {
+    let kept = KEPT_D3D.with(|k| k.borrow_mut().take()).is_some();
+    let worker = D3D_WORKER.with(|w| w.borrow_mut().take());
+    let had = kept || worker.is_some();
+    if let Some(h) = worker {
+        if h.is_finished() {
+            let _ = h.join();
+        }
+        // (not finished: dropping the handle detaches the thread; its result is dropped when it ends)
+    }
+    had
 }
 
 pub fn new_d3d() -> Result<ID3D11Device> {
@@ -42,11 +103,7 @@ pub struct Chain {
 
 impl Chain {
     pub fn new(w: u32, h: u32) -> Result<Chain> {
-        let kept = KEPT_D3D.with(|k| k.borrow_mut().take());
-        let d3d: ID3D11Device = match kept {
-            Some(d) if unsafe { d.GetDeviceRemovedReason() }.is_ok() => d,
-            _ => new_d3d()?,
-        };
+        let d3d = take_or_make_device()?;
         crate::timing::note("open_step d3d");
         Self::new_on(d3d, w, h)
     }
@@ -107,6 +164,52 @@ impl Drop for Chain {
     fn drop(&mut self) {
         unsafe {
             let _ = CloseHandle(self.waitable);
+        }
+    }
+}
+
+/// Order 051: the swap chain a window's pixels go into - Skia's CPU pixels copied in (the fallback, `Chain`), or Skia
+/// drawing on the GPU straight into its back buffers (`gpu::GpuChain`).
+pub enum Swap {
+    Cpu(Chain),
+    Gpu(crate::gpu::GpuChain),
+}
+
+impl Swap {
+    pub fn swap(&self) -> &IDXGISwapChain2 {
+        match self {
+            Swap::Cpu(c) => &c.swap,
+            Swap::Gpu(c) => &c.swap,
+        }
+    }
+
+    pub fn waitable(&self) -> HANDLE {
+        match self {
+            Swap::Cpu(c) => c.waitable,
+            Swap::Gpu(c) => c.waitable,
+        }
+    }
+
+    pub fn size(&self) -> (u32, u32) {
+        match self {
+            Swap::Cpu(c) => (c.w, c.h),
+            Swap::Gpu(c) => (c.w, c.h),
+        }
+    }
+
+    pub fn is_gpu(&self) -> bool {
+        matches!(self, Swap::Gpu(_))
+    }
+
+    /// Let go of the GPU work now (the window is closing).
+    pub fn release(&self) {
+        match self {
+            Swap::Cpu(c) => c.release(),
+            Swap::Gpu(c) => {
+                if !c.gpu.lost() {
+                    c.gpu.finish();
+                }
+            }
         }
     }
 }

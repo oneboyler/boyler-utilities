@@ -53,6 +53,7 @@ checksum = "3ded4057c258ba199e2d26386d3af3780957ecaee6c4ef4041c6b4b8b97c0b06"
 name = "bu-activity"
 version = "0.1.0"
 dependencies = [
+ "bu-rawin",
  "thiserror",
  "windows",
 ]
@@ -68,7 +69,7 @@ dependencies = [
 
 [[package]]
 name = "bu-app"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "bu-activity",
  "bu-addons",
@@ -82,6 +83,7 @@ dependencies = [
  "bu-obs",
  "bu-perf",
  "bu-quickfix",
+ "bu-rawin",
  "bu-screenshot",
  "bu-search",
  "bu-security",
@@ -127,6 +129,7 @@ dependencies = [
 name = "bu-display"
 version = "0.1.0"
 dependencies = [
+ "bu-procwatch",
  "serde",
  "serde_json",
  "thiserror",
@@ -147,6 +150,7 @@ dependencies = [
 name = "bu-mouse"
 version = "0.1.0"
 dependencies = [
+ "bu-procwatch",
  "png",
  "serde",
  "serde_json",
@@ -181,10 +185,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "bu-procwatch"
+version = "0.1.0"
+dependencies = [
+ "windows",
+]
+
+[[package]]
 name = "bu-quickfix"
 version = "0.1.0"
 dependencies = [
  "thiserror",
+ "windows",
+]
+
+[[package]]
+name = "bu-rawin"
+version = "0.1.0"
+dependencies = [
  "windows",
 ]
 
@@ -674,6 +692,7 @@ checksum = "c61cb643dac43067f3eb76c866635a74377ac0abca0ff2590674e1e295514c3d"
 dependencies = [
  "bitflags",
  "skia-bindings",
+ "windows",
 ]
 
 [[package]]

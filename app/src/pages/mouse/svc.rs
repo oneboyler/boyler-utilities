@@ -101,6 +101,9 @@ pub enum Cmd {
     /// the change log's reset (the frame's review, a ticked line): put one item to this value; the answer comes back on
     /// the sender (the frame waits for it)
     Restore(String, Val, Sender<Result<(), String>>),
+    /// Order 047: the same, asked by the review's worker thread (a detached reset copy): its answer is not one the page
+    /// counts as pending
+    RestoreAway(String, Val, Sender<Result<(), String>>),
     /// a reset was put back on the UI thread (Order 036 review): only read again, so the tab shows it
     Reread,
 }
@@ -172,6 +175,11 @@ impl Svc {
                 self.pending += 1;
             }
         }
+    }
+
+    /// Order 047: the worker's command line for another thread (a detached reset copy: `Cmd::RestoreAway`).
+    pub fn sender(&self) -> Option<Sender<Cmd>> {
+        self.tx.clone()
     }
 
     /// Replies that arrived (never waits).
@@ -492,16 +500,35 @@ impl<O: MouseOs> Restorer for Mouse<O> {
     }
 }
 
-pub fn restorer() -> Box<dyn Restorer> {
+pub fn restorer() -> Box<dyn Restorer + Send> {
     // (unit tests: always the fake - a closed tab is asked by tests of other parts too)
     if crate::testmode::on() || cfg!(test) {
-        return Box::new(sample_fake());
+        return Box::new(SendFake(sample_fake()));
     }
     #[cfg(windows)]
-    let m: Box<dyn Restorer> = Box::new(real_bare(crate::testmode::real_read()));
+    let m: Box<dyn Restorer + Send> = Box::new(real_bare(crate::testmode::real_read()));
     #[cfg(not(windows))]
-    let m: Box<dyn Restorer> = Box::new(sample_fake());
+    let m: Box<dyn Restorer + Send> = Box::new(SendFake(sample_fake()));
     m
+}
+
+/// Order 047: the closed tab's FAKE service may be used on the review's worker thread (a detached reset copy).
+struct SendFake(Mouse<FakeOs>);
+// SAFETY: `FakeOs` is not `Send` only because its fake mice are `Box<dyn FnMut>` with no `Send` bound; the sample PC's
+// one mouse (`sample_fake_with`) captures only its `CmouseModel` (plain data). One thread uses it at a time (the page
+// keeps it behind a `Mutex`).
+unsafe impl Send for SendFake {}
+
+impl Restorer for SendFake {
+    fn val(&self, item: &str) -> Option<Val> {
+        Restorer::val(&self.0, item)
+    }
+    fn defaults(&self) -> Vec<DefaultItem> {
+        Restorer::defaults(&self.0)
+    }
+    fn restore(&mut self, item: &str, raw: &str) -> Result<(), String> {
+        Restorer::restore(&mut self.0, item, raw)
+    }
 }
 
 thread_local! {
@@ -582,6 +609,8 @@ fn run<O: MouseOs>(mut m: Mouse<O>, rx: Receiver<Cmd>, tx: Sender<Reply>, mut ac
                 let items = watched(&c);
                 let before: Vec<(&str, Option<Val>)> = items.iter().map(|i| (*i, item_val(&m, i))).collect();
                 let driver_before = if items.contains(&"accel") && !accel_logged { m.driver_state().ok().flatten() } else { None };
+                // (a detached reset copy asked: the page did not count it as pending)
+                let away = matches!(c, Cmd::RestoreAway(..));
                 let toast = apply(&mut m, &list, &mut on, c);
                 let mut changes = Vec::new();
                 for (i, old) in before {
@@ -599,7 +628,7 @@ fn run<O: MouseOs>(mut m: Mouse<O>, rx: Receiver<Cmd>, tx: Sender<Reply>, mut ac
                     }
                     changes.push((i.to_string(), label(i).to_string(), old, new));
                 }
-                if !send(Reply { view: view(&m, mice.clone(), on.clone()), toast, reading_mouse: false, unasked: false, changes: changes.clone() }) {
+                if !send(Reply { view: view(&m, mice.clone(), on.clone()), toast, reading_mouse: false, unasked: away, changes: changes.clone() }) {
                     if note_if_gone {
                         for (i, l, o, n) in &changes {
                             crate::undo::note(PAGE, i, l, o, n);
@@ -693,7 +722,7 @@ fn apply<O: MouseOs>(m: &mut Mouse<O>, mice: &[YourMouse], on: &mut Option<OnMou
         Cmd::Preview(r, s) => m.preview_cursor(r, &s).err().and_then(err),
         Cmd::EndPreview => m.end_preview().err().and_then(err),
         Cmd::Reread => None,
-        Cmd::Restore(item, to, back) => {
+        Cmd::Restore(item, to, back) | Cmd::RestoreAway(item, to, back) => {
             // the frame shows the outcome (its own toast); the page's view follows from this answer
             let _ = back.send(restore(m, &item, &to.raw));
             None

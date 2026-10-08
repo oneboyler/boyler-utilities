@@ -68,6 +68,8 @@ pub struct Timers {
     lap_at: Option<(usize, f64)>,
     /// the world clock's minute last shown (it repaints once a minute)
     shown_minute: String,
+    /// Order 047: what the running timers showed at the last tick (digits, ring) - a change repaints
+    shown_sig: Option<u64>,
 }
 
 /// A colour with the hover mix of `.tmrw`'s transition.
@@ -578,7 +580,24 @@ impl Page for Timers {
             m.check();
             (std::mem::take(&mut m.ended), m.any_running(), m.mode)
         });
-        let mut dirty = running;
+        // Order 047: a running timer repaints only when what it shows changed (a digit; its ring / line by a quarter
+        // pixel) - not every frame of a 360 Hz screen; `wake_at` looks again every 5 ms
+        let sig = if running {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            self.with(|m| {
+                for t in m.timers.iter().filter(|t| t.running()) {
+                    t.big_text().hash(&mut h);
+                    t.short_text().hash(&mut h);
+                    ((t.share_left() * 4000.0) as i32).hash(&mut h);
+                }
+            });
+            Some(h.finish())
+        } else {
+            None
+        };
+        let mut dirty = sig != self.shown_sig;
+        self.shown_sig = sig;
         if let Some((id, text)) = ended.into_iter().last() {
             self.show_toast(text, now);
             self.end_at = Some((id, now));
@@ -589,6 +608,22 @@ impl Page for Timers {
             dirty = true;
         }
         dirty
+    }
+    /// (Order 047: not opened ahead on hover - opening shows the bars preview on the screen)
+    fn preopen(&self) -> bool {
+        false
+    }
+    fn wake_at(&self, now: f64) -> Option<f64> {
+        // a running timer's digits / ring: looked at every 5 ms (a stopwatch's hundredths change every 10); the world
+        // clock's minute every 250 ms
+        let (running, clock) = self.with(|m| (m.any_running(), m.mode == Mode::Clk));
+        if running {
+            Some(now + 5.0)
+        } else if clock {
+            Some(now + 250.0)
+        } else {
+            None
+        }
     }
     fn event(&mut self, ev: &Ev, cx: &mut Cx) {
         let now = cx.now;

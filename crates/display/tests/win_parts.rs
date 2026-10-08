@@ -1,5 +1,6 @@
 //! Windows-layer parts that can be proven without changing anything: the undocumented DPI packet maths, the EDID
-//! size parser, and the app watcher (source fallback, real WMI start + exit of a hidden throw-away `ping` we start).
+//! size parser, and the app watcher (source fallback, start + exit of a hidden throw-away `ping` we start; the test with the
+//! real window-creation hook is #[ignore]d: tests install no real WinEvent hook).
 #![cfg(windows)]
 
 use bu_display::autoswitch::AppEvent;
@@ -77,7 +78,7 @@ fn no_rules_means_no_subscription() {
     assert_eq!(w.active_source(), None);
 }
 
-/// A fake source WMI "refuses" and one that works: the watcher must fall back to the second.
+/// A fake source that is refused and one that works: the watcher must fall back to the second.
 struct Refuses;
 impl watch::ProcessStartSource for Refuses {
     fn name(&self) -> &'static str {
@@ -129,8 +130,11 @@ fn all_sources_refusing_is_a_typed_error() {
 }
 
 #[test]
-fn real_wmi_reports_a_process_start_and_exit() {
-    // REAL: the default sources (admin trace first, else WMI creation events) for "ping.exe"; a hidden ping we start.
+#[ignore = "installs the real window-creation WinEvent hook (run by hand: cargo test -p bu-display --test win_parts -- --ignored)"]
+fn real_watcher_reports_a_process_start_and_exit() {
+    // REAL: the default sources (admin trace only if elevated, then the bu-procwatch window-creation watcher) for
+    // "ping.exe"; a hidden ping we start. A hidden ping makes no window, so `rescan` stands in for the window a game
+    // would create (the same snapshot path runs).
     let (tx, rx) = mpsc::channel();
     let w = watch::AppWatcher::start(vec!["PING.EXE".into()], move |e| {
         let _ = tx.send((e, Instant::now()));
@@ -138,15 +142,19 @@ fn real_wmi_reports_a_process_start_and_exit() {
     .unwrap();
     let src = w.active_source().unwrap();
     println!("active source: {src}");
+    std::thread::sleep(Duration::from_millis(300)); // the watcher's first snapshot (what already runs) is taken
     let t0 = Instant::now();
     let mut child = hidden_ping(3);
     let pid = child.id();
     // Other terminals may run ping too: only our pid counts.
-    let deadline = Instant::now() + Duration::from_secs(60); // generous: only an upper bound, PC load can slow WMI
+    let deadline = Instant::now() + Duration::from_secs(60); // generous: only an upper bound, PC load can slow it
     let mut started_at = None;
     let mut stopped = false;
     while Instant::now() < deadline && !stopped {
-        if let Ok((e, at)) = rx.recv_timeout(Duration::from_millis(500)) {
+        if started_at.is_none() {
+            bu_procwatch::rescan();
+        }
+        if let Ok((e, at)) = rx.recv_timeout(Duration::from_millis(200)) {
             match e {
                 AppEvent::Started { pid: p, has_window, .. } if p == pid => {
                     assert!(!has_window);
@@ -175,7 +183,7 @@ fn watcher_drop_releases_exit_waits_without_events() {
     let mut child = hidden_ping(60);
     w.report_start(child.id(), "ping.exe".into());
     assert!(matches!(rx.recv_timeout(Duration::from_secs(60)).unwrap(), AppEvent::Started { .. }));
-    drop(w); // cancel event wakes the waiting thread: no Stopped is sent
+    drop(w); // the exit wait is unregistered: no Stopped is sent
     let _ = child.kill();
     let _ = child.wait();
     assert!(rx.recv_timeout(Duration::from_millis(300)).is_err());

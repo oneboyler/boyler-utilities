@@ -13,9 +13,10 @@
 //! - the OS layer is the [`KeysOs`] trait: [`real::RealKeysOs`] = RegisterHotKey / UnregisterHotKey on the app's window
 //!   (WM_HOTKEY, wParam = slot → [`KeysManager::action_for_slot`]) for normal keys; Raw Input (RIDEV_INPUTSINK, listen
 //!   only, no hooks anywhere — boss A_014_01) for modifier-only keys, mouse buttons and actions flagged
-//!   [`Action::needs_release`], registered only while such a key is bound ([`raw`]); WM_INPUT →
-//!   `KeysManager::on_wm_input` (real.rs) → `(action id, down)`. [`fake::FakeKeysOs`] for tests — tests never register
-//!   keys or raw input;
+//!   [`Action::needs_release`], registered only while such a key is bound ([`raw`]) — through bu-rawin, the process's
+//!   one Raw Input owner on its own thread (Order 048): it wakes the message window with `services::WM_RAWKEYS` only
+//!   for key packets and mouse buttons / wheel (never a move) → `services::raw_packets` → [`KeysManager::on_raw`] →
+//!   `(action id, down)`. [`fake::FakeKeysOs`] for tests — tests never register keys or raw input;
 //! - the mapping is saved in the settings store (app scope, key "keys") on every change, so "Reset the app's own
 //!   settings" clears it ([`KeysManager::reload`] afterwards).
 
@@ -463,7 +464,7 @@ impl<O: KeysOs> KeysManager<O> {
         self.entries.iter().find(|e| e.slot == slot && e.live).map(|e| e.action.id.as_str())
     }
 
-    /// One Raw Input packet (WM_INPUT, parsed): `fire(action id, down)` for each action it triggers. Modifier-only and
+    /// One Raw Input packet (from bu-rawin, parsed): `fire(action id, down)` for each action it triggers. Modifier-only and
     /// mouse-button keys fire once with down = true; release keys fire down and up. A mouse move does nothing.
     #[inline]
     pub fn on_raw(&mut self, p: Packet, mut fire: impl FnMut(&str, bool)) {

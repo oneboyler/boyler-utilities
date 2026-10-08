@@ -31,6 +31,8 @@ impl T {
     fn with(rt: Arc<Rt>) -> T {
         let mut p = Display::default();
         p.open_rt(rt, &env(), 0.0);
+        // Order 047: the monitors are read on the page's worker
+        p.settle(0.0);
         let mut t = T { p, g: Gfx::new(1.0), st: State::default(), now: 0.0 };
         t.build();
         t
@@ -46,6 +48,9 @@ impl T {
         self.now += 16.0;
         let mut cx = Cx::new(self.now, false, &self.g, &mut self.st);
         self.p.event(&e, &mut cx);
+        // Order 047: its worker job (a mode change, a read) answered and landed
+        let now = self.now;
+        self.p.settle(now);
         self.build();
     }
     fn click(&mut self, k: Key) {
@@ -616,4 +621,191 @@ fn item_ids_read_back() {
         assert_eq!(reset::Item::parse(&it.id()), Some(it));
     }
     assert_eq!(reset::Item::parse("nope:x"), None);
+}
+
+// ---------------------------------------------------------------- Order 047: the menu's thread never waits
+
+impl T {
+    /// The page on a SLOW worker (every job sleeps 300 ms first - a stand-in for SetDisplayConfig, the monitors' read, a
+    /// DDC/CI write holding the service): its open hands the menu's thread back within one frame.
+    fn slow() -> T {
+        let mut p = Display::default();
+        p.slow = 300;
+        let rt = Rt::fake_sample();
+        crate::offui::assert_quick("Display open", || p.open_rt(rt, &env(), 0.0));
+        assert!(p.mons.is_empty(), "the monitors are read on the worker");
+        p.settle(0.0);
+        let mut t = T { p, g: Gfx::new(1.0), st: State::default(), now: 0.0 };
+        t.build();
+        t
+    }
+    /// An event that must not wait (the Cx is made outside the timed part); its answer is not waited for.
+    fn quick(&mut self, e: Ev, what: &str) {
+        self.now += 16.0;
+        let mut cx = Cx::new(self.now, false, &self.g, &mut self.st);
+        let p = &mut self.p;
+        crate::offui::assert_quick(what, || p.event(&e, &mut cx));
+    }
+    /// The answers landed.
+    fn settle(&mut self) {
+        let now = self.now;
+        self.p.settle(now);
+        self.build();
+    }
+}
+
+/// Apply, Revert and Keep (SetDisplayConfig on a real PC: 0.5 - 3 s) return at once; the keep bar and its countdown
+/// come with Windows' answer, exactly as before.
+#[test]
+fn apply_revert_and_keep_never_hold_the_menu() {
+    let mut t = T::slow();
+    t.type_into(Fld::W, "1280");
+    t.type_into(Fld::H, "720");
+    t.quick(Ev::Click(K_APPLY), "Apply");
+    assert!(t.calls().is_empty() && t.p.cfm_on.is_none(), "Windows hasn't answered yet");
+    t.settle();
+    assert!(matches!(t.calls().last(), Some(FakeCall::ApplyMode(..))), "{:?}", t.calls());
+    assert!(t.p.cfm_on.is_some() && t.rt().svc.lock().unwrap().pending().is_some(), "the keep bar after Windows' answer");
+    t.quick(Ev::Click(K_REVERT), "Revert");
+    t.settle();
+    assert_eq!(t.toast(), "Back to 1920 × 1080 · 165 Hz");
+    assert_eq!(t.fields().w, 1920);
+    t.type_into(Fld::W, "1280");
+    t.type_into(Fld::H, "720");
+    t.quick(Ev::Click(K_APPLY), "Apply again");
+    t.settle();
+    t.quick(Ev::Click(K_KEEP), "Keep");
+    assert!(t.p.cfm_on.is_none(), "the bar goes with the click");
+    t.settle();
+    assert!(t.toast().starts_with("Kept 1280 × 720"), "{}", t.toast());
+    assert!(matches!(t.calls().last(), Some(FakeCall::SaveCurrent(_))), "{:?}", t.calls());
+    assert!(t.rt().svc.lock().unwrap().pending().is_none());
+}
+
+/// Main display (SetDisplayConfig) returns at once; the toast comes with the answer.
+#[test]
+fn main_display_never_holds_the_menu() {
+    let mut t = T::slow();
+    t.click(idx(K_MON, 1));
+    t.quick(Ev::Click(K_MAIN), "Main display");
+    t.settle();
+    assert_eq!(t.calls().last(), Some(&FakeCall::SetMain(MonitorId(LG.into()))));
+    assert_eq!(t.toast(), "Main display: 2 · LG 24GL600F");
+}
+
+/// The tab opens on the last read at once (`env.keep`); the fresh read follows from the worker.
+#[test]
+fn the_tab_opens_on_its_last_read() {
+    let e = env();
+    let mut p = Display::default();
+    p.open_rt(Rt::fake_sample(), &e, 0.0);
+    p.settle(0.0);
+    p.close();
+    let mut q = Display::default();
+    q.slow = 300;
+    let rt = Rt::fake_sample();
+    crate::offui::assert_quick("Display open again", || q.open_rt(rt, &e, 0.0));
+    assert!(!q.mons.is_empty() && q.f.is_some() && q.ready(), "the last read at once");
+    q.settle(0.0);
+    assert_eq!(q.mons.len(), 2);
+}
+
+/// A rule switched / removed: the app watcher (WMI's answer: 0.1 - 1.5 s on a real PC) is brought up to date on its
+/// own thread (here slowed by `offui::set_test_delay`).
+#[test]
+fn a_rule_change_never_waits_for_the_watcher() {
+    let mut t = T::new();
+    let before = crate::offui::done();
+    crate::offui::set_test_delay(300);
+    t.quick(Ev::Click(sub(idx(K_RULE, 2), "tg")), "a rule switched on");
+    assert!(t.p.rules()[2].enabled);
+    let t0 = std::time::Instant::now();
+    while crate::offui::done() <= before && t0.elapsed().as_secs() < 5 {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    crate::offui::set_test_delay(0);
+    assert!(crate::offui::done() > before, "the watcher's update ran");
+}
+
+/// Nothing moving = no frames: `tick` is false, `wake_at` None; a deleted chip's fade ends at a timed wake-up.
+#[test]
+fn idle_page_asks_for_no_frames() {
+    let mut t = T::new();
+    let now = t.now + 1000.0;
+    assert!(!t.p.tick(now), "nothing moves: no frames");
+    assert_eq!(t.p.wake_at(now), None);
+    let id = t.p.presets()[0].id;
+    t.click(sub(idx(K_PST, id.0 as usize), "del"));
+    let t0 = t.p.pst_out.unwrap().1;
+    assert_eq!(t.p.wake_at(t0 + 1.0), Some(t0 + 160.0));
+    assert!(t.p.tick(t0 + 160.0), "the chip leaves at its fade's end");
+    assert!(t.p.pst_out.is_none() && t.p.wake_at(t0 + 160.0).is_none());
+    assert!(!t.p.tick(t0 + 200.0));
+    assert_eq!(t.p.presets().len(), 2);
+}
+
+/// Order 047: the reset review reads and puts back through the page's worker copy (`detach`, the page's runtime): with
+/// a slow copy (300 ms a call) its open and its Reset (a mode change on a real PC) hand the menu's thread back within one
+/// frame, the mode still goes back, and the open page reads it again (`reset_done`).
+#[test]
+fn the_reset_review_never_holds_the_menu() {
+    use crate::undo::{Applied, Opened};
+    fn wait_for<T>(mut f: impl FnMut() -> Option<T>) -> T {
+        let t0 = std::time::Instant::now();
+        loop {
+            if let Some(v) = f() {
+                return v;
+            }
+            assert!(t0.elapsed().as_secs() < 10, "the worker never answered");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+    start_services();
+    let mut t = T::new();
+    let dell = MonitorId(DELL.into());
+    t.click(idx(K_SCALE, 0));
+    t.type_into(Fld::W, "1440");
+    t.click(K_APPLY);
+    t.click(K_KEEP);
+    assert_eq!(t.rt().svc.lock().unwrap().monitor(&dell).unwrap().current.width, 1440);
+    t.p.slow = 300;
+    let review = {
+        let mut pages: [&mut dyn Resettable; 1] = [&mut t.p];
+        let opened = crate::services::with(|s| crate::offui::assert_quick("the review opens", || Review::open(Kind::HowItWas, false, &mut pages, &s.store))).unwrap();
+        let Opened::Reading(mut job) = opened else { panic!("read on a worker thread") };
+        wait_for(|| job.take())
+    };
+    let mode = review.lines.iter().position(|l| l.item == format!("mode:{DELL}")).expect("the mode's line");
+    assert_eq!(review.lines[mode].change_text(), "1440 × 1080 · 165 Hz · Stretch  →  1920 × 1080 · 165 Hz · Keep aspect");
+    let res = {
+        let mut pages: [&mut dyn Resettable; 1] = [&mut t.p];
+        let applied = crate::offui::assert_quick("Reset", || review.start_apply(&mut pages));
+        let Applied::Running(mut job) = applied else { panic!("put back on a worker thread") };
+        wait_for(|| job.take())
+    };
+    assert!(res.iter().all(|r| r.outcome == Outcome::Ok), "{res:?}");
+    assert_eq!(t.rt().svc.lock().unwrap().monitor(&dell).unwrap().current.width, 1920, "back to how the PC was");
+    t.p.reset_done();
+    t.settle();
+    assert_eq!(t.fields().w, 1920, "the open page shows it");
+    crate::services::shutdown();
+}
+
+/// Order 047: a second mode click while one is on the worker (here a preset during an Apply) is remembered and sent when
+/// the first has answered - the fields, the keep bar and Windows end on the second one.
+#[test]
+fn a_mode_click_during_a_mode_change_is_sent_after_it() {
+    let mut t = T::slow();
+    t.type_into(Fld::W, "1280");
+    t.type_into(Fld::H, "720");
+    t.quick(Ev::Click(K_APPLY), "Apply");
+    let stretch = t.p.presets().into_iter().find(|p| p.scaling == GpuScaling::Stretch).unwrap();
+    t.quick(Ev::Click(idx(K_PST, stretch.id.0 as usize)), "a preset during the Apply");
+    t.settle();
+    let applied: Vec<FakeCall> = t.calls().into_iter().filter(|c| matches!(c, FakeCall::ApplyMode(..))).collect();
+    assert_eq!(applied.len(), 2, "{applied:?}");
+    let want = bu_display::Mode { width: 1440, height: 1080, refresh: RefreshRate::new(164_950, 1000), scaling: GpuScaling::Stretch };
+    assert_eq!(applied[1], FakeCall::ApplyMode(MonitorId(DELL.into()), want));
+    assert_eq!((t.fields().w, t.fields().sc), (1440, GpuScaling::Stretch));
+    assert!(t.p.cfm_on.is_some() && t.p.next.is_none());
 }

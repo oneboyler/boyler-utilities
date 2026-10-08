@@ -1,0 +1,25 @@
+[package]
+name = "bu-procwatch"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "Boyler Utilities - one shared 'a watched game started / ended' signal for the per-app switchers (Display, Mouse). No UI, no WMI, no polling."
+
+[lib]
+name = "bu_procwatch"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_Threading",
+    "Win32_UI_Accessibility",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+# Order 048's proof: the watcher's own CPU while it listens (WmiPrvSE is measured from outside)
+[[example]]
+name = "procwatch-cost"
+path = "examples/cost.rs"

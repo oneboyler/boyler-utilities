@@ -1,5 +1,7 @@
-//! Idle-cost measurement of the parts that run while the menu is closed: the app watcher (WMI start subscription + one
-//! exit wait) and an armed keep countdown. Prints the process CPU time used over the window and its memory.
+//! Idle-cost measurement of the parts that run while the menu is closed: the app watcher (the bu-procwatch window-creation
+//! hook + one exit wait on the thread pool) and an armed keep countdown. Prints the process CPU time used over the window
+//! and its memory. Our own CPU now includes the hook callbacks (one per new window anywhere); WmiPrvSE no longer re-reads the
+//! process list for us.
 //! Changes nothing (the watched exe names match nothing; the countdown has no pending change to revert).
 //!
 //!   cargo run -p bu-display --example display-idle -- <seconds> [no-rules]

@@ -8,7 +8,8 @@ use bu_startup::saved::{State as SavedState, Target};
 use bu_startup::{Change, Hive, RegView, Startup, StartupEntry, StartupError, StartupList, RUN};
 
 pub enum Svc {
-    Fake(Box<Startup<FakeOs>>),
+    /// shared, so the list can be read again on a helper thread like the real one (Order 047)
+    Fake(std::sync::Arc<Startup<FakeOs>>),
     #[cfg(windows)]
     Real(Startup<crate::admin::proxy::StartupOs>),
 }
@@ -27,6 +28,27 @@ impl Svc {
             Svc::Fake(s) => s.list(),
             #[cfg(windows)]
             Svc::Real(s) => s.list(),
+        }
+    }
+    /// Order 047: the list read as a job for a helper thread (Task Scheduler, the services, every program's version info:
+    /// 0.2 - 1.5 s on a real PC) - the real one reads with its own copy of the OS layer, as the tab's open does.
+    pub fn lister(&self) -> Box<dyn FnOnce() -> StartupList + Send> {
+        match self {
+            Svc::Fake(s) => {
+                let s = s.clone();
+                Box::new(move || s.list())
+            }
+            #[cfg(windows)]
+            Svc::Real(_) => Box::new(|| Startup::new(bu_startup::real::RealOs::new()).list()),
+        }
+    }
+    /// Order 047: the same service for another thread - the fake shared (its state is the "PC"); None for the real one
+    /// (that thread makes its own: every state lives in Windows).
+    pub fn share(&self) -> Option<Svc> {
+        match self {
+            Svc::Fake(s) => Some(Svc::Fake(s.clone())),
+            #[cfg(windows)]
+            Svc::Real(_) => None,
         }
     }
     pub fn set(&self, e: &StartupEntry, on: bool) -> Result<Change, StartupError> {
@@ -128,6 +150,6 @@ impl Svc {
         }
         xml.push_str("</Startup></StartupData>");
         f = f.impact(Ok(vec![xml]));
-        Svc::Fake(Box::new(Startup::new(f)))
+        Svc::Fake(std::sync::Arc::new(Startup::new(f)))
     }
 }

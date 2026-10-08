@@ -26,7 +26,9 @@ const IN: Bezier = Bezier::new(0.3, 1.3, 0.5, 1.0);
 const HOLD_MS: f64 = 1950.0;
 const OUT_MS: f64 = 320.0;
 
-/// An Identify run is on screen (the page keeps painting meanwhile: nothing to repaint, but cheap).
+/// An Identify run is on screen. (Order 047: the numbers are their own windows painted on their own thread - the menu
+/// needs no frames for them; only tests ask.)
+#[cfg(test)]
 pub fn running() -> bool {
     RUNNING.load(Ordering::Relaxed)
 }

@@ -380,6 +380,13 @@ enum Msg {
     Opened(String, Result<(), AppsError>),
 }
 
+/// A worker thread's message to the page, and the menu woken so it shows (Order 047: the page no longer asks for a frame
+/// every 3 ms while a worker runs - the menu sleeps until this wake).
+fn post(tx: &mpsc::Sender<Msg>, m: Msg) {
+    let _ = tx.send(m);
+    crate::services::Waker.wake();
+}
+
 #[derive(Default)]
 pub struct Apps {
     env: Env,
@@ -474,7 +481,7 @@ impl Apps {
             self.loading = true;
             let tx = self.send();
             std::thread::spawn(move || {
-                let _ = tx.send(Msg::Listed(svc.list()));
+                post(&tx, Msg::Listed(svc.list()));
             });
         }
     }
@@ -627,9 +634,9 @@ impl Apps {
             let refs: Vec<&InstalledApp> = list.iter().collect();
             let tx2 = tx.clone();
             let out = svc.uninstall_many(&refs, move |i, p| {
-                let _ = tx2.send(Msg::Progress(i, p));
+                post(&tx2, Msg::Progress(i, p));
             });
-            let _ = tx.send(Msg::Done(out));
+            post(&tx, Msg::Done(out));
         };
         if self.env.fake() {
             job();
@@ -650,7 +657,7 @@ impl Apps {
         let tx = self.send();
         let job = move || {
             let r = svc.fix(&a, f);
-            let _ = tx.send(Msg::Fixed(a.name.clone(), r));
+            post(&tx, Msg::Fixed(a.name.clone(), r));
         };
         if self.env.fake() {
             job();
@@ -682,7 +689,7 @@ impl Apps {
         let tx = self.send();
         let job = move || {
             let r = svc.open_folder(&a);
-            let _ = tx.send(Msg::Opened(a.name.clone(), r));
+            post(&tx, Msg::Opened(a.name.clone(), r));
         };
         if self.env.fake() {
             job();
@@ -1195,10 +1202,9 @@ impl Page for Apps {
     fn build(&mut self, cx: &mut Cx) -> Vec<El> {
         self.now = cx.now;
         self.pump();
-        if self.loading || self.run.as_ref().map(|r| r.1.values().any(|v| !matches!(v, RowRun::Gone(_)))).unwrap_or(false) {
-            // a worker thread is busy: keep frames coming so its answer shows (tick pumps it)
-            cx.st.busy = true;
-        }
+        // Order 047: a worker thread that is busy (the list read, an uninstall run) no longer keeps frames coming - each of
+        // its messages wakes the menu (`post`) and `tick` pumps it. What moves meanwhile asks for its own frames: the
+        // "Uninstalling…" spinner (`bits::uspin`), a folding row, a lock's pulse.
         if let Some((list, st)) = &self.run {
             let _ = list;
             if st.values().all(|v| matches!(v, RowRun::Gone(t0) if cx.now - t0 > 220.0)) && !st.is_empty() {
@@ -1598,6 +1604,21 @@ mod tests {
         p.click_row_mod(&id_of(&p, "OBS Studio"), false, true);
         let names: Vec<&str> = p.selected().iter().map(|a| a.name.as_str()).collect();
         assert_eq!(names, vec!["Steam", "Google Chrome", "Microsoft Teams", "OBS Studio"]);
+    }
+
+    /// Order 047 (idle cost): with nothing moving the tab asks for no frames - `tick` is false, a build is not busy (a
+    /// worker's messages wake the menu themselves, `post`).
+    #[test]
+    fn nothing_moving_asks_for_no_frames() {
+        let mut p = page();
+        assert!(!p.tick(10.0), "nothing new: no repaint");
+        assert_eq!(p.wake_at(10.0), None);
+        let g = Gfx::new(1.0);
+        let mut st = State::default();
+        let mut cx = Cx::new(20.0, false, &g, &mut st);
+        let _ = p.build(&mut cx);
+        drop(cx);
+        assert!(!st.busy, "an idle tab asks for no frames");
     }
 
     #[test]

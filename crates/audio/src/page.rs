@@ -55,6 +55,8 @@ pub struct PageSnapshot {
     pub app_levels: Vec<(String, f32)>,
     /// Number of level reads done (tests prove levels stop when not asked).
     pub level_reads: u64,
+    /// Order 047: counts every write: the same number = the same snapshot (the page skips the copy).
+    pub gen: u64,
     /// The last command's error.
     pub last_error: Option<AudioError>,
     /// Changes done through this page, oldest first ([`AudioPage::undo_last`]).
@@ -76,7 +78,16 @@ pub struct AudioPage<O: AudioOs + 'static> {
     join: Option<JoinHandle<()>>,
 }
 
+/// The snapshot to WRITE: counts the write (`PageSnapshot::gen`, Order 047: the page copies the snapshot only when it
+/// changed).
 fn lock(m: &Mutex<PageSnapshot>) -> std::sync::MutexGuard<'_, PageSnapshot> {
+    let mut g = peek(m);
+    g.gen = g.gen.wrapping_add(1);
+    g
+}
+
+/// The snapshot to READ (no write counted).
+fn peek(m: &Mutex<PageSnapshot>) -> std::sync::MutexGuard<'_, PageSnapshot> {
     m.lock().unwrap_or_else(|p| p.into_inner())
 }
 
@@ -168,7 +179,12 @@ impl<O: AudioOs + 'static> AudioPage<O> {
 
     /// The latest answers (never waits for Windows).
     pub fn snapshot(&self) -> PageSnapshot {
-        lock(&self.snap).clone()
+        peek(&self.snap).clone()
+    }
+
+    /// Order 047: the snapshot's write count (`PageSnapshot::gen`) - cheap: no copy.
+    pub fn gen(&self) -> u64 {
+        peek(&self.snap).gen
     }
 
     /// Any change, run on the worker: e.g. `page.run(|s| s.set_device_volume(&id, 0.5).map(Some))`.
@@ -212,7 +228,7 @@ fn refresh_fast<O: AudioOs>(svc: &mut AudioService<O>, snap: &Mutex<PageSnapshot
 
 fn read_levels<O: AudioOs>(svc: &mut AudioService<O>, snap: &Mutex<PageSnapshot>) {
     let (out, inp, apps) = {
-        let s = lock(snap);
+        let s = peek(snap);
         (s.output.as_ref().map(|o| o.0.clone()), s.input.as_ref().map(|i| i.0.clone()), s.apps.clone())
     };
     let ol = out.and_then(|id| svc.os_mut().peak(&id).ok()).unwrap_or(0.0);

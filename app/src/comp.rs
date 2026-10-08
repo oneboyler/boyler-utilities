@@ -20,6 +20,7 @@ use windows_numerics::Vector2;
 
 use crate::effects;
 use crate::present::Chain;
+use windows::Win32::Graphics::Dxgi::IDXGISwapChain2;
 
 pub struct Glass {
     pub compositor: Compositor,
@@ -215,9 +216,9 @@ pub const SATURATE: f32 = 1.7;
 pub const BRIGHTNESS: f32 = 1.04;
 
 /// A brush showing a swap chain 1:1 from the top-left (no stretching, no filtering at rest).
-fn surface_brush(compositor: &Compositor, chain: &Chain) -> Result<CompositionSurfaceBrush> {
+fn surface_brush(compositor: &Compositor, swap: &IDXGISwapChain2) -> Result<CompositionSurfaceBrush> {
     let ci: ICompositorInterop = compositor.cast()?;
-    let surf = unsafe { ci.CreateCompositionSurfaceForSwapChain(&chain.swap)? };
+    let surf = unsafe { ci.CreateCompositionSurfaceForSwapChain(swap)? };
     let sb = compositor.CreateSurfaceBrushWithSurface(&surf)?;
     sb.SetStretch(CompositionStretch::None)?;
     sb.SetHorizontalAlignmentRatio(0.0)?;
@@ -226,11 +227,12 @@ fn surface_brush(compositor: &Compositor, chain: &Chain) -> Result<CompositionSu
 }
 
 impl Glass {
+    /// `chain`: the menu's own pixels (`w` x `h` px; a CPU or a GPU swap chain - Order 051).
     /// `mask`: the swap chain holding Skia's coverage of the rounded window shape (white, alpha = coverage).
     /// `capture`: option 3's swap chain with the desktop behind the window (its top-left = the window's), and the
     /// display scale (the blur's sigma is 13 CSS px).
     #[allow(clippy::too_many_arguments)]
-    pub fn new(hwnd: HWND, chain: &Chain, mask: &Chain, capture: Option<(&Chain, f32)>, w: f32, h: f32, radius: f32, mode: GlassMode) -> Result<Glass> {
+    pub fn new(hwnd: HWND, chain: (&IDXGISwapChain2, u32, u32), mask: &IDXGISwapChain2, capture: Option<(&Chain, f32)>, w: f32, h: f32, radius: f32, mode: GlassMode) -> Result<Glass> {
         let compositor = Compositor::new()?;
         let interop: ICompositorDesktopInterop = compositor.cast()?;
         let target = unsafe { interop.CreateDesktopWindowTarget(hwnd, false)? };
@@ -260,7 +262,7 @@ impl Glass {
             let col = effects::saturate_brightness(SATURATE, BRIGHTNESS, blurred.cast()?);
             let factory = compositor.CreateEffectFactory(&col)?;
             let eb = factory.CreateBrush()?;
-            eb.SetSourceParameter(h!("desk"), &surface_brush(&compositor, cap)?)?;
+            eb.SetSourceParameter(h!("desk"), &surface_brush(&compositor, &cap.swap)?)?;
             let mb = compositor.CreateMaskBrush()?;
             mb.SetSource(&eb)?;
             mb.SetMask(&surface_brush(&compositor, mask)?)?;
@@ -268,14 +270,14 @@ impl Glass {
         }
 
         let ci: ICompositorInterop = compositor.cast()?;
-        let surf = unsafe { ci.CreateCompositionSurfaceForSwapChain(&chain.swap)? };
+        let surf = unsafe { ci.CreateCompositionSurfaceForSwapChain(chain.0)? };
         let sb = compositor.CreateSurfaceBrushWithSurface(&surf)?;
         sb.SetStretch(CompositionStretch::None)?;
         sb.SetHorizontalAlignmentRatio(0.0)?;
         sb.SetVerticalAlignmentRatio(0.0)?;
         let content = compositor.CreateSpriteVisual()?;
         content.SetBrush(&sb)?;
-        content.SetSize(Vector2 { X: chain.w as f32, Y: chain.h as f32 })?;
+        content.SetSize(Vector2 { X: chain.1 as f32, Y: chain.2 as f32 })?;
 
         let kids = root.Children()?;
         kids.InsertAtTop(&glass)?;
@@ -298,7 +300,8 @@ impl Glass {
         let _ = self.root.SetOpacity(o);
     }
 
-    /// Move the glass + content inside the window (used for the open rise / close drop).
+    /// Move the glass + content inside the window (used for the open rise / close drop; Order 047 item 12: the whole
+    /// motion, from the room the window has above the menu's box).
     pub fn set_offset_y(&self, dy: f32) {
         let _ = self.root.SetOffset(windows_numerics::Vector3 { X: 0.0, Y: dy, Z: 0.0 });
     }

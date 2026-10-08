@@ -68,6 +68,12 @@ enum Msg {
 
 type Inbox = Arc<Mutex<Vec<Msg>>>;
 
+#[cfg(test)]
+thread_local! {
+    /// Order 047's proof (one test): a change runs on its own thread as in the app, `Some(ms)` slower (else in place)
+    static SLOW_CHANGE_MS: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
 /// The speed test and the game-server pings live HERE, not in the page (the owner Oct 8, F2: closing the window or leaving the
 /// tab must not stop or wipe them): kept in the app's store (`env.keep`, key [`BG_KEY`]) for the app's whole life. Their
 /// threads write into it and wake the menu; the page shows what is in it - at once when the tab opens again.
@@ -341,6 +347,15 @@ impl Network {
     /// Runs one change on a short-lived thread; its result comes back through the inbox.
     fn spawn(&self, f: impl FnOnce(&NetworkService, &Inbox) + Send + 'static) {
         let (Some(svc), inbox) = (self.svc(), self.inbox.clone()) else { return };
+        #[cfg(test)]
+        if let Some(ms) = SLOW_CHANGE_MS.with(|c| c.get()) {
+            // Order 047's proof: the app's own path (a thread), each change as slow as a slow PC
+            let _ = std::thread::Builder::new().name("bu-net-change".into()).spawn(move || {
+                std::thread::sleep(Duration::from_millis(ms));
+                f(&svc, &inbox)
+            });
+            return;
+        }
         if cfg!(test) {
             // unit tests: in place (a change's change-log entry is then written on the test's own thread, into its own store)
             f(&svc, &inbox);
@@ -805,6 +820,14 @@ impl Page for Network {
         a || b
     }
 
+    /// Order 047: the threads wake the menu with each result (the connection ping once a second, the speed test's
+    /// samples, a round of game pings), so `tick` is true only when one came. One gap: a speed test's thread ends just
+    /// after its last wake, and its end (the join, Start again) is seen at a tick - so while one runs, a tick every
+    /// 100 ms (it paints only when `sync` says something changed).
+    fn wake_at(&self, now: f64) -> Option<f64> {
+        self.speed_running.then_some(now + 100.0)
+    }
+
     fn build(&mut self, cx: &mut Cx) -> Vec<El> {
         self.now = cx.now;
         view::page(self, cx)
@@ -1106,6 +1129,54 @@ impl Network {
     }
 }
 
+// The reset's reads and writes, for the page itself and its detached copy (Order 047: `NetReset`, on the review's worker
+// thread) alike: the service + the open page's last read of the adapters (None = closed).
+
+fn rs_current(svc: &NetworkService, conn: Option<&ConnectionState>, item: &str) -> Option<Val> {
+    if let Some(id) = item.strip_prefix("dns:") {
+        // one IP Helper read
+        return svc.os().dns_servers(id).ok().map(|s| dns_val(&s));
+    }
+    // an adapter's switch: the open page's last read (Windows' radio state is a slow read)
+    let id = item.strip_prefix("adapter:")?;
+    conn?.adapter(id).map(|a| on_val(a.enabled))
+}
+
+/// Every adapter switched off → On; every Ethernet / Wi-Fi adapter with hand-set DNS → Automatic (a VPN's own DNS is
+/// the VPN's business).
+fn rs_defaults(svc: &NetworkService, conn: Option<&ConnectionState>) -> Vec<DefaultItem> {
+    let conn = match conn {
+        Some(c) => Some(c.clone()),
+        None => svc.connection_state().ok(),
+    };
+    let Some(conn) = conn else { return Vec::new() };
+    let mut v = Vec::new();
+    for a in &conn.adapters {
+        v.push(DefaultItem { item: format!("adapter:{}", a.id), label: a.name.clone(), now: on_val(a.enabled), default: on_val(true) });
+    }
+    for a in conn.adapters.iter().filter(|a| a.kind.physical()) {
+        if let Ok(s) = svc.os().dns_servers(&a.id) {
+            v.push(DefaultItem { item: format!("dns:{}", a.id), label: dns_label(&a.name), now: dns_val(&s), default: dns_val(&DnsServers::default()) });
+        }
+    }
+    v
+}
+
+fn rs_apply(svc: &NetworkService, item: &str, to: &Val) -> Result<(), String> {
+    if crate::testmode::real_read() {
+        return Err("A read-only test copy changes nothing".into());
+    }
+    if let Some(id) = item.strip_prefix("adapter:") {
+        svc.set_adapter(id, to.raw == "on").map_err(|e| net_err(&e))?;
+    } else if let Some(id) = item.strip_prefix("dns:") {
+        let s = parse_dns(&to.raw).ok_or("Unknown value")?;
+        svc.set_dns_on(id, &s).map_err(|e| net_err(&e))?;
+    } else {
+        return Err("Unknown setting".into());
+    }
+    Ok(())
+}
+
 impl Resettable for Network {
     fn page_id(&self) -> &str {
         "net"
@@ -1114,51 +1185,49 @@ impl Resettable for Network {
         "Network"
     }
     fn current(&self, item: &str) -> Option<Val> {
-        if let Some(id) = item.strip_prefix("dns:") {
-            // one IP Helper read
-            return self.rs_service().os().dns_servers(id).ok().map(|s| dns_val(&s));
-        }
-        // an adapter's switch: the open page's last read (Windows' radio state is a slow read)
-        let id = item.strip_prefix("adapter:")?;
-        self.conn.as_ref()?.adapter(id).map(|a| on_val(a.enabled))
+        rs_current(&self.rs_service(), self.conn.as_ref(), item)
     }
-    /// Every adapter switched off → On; every Ethernet / Wi-Fi adapter with hand-set DNS → Automatic (a VPN's own DNS is
-    /// the VPN's business).
     fn windows_defaults(&self) -> Vec<DefaultItem> {
-        let svc = self.rs_service();
-        let conn = match &self.conn {
-            Some(c) => Some(c.clone()),
-            None => svc.connection_state().ok(),
-        };
-        let Some(conn) = conn else { return Vec::new() };
-        let mut v = Vec::new();
-        for a in &conn.adapters {
-            v.push(DefaultItem { item: format!("adapter:{}", a.id), label: a.name.clone(), now: on_val(a.enabled), default: on_val(true) });
-        }
-        for a in conn.adapters.iter().filter(|a| a.kind.physical()) {
-            if let Ok(s) = svc.os().dns_servers(&a.id) {
-                v.push(DefaultItem { item: format!("dns:{}", a.id), label: dns_label(&a.name), now: dns_val(&s), default: dns_val(&DnsServers::default()) });
-            }
-        }
-        v
+        rs_defaults(&self.rs_service(), self.conn.as_ref())
     }
     fn apply(&mut self, item: &str, to: &Val) -> Result<(), String> {
-        if crate::testmode::real_read() {
-            return Err("A read-only test copy changes nothing".into());
-        }
-        let svc = self.rs_service();
-        if let Some(id) = item.strip_prefix("adapter:") {
-            svc.set_adapter(id, to.raw == "on").map_err(|e| net_err(&e))?;
-        } else if let Some(id) = item.strip_prefix("dns:") {
-            let s = parse_dns(&to.raw).ok_or("Unknown value")?;
-            svc.set_dns_on(id, &s).map_err(|e| net_err(&e))?;
-        } else {
-            return Err("Unknown setting".into());
-        }
+        rs_apply(&self.rs_service(), item, to)?;
         // the open page shows the new state
+        self.reset_done();
+        Ok(())
+    }
+    /// Order 047: the review reads (IP Helper, the adapters of a closed page) and puts back (an admin prompt) on its
+    /// worker thread.
+    fn detach(&mut self) -> Option<crate::undo::Detached> {
+        Some(Box::new(NetReset { svc: self.rs_service(), conn: self.conn.clone() }))
+    }
+    fn reset_done(&mut self) {
         if self.svc.is_some() {
             self.read_all();
         }
-        Ok(())
+    }
+}
+
+/// Order 047: the Network page's reset as a copy for the review's worker thread.
+struct NetReset {
+    svc: Arc<NetworkService>,
+    conn: Option<ConnectionState>,
+}
+
+impl Resettable for NetReset {
+    fn page_id(&self) -> &str {
+        "net"
+    }
+    fn page_title(&self) -> &str {
+        "Network"
+    }
+    fn current(&self, item: &str) -> Option<Val> {
+        rs_current(&self.svc, self.conn.as_ref(), item)
+    }
+    fn windows_defaults(&self) -> Vec<DefaultItem> {
+        rs_defaults(&self.svc, self.conn.as_ref())
+    }
+    fn apply(&mut self, item: &str, to: &Val) -> Result<(), String> {
+        rs_apply(&self.svc, item, to)
     }
 }

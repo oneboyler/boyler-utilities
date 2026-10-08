@@ -96,6 +96,22 @@ pub trait Page {
     fn tick(&mut self, _now: f64) -> bool {
         false
     }
+    /// Order 047: while `tick` says nothing moves, when (ms) it wants to be asked again - a page that polls something
+    /// without a waker (meters waiting for sound, a "Starting Steam..." that ends at a time). The menu sleeps until then
+    /// (no frames, no CPU); at it `tick` runs, and only a `true` draws. None = only input / a waker wakes it.
+    fn wake_at(&self, _now: f64) -> Option<f64> {
+        None
+    }
+    /// Order 047: the last `tick`'s true moved only what its live boxes read when they are painted (Audio's meters): the
+    /// frame repaints the live pass from the boxes it has - no build, no static repaint.
+    fn live_only(&self) -> bool {
+        false
+    }
+    /// Order 047 item 10: may the page be opened ahead while the pointer rests on its icon (a click then shows it at
+    /// once)? False for a page whose opening shows something outside the menu (Timers' bars preview).
+    fn preopen(&self) -> bool {
+        true
+    }
     /// a popup of this page (small window, review list...) drawn above everything, in window coordinates
     fn popup(&mut self, _cx: &mut Cx) -> Option<El> {
         None

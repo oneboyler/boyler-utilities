@@ -219,6 +219,57 @@ mod tests {
         crate::services::shutdown();
     }
 
+    /// Order 047: Get while the original runs and its Quit takes its time (here 300 ms more; a real one up to 3 s + 1 s):
+    /// the click hands the menu's thread back within one frame - the take-over runs off it - and when it ends the menu's
+    /// thread saves its settings and change log line, switches ours on and puts up the take-over's line.
+    #[test]
+    fn get_takes_over_off_the_menus_thread() {
+        use std::sync::{Arc, Mutex};
+        use std::time::{Duration, Instant};
+        let d = dir("offui");
+        write_ini(&d.0);
+        crate::services::init(windows::Win32::Foundation::HWND::default(), true);
+        let seen: Arc<Mutex<Option<bu_obs::fake::FakeOs>>> = Arc::new(Mutex::new(None));
+        let (s2, p) = (seen.clone(), d.0.clone());
+        crate::offui::assert_quick("Get of Notifications for OBS with the original running", || {
+            crate::addons::begin_take_over(true, move || {
+                // the original's own Quit, slow
+                std::thread::sleep(Duration::from_millis(300));
+                let (st, mut obs, _) = pc(&p, true, Some(&[2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]), true);
+                *s2.lock().unwrap() = Some(obs.clone());
+                crate::addons::take_over_work(&st, &mut obs)
+            })
+        });
+        assert!(crate::addons::taking_over(), "the Get waits for its take-over");
+        assert!(!crate::obs::running(), "ours starts only after the take-over");
+        let t0 = Instant::now();
+        while !crate::addons::poll_take_over() {
+            assert!(t0.elapsed() < Duration::from_secs(5), "the take-over did not end");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(!crate::addons::taking_over());
+        assert_eq!(crate::addons::take_notice().as_deref(), Some("Took over NotificationsForOBS: settings imported, its startup turned off (undo in Settings)"));
+        // its copy was asked to Quit; ours runs on the imported settings; the change log has the Startup tab's line
+        seen.lock().unwrap().as_ref().expect("the take-over ran").with(|s| assert!(s.other_closed == [PID] && s.other.is_none()));
+        assert!(crate::obs::running());
+        let set = crate::obs::settings().unwrap();
+        assert_eq!((set.where_, set.pos, set.vol, set.status), (2, 3, 80, 1));
+        let r = crate::services::with(|s| crate::undo::read_record(&s.store, "sup", ITEM)).flatten().expect("a change log line");
+        assert_eq!((r.was.raw.as_str(), r.now.raw.as_str()), ("on", "off"));
+        crate::addons::set_for("obs", false, true);
+        crate::services::shutdown();
+    }
+
+    /// Order 047: the Add-ons page at rest (no take-over, nothing running) asks for no frames.
+    #[test]
+    fn the_addons_page_at_rest_needs_no_frames() {
+        use crate::pages::Page;
+        let mut p = crate::pages::addons::Addons::default();
+        assert!(!p.tick(0.0));
+        assert!(!p.tick(16.0));
+        assert_eq!(p.wake_at(16.0), None);
+    }
+
     /// No Run entry (never on this PC): nothing is taken over, ours starts on its defaults.
     #[test]
     fn get_without_the_original_starts_ours_on_defaults() {

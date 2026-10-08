@@ -74,6 +74,19 @@ const SEL_TEXT: Rgba = Rgba(0.0, 120.0 / 255.0, 215.0 / 255.0, 1.0);
 /// A muted app's thumb: `.mxr.mu .rng::-webkit-slider-thumb{background:#c8cad2}`
 const THUMB_MU: Rgba = Rgba(200.0 / 255.0, 202.0 / 255.0, 210.0 / 255.0, 1.0);
 
+thread_local! {
+    /// Order 047: the real worker's last full snapshot of this run - the page shows it at once when it opens again
+    static LAST_SNAP: std::cell::RefCell<Option<std::rc::Rc<PageSnapshot>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Order 047: the meters' levels for the live pass (devices; apps by group).
+#[derive(Default)]
+struct LiveLv {
+    vo: Level,
+    vi: Level,
+    apps: HashMap<String, Level>,
+}
+
 /// One mixer row.
 struct App {
     group: String,
@@ -128,6 +141,16 @@ struct St {
     apps: Vec<App>,
     vo: Level,
     vi: Level,
+    /// Order 047: the levels as the meters paint them (the live pass reads these when it paints: a moving meter repaints
+    /// without the page being built again) and which app rows showed a held peak at the last build
+    live: std::rc::Rc<std::cell::RefCell<LiveLv>>,
+    peaks: Vec<bool>,
+    /// the last tick moved only the meters (the live pass repaints them; no build)
+    live_only: bool,
+    /// Order 047: the last snapshot copied and its write count
+    snap_cache: Option<(u64, std::rc::Rc<PageSnapshot>)>,
+    /// Order 047: the last snapshot of this run, shown until the worker's first read is in
+    seed: Option<std::rc::Rc<PageSnapshot>>,
     /// the slider being dragged and the pointer's offset from its thumb centre
     drag: Option<(Key, f32)>,
     /// after a change the page keeps its own values until the worker has answered
@@ -137,6 +160,8 @@ struct St {
     /// the list just closed by a click on its own button: that click must not open it again
     just_closed: Option<Flow>,
     mic: MicMute,
+    /// Order 047: the mic's mute state read off the menu's thread after a change (`tick` takes it)
+    mic_read: std::sync::Arc<std::sync::Mutex<Option<bool>>>,
     muted: bool,
     mute: Option<mute::MuteUi>,
     review: Option<Review>,
@@ -154,6 +179,8 @@ struct St {
     /// Windows' text selection colour and caret blink time (the frame keeps them for test A's page only)
     sel: Rgba,
     caret_ms: f64,
+    /// Order 047: which app rows showed as quiet (no sound for 1.5 s) at the last tick: a change repaints
+    quiet: Vec<bool>,
 }
 
 pub struct Audio {
@@ -253,16 +280,42 @@ pub fn reset_caches() {
 pub fn remember_widths(_g: &crate::gfx::Gfx, _names: &[String]) {}
 
 impl St {
+    /// Mute settings opens: the fake reads in place as before; a real mic (Order 047) opens on the last known state and
+    /// is read off the menu's thread.
+    fn mute_ui(&self, now: f64) -> mute::MuteUi {
+        if matches!(self.svc, Svc::Fake(..)) {
+            mute::MuteUi::open(self.mic.clone(), now, self.frozen)
+        } else {
+            mute::MuteUi::open_real(self.mic.clone(), now, self.frozen, self.muted)
+        }
+    }
+
     // ============================================================== state from the worker
     fn poll(&mut self, now: f64) -> bool {
         // Order 036: the worker's change-log entries (a new default device, a device switched on / off)
         for (item, label, old, new) in self.svc.take_notes() {
             svc::log(&item, &label, &old, &new);
         }
-        let s: PageSnapshot = self.svc.snapshot();
-        if !s.ready {
+        // Order 047: the worker's snapshot is copied only when it wrote something new (its levels every 16 ms) - not on
+        // every frame of a 360 Hz screen
+        let g = self.svc.gen();
+        let s: std::rc::Rc<PageSnapshot> = match self.snap_cache.take() {
+            Some((cg, c)) if cg == g => c,
+            _ => std::rc::Rc::new(self.svc.snapshot()),
+        };
+        self.snap_cache = Some((g, s.clone()));
+        let s = if s.ready {
+            self.seed = None;
+            if !matches!(self.svc, Svc::Fake(..)) {
+                LAST_SNAP.with(|l| *l.borrow_mut() = Some(s.clone()));
+            }
+            s
+        } else if let Some(seed) = self.seed.take() {
+            // (the worker's first read is not in yet: the last one of this run shows meanwhile - once)
+            seed
+        } else {
             return false;
-        }
+        };
         let mut changed = false;
         if self.expect_err {
             if let Some(e) = &s.last_error {
@@ -391,6 +444,22 @@ impl St {
             }
         }
         changed
+    }
+
+    /// Order 047: the levels into `live`, where the meters' paint reads them (each tick, and each build).
+    fn sync_live(&mut self) {
+        let mut lv = self.live.borrow_mut();
+        lv.vo = self.vo;
+        lv.vi = self.vi;
+        lv.apps.clear();
+        for a in &self.apps {
+            lv.apps.insert(a.group.clone(), a.lv);
+        }
+    }
+
+    /// Order 047: is any meter (devices, apps) still showing a level or a peak tick? (Then frames keep coming.)
+    fn meters_moving(&self) -> bool {
+        self.vo.moving() || self.vi.moving() || self.apps.iter().any(|r| r.lv.moving())
     }
 
     fn run(&mut self, c: Cmd, now: f64) {
@@ -592,6 +661,8 @@ impl Audio {
     fn build_page(&mut self, cx: &mut Cx) -> Vec<El> {
         let header = pieces::header("Audio", None);
         let Some(st) = self.st.as_mut() else { return vec![header] };
+        st.sync_live();
+        st.peaks = st.apps.iter().map(|a| a.lv.pk - a.lv.l > 0.02).collect();
         // ---- Devices
         let out_row = dev_row(cx, st, Flow::Output);
         let in_row = dev_row(cx, st, Flow::Input);
@@ -616,9 +687,7 @@ impl Audio {
         // ---- New apps volume: `.grp.nag{margin-top:14px}`
         let nag = group::grp(vec![new_row(cx, st)]).margin(14.0, 0.0, 0.0, 0.0);
         let rs = reset::reset_line(cx, K_RESET, Some("Windows defaults"));
-        if st.edit.is_some() {
-            cx.st.busy = true; // the caret blinks
-        }
+        // (the caret's blink wakes the menu at each flip - `Cx::wake_every` in the % field; Order 047)
         vec![header, devices, apps, nag, rs]
     }
 }
@@ -677,10 +746,25 @@ fn dev_row(cx: &mut Cx, st: &mut St, flow: Flow) -> El {
         lbl = lbl.child(El::block().w(lw).h(12.0).none().child(l.none().w(lw)));
     }
     // `.dvs{position:relative;flex:1;min-width:0;height:30px}`: the canvas (live) and the range over it (8 px transparent track)
-    let lv = if out { st.vo } else { st.vi };
+    // (Order 047: the level is read when the live pass paints it - `St::live`, written by `tick`)
+    let src = st.live.clone();
     // `.vis.mut{opacity:.35}` (transition .3 s) - the Input's pill while the mic is muted
     let vis_op = if out { 1.0 } else { cx.tr(kv, 9, if st.muted { 0.35 } else { 1.0 }, 300.0, EASE) };
-    let vis = El::paint(move |g, r| meter::level_pill(g, r, vol, lv)).abs(0.0, 0.0, 0.0, 0.0).opacity(vis_op).live().no_hit();
+    let vis = El::paint(move |g, r| {
+        let lv = {
+            let s = src.borrow();
+            if out {
+                s.vo
+            } else {
+                s.vi
+            }
+        };
+        meter::level_pill(g, r, vol, lv)
+    })
+    .abs(0.0, 0.0, 0.0, 0.0)
+    .opacity(vis_op)
+    .live()
+    .no_hit();
     let look = slider::Look { track_h: 8.0, fill: Rgba(0.0, 0.0, 0.0, 0.0), track: Rgba(0.0, 0.0, 0.0, 0.0), thumb: WHITE };
     let rng = slider::slider(cx, kv, vol, 0.0, 30.0, look).w_pct(100.0).abs(0.0, 0.0, f32::NAN, f32::NAN);
     let dvs = El::block().flex1().h(30.0).child(vis).child(rng);
@@ -703,6 +787,7 @@ fn pct(cx: &mut Cx, st: &St, k: Key, v: f32, col: Rgba) -> El {
     if let Some(e) = st.edit.as_ref().filter(|e| e.key == k) {
         let tw = cx.g.text_width(&e.text, font);
         let blink = ((cx.now - e.start) / st.caret_ms) as i64 % 2 == 0;
+        cx.wake_every(st.caret_ms, e.start);
         let sel = st.sel;
         let (text, sel_all) = (e.text.clone(), e.sel_all);
         let isig = (text.clone(), sel_all, blink, tw.to_bits(), [sel.0, sel.1, sel.2, sel.3].map(f32::to_bits));
@@ -768,7 +853,10 @@ fn app_row(cx: &mut Cx, st: &mut St, i: usize) -> El {
     // `.lvl{position:absolute;left:0;right:0;top:25px;height:3px}` (gone while muted)
     let pk_op = if a.lv.pk - a.lv.l > 0.02 { 0.9 } else { 0.0 };
     let pk_op = cx.tr(rk, 3, pk_op, 300.0, EASE);
-    let lvl = slider::level_bar(0.0, a.lv.l, a.lv.pk, pk_op, a.c, a.c2).w_pct(100.0).abs(0.0, 25.0, f32::NAN, f32::NAN).opacity(1.0 - mu).no_hit();
+    // (Order 047: level + peak read when the live pass paints it - `St::live`, written by `tick`)
+    let (src, group) = (st.live.clone(), a.group.clone());
+    let now_lv = move || src.borrow().apps.get(&group).map(|l| (l.l, l.pk)).unwrap_or((0.0, 0.0));
+    let lvl = slider::level_bar_with(0.0, now_lv, pk_op, a.c, a.c2).w_pct(100.0).abs(0.0, 25.0, f32::NAN, f32::NAN).opacity(1.0 - mu).no_hit();
     let mxc = El::block().flex1().h(22.0).margin(0.0, 0.0, 0.0, 4.0).opacity(1.0 - 0.58 * mu).child(rng).child(lvl);
     // `.mxr .sv{margin:0 12px}`
     let pct = pct(cx, st, kp, st.apps[i].vol, cmix(FG2(), FG3(), mu)).margin(0.0, 12.0, 0.0, 12.0);
@@ -885,8 +973,16 @@ impl Page for Audio {
         svc::ensure_watcher(env.test, env.real_read);
         micicon::set_fake(fake || env.test);
         let mic = mute::service(fake, env.frozen, env.real_read);
-        let muted = mute::mic_muted(&mic);
-        mute::watch(&mic);
+        // Order 047: a real mic's read and its watch (Core Audio, 10-50 ms) run on the key worker: the page opens on the
+        // last known state, the read follows (`mic_read`)
+        let muted = if fake {
+            let m = mute::mic_muted(&mic);
+            mute::watch(&mic);
+            m
+        } else {
+            mute::watch_off(&mic, true);
+            mute::last_muted()
+        };
         let mut st = St {
             svc,
             frozen: env.frozen,
@@ -897,12 +993,18 @@ impl Page for Audio {
             apps: Vec::new(),
             vo: Level::default(),
             vi: Level::default(),
+            live: Default::default(),
+            peaks: Vec::new(),
+            live_only: false,
+            snap_cache: None,
+            seed: None,
             drag: None,
             hold_until: 0.0,
             edit: None,
             menu: None,
             just_closed: None,
             mic,
+            mic_read: Default::default(),
             muted,
             mute: None,
             review: None,
@@ -916,13 +1018,22 @@ impl Page for Audio {
             reset_req: None,
             sel: if env.frozen { SEL_TEXT } else { sys_highlight() },
             caret_ms: if env.frozen { 530.0 } else { caret_blink() },
+            quiet: Vec::new(),
         };
-        // the worker answers within milliseconds (the fake at once): show the first full read right away
-        for _ in 0..50 {
-            if st.svc.snapshot().ready {
-                break;
+        // the fake answers at once: its first full read shows right away. Order 047: the real worker is never waited for
+        // (it spun up to 100 ms here) - the page shows what it showed last time (this run) until the worker's first read
+        if matches!(st.svc, Svc::Fake(..)) {
+            for _ in 0..50 {
+                if st.svc.snapshot().ready {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(2));
             }
-            std::thread::sleep(std::time::Duration::from_millis(2));
+        } else {
+            st.seed = LAST_SNAP.with(|l| l.borrow().clone());
+        }
+        if !fake {
+            mute::read_state(&st.mic, st.mic_read.clone());
         }
         st.poll(now);
         self.st = Some(st);
@@ -956,20 +1067,36 @@ impl Page for Audio {
     fn jump(&mut self, target: &str) {
         if let Some(st) = self.st.as_mut() {
             if (matches!(target, "mute" | "mm" | "Mic mute") || target.starts_with("mic.")) && st.mute.is_none() {
-                st.mute = Some(mute::MuteUi::open(st.mic.clone(), st.last, st.frozen));
+                st.mute = Some(st.mute_ui(st.last));
             }
         }
     }
     fn close(&mut self) {
         if let Some(st) = self.st.take() {
-            mute::unwatch(&st.mic);
+            if matches!(st.svc, Svc::Fake(..)) {
+                mute::unwatch(&st.mic);
+            } else {
+                // (on the key worker, after its start: stopping waits for the watch's thread)
+                mute::watch_off(&st.mic, false);
+            }
             // the preview / Move end with the page
             if st.mute.is_some() {
                 mute::sync_icon(st.muted, false, false, false);
             }
-            // Order 036: the worker ends with the page (a change already asked for is still made); its entries are written
-            for (item, label, old, new) in st.svc.finish() {
-                svc::log(&item, &label, &old, &new);
+            // Order 036: the worker ends with the page (a change already asked for is still made); its entries are written.
+            // Order 047: the real worker may be inside a Core Audio call (its first full read: 100-400 ms) - it is waited
+            // for off the menu's thread (the change log takes notes from any thread); the fake (tests) ends here
+            if matches!(st.svc, Svc::Fake(..)) {
+                for (item, label, old, new) in st.svc.finish() {
+                    svc::log(&item, &label, &old, &new);
+                }
+            } else {
+                let s = st.svc;
+                crate::offui::spawn("audio-close", move || {
+                    for (item, label, old, new) in s.finish() {
+                        crate::undo::note("aud", &item, &label, &old, &new);
+                    }
+                });
             }
         }
     }
@@ -978,16 +1105,50 @@ impl Page for Audio {
     }
     fn tick(&mut self, now: f64) -> bool {
         let Some(st) = self.st() else { return false };
-        let changed = st.poll(now);
+        let mut changed = st.poll(now);
         if let Some(m) = &mut st.mute {
-            m.refresh();
+            // (Order 047: reads only after a change, off the menu's thread for a real mic; true = the state shown changed)
+            changed |= m.refresh();
             st.muted = m.muted();
         } else if mute::take_changed() {
-            let was = st.muted;
-            st.muted = mute::mic_muted(&st.mic);
-            mute::sync_icon(st.muted, false, false, was != st.muted);
+            if matches!(st.svc, Svc::Fake(..)) {
+                let was = st.muted;
+                st.muted = mute::mic_muted(&st.mic);
+                mute::sync_icon(st.muted, false, false, was != st.muted);
+            } else {
+                // Order 047: the real mic's state is a Core Audio read (10-50 ms) - off the menu's thread, on the key
+                // worker (in order: an older read never lands last); the next tick shows it
+                mute::read_state(&st.mic, st.mic_read.clone());
+            }
         }
-        changed || !st.frozen
+        let read = st.mic_read.lock().ok().and_then(|mut s| s.take());
+        if let Some(v) = read {
+            let was = st.muted;
+            st.muted = v;
+            mute::sync_icon(st.muted, false, false, was != st.muted);
+            changed |= was != st.muted;
+        }
+        // Order 047: frames only while a meter moves (or something changed); in silence the menu sleeps and `wake_at`
+        // looks for sound again at the worker's own rate (it reads levels every 16 ms)
+        let quiet: Vec<bool> = st.apps.iter().map(|a| now - a.last_sound > 1500.0).collect();
+        let went_quiet = !st.frozen && quiet != st.quiet;
+        st.quiet = quiet;
+        // the meters paint from `live` in the live pass; a held peak's dot showing / hiding is a transition of the built
+        // page (a rebuild)
+        st.sync_live();
+        let peaks: Vec<bool> = st.apps.iter().map(|a| a.lv.pk - a.lv.l > 0.02).collect();
+        let peak_flip = peaks != st.peaks;
+        st.peaks = peaks;
+        let moving = !st.frozen && st.meters_moving();
+        st.live_only = !(changed || went_quiet || peak_flip);
+        changed || went_quiet || peak_flip || moving
+    }
+    fn live_only(&self) -> bool {
+        self.st.as_ref().is_some_and(|s| s.live_only)
+    }
+    fn wake_at(&self, now: f64) -> Option<f64> {
+        let st = self.st.as_ref()?;
+        (!st.frozen).then_some(now + 16.0)
     }
     fn event(&mut self, ev: &Ev, cx: &mut Cx) {
         let now = cx.now;
@@ -1271,12 +1432,17 @@ fn click(st: &mut St, k: Key, now: f64) {
             }
         }
         K_MIC => {
-            if let Ok(s) = st.mic.toggle() {
-                st.muted = s.muted;
-                mute::sync_icon(st.muted, false, false, true);
+            // Order 047: a real mic is toggled on the key's worker (Core Audio, 10-50 ms): the button shows the flip at once,
+            // the icon follows the worker's answer
+            let fake = matches!(st.svc, Svc::Fake(..));
+            if let Some(m) = mute::toggle_now(&st.mic, st.muted, fake, true) {
+                st.muted = m;
+                if fake {
+                    mute::sync_icon(st.muted, false, false, true);
+                }
             }
         }
-        K_MML => st.mute = Some(mute::MuteUi::open(st.mic.clone(), now, st.frozen)),
+        K_MML => st.mute = Some(st.mute_ui(now)),
         K_KEEP => {
             let b = st.before(k);
             let mut r = svc::rules();
@@ -1341,6 +1507,7 @@ fn reset_now(st: &mut St, r: &Review, now: f64) {
 // =================================================================================================== Order 036: reset
 /// Where a reset's device-side change goes: the open page's fake, a closed test copy's own fake, or Windows (a real
 /// service made for the call on its own thread - the open page's worker sees the result on its next read).
+#[derive(Clone)]
 enum Target {
     Fake(bu_audio::SharedFake),
     Real,
@@ -1357,33 +1524,94 @@ impl Audio {
         }
     }
 
-    fn device_apply(&self, item: &str, to: &Val) -> Result<(), String> {
-        match self.target() {
-            Target::Fake(f) => svc::apply_item(&mut bu_audio::AudioService::new(f), item, to),
-            #[cfg(windows)]
-            Target::Real => svc::on_real(|s| svc::apply_item(s, item, to)),
-            #[cfg(not(windows))]
-            Target::Real => Err("Windows only".into()),
-        }
+    /// The open page's app rows for the reset (item, label, value), as `apps_now` gives them. None = closed.
+    fn seen_apps(&self) -> Option<Vec<(String, String, Val)>> {
+        let st = self.st.as_ref()?;
+        Some(st.apps.iter().filter(|a| !a.group.starts_with("pid:")).map(|a| (svc::app_item(&a.group), format!("{} volume", a.name), svc::app_val(a.vol, a.muted))).collect())
     }
 
-    /// The apps on the output device now: (item, label, value) - the open page's rows, else read for the call.
-    fn apps_now(&self) -> Vec<(String, String, Val)> {
-        if let Some(st) = &self.st {
-            return st.apps.iter().filter(|a| !a.group.starts_with("pid:")).map(|a| (svc::app_item(&a.group), format!("{} volume", a.name), svc::app_val(a.vol, a.muted))).collect();
-        }
-        let rows = match self.target() {
-            Target::Fake(f) => svc::apps_now(&mut bu_audio::AudioService::new(f)),
-            #[cfg(windows)]
-            Target::Real => svc::on_real(|s| Ok(svc::apps_now(s))).unwrap_or_default(),
-            #[cfg(not(windows))]
-            Target::Real => Vec::new(),
-        };
-        rows.into_iter()
-            .filter(|a| !a.group.starts_with("pid:"))
-            .map(|a| (svc::app_item(&a.group), format!("{} volume", a.look.name), svc::app_val(a.volume, a.muted)))
-            .collect()
+    /// Order 047: the open page's values of every device / app item (what `St::current` answers), taken here at once
+    /// from its worker's snapshot (cheap) for a detached reset copy. None = closed (the last recorded values are used).
+    fn seen_vals(&self) -> Option<HashMap<String, Val>> {
+        let st = self.st.as_ref()?;
+        let s = st.svc.snapshot();
+        let mut items = vec!["out.default".to_string(), "in.default".to_string()];
+        items.extend(s.outputs.iter().chain(s.inputs.iter()).map(|d| format!("dev:{}", d.device.id)));
+        items.extend(st.apps.iter().map(|a| svc::app_item(&a.group)));
+        Some(items.into_iter().filter_map(|i| st.current(&i).map(|v| (i, v))).collect())
     }
+}
+
+fn device_apply(t: &Target, item: &str, to: &Val) -> Result<(), String> {
+    match t {
+        Target::Fake(f) => svc::apply_item(&mut bu_audio::AudioService::new(f.clone()), item, to),
+        #[cfg(windows)]
+        Target::Real => svc::on_real(|s| svc::apply_item(s, item, to)),
+        #[cfg(not(windows))]
+        Target::Real => Err("Windows only".into()),
+    }
+}
+
+/// The apps on the output device now: (item, label, value) - the open page's rows (`seen`), else read for the call.
+fn apps_now(t: &Target, seen: Option<&Vec<(String, String, Val)>>) -> Vec<(String, String, Val)> {
+    if let Some(v) = seen {
+        return v.clone();
+    }
+    let rows = match t {
+        Target::Fake(f) => svc::apps_now(&mut bu_audio::AudioService::new(f.clone())),
+        #[cfg(windows)]
+        Target::Real => svc::on_real(|s| Ok(svc::apps_now(s))).unwrap_or_default(),
+        #[cfg(not(windows))]
+        Target::Real => Vec::new(),
+    };
+    rows.into_iter()
+        .filter(|a| !a.group.starts_with("pid:"))
+        .map(|a| (svc::app_item(&a.group), format!("{} volume", a.look.name), svc::app_val(a.volume, a.muted)))
+        .collect()
+}
+
+fn rules_current(r: svc::Rules, item: &str) -> Val {
+    if item == svc::KEEP {
+        svc::on_val(r.keep)
+    } else {
+        svc::newapps_val(r)
+    }
+}
+
+/// "Windows defaults" (RS.aud): both switches off, every app at 100 %.
+fn rs_defaults(r: svc::Rules, apps: Vec<(String, String, Val)>) -> Vec<DefaultItem> {
+    let mut v = vec![
+        DefaultItem { item: svc::KEEP.into(), label: svc::KEEP_LABEL.into(), now: svc::on_val(r.keep), default: svc::on_val(false) },
+        DefaultItem {
+            item: svc::NEWAPPS.into(),
+            label: svc::NEWAPPS_LABEL.into(),
+            now: svc::newapps_val(r),
+            default: svc::newapps_val(svc::Rules { new_on: false, ..r }),
+        },
+    ];
+    for (item, label, now) in apps {
+        v.push(DefaultItem { item, label, now, default: svc::app_val(1.0, false) });
+    }
+    v
+}
+
+/// One of the two switches put to `to` (None = not one of them).
+fn rules_apply(mut r: svc::Rules, item: &str, to: &Val) -> Option<Result<svc::Rules, String>> {
+    match item {
+        svc::KEEP => r.keep = to.raw == "on",
+        svc::NEWAPPS => match to.raw.strip_prefix("on|") {
+            Some(v) => {
+                r.new_on = true;
+                match v.parse::<f32>() {
+                    Ok(x) => r.new_vol = x.clamp(0.0, 1.0),
+                    Err(_) => return Some(Err("Unknown value".into())),
+                }
+            }
+            None => r.new_on = false,
+        },
+        _ => return None,
+    }
+    Some(Ok(r))
 }
 
 /// Audio's items: the default output / input (all three roles), each device's switch, each app's volume + mute, and the
@@ -1398,55 +1626,102 @@ impl Resettable for Audio {
     }
     fn current(&self, item: &str) -> Option<Val> {
         match item {
-            svc::KEEP | svc::NEWAPPS => {
-                let r = svc::rules();
-                Some(if item == svc::KEEP { svc::on_val(r.keep) } else { svc::newapps_val(r) })
-            }
+            svc::KEEP | svc::NEWAPPS => Some(rules_current(svc::rules(), item)),
             // the devices / apps only while the page is open (its worker's snapshot; Windows' audio service can take a second)
             _ => self.st.as_ref().and_then(|st| st.current(item)),
         }
     }
     fn windows_defaults(&self) -> Vec<DefaultItem> {
-        let r = svc::rules();
-        let mut v = vec![
-            DefaultItem { item: svc::KEEP.into(), label: svc::KEEP_LABEL.into(), now: svc::on_val(r.keep), default: svc::on_val(false) },
-            DefaultItem {
-                item: svc::NEWAPPS.into(),
-                label: svc::NEWAPPS_LABEL.into(),
-                now: svc::newapps_val(r),
-                default: svc::newapps_val(svc::Rules { new_on: false, ..r }),
-            },
-        ];
-        for (item, label, now) in self.apps_now() {
-            v.push(DefaultItem { item, label, now, default: svc::app_val(1.0, false) });
-        }
-        v
+        rs_defaults(svc::rules(), apps_now(&self.target(), self.seen_apps().as_ref()))
     }
     fn apply(&mut self, item: &str, to: &Val) -> Result<(), String> {
         if crate::testmode::real_read() {
             return Err("A read-only test copy changes nothing".into());
         }
-        let mut r = svc::rules();
-        match item {
-            svc::KEEP => r.keep = to.raw == "on",
-            svc::NEWAPPS => match to.raw.strip_prefix("on|") {
-                Some(v) => {
-                    r.new_on = true;
-                    r.new_vol = v.parse::<f32>().map_err(|_| "Unknown value")?.clamp(0.0, 1.0);
-                }
-                None => r.new_on = false,
-            },
-            _ => {
-                self.device_apply(item, to)?;
-                if let Some(st) = self.st.as_mut() {
-                    // the open page shows Windows' answer, not its own values held after a change
-                    st.hold_until = 0.0;
-                }
-                return Ok(());
-            }
+        if let Some(r) = rules_apply(svc::rules(), item, to) {
+            svc::set_rules(r?);
+            return Ok(());
         }
-        svc::set_rules(r);
+        device_apply(&self.target(), item, to)?;
+        if let Some(st) = self.st.as_mut() {
+            // the open page shows Windows' answer, not its own values held after a change
+            st.hold_until = 0.0;
+        }
         Ok(())
+    }
+    /// Order 047: a closed page's apps (Windows' audio service, a second) and every put-back (`on_real`: a Core Audio
+    /// service made for the call) on the review's worker thread. The two switches live on the menu's thread (the
+    /// settings store): the copy hands each put-back line over (`PENDING_RULES`), the main loop saves it
+    /// (`drain_pending_rules`, also with the menu closed).
+    fn detach(&mut self) -> Option<crate::undo::Detached> {
+        Some(Box::new(AudReset { rules: svc::rules(), vals: self.seen_vals(), apps: self.seen_apps(), target: self.target() }))
+    }
+    fn reset_done(&mut self) {
+        drain_pending_rules();
+        if let Some(st) = self.st.as_mut() {
+            // the open page shows Windows' answer, not its own values held after a change
+            st.hold_until = 0.0;
+        }
+    }
+}
+
+/// Order 047: the switch lines a detached reset put back on the review's worker thread, waiting for the menu's thread
+/// (the switches and the settings store live there): (item, value).
+static PENDING_RULES: std::sync::Mutex<Vec<(String, Val)>> = std::sync::Mutex::new(Vec::new());
+
+/// Order 047: save the switch lines a detached reset put back (the main loop calls it after every wake-up, menu open or
+/// closed; `reset_done` too). Each line onto the switches as they are NOW (a toggle made meanwhile stays).
+pub fn drain_pending_rules() {
+    let lines = match PENDING_RULES.lock() {
+        Ok(mut q) if !q.is_empty() => std::mem::take(&mut *q),
+        _ => return,
+    };
+    for (item, to) in lines {
+        if let Some(Ok(r)) = rules_apply(svc::rules(), &item, &to) {
+            svc::set_rules(r);
+        }
+    }
+}
+
+/// Order 047: the Audio page's reset as a copy for the review's worker thread.
+struct AudReset {
+    /// the two switches as they were, then as the copy put them (each line handed over through `PENDING_RULES`)
+    rules: svc::Rules,
+    /// the open page's device / app values (None = closed)
+    vals: Option<HashMap<String, Val>>,
+    apps: Option<Vec<(String, String, Val)>>,
+    target: Target,
+}
+
+impl Resettable for AudReset {
+    fn page_id(&self) -> &str {
+        "aud"
+    }
+    fn page_title(&self) -> &str {
+        "Audio"
+    }
+    fn current(&self, item: &str) -> Option<Val> {
+        match item {
+            svc::KEEP | svc::NEWAPPS => Some(rules_current(self.rules, item)),
+            _ => self.vals.as_ref()?.get(item).cloned(),
+        }
+    }
+    fn windows_defaults(&self) -> Vec<DefaultItem> {
+        rs_defaults(self.rules, apps_now(&self.target, self.apps.as_ref()))
+    }
+    fn apply(&mut self, item: &str, to: &Val) -> Result<(), String> {
+        if crate::testmode::real_read() {
+            return Err("A read-only test copy changes nothing".into());
+        }
+        if let Some(r) = rules_apply(self.rules, item, to) {
+            self.rules = r?;
+            if let Ok(mut q) = PENDING_RULES.lock() {
+                q.push((item.to_string(), to.clone()));
+            }
+            crate::services::Waker.wake();
+            return Ok(());
+        }
+        device_apply(&self.target, item, to)
     }
 }
 

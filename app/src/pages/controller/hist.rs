@@ -10,6 +10,7 @@
 
 use bu_controller::{Change, PadKind, PadView, Part, PrefSetting};
 
+use super::work::{After, Job, Want, Wr};
 use super::Open;
 use crate::ui::el::Key;
 
@@ -139,104 +140,85 @@ impl Open {
     }
 
     /// Ctrl+Z (`redo` = false) / Ctrl+Y: the newest step of that list, written back; the tab shows where it happened.
+    /// Order 047: written on the tab's worker like any change (shown at once when it is on screen); the step moves to the
+    /// other list with the answer ("Undone · …"), or back to its own when the write did not go through.
     pub(super) fn undo(&mut self, redo: bool, now: f64) {
+        // a change still being written keeps its step until its answer: wait for it (else the older change is undone)
+        if self.out_state > 0 {
+            self.undo_q.push(redo);
+            return;
+        }
         let step = if redo { self.hist.redo.pop() } else { self.hist.undo.pop() };
-        let Some(mut step) = step else {
+        let Some(step) = step else {
             self.say(if redo { "Nothing to redo" } else { "Nothing to undo" }, now);
             return;
         };
-        match self.replay(&mut step, redo) {
-            Ok(()) => {
-                self.say(format!("{} \u{b7} {}", if redo { "Redone" } else { "Undone" }, step.label), now);
-                if redo {
-                    self.hist.undo.push(step);
-                } else {
-                    self.hist.redo.push(step);
-                }
-            }
-            Err(e) => {
-                // not written: the step stays where it was
-                if redo {
-                    self.hist.redo.push(step);
-                } else {
-                    self.hist.undo.push(step);
-                }
-                self.say(e, now);
-            }
-        }
+        self.replay(step, redo);
     }
 
-    fn replay(&mut self, step: &mut Step, redo: bool) -> Result<(), String> {
-        match &mut step.what {
+    fn replay(&mut self, step: Step, redo: bool) {
+        match step.what.clone() {
             What::Layout { game, kind, set, before, after } => {
-                self.show_at(game, *kind, Some(*set))?;
-                let changes = if redo { after.clone() } else { before.clone() };
-                self.apply_layout(&changes)
+                let changes = if redo { after } else { before };
+                if self.show_at(&game, kind, Some(set)) {
+                    self.local(&changes);
+                }
+                let want = Want { kind, key: Some(game.clone()), set: Some(set), fresh: false };
+                self.send(Job::Write { wr: Wr::Layout { key: game, kind, set, changes, gone: true }, want, after: After::Replay { step, redo } });
             }
             What::Prefs { serial, before, after } => {
-                let vals = if redo { after.clone() } else { before.clone() };
-                let v: Vec<(PrefSetting, Option<&str>)> = vals.iter().map(|(s, v)| (*s, v.as_deref())).collect();
-                let had = self.had_prefs(serial);
-                let r = match &mut self.svc {
-                    Ok(s) => s.set_preferences(serial, &v, &step.label).map_err(|e| e.to_string()),
-                    Err(e) => Err(e.clone()),
-                };
-                r?;
-                let serial = serial.clone();
-                self.log_prefs(&serial, had);
-                self.reload_prefs();
-                Ok(())
+                let vals = if redo { after } else { before };
+                self.local_prefs(&serial, &vals);
+                let want = self.want();
+                let label = step.label.clone();
+                self.send(Job::Write { wr: Wr::Prefs { serial, vals, label }, want, after: After::Replay { step, redo } });
             }
-            What::NewSet { game, kind, from, title, id } => {
-                self.show_at(game, *kind, None)?;
-                let g = self.game().cloned().ok_or("That game is gone")?;
-                let had = self.had_layout(&g.key);
-                if redo {
-                    let r = match &mut self.svc {
-                        Ok(s) => s.add_action_set(&g.key, *kind, *from, title).map_err(|e| e.to_string()),
-                        Err(e) => Err(e.clone()),
-                    };
-                    *id = r?;
-                    self.set = *id;
-                } else {
-                    // bu-controller's exact undo, only while the new set is still its last write
-                    let last = self.svc.as_ref().ok().and_then(|s| s.undo_label());
-                    if last.as_deref() != Some(format!("{} \u{b7} new action set", g.name).as_str()) {
-                        return Err("The new action set can\u{2019}t be taken back any more (the layout was changed since)".into());
+            What::NewSet { game, kind, from, title, .. } => {
+                let here = self.show_at(&game, kind, None);
+                let wr = if redo {
+                    if here {
+                        self.local_new_set(from, &title);
                     }
-                    let r = match &mut self.svc {
-                        Ok(s) => s.undo().map(|_| ()).map_err(|e| e.to_string()),
-                        Err(e) => Err(e.clone()),
-                    };
-                    r?;
-                    self.set = *from;
-                }
-                self.log_layout(&g, had);
-                self.load_games_keep();
-                Ok(())
+                    Wr::NewSet { key: game.clone(), kind, from, title }
+                } else {
+                    Wr::UndoNewSet { key: game.clone(), kind, from }
+                };
+                // the set shown after it: the new one / the one it was made from (the worker sets it when it went through)
+                let want = Want { kind, key: Some(game), set: if here { Some(self.set) } else { None }, fresh: false };
+                self.send(Job::Write { wr, want, after: After::Replay { step, redo } });
             }
         }
     }
 
-    /// Show this game / controller type / action set (an undo of something not on screen shows it first).
-    fn show_at(&mut self, game: &str, kind: PadKind, set: Option<u32>) -> Result<(), String> {
+    /// Show this game / controller type / action set (an undo of something not on screen shows it first). True = it is
+    /// on screen with its layout (the step can show at once); false = it is read with the step's write.
+    fn show_at(&mut self, game: &str, kind: PadKind, set: Option<u32>) -> bool {
         if kind != self.kind {
             self.kind = kind;
             self.pic = super::pic::pic(kind);
             self.sel = None;
-            self.load_games();
-            self.start_live();
-        }
-        let gi = self.games.iter().position(|g| g.key == game).ok_or("That game\u{2019}s layout is gone")?;
-        if gi != self.gi {
-            self.gi = gi;
-            self.sel = None;
             self.set = set.unwrap_or(0);
-            self.load_view();
-        } else if let Some(s) = set.filter(|s| *s != self.set) {
-            self.set = s;
-            self.load_view();
+            self.clear_view();
+            self.start_live();
+            return false;
         }
-        Ok(())
+        match self.games.iter().position(|g| g.key == game) {
+            Some(gi) if gi != self.gi => {
+                self.gi = gi;
+                self.sel = None;
+                self.set = set.unwrap_or(0);
+                self.clear_view();
+                false
+            }
+            Some(_) => {
+                if let Some(s) = set.filter(|s| *s != self.set) {
+                    self.set = s;
+                    self.show_set();
+                }
+                self.lay.is_some()
+            }
+            // gone: the worker says so ("That game's layout is gone")
+            None => false,
+        }
     }
 }

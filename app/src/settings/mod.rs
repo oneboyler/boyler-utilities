@@ -5,6 +5,9 @@
 //!   by page id) and [`Scope::Pc`] ("how your PC was" — the undo module's records; "Reset the app's own settings" keeps it);
 //! - typed get / set: bool, i64, f64, string, string list; a value of another type reads as "not set";
 //! - every set writes the whole file at once (temp file + rename) and only when the value really changed;
+//! - Order 050: the app's store ([`SettingsStore::write_in_background`]) hands each new file to ONE writer thread - the
+//!   UI thread never waits for the disk (a flush to disk takes 10-100+ ms, seconds while the disk is busy); the writer
+//!   always writes the newest file (several changes in a row = one write) and dropping the store waits for it;
 //! - a broken file is kept aside as `settings.cfg.broken` and the defaults are used ([`SettingsStore::load_note`]).
 //!   The file is plain UTF-8 text, one value per line: `section TAB key TAB type TAB value` (tab, newline, `\` escaped).
 
@@ -88,6 +91,8 @@ pub struct SettingsStore {
     folder: PathBuf,
     values: BTreeMap<(String, String), Value>,
     note: Option<LoadNote>,
+    /// Order 050: the background writer (None = every write on the caller's thread - unit tests)
+    writer: Option<writer::Writer>,
 }
 
 impl SettingsStore {
@@ -100,7 +105,7 @@ impl SettingsStore {
     pub fn open(folder: impl Into<PathBuf>) -> Self {
         let folder = folder.into();
         let path = folder.join(FILE_NAME);
-        let mut store = SettingsStore { folder, values: BTreeMap::new(), note: None };
+        let mut store = SettingsStore { folder, values: BTreeMap::new(), note: None, writer: None };
         match std::fs::read(&path) {
             Ok(bytes) => match format::parse(&bytes) {
                 Ok(values) => store.values = values,
@@ -110,6 +115,19 @@ impl SettingsStore {
             Err(e) => store.note = Some(LoadNote::Unreadable(e.to_string())),
         }
         store
+    }
+
+    /// Order 050: from now on every write goes to one background writer thread (the app's store: the UI thread never
+    /// waits for the disk). [`SettingsStore::wait_written`] / dropping the store waits until the newest file is on disk.
+    pub fn write_in_background(&mut self) {
+        if self.writer.is_none() {
+            self.writer = writer::Writer::start(self.folder.clone());
+        }
+    }
+
+    /// Wait (at most `max`) until every change so far is on disk. true = all written (or no background writer).
+    pub fn wait_written(&self, max: std::time::Duration) -> bool {
+        self.writer.as_ref().is_none_or(|w| w.wait(max))
     }
 
     /// The settings file's full path.
@@ -281,21 +299,139 @@ impl SettingsStore {
         self.write().map(|_| true)
     }
 
-    /// Write the whole file: `settings.cfg.tmp` (flushed to disk), then renamed over `settings.cfg`.
+    /// Write the whole file - on the background writer when there is one (Order 050; a failed write's error comes back
+    /// from the next write).
     fn write(&self) -> io::Result<()> {
-        use std::io::Write;
-        std::fs::create_dir_all(&self.folder)?;
-        let path = self.path();
-        let tmp = self.folder.join(format!("{FILE_NAME}.tmp"));
         let text = format::write(&self.values);
-        {
-            let mut f = std::fs::File::create(&tmp)?;
-            f.write_all(text.as_bytes())?;
-            f.sync_all()?;
+        match &self.writer {
+            Some(w) => w.send(text),
+            None => write_file(&self.folder, &text),
         }
-        std::fs::rename(&tmp, &path).inspect_err(|_| {
-            let _ = std::fs::remove_file(&tmp);
-        })
+    }
+}
+
+impl Drop for SettingsStore {
+    fn drop(&mut self) {
+        // the newest file goes to disk before the app ends (the writer's own Drop waits for it and joins)
+        self.writer.take();
+    }
+}
+
+/// `settings.cfg.tmp` (flushed to disk), then renamed over `settings.cfg`.
+fn write_file(folder: &Path, text: &str) -> io::Result<()> {
+    use std::io::Write;
+    std::fs::create_dir_all(folder)?;
+    let path = folder.join(FILE_NAME);
+    let tmp = folder.join(format!("{FILE_NAME}.tmp"));
+    {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(text.as_bytes())?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp, &path).inspect_err(|_| {
+        let _ = std::fs::remove_file(&tmp);
+    })
+}
+
+/// Order 050: the one writer thread of the app's store.
+mod writer {
+    use std::io;
+    use std::path::PathBuf;
+    use std::sync::{Arc, Condvar, Mutex};
+    use std::time::{Duration, Instant};
+
+    #[derive(Default)]
+    struct Slot {
+        /// the newest file not written yet
+        text: Option<String>,
+        /// files handed in / written (all on disk when `done == sent`)
+        sent: u64,
+        done: u64,
+        /// the last write's error, handed back by the next `send`
+        err: Option<String>,
+        quit: bool,
+    }
+
+    pub(super) struct Writer {
+        shared: Arc<(Mutex<Slot>, Condvar)>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl Writer {
+        pub(super) fn start(folder: PathBuf) -> Option<Writer> {
+            let shared: Arc<(Mutex<Slot>, Condvar)> = Arc::default();
+            let sh = shared.clone();
+            let thread = std::thread::Builder::new()
+                .name("bu-settings-write".into())
+                .spawn(move || {
+                    let (m, cv) = &*sh;
+                    let Ok(mut g) = m.lock() else { return };
+                    loop {
+                        if let Some(text) = g.text.take() {
+                            let upto = g.sent;
+                            drop(g);
+                            let r = super::write_file(&folder, &text);
+                            let Ok(g2) = m.lock() else { return };
+                            g = g2;
+                            g.err = r.err().map(|e| e.to_string());
+                            g.done = upto;
+                            cv.notify_all();
+                            continue;
+                        }
+                        if g.quit {
+                            return;
+                        }
+                        let Ok(g2) = cv.wait(g) else { return };
+                        g = g2;
+                    }
+                })
+                .ok()?;
+            Some(Writer { shared, thread: Some(thread) })
+        }
+
+        /// Hand in the newest file (an older one not written yet is dropped). Returns the previous write's error.
+        pub(super) fn send(&self, text: String) -> io::Result<()> {
+            let (m, cv) = &*self.shared;
+            let mut g = m.lock().map_err(|_| io::Error::other("the settings writer stopped"))?;
+            g.text = Some(text);
+            g.sent += 1;
+            cv.notify_all();
+            match g.err.take() {
+                Some(e) => Err(io::Error::other(e)),
+                None => Ok(()),
+            }
+        }
+
+        /// Wait until every file handed in is written (at most `max`).
+        pub(super) fn wait(&self, max: Duration) -> bool {
+            let (m, cv) = &*self.shared;
+            let end = Instant::now() + max;
+            let Ok(mut g) = m.lock() else { return false };
+            while g.done < g.sent {
+                let left = end.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    return false;
+                }
+                match cv.wait_timeout(g, left) {
+                    Ok((g2, _)) => g = g2,
+                    Err(_) => return false,
+                }
+            }
+            true
+        }
+    }
+
+    impl Drop for Writer {
+        fn drop(&mut self) {
+            let _ = self.wait(Duration::from_secs(5));
+            if let Ok(mut g) = self.shared.0.lock() {
+                g.quit = true;
+            }
+            self.shared.1.notify_all();
+            if let Some(t) = self.thread.take() {
+                let _ = t.join();
+            }
+        }
     }
 }
 

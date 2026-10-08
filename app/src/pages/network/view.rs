@@ -64,8 +64,10 @@ fn conn_gh(n: &mut Network, cx: &mut Cx) -> El {
     r.push(mbtn::mbtn(cx, K_DNS, Mb::Dns(cur), n.dns_wait).tip("Who looks up web addresses \u{b7} for the connection in use"));
     // Flush DNS -> `.done` (green check "Flushed") for 1.6 s
     let done = n.flushed_at.is_some_and(|t| cx.now - t < mbtn::DONE_MS);
-    if done {
-        cx.st.busy = true;
+    if let (true, Some(t)) = (done, n.flushed_at) {
+        // Order 047: "Flushed" just stays for 1.6 s - built again at its end, no frames in between (the button's own
+        // fade asks for its frames while it moves)
+        cx.wake_at(t + mbtn::DONE_MS);
     }
     let what = if done { Mb::Done("Flushed") } else { Mb::Text("Flush DNS") };
     r.push(mbtn::mbtn(cx, K_FLUSH, what, false).tip("Forgets saved web addresses \u{b7} fixes sites that won\u{2019}t load"));
@@ -372,9 +374,8 @@ fn speed(n: &mut Network, cx: &mut Cx) -> El {
     let dur = if s.done && !s.run { 700.0 } else { 110.0 };
     let gv = cx.tr(K_START, 20, target as f32, dur, if s.done { Bezier::new(0.33, 1.0, 0.68, 1.0) } else { Bezier::new(0.0, 0.0, 1.0, 1.0) }) as f64;
     let png_t = cx.tr(K_START, 21, if png { 1.0 } else { 0.0 }, 250.0, EASE);
-    if s.run {
-        cx.st.busy = true;
-    }
+    // Order 047: a running test no longer asks for a frame every 3 ms: its thread wakes the menu with each sample (10 a
+    // second) and the gauge's own easing (`cx.tr` above) asks for frames while the needle moves - nothing between phases
     let look = Look { value: gv, up: s.run && phase == Some(SpeedPhase::Upload), png: png_t };
     let arc = El::paint(move |g, (x, y, _, _)| gauge::paint(g, x, y, look)).abs(0.0, 0.0, 0.0, 0.0).no_hit();
     // the readout `.gro{position:absolute;left:0;right:0;top:66px;flex-direction:column;align-items:center;opacity:0;transform:scale(.94);

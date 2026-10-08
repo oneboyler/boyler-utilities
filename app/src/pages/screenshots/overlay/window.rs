@@ -3,15 +3,21 @@
 //! (its message loop dispatches to `wndproc`). The overlay windows are excluded from screen capture
 //! (`WDA_EXCLUDEFROMCAPTURE`), so a Live snap never sees them.
 //!
+//! Order 048 (a user's whole desktop froze): the UI thread never waits on Windows here - grabbing the screen and Copy / Save
+//! run on a worker (`worker.rs`; the overlay opens when the key's picture lands), and while the overlay is open a watchdog
+//! (`watchdog.rs`) takes its windows off the screen if this thread ever stops answering for 450 ms.
+//!
 //! Nothing here runs in a test copy: `start` refuses when the app runs in test mode (tests drive `model` / `capture` against
 //! bu-screenshot's fake and render `view` off-screen).
 
 use std::cell::RefCell;
+use std::path::PathBuf;
 use std::rc::Rc;
 
 use skia_safe as sk;
 use windows::core::*;
 use windows::Win32::Foundation::*;
+use windows::Win32::Graphics::DirectComposition::*;
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
@@ -21,6 +27,8 @@ use bu_screenshot::real::RealOs;
 use bu_screenshot::{Monitor, Screenshots};
 
 use super::capture::{Capture, Done, Step};
+use super::watchdog;
+use super::worker::{self, Job, Res, Tag};
 use super::model::{Corner, Finish, Keep, Mode, Out, Pointer, Tool, COLORS};
 use super::toast;
 use super::view::{self, *};
@@ -65,6 +73,8 @@ const TIMER: usize = 0x5C01;
 const WDA_EXCLUDEFROMCAPTURE: WINDOW_DISPLAY_AFFINITY = WINDOW_DISPLAY_AFFINITY(0x11);
 
 /// One layered window and its pixels (a DIB that Skia draws into directly). Also the lightbox's host (lbhost.rs).
+/// Order 051: or a window whose pixels Skia draws on the GPU (`gpu`), straight into a composition swap chain shown by
+/// DirectComposition - the capture overlay's monitor windows.
 pub(crate) struct Layer {
     hwnd: HWND,
     x: i32,
@@ -75,6 +85,23 @@ pub(crate) struct Layer {
     bmp: HBITMAP,
     old: HGDIOBJ,
     bits: *mut u8,
+    gpu: Option<GpuOut>,
+}
+
+/// Order 051: a monitor window's GPU output - the swap chain (paced by its frame-latency waitable: the compositor's clock of
+/// that monitor) and the DirectComposition visual showing it (its opacity = the fade).
+pub(crate) struct GpuOut {
+    chain: crate::gpu::GpuChain,
+    dev: IDCompositionDesktopDevice,
+    _target: IDCompositionTarget,
+    visual: IDCompositionVisual2,
+    alpha: f32,
+    /// the waitable fired and no frame used it yet (the compositor has room for one)
+    slot: bool,
+    /// something changed since the last frame (painted at the next slot)
+    want: bool,
+    /// when it was last painted (ms): a window whose waitable stays silent for 100 ms is painted anyway (`overdue`)
+    painted_at: f64,
 }
 
 impl Layer {
@@ -93,14 +120,48 @@ impl Layer {
             let screen = GetDC(None);
             let dc = CreateCompatibleDC(Some(screen));
             ReleaseDC(None, screen);
-            let mut l = Layer { hwnd, x, y, w: 0, h: 0, dc, bmp: HBITMAP::default(), old: HGDIOBJ::default(), bits: std::ptr::null_mut() };
+            let mut l = Layer { hwnd, x, y, w: 0, h: 0, dc, bmp: HBITMAP::default(), old: HGDIOBJ::default(), bits: std::ptr::null_mut(), gpu: None };
             l.resize(w, h)?;
             Ok(l)
         }
     }
 
+    /// Order 051: a monitor window drawn on the GPU - no layered window, no DIB: a composition swap chain the size of the
+    /// window, shown by a DirectComposition visual (a normal window takes the clicks on every pixel, transparent or not).
+    fn new_gpu(gpu: &Rc<crate::gpu::Gpu>, x: i32, y: i32, w: i32, h: i32) -> Result<Layer> {
+        register();
+        unsafe {
+            let ex = WS_EX_NOREDIRECTIONBITMAP | WS_EX_TOPMOST | WS_EX_TOOLWINDOW;
+            let inst = GetModuleHandleW(None)?;
+            let hwnd = CreateWindowExW(ex, CLASS, w!("Boyler Utilities capture"), WS_POPUP, x, y, w, h, None, None, Some(inst.into()), None)?;
+            let made = (|| -> Result<GpuOut> {
+                let _ = SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE);
+                let chain = crate::gpu::GpuChain::new(gpu, w.max(1) as u32, h.max(1) as u32)?;
+                let dev: IDCompositionDesktopDevice = DCompositionCreateDevice2(None)?;
+                let target = dev.CreateTargetForHwnd(hwnd, true)?;
+                let visual = dev.CreateVisual()?;
+                visual.SetContent(&chain.swap)?;
+                target.SetRoot(&visual)?;
+                dev.Commit()?;
+                Ok(GpuOut { chain, dev, _target: target, visual, alpha: 1.0, slot: true, want: true, painted_at: crate::timing::now() })
+            })();
+            match made {
+                Ok(g) => Ok(Layer { hwnd, x, y, w: w.max(1), h: h.max(1), dc: HDC::default(), bmp: HBITMAP::default(), old: HGDIOBJ::default(), bits: std::ptr::null_mut(), gpu: Some(g) }),
+                Err(e) => {
+                    let _ = DestroyWindow(hwnd);
+                    Err(e)
+                }
+            }
+        }
+    }
+
+    /// Drawn on the GPU?
+    pub(crate) fn is_gpu(&self) -> bool {
+        self.gpu.is_some()
+    }
+
     fn resize(&mut self, w: i32, h: i32) -> Result<()> {
-        if w == self.w && h == self.h && !self.bits.is_null() {
+        if self.gpu.is_some() || (w == self.w && h == self.h && !self.bits.is_null()) {
             return Ok(());
         }
         unsafe {
@@ -138,13 +199,35 @@ impl Layer {
 
     /// Skia draws straight into the window's pixels.
     pub(crate) fn surface(&mut self) -> Option<sk::Surface> {
+        if let Some(g) = &self.gpu {
+            return Some(g.chain.back());
+        }
         let info = sk::ImageInfo::new((self.w, self.h), sk::ColorType::BGRA8888, sk::AlphaType::Premul, None);
         let len = (self.w * self.h * 4) as usize;
         let px = unsafe { std::slice::from_raw_parts_mut(self.bits, len) };
         sk::surfaces::wrap_pixels(&info, px, (self.w * 4) as usize, Some(&crate::gfx::surface_props())).map(|s| unsafe { s.release() })
     }
 
-    pub(crate) fn present(&self, alpha: f32) {
+    pub(crate) fn present(&mut self, alpha: f32) {
+        if let Some(g) = &mut self.gpu {
+            let a = alpha.clamp(0.0, 1.0);
+            if a != g.alpha {
+                g.alpha = a;
+                unsafe {
+                    if let Ok(v3) = g.visual.cast::<IDCompositionVisual3>() {
+                        let _ = v3.SetOpacity2(a);
+                    }
+                    let _ = g.dev.Commit();
+                }
+            }
+            if let Err(e) = g.chain.present() {
+                crate::timing::note(&format!("overlay present failed {:08x}", e.code().0));
+                if crate::gpu::is_lost_error(&e) || g.chain.gpu.lost() {
+                    LOST.with(|l| l.set(true));
+                }
+            }
+            return;
+        }
         unsafe {
             let blend = BLENDFUNCTION { BlendOp: AC_SRC_OVER as u8, BlendFlags: 0, SourceConstantAlpha: (alpha.clamp(0.0, 1.0) * 255.0).round() as u8, AlphaFormat: AC_SRC_ALPHA as u8 };
             let pt = POINT { x: self.x, y: self.y };
@@ -157,6 +240,8 @@ impl Layer {
 
 impl Drop for Layer {
     fn drop(&mut self) {
+        // (the GPU output first: the GPU finishes with the swap chain before the window goes)
+        self.gpu = None;
         unsafe {
             if !self.old.is_invalid() {
                 SelectObject(self.dc, self.old);
@@ -164,7 +249,9 @@ impl Drop for Layer {
             if !self.bmp.is_invalid() {
                 let _ = DeleteObject(self.bmp.into());
             }
-            let _ = DeleteDC(self.dc);
+            if !self.dc.is_invalid() {
+                let _ = DeleteDC(self.dc);
+            }
             let _ = DestroyWindow(self.hwnd);
         }
     }
@@ -193,6 +280,40 @@ struct Session {
     pressed: Option<Key>,
     /// closing after Copy / Save / a click (ms): the overlay fades out
     closing: Option<(f64, Option<Done>)>,
+    /// Order 051: the GPU the monitor windows are drawn on (None = the CPU path: layered windows)
+    gpu: Option<Rc<crate::gpu::Gpu>>,
+    /// Order 048: this capture's number (a worker's result for another one is dropped), its engine's folder, the jobs sent
+    id: u64,
+    data_dir: PathBuf,
+    seq: u64,
+    /// a new picture is on its way (the job's number; a Snap / Live off): only the newest one is used
+    grab_pending: Option<u64>,
+    /// Copy / Save is running (the job's number); the overlay fades meanwhile
+    finish_pending: Option<u64>,
+    /// Live was on when that picture was asked for: the overlay shows the screen through until it lands
+    show_live: bool,
+}
+
+impl Session {
+    fn next_tag(&mut self) -> Tag {
+        self.seq += 1;
+        Tag { session: self.id, seq: self.seq }
+    }
+}
+
+/// The Screenshot key was pressed and the screen is being grabbed (Order 048: on a worker - the overlay opens when it lands).
+struct Starting {
+    id: u64,
+    hooks: Rc<Hooks>,
+    pointer: (f32, f32),
+    data_dir: PathBuf,
+}
+
+/// A Copy / Save still running after its overlay closed: the toast comes when it is done.
+struct LateShot {
+    tag: Tag,
+    hooks: Rc<Hooks>,
+    home: Monitor,
 }
 
 /// A finished shot on screen: the toast, then its thumbnail flying off, then (for a click) the flash that came before it.
@@ -222,6 +343,29 @@ thread_local! {
     static FLASH: RefCell<Vec<FlashWin>> = const { RefCell::new(Vec::new()) };
     static KEEP: RefCell<Option<Keep>> = const { RefCell::new(None) };
     static REGISTERED: RefCell<bool> = const { RefCell::new(false) };
+    /// Order 051: a GPU present failed with a lost device - the overlay goes on on the CPU path
+    static LOST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static STARTING: RefCell<Option<Starting>> = const { RefCell::new(None) };
+    static LATE: RefCell<Vec<LateShot>> = const { RefCell::new(Vec::new()) };
+    static NEXT_ID: RefCell<u64> = const { RefCell::new(0) };
+    /// a hidden message-only window of the overlay's class: the workers' results come to it (WM_JOB_DONE)
+    static MSG_WIN: RefCell<HWND> = RefCell::new(HWND::default());
+}
+
+/// The overlay's message window (made once, never on screen).
+fn msg_window() -> HWND {
+    register();
+    MSG_WIN.with(|m| {
+        let mut h = m.borrow_mut();
+        if h.is_invalid() {
+            unsafe {
+                if let Ok(inst) = GetModuleHandleW(None) {
+                    *h = CreateWindowExW(WINDOW_EX_STYLE(0), CLASS, w!(""), WINDOW_STYLE(0), 0, 0, 0, 0, Some(HWND_MESSAGE), None, Some(inst.into()), None).unwrap_or_default();
+                }
+            }
+        }
+        *h
+    })
 }
 
 fn register() {
@@ -242,13 +386,14 @@ fn now() -> f64 {
     crate::timing::now()
 }
 
-/// Is the overlay open?
+/// Is the overlay open (or opening: the screen is being grabbed)?
 pub fn is_open() -> bool {
-    SESSION.with(|s| s.try_borrow().map(|s| s.is_some()).unwrap_or(true))
+    SESSION.with(|s| s.try_borrow().map(|s| s.is_some()).unwrap_or(true)) || STARTING.with(|s| s.try_borrow().map(|s| s.is_some()).unwrap_or(true))
 }
 
 /// The Screenshot key's action: freeze every monitor and open the overlay on them. Refused in a test copy (tests never
-/// capture the screen) and while it is already open.
+/// capture the screen) and while it is already open. Order 048: the grab runs on a worker (it can wait 1-2 s for Windows);
+/// the overlay opens when the picture lands ([`opened`]); a failure is reported through `on_error`.
 pub fn start(hooks: Hooks) -> std::result::Result<(), String> {
     if let Some(why) = refused(crate::testmode::on()) {
         return Err(why.into());
@@ -257,28 +402,124 @@ pub fn start(hooks: Hooks) -> std::result::Result<(), String> {
         return Ok(());
     }
     let Some(dir) = bu_screenshot::real::default_data_dir() else { return Err("no LOCALAPPDATA folder".into()) };
-    let svc = Screenshots::new(RealOs::new(), dir);
+    let notify = msg_window();
+    if notify.is_invalid() {
+        return Err("the capture overlay's window could not be made".into());
+    }
     let mut p = POINT::default();
     unsafe {
         let _ = GetCursorPos(&mut p);
     }
-    let t = now();
-    let keep = KEEP.with(|k| k.borrow().clone());
-    let hooks = Rc::new(hooks);
-    let cap = match Capture::start(svc, (p.x as f32, p.y as f32), t, keep) {
-        Ok(c) => c,
-        Err(e) => {
-            let msg = format!("Screenshot failed: {e}");
-            (hooks.on_error)(&msg);
-            return Err(msg);
+    let id = NEXT_ID.with(|n| {
+        *n.borrow_mut() += 1;
+        *n.borrow()
+    });
+    let st = Starting { id, hooks: Rc::new(hooks), pointer: (p.x as f32, p.y as f32), data_dir: dir.clone() };
+    STARTING.with(|c| *c.borrow_mut() = Some(st));
+    worker::spawn(Tag { session: id, seq: 0 }, dir, Job::Grab, notify);
+    Ok(())
+}
+
+/// The key's grab landed: the overlay opens on it (or the failure is reported).
+fn opened(tag: Tag, r: bu_screenshot::Result<bu_screenshot::Frozen>) {
+    let st = STARTING.with(|c| {
+        let mut b = c.borrow_mut();
+        if b.as_ref().map(|s| s.id) == Some(tag.session) {
+            b.take()
+        } else {
+            None
         }
+    });
+    let Some(st) = st else { return };
+    let hooks = st.hooks;
+    let fail = |msg: String| (hooks.on_error)(&msg);
+    let frozen = match r {
+        Ok(f) => f,
+        Err(e) => return fail(format!("Screenshot failed: {e}")),
     };
+    let svc = Screenshots::new(RealOs::new(), st.data_dir.clone());
+    let keep = KEEP.with(|k| k.borrow().clone());
+    let cap = Capture::with_frozen(svc, frozen, st.pointer, now(), keep);
+    let p = POINT { x: st.pointer.0 as i32, y: st.pointer.1 as i32 };
+    if let Err(e) = open_session(cap, hooks.clone(), p, false, st.id, st.data_dir) {
+        fail(format!("Screenshot failed: {e}"));
+    }
+}
+
+/// Order 051, test copies only: the overlay over a made-up picture on one made-up monitor (`gputest`) - never a grab of the
+/// screen; the engine runs on the read-only OS layer (Copy / Save / Snap are refused) and the windows never take the focus.
+pub fn start_test(x: i32, y: i32, w: u32, h: u32) -> std::result::Result<(), String> {
+    if !crate::testmode::on() {
+        return Err("test copies only".into());
+    }
+    if is_open() {
+        return Ok(());
+    }
+    let frozen = super::gputest::frozen(x, y, w, h);
+    let dir = std::env::temp_dir().join("BoylerUtilities-test").join("overlay");
+    let svc = Screenshots::new(RealOs::read_only(), dir.clone());
+    let p = POINT { x: x + w as i32 / 2, y: y + h as i32 / 2 };
+    let model = super::model::Model::new(frozen.monitors.clone(), (p.x as f32, p.y as f32), now(), None);
+    let id = NEXT_ID.with(|n| {
+        *n.borrow_mut() += 1;
+        *n.borrow()
+    });
+    open_session(Capture { svc, frozen, model }, Rc::new(Hooks::default()), p, true, id, dir)
+}
+
+/// Test copies: the first overlay window (the drag's target) and how it is drawn.
+pub fn test_window() -> Option<(HWND, bool)> {
+    SESSION.with(|c| c.try_borrow().ok().and_then(|b| b.as_ref().and_then(|s| s.wins.first().map(|w| (w.layer.hwnd, w.layer.is_gpu())))))
+}
+
+/// Test copies: close without a shot.
+pub fn test_close() {
+    close(None);
+}
+
+/// Test copies (`ovlose`): the overlay's GPU device removed, as a driver crash would.
+pub fn test_lose_gpu() {
+    SESSION.with(|c| {
+        if let Some(g) = c.borrow().as_ref().and_then(|s| s.gpu.clone()) {
+            g.remove_for_test();
+        }
+    });
+    paint_all();
+}
+
+/// The overlay's windows over the captured picture (`test`: never takes the focus).
+/// Order 048: `id` / `data_dir` = the capture's number and its engine's folder (its workers' results find it by them).
+fn open_session(cap: Capture<RealOs>, hooks: Rc<Hooks>, p: POINT, test: bool, id: u64, data_dir: PathBuf) -> std::result::Result<(), String> {
     let mut wins = Vec::new();
+    // Order 051: on the GPU (the adapter driving the monitor under the pointer), else today's layered windows
+    let gpu = crate::gpu::get(Some(unsafe { MonitorFromPoint(p, MONITOR_DEFAULTTOPRIMARY) }));
     for (mi, m) in cap.model.monitors.iter().enumerate() {
-        let layer = Layer::new(m.rect.x, m.rect.y, m.rect.w as i32, m.rect.h as i32, false).map_err(|e| e.to_string())?;
+        let layer = match gpu.as_ref().map(|g| Layer::new_gpu(g, m.rect.x, m.rect.y, m.rect.w as i32, m.rect.h as i32)) {
+            Some(Ok(l)) => l,
+            r => {
+                if let Some(Err(e)) = r {
+                    crate::timing::note(&format!("overlay gpu window failed {:08x} {} - layered window", e.code().0, e.message()));
+                }
+                Layer::new(m.rect.x, m.rect.y, m.rect.w as i32, m.rect.h as i32, false).map_err(|e| e.to_string())?
+            }
+        };
         wins.push(MonWin { mi, layer, g: Gfx::new(m.dpi as f32 / 96.0), st: State::default(), front: None, bg: None, tips: Default::default() });
     }
-    let mut s = Session { cap, wins, icons: Icons::new(), hooks, pressed: None, closing: None };
+    let mut s = Session {
+        cap,
+        wins,
+        icons: Icons::new(),
+        hooks,
+        pressed: None,
+        closing: None,
+        gpu,
+        id,
+        data_dir,
+        seq: 0,
+        grab_pending: None,
+        finish_pending: None,
+        show_live: false,
+    };
     // Order 045: Save's hover name says where it saves (`S.shotDir`, as the page shows the folder)
     if let Ok(d) = s.cap.svc.save_dir() {
         s.cap.model.save_dir = super::super::gallery::short_dir(&d, super::super::gallery::profile_dir(false).as_deref());
@@ -287,19 +528,22 @@ pub fn start(hooks: Hooks) -> std::result::Result<(), String> {
     let home = s.cap.model.home;
     SESSION.with(|c| *c.borrow_mut() = Some(s));
     paint_all();
-    SESSION.with(|c| {
-        if let Some(s) = c.borrow().as_ref() {
-            unsafe {
-                for w in &s.wins {
-                    let _ = ShowWindow(w.layer.hwnd, SW_SHOWNA);
-                }
-                if let Some(w) = s.wins.iter().find(|w| w.mi == home) {
-                    let _ = SetForegroundWindow(w.layer.hwnd);
-                    let _ = SetFocus(Some(w.layer.hwnd));
-                }
+    let hwnds = SESSION.with(|c| {
+        let b = c.borrow();
+        let Some(s) = b.as_ref() else { return Vec::new() };
+        unsafe {
+            for w in &s.wins {
+                let _ = ShowWindow(w.layer.hwnd, SW_SHOWNA);
+            }
+            if let Some(w) = s.wins.iter().find(|w| w.mi == home).filter(|_| !test) {
+                let _ = SetForegroundWindow(w.layer.hwnd);
+                let _ = SetFocus(Some(w.layer.hwnd));
             }
         }
+        s.wins.iter().map(|w| w.layer.hwnd).collect()
     });
+    // Order 048: from now on the windows are watched - if this thread ever stops answering, they leave the screen
+    watchdog::open(&hwnds);
     tick_timer(true);
     Ok(())
 }
@@ -315,6 +559,10 @@ fn slice_frozen(s: &mut Session) {
     for w in &mut s.wins {
         let m: &Monitor = &s.cap.model.monitors[w.mi];
         w.bg = f.crop(&m.rect).ok().and_then(|img| super::compose::to_sk(&img));
+        // Order 051: a GPU window gets the frozen picture as a texture (uploaded once, not every frame)
+        if let (Some(g), true) = (&s.gpu, w.layer.is_gpu()) {
+            w.bg = w.bg.take().map(|img| g.texture(&img).unwrap_or(img));
+        }
     }
 }
 
@@ -334,9 +582,15 @@ fn tick_timer(on: bool) {
     });
 }
 
-/// Paint every monitor's window; true while something moves.
+/// Paint every monitor's window; true while something moves. Order 051: a window drawn on the GPU is painted only when its
+/// swap chain has room (its monitor's next refresh) - else it is marked and painted at that moment (`on_waitable`).
 fn paint_all() -> bool {
-    SESSION.with(|c| {
+    paint_wins(None)
+}
+
+/// `only` = the one GPU window whose waitable just fired (None = every window: an input or the timer).
+fn paint_wins(only: Option<usize>) -> bool {
+    let busy = SESSION.with(|c| {
         let Ok(mut b) = c.try_borrow_mut() else { return false };
         let Some(s) = b.as_mut() else { return false };
         let t = now();
@@ -345,22 +599,188 @@ fn paint_all() -> bool {
             Some((at, _)) => 1.0 - (((t - at) - 110.0) / 150.0).clamp(0.0, 1.0) as f32,
             None => 1.0,
         };
-        let live = s.cap.model.live;
+        // (Order 048: Live off / a Snap: the screen shows through until the new picture is in from the worker)
+        let live = s.cap.model.live || s.show_live;
+        let closing = s.closing.is_some();
+        for (i, w) in s.wins.iter_mut().enumerate() {
+            if only.is_some_and(|o| o != i) {
+                continue;
+            }
+            if let Some(g) = &mut w.layer.gpu {
+                // a removed device never fires its waitable again: the fallback must not wait for a failed present
+                if g.chain.gpu.lost() {
+                    LOST.with(|l| l.set(true));
+                    continue;
+                }
+                if only.is_none() {
+                    g.want = true;
+                }
+                if !g.want || !g.slot {
+                    busy |= g.want;
+                    continue;
+                }
+                g.slot = false;
+            }
+            let wbusy = paint_win(w, &s.icons, &s.cap.model, t, fade, live);
+            if let Some(g) = &mut w.layer.gpu {
+                g.want = wbusy || closing;
+                g.painted_at = now();
+            }
+            busy |= wbusy;
+        }
+        busy || closing
+    });
+    if LOST.with(|l| l.replace(false)) {
+        cpu_fallback();
+    }
+    busy
+}
+
+/// Order 051: the GPU device was lost while the overlay was open - every monitor window again as today's layered window,
+/// painted before it is shown and before the GPU window goes (nothing blank, not even for a frame), the GPU released. If a
+/// layered window can't be made the overlay closes (never a frozen window).
+fn cpu_fallback() {
+    thread_local! {
+        static FALLING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+    if FALLING.with(|f| f.replace(true)) {
+        return;
+    }
+    crate::gpu::mark_lost();
+    let focus = unsafe { GetFocus() };
+    let (mut old, mut shown, mut focus_to, mut failed) = (Vec::new(), Vec::new(), None, false);
+    SESSION.with(|c| {
+        let Ok(mut b) = c.try_borrow_mut() else { return };
+        let Some(s) = b.as_mut() else { return };
         for w in &mut s.wins {
+            if !w.layer.is_gpu() {
+                continue;
+            }
+            match Layer::new(w.layer.x, w.layer.y, w.layer.w, w.layer.h, false) {
+                Ok(l) => {
+                    if focus == w.layer.hwnd {
+                        focus_to = Some(l.hwnd);
+                    }
+                    shown.push(l.hwnd);
+                    old.push(std::mem::replace(&mut w.layer, l));
+                }
+                Err(_) => failed = true,
+            }
+        }
+        // the frozen pictures back on the CPU (the GPU textures are gone with the device)
+        s.gpu = None;
+        slice_frozen(s);
+    });
+    if failed {
+        drop(old);
+        close(None);
+    } else {
+        paint_all();
+        unsafe {
+            for h in &shown {
+                let _ = ShowWindow(*h, SW_SHOWNA);
+            }
+            if let Some(h) = focus_to {
+                let _ = SetForegroundWindow(h);
+                let _ = SetFocus(Some(h));
+            }
+        }
+        drop(old);
+        tick_timer(true);
+        // Order 048: the watchdog watches the new windows
+        let hwnds: Vec<HWND> = SESSION.with(|c| c.borrow().as_ref().map(|s| s.wins.iter().map(|w| w.layer.hwnd).collect()).unwrap_or_default());
+        watchdog::open(&hwnds);
+    }
+    FALLING.with(|f| f.set(false));
+}
+
+/// Order 051: GPU windows waiting for a frame whose waitable stayed silent for 100 ms (a hidden monitor, or other handles
+/// firing all the time) are painted anyway; a lost device is noticed here too.
+pub fn overdue() {
+    let t = now();
+    let idx: Vec<usize> = SESSION.with(|c| {
+        let Ok(mut b) = c.try_borrow_mut() else { return Vec::new() };
+        let Some(s) = b.as_mut() else { return Vec::new() };
+        let mut v = Vec::new();
+        for (i, w) in s.wins.iter_mut().enumerate() {
+            if let Some(g) = &mut w.layer.gpu {
+                if g.want && !g.slot && (t - g.painted_at > 100.0 || g.chain.gpu.lost()) {
+                    g.slot = true;
+                    v.push(i);
+                }
+            }
+        }
+        v
+    });
+    for i in idx {
+        paint_wins(Some(i));
+    }
+}
+
+/// Order 051: the swap chains' waitables of the GPU windows that wait for a frame (the main loop waits on them).
+pub fn frame_waitables() -> Vec<HANDLE> {
+    SESSION.with(|c| {
+        let Ok(b) = c.try_borrow() else { return Vec::new() };
+        let Some(s) = b.as_ref() else { return Vec::new() };
+        s.wins.iter().filter_map(|w| w.layer.gpu.as_ref().filter(|g| g.want && !g.slot).map(|g| g.chain.waitable)).collect()
+    })
+}
+
+/// Order 051: a GPU window's waitable fired (`h`; None = none fired for 100 ms - every waiting window is painted anyway, so a
+/// hidden monitor never freezes the others): it is painted now if it waits for a frame.
+pub fn on_waitable(h: Option<HANDLE>) {
+    let idx: Vec<usize> = SESSION.with(|c| {
+        let Ok(mut b) = c.try_borrow_mut() else { return Vec::new() };
+        let Some(s) = b.as_mut() else { return Vec::new() };
+        let mut v = Vec::new();
+        for (i, w) in s.wins.iter_mut().enumerate() {
+            if let Some(g) = &mut w.layer.gpu {
+                if h.is_none_or(|h| h == g.chain.waitable) {
+                    g.slot = true;
+                    v.push(i);
+                }
+            }
+        }
+        v
+    });
+    for i in idx {
+        paint_wins(Some(i));
+    }
+}
+
+/// One monitor window painted and presented; true while something on it moves.
+fn paint_win(w: &mut MonWin, icons: &Icons, model: &super::model::Model, t: f64, fade: f32, live: bool) -> bool {
+    let c0 = if PROF.with(|p| *p) { crate::timing::thread_cpu_ms() } else { -1.0 };
+    let busy = paint_win_inner(w, icons, model, t, fade, live);
+    if c0 >= 0.0 {
+        crate::timing::ov_frame(t, crate::timing::thread_cpu_ms() - c0, w.mi, w.layer.is_gpu());
+    }
+    busy
+}
+
+thread_local! {
+    /// BU_PROF (test copies): every overlay frame's UI-thread CPU goes to the timing log
+    static PROF: bool = crate::testmode::env("BU_PROF").is_some();
+}
+
+fn paint_win_inner(w: &mut MonWin, icons: &Icons, model: &super::model::Model, t: f64, fade: f32, live: bool) -> bool {
+    let mut busy = false;
+    {
+        {
             let mut cx = Cx::new(t, false, &w.g, &mut w.st);
-            let sc = view::scene(&s.cap.model, &mut cx, w.mi, t);
+            let sc = view::scene(model, &mut cx, w.mi, t);
             busy |= sc.busy || w.st.busy;
             w.st.busy = false;
             w.st.sweep();
-            let Some(mut surf) = w.layer.surface() else { continue };
+            let Some(mut surf) = w.layer.surface() else { return busy };
             let bg = if live { None } else { w.bg.as_ref() };
-            let (_, front) = view::paint(&w.g, &s.icons, &mut surf, &sc, bg);
+            let (_, front) = view::paint(&w.g, icons, &mut surf, &sc, bg);
             // Order 045: the shared tip on top (the menu's `update_tips` + `draw_popup`): the hovered chain, 500 ms for a title
             busy |= w.tips.update(&w.g, &[(&front, (0.0, 0.0))], &w.st.hover, t, sc.w);
             if let Some(b) = w.tips.el(t) {
                 let base = surf.image_snapshot();
                 w.g.begin(surf.canvas());
-                Laid::new(&w.g, El::block().w(sc.w).h(sc.h).no_hit().child(b), sc.w, Some(sc.h)).paint(&w.g, &s.icons, 0.0, 0.0, Some(&base));
+                Laid::new(&w.g, El::block().w(sc.w).h(sc.h).no_hit().child(b), sc.w, Some(sc.h)).paint(&w.g, icons, 0.0, 0.0, Some(&base));
                 w.g.end();
             }
             if live {
@@ -375,8 +795,8 @@ fn paint_all() -> bool {
             w.front = Some(front);
             w.layer.present(fade);
         }
-        busy || s.closing.is_some()
-    })
+    }
+    busy
 }
 
 /// A window's pointer position -> desktop px and the window's DIPs.
@@ -519,24 +939,108 @@ enum After {
 fn act(s: &mut Session, out: Out) -> After {
     let t = now();
     let was_live = s.cap.model.live;
+    match out {
+        // Order 048: a new picture (Live off / Snap) and Copy / Save run on a worker - the overlay keeps answering
+        Out::Live(false) | Out::Snap => {
+            let tag = s.next_tag();
+            s.grab_pending = Some(tag.seq);
+            s.show_live |= was_live;
+            worker::spawn(tag, s.data_dir.clone(), Job::Grab, msg_window());
+            return After::None;
+        }
+        Out::Finish(kind) => {
+            // a picture still on its way: the finish takes this moment itself
+            let Some(job) = s.cap.finish_job(kind, s.grab_pending.is_some()) else { return After::None };
+            let tag = s.next_tag();
+            s.grab_pending = None;
+            s.finish_pending = Some(tag.seq);
+            // the white flash over the box, then the overlay fades (coFinish: 110 ms, then 150 ms); the shot (toast) comes
+            // when the worker is done
+            s.closing = Some((t, None));
+            worker::spawn(tag, s.data_dir.clone(), Job::Finish(job), msg_window());
+            return After::None;
+        }
+        _ => {}
+    }
     match s.cap.apply(out.clone()) {
         Ok(Step::Stay) => {
-            if matches!(out, Out::Snap | Out::Live(false)) || (was_live && !s.cap.model.live) {
+            if was_live && !s.cap.model.live {
                 slice_frozen(s);
             }
             After::None
         }
         Ok(Step::Closed) => After::Close(None),
-        Ok(Step::Shot(d)) => {
-            if matches!(out, Out::Finish(_)) {
-                // the white flash over the box, then the overlay fades (coFinish: 110 ms, then 150 ms)
-                s.closing = Some((t, Some(d)));
-                After::None
-            } else {
-                After::Close(Some(d))
+        Ok(Step::Shot(d)) => After::Close(Some(d)),
+        Err(e) => After::Error(format!("Screenshot failed: {e}")),
+    }
+}
+
+/// A worker's result came in (WM_JOB_DONE): the opening overlay, a new picture, a finished shot.
+fn job_done() {
+    for (tag, res) in worker::take() {
+        match res {
+            Res::Grab(r) if tag.seq == 0 => opened(tag, r),
+            Res::Grab(r) => {
+                let after = SESSION.with(|c| {
+                    let mut b = c.borrow_mut();
+                    let s = b.as_mut().filter(|s| s.id == tag.session && s.grab_pending == Some(tag.seq))?;
+                    s.grab_pending = None;
+                    s.show_live = false;
+                    match r {
+                        Ok(f) => {
+                            s.cap.frozen = f;
+                            slice_frozen(s);
+                            None
+                        }
+                        Err(e) => Some(After::Error(format!("Screenshot failed: {e}"))),
+                    }
+                });
+                match after {
+                    Some(a) => finish_after(a),
+                    None => {
+                        if paint_all() {
+                            tick_timer(true);
+                        }
+                    }
+                }
+            }
+            Res::Finish(r) => {
+                // still fading out: the shot waits for the fade's end (WM_TIMER); a failure closes now
+                let open = SESSION.with(|c| c.borrow().as_ref().is_some_and(|s| s.id == tag.session && s.finish_pending == Some(tag.seq)));
+                match open {
+                    true => {
+                        let a = SESSION.with(|c| {
+                            let mut b = c.borrow_mut();
+                            let Some(s) = b.as_mut() else { return After::None };
+                            s.finish_pending = None;
+                            match r {
+                                Ok(d) => {
+                                    if let Some(cl) = s.closing.as_mut() {
+                                        cl.1 = Some(d);
+                                    }
+                                    After::None
+                                }
+                                Err(e) => After::Error(format!("Screenshot failed: {e}")),
+                            }
+                        });
+                        finish_after(a);
+                    }
+                    false => {
+                        // the overlay is already gone: the toast now
+                        let late = LATE.with(|l| {
+                            let mut l = l.borrow_mut();
+                            l.iter().position(|x| x.tag == tag).map(|i| l.remove(i))
+                        });
+                        if let Some(late) = late {
+                            match r {
+                                Ok(d) => shot_done(d, &late.home, late.hooks),
+                                Err(e) => (late.hooks.on_error)(&format!("Screenshot failed: {e}")),
+                            }
+                        }
+                    }
+                }
             }
         }
-        Err(e) => After::Error(format!("Screenshot failed: {e}")),
     }
 }
 
@@ -558,19 +1062,32 @@ fn finish_after(a: After) {
 fn close(done: Option<Done>) {
     let s = SESSION.with(|c| c.borrow_mut().take());
     let Some(s) = s else { return };
+    // nothing to watch any more (Order 048)
+    watchdog::close();
     KEEP.with(|k| *k.borrow_mut() = Some(s.cap.model.keep()));
     let hooks = s.hooks.clone();
     let home = s.cap.model.monitors[view::bars_monitor(&s.cap.model)].clone();
-    drop(s);
-    if let Some(d) = done {
-        if let Some(shot) = &d.shot {
-            (hooks.on_shot)(shot);
-        }
-        if let Some(r) = d.flash {
-            flash(r);
-        }
-        show_toast(d, &home, hooks);
+    // a Copy / Save still running on its worker: its toast comes when it is done (`job_done`)
+    if let (None, Some(seq)) = (&done, s.finish_pending) {
+        LATE.with(|l| l.borrow_mut().push(LateShot { tag: Tag { session: s.id, seq }, hooks: hooks.clone(), home: home.clone() }));
     }
+    drop(s);
+    // Order 051: the menu may still draw on the same GPU device - the overlay's GPU memory goes now
+    crate::gpu::trim_current();
+    if let Some(d) = done {
+        shot_done(d, &home, hooks);
+    }
+}
+
+/// A shot is done: the gallery hears of it, the flash (a click) and the toast.
+fn shot_done(d: Done, home: &Monitor, hooks: Rc<Hooks>) {
+    if let Some(shot) = &d.shot {
+        (hooks.on_shot)(shot);
+    }
+    if let Some(r) = d.flash {
+        flash(r);
+    }
+    show_toast(d, home, hooks);
 }
 
 /// `#flash`: a soft white flash over the screen(s) taken (0 -> 50 % at 18 % -> 0, 440 ms, ease-out).
@@ -759,6 +1276,29 @@ fn set_cursor(s: &Session, w: usize, d: (f32, f32)) {
 
 extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     unsafe {
+        // Order 048: this thread answers the watchdog; if the watchdog had to take the overlay off the screen (this thread
+        // was stuck), the capture ends now that the thread runs again - the user has gone on meanwhile
+        if msg == watchdog::WM_BEAT {
+            watchdog::beat();
+            return LRESULT(0);
+        }
+        // (the flag is only taken where the capture can be closed: inside a nested message the session is borrowed - the
+        // next message closes it)
+        let free = SESSION.with(|c| c.try_borrow_mut().is_ok());
+        if free && watchdog::take_fired().is_some() {
+            let hooks = SESSION.with(|c| c.borrow().as_ref().map(|s| s.hooks.clone()));
+            if let Some(h) = hooks {
+                close(None);
+                (h.on_error)("The screenshot overlay stopped answering, so it was closed. Press the key again.");
+            }
+            if !IsWindow(Some(hwnd)).as_bool() {
+                return LRESULT(0);
+            }
+        }
+        if msg == worker::WM_JOB_DONE {
+            job_done();
+            return LRESULT(0);
+        }
         if msg == WM_TIMER && wp.0 == TIMER {
             let a = paint_all();
             let b = paint_flash();

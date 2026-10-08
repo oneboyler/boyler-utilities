@@ -269,6 +269,19 @@ impl Gfx {
         let prev = self.stack.borrow_mut().pop().unwrap_or(std::ptr::null());
         self.cur.set(prev);
     }
+    /// A surface of the same kind as the current canvas (on the GPU when it draws on the GPU - Order 051), for a picture that
+    /// is made now and drawn into it; a CPU surface when the canvas is a recording or a CPU one.
+    pub fn surface_like(&self, w: i32, h: i32) -> Option<sk::Surface> {
+        let ii = sk::ImageInfo::new((w.max(1), h.max(1)), sk::ColorType::BGRA8888, sk::AlphaType::Premul, Some(sk::ColorSpace::new_srgb()));
+        let c = self.cur.get();
+        if !c.is_null() {
+            if let Some(s) = unsafe { &*c }.new_surface(&ii, Some(&surface_props())) {
+                return Some(s);
+            }
+        }
+        new_surface(w, h)
+    }
+
     pub fn cv(&self) -> &Canvas {
         let p = self.cur.get();
         assert!(!p.is_null(), "no canvas");

@@ -1,7 +1,8 @@
 //! The menu window (exists only while the menu is open): a composition window for the glass + content, a
 //! click-through layered window above it for the flyout's soft shadow, and the per-frame drawing pipeline:
-//! Skia paints the frame on the CPU with the drawing's own layer structure (`Menu::compose`), and the finished pixels go
-//! into the composition swap chain with one copy (present.rs).
+//! Skia paints the frame with the drawing's own layer structure (`Menu::compose`) - on the GPU straight into the composition
+//! swap chain's back buffer (Order 051, gpu.rs), or on the CPU with one copy into the swap chain (present.rs) when the GPU
+//! can't be used.
 
 use skia_safe as sk;
 use windows::core::*;
@@ -15,7 +16,9 @@ use crate::audio::Audio;
 use crate::comp::Glass;
 use crate::gfx::*;
 use crate::icons::Icons;
-use crate::present::Chain;
+use crate::gpu::{self, Gpu, GpuChain};
+use crate::present::{Chain, Swap};
+use std::rc::Rc;
 use crate::timing;
 use crate::ui::{self, Frame, Ui, PAGE_H, PAGE_TOP, RADIUS, WIN_H, WIN_W};
 
@@ -30,11 +33,15 @@ pub struct Menu {
     pub hwnd: HWND,
     pub shadow: HWND,
     g: Gfx,
-    chain: Chain,
+    /// Order 051: the GPU the frame is drawn on (None = the CPU path)
+    gpu: Option<Rc<Gpu>>,
+    /// the CPU path after a lost device: when to try the GPU again
+    retry_at: Option<f64>,
+    /// the monitor the menu is on (the GPU adapter that drives it is used)
+    mon: HMONITOR,
+    chain: Swap,
     /// Skia's coverage of the rounded window shape, the glass's mask (Order 013)
-    mask: Chain,
-    /// the same coverage as pixels (test pictures: `snapscreen`)
-    mask_px: crate::png::Pixels,
+    mask: Swap,
     /// option 3 (BU_GLASS=gpu): the swap chain the desktop capture is copied into
     capchain: Option<Chain>,
     glass: Glass,
@@ -77,6 +84,8 @@ pub struct Menu {
     pub noact: bool,
     pub frames: u64,
     pub presented_once: bool,
+    /// when the last frame was presented (ms): a waitable that stays silent for 100 ms is not waited for (main loop)
+    pub last_frame: f64,
     /// the swap chain's waitable fired and no frame has used it yet (waiting on it again would lose it)
     pub slot: bool,
 }
@@ -140,19 +149,32 @@ impl Menu {
                 _ => Gfx::new(scale),
             };
             crate::timing::note("open_step gfx");
-            let chain = Chain::new(w as u32, h as u32)?;
+            // Order 051: the GPU (the adapter driving the menu's monitor), unless a test glass mode needs the CPU frame
+            // (BU_GLASS=own / gpu read and copy it on the CPU)
+            let mon = MonitorFromPoint(POINT { x: (work.left + work.right) / 2, y: (work.top + work.bottom) / 2 }, MONITOR_DEFAULTTOPRIMARY);
+            let gpu = match mode {
+                crate::comp::GlassMode::Host | crate::comp::GlassMode::BlurBehind => gpu::get(Some(mon)),
+                _ => None,
+            };
+            let (gpu, chain, mask) = make_swaps(gpu, &g, w, h)?;
+            // the layers on the same device; a GPU that can't give them (out of memory, a crash just now) = the CPU path
+            let (gpu, chain, mask, ly, lc) = match (Layers::new(gpu.clone(), w, h), surf_on(gpu.as_ref(), w, h)) {
+                (Ok(ly), Ok(lc)) => (gpu, chain, mask, ly, lc),
+                (a, b) if gpu.is_some() => {
+                    let e = a.err().or(b.err()).map(|e| format!("{:08x}", e.code().0)).unwrap_or_default();
+                    timing::note(&format!("gpu path=cpu reason=layers {e}"));
+                    gpu::mark_lost();
+                    drop((chain, mask, gpu));
+                    let (gpu, chain, mask) = make_swaps(None, &g, w, h)?;
+                    (gpu, chain, mask, Layers::new(None, w, h)?, surf_on(None, w, h)?)
+                }
+                (a, b) => {
+                    a?;
+                    b?;
+                    unreachable!()
+                }
+            };
             crate::timing::note("open_step chain");
-            // the window's edge (Order 013): Skia's anti-aliased coverage of the 14 px rounded shape - the same clip the
-            // drawing's backdrop is cut with - is the glass's mask. No window region: the menu window shows its whole
-            // rectangle exactly as the drawing's layer has it there (the outer shadow round the corners, and the page's
-            // scrollbar, which reaches 1 px past the curve at the bottom-right corner, measured)
-            let mut msurf = layer(w, h)?;
-            g.begin(msurf.canvas());
-            g.clip_coverage(0.0, 0.0, WIN_W, WIN_H, RADIUS);
-            g.end();
-            let mask_px = crate::png::from_surface(&mut msurf);
-            let mask = Chain::new_on(chain.d3d.clone(), w as u32, h as u32)?;
-            mask.present(&mask_px.data, (w * 4) as u32)?;
             let glass_ok = match mode {
                 crate::comp::GlassMode::Own | crate::comp::GlassMode::Gpu => test_flag("noexclude") || crate::capture::exclude_from_capture(hwnd),
                 crate::comp::GlassMode::Host => {
@@ -186,10 +208,9 @@ impl Menu {
             };
             // the theme first: the glass brush, the shadow and every colour follow it (Order 033)
             let light = ui::sync_theme();
-            let glass = Glass::new(hwnd, &chain, &mask, capchain.as_ref().map(|c| (c, scale)), w as f32, h as f32, RADIUS * scale, mode)?;
+            let (cw, ch) = chain.size();
+            let glass = Glass::new(hwnd, (chain.swap(), cw, ch), mask.swap(), capchain.as_ref().map(|c| (c, scale)), w as f32, h as f32, RADIUS * scale, mode)?;
             crate::timing::note("open_step glass");
-            let ly = Layers { page: layer(w, h)?, page2: layer(w, h)?, switch_key: None, after: layer(w, h)?, live: layer(w, h)?, dock: layer(w, h)?, rim: layer(w, h)?, over: layer(w, h)?, over_key: None, no_band: false, valid: false, rim_valid: false, after_valid: false, band: None, band_ct: 0, dock_sig: None };
-            let lc = layer(w, h)?;
 
             // the shadow window: layered + click-through, owned by the menu so it always sits right above it
             let sw = ((WIN_W + SH_L + SH_R) * scale).ceil() as i32;
@@ -219,9 +240,11 @@ impl Menu {
                 hwnd,
                 shadow,
                 g,
+                gpu,
+                retry_at: None,
+                mon,
                 chain,
                 mask,
-                mask_px,
                 capchain,
                 glass,
                 mode,
@@ -253,6 +276,7 @@ impl Menu {
                 noact,
                 frames: 0,
                 presented_once: false,
+                last_frame: now,
                 slot: false,
             };
             ui::remember_widths(&m.g, &m.ui.device_names());
@@ -273,8 +297,8 @@ impl Menu {
                 // option 3: exactly the window's box (its swap chain's size); option 2: + the motion below it
                 let below = if mode == crate::comp::GlassMode::Gpu { 0 } else { (24.0 * scale).ceil() as i32 };
                 let r = RECT { left: x, top: y, right: x + w, bottom: y + h + below };
-                let gpu = m.capchain.as_ref().map(|c| crate::capture::GpuTarget { dev: c.d3d.clone(), swap: c.swap.clone() });
-                m.cap = Some(crate::capture::Capture::start(hwnd, r, gpu));
+                let gt = m.capchain.as_ref().map(|c| crate::capture::GpuTarget { dev: c.d3d.clone(), swap: c.swap.clone() });
+                m.cap = Some(crate::capture::Capture::start(hwnd, r, gt));
                 if mode == crate::comp::GlassMode::Own {
                     m.glass_px = Some(layer(w, h)?);
                     m.out = Some(layer(w, h)?);
@@ -492,14 +516,41 @@ impl Menu {
         self.glass.set_opacity(op);
         self.glass.set_offset_y(frac);
         let p2 = timing::now();
+        // Order 051: back on the GPU after a lost device (RETRY_MS later), or onto the CPU path when it is lost now
+        if self.gpu.is_none() && self.retry_at.is_some_and(|t| now >= t) {
+            self.retry_at = None;
+            if let Some(g) = gpu::get(Some(self.mon)) {
+                if let Err(e) = self.rebuild(Some(g)) {
+                    timing::note(&format!("gpu retry failed {:08x}", e.code().0));
+                    let _ = self.rebuild(None);
+                }
+            }
+        }
+        if self.gpu.as_ref().is_some_and(|g| g.lost()) {
+            self.on_lost()?;
+            self.glass.set_opacity(op);
+            self.glass.set_offset_y(frac);
+        }
         self.draw(now)?;
         let p3 = timing::now();
-        self.present()?;
+        if let Err(e) = self.present() {
+            if self.gpu.is_some() && (gpu::is_lost_error(&e) || self.gpu.as_ref().is_some_and(|g| g.lost())) {
+                // the frame is drawn again on the CPU at once: no blank window
+                self.on_lost()?;
+                self.glass.set_opacity(op);
+                self.glass.set_offset_y(frac);
+                self.draw(now)?;
+                self.present()?;
+            } else {
+                return Err(e);
+            }
+        }
         let p4 = timing::now();
         if p4 - p0 > 8.0 {
             timing::note(&format!("slow_frame update {:.1} window {:.1} draw {:.1} present {:.1}", p1 - p0, p2 - p1, p3 - p2, p4 - p3));
         }
         self.frames += 1;
+        self.last_frame = timing::now();
         if c0 > 0.0 {
             timing::frame_cpu(now, timing::thread_cpu_ms() - c0);
         } else {
@@ -534,8 +585,56 @@ impl Menu {
         self.ui.dirty = true;
     }
 
+    /// Order 051: the GPU device was lost (driver update / crash, `gpulose`): everything again on the CPU path at once, the
+    /// GPU tried again `gpu::RETRY_MS` later.
+    fn on_lost(&mut self) -> Result<()> {
+        gpu::mark_lost();
+        self.retry_at = Some(timing::now() + gpu::RETRY_MS + 1.0);
+        self.rebuild(None)
+    }
+
+    /// The menu's swap chains, glass and layers again on `gpu` (None = the CPU path); the next frame paints everything.
+    fn rebuild(&mut self, gpu: Option<Rc<Gpu>>) -> Result<()> {
+        let t = timing::now();
+        self.glass.close();
+        drop_tiles();
+        ui::reset_caches();
+        self.ui.clear_dock_cache();
+        let (gpu, chain, mask) = make_swaps(gpu, &self.g, self.w, self.h)?;
+        let (cw, ch) = chain.size();
+        self.glass = Glass::new(self.hwnd, (chain.swap(), cw, ch), mask.swap(), None, self.w as f32, self.h as f32, RADIUS * self.scale, self.mode)?;
+        self.chain = chain;
+        self.mask = mask;
+        self.ly = Layers::new(gpu.clone(), self.w, self.h)?;
+        self.lc = surf_on(gpu.as_ref(), self.w, self.h)?;
+        self.gpu = gpu;
+        // the rim picture (and the shadow window) again
+        self.restyle_shadow();
+        self.glass.set_opacity(self.last_alpha as f32 / 255.0);
+        self.slot = true;
+        self.ui.dirty = true;
+        timing::note(&format!("gpu rebuild path={} {:.1} ms", if self.gpu.is_some() { "gpu" } else { "cpu" }, timing::now() - t));
+        Ok(())
+    }
+
+    /// Which path draws the menu now (test command `gpustate`).
+    pub fn gpu_state(&self) -> String {
+        format!("path={} chain_gpu={} device_alive={}", if self.gpu.is_some() { "gpu" } else { "cpu" }, self.chain.is_gpu(), gpu::alive())
+    }
+
+    /// Test only (`gpulose`): the device removed as a driver crash would.
+    pub fn lose_gpu_for_test(&self) {
+        if let Some(g) = &self.gpu {
+            g.remove_for_test();
+        }
+    }
+
     fn draw(&mut self, now: f64) -> Result<()> {
         self.last_now = now;
+        // Order 051: on the GPU the frame is painted straight into the swap chain's back buffer
+        if let Swap::Gpu(c) = &self.chain {
+            self.lc = c.back();
+        }
         let Menu { g, icons, ly, lc, ui, .. } = self;
         lc.canvas().clear(sk::Color::TRANSPARENT);
         Self::compose(g, icons, ui, ly, lc, 0.0, 0.0, false, now);
@@ -867,7 +966,8 @@ impl Menu {
                 h.finish()
             };
             let th = crate::timing::now();
-            if invalid || shadows || ly.over_key != Some(key) {
+            // (on the GPU there are no CPU pixels to compare: painted every frame they show - cheap there)
+            if invalid || shadows || ly.gpu.is_some() || ly.over_key != Some(key) {
                 ly.over_key = Some(key);
                 ly.over.canvas().clear(sk::Color::TRANSPARENT);
                 g.begin(ly.over.canvas());
@@ -948,6 +1048,10 @@ impl Menu {
 
     /// Hand the finished frame to the swap chain.
     fn present(&mut self) -> Result<()> {
+        let chain = match &mut self.chain {
+            Swap::Gpu(c) => return c.present(),
+            Swap::Cpu(c) => c,
+        };
         let src = match &mut self.out {
             Some(o) if self.mode == crate::comp::GlassMode::Own => o,
             _ => &mut self.lc,
@@ -955,7 +1059,7 @@ impl Menu {
         let pm = src.peek_pixels().ok_or_else(|| Error::from(E_FAIL))?;
         let rb = pm.row_bytes();
         let bytes = pm.bytes().ok_or_else(|| Error::from(E_FAIL))?;
-        self.chain.present(bytes, rb as u32)
+        chain.present(bytes, rb as u32)
     }
 
     /// Order 041 self-check (test command `verify`): this frame painted the incremental way (tile cache, kept top row,
@@ -1026,7 +1130,7 @@ impl Menu {
         // the window's own layer on a transparent surface of its own, as on the screen: the top row's frosted parts
         // (hover chevrons, names) read only the window's content (Chromium: #sw is their backdrop root), never the
         // desktop under it (Order 014: hover chevron 674 px before)
-        let mut win = layer(sw, sh)?;
+        let mut win = surf_on(self.gpu.as_ref(), sw, sh)?;
         let Menu { g, icons, ly, ui, last_now, .. } = self;
         Self::compose(g, icons, ui, ly, &mut win, wx, wy, true, *last_now);
         out.canvas().draw_image(win.image_snapshot(), (0, 0), None);
@@ -1056,7 +1160,7 @@ impl Menu {
             g.end();
         }
         // backdrop x mask and the blend onto the desktop in ONE draw (one rounding), as the compositor does it on the GPU
-        let mimg = crate::png::to_image(&self.mask_px).ok_or_else(|| Error::from(E_FAIL))?;
+        let mimg = crate::png::to_image(&self.mask_pixels()).ok_or_else(|| Error::from(E_FAIL))?;
         let glimg = gl.image_snapshot();
         let so = sk::SamplingOptions::default();
         let gsh = glimg.to_shader((sk::TileMode::Decal, sk::TileMode::Decal), so, None).ok_or_else(|| Error::from(E_FAIL))?;
@@ -1064,7 +1168,7 @@ impl Menu {
         let mut gp = sk::Paint::default();
         gp.set_shader(sk::shaders::blend(sk::BlendMode::DstIn, gsh, msh));
         let frame = self.lc.image_snapshot();
-        let mut out = layer(sw, sh)?;
+        let mut out = surf_on(self.gpu.as_ref(), sw, sh)?;
         let c = out.canvas();
         c.draw_image(&dimg, (0, 0), None);
         c.draw_rect(sk::Rect::from_xywh(dx as f32, dy as f32, self.w as f32, self.h as f32), &gp);
@@ -1093,7 +1197,11 @@ impl Menu {
         self.g.end();
         let full = crate::png::from_surface(&mut sl);
         let t0 = crate::timing::now();
-        let d2 = crate::d2dref::blur_d2d(&self.chain.d3d, &dp, (dx, dy, self.w, self.h), 13.0 * s, crate::comp::SATURATE, crate::comp::BRIGHTNESS)?;
+        let d3d = match &self.chain {
+            Swap::Cpu(c) => c.d3d.clone(),
+            Swap::Gpu(_) => crate::present::new_d3d()?,
+        };
+        let d2 = crate::d2dref::blur_d2d(&d3d, &dp, (dx, dy, self.w, self.h), 13.0 * s, crate::comp::SATURATE, crate::comp::BRIGHTNESS)?;
         let t1 = crate::timing::now();
         let (w, h) = (self.w as usize, self.h as usize);
         let mut side = crate::png::Pixels { w: (w * 3) as u32, h: h as u32, data: vec![0; w * 3 * h * 4] };
@@ -1134,11 +1242,11 @@ impl Menu {
 
     /// The window's edge mask pixels (white, alpha = coverage).
     pub fn mask_pixels(&self) -> crate::png::Pixels {
-        crate::png::Pixels { w: self.mask_px.w, h: self.mask_px.h, data: self.mask_px.data.clone() }
+        mask_raster(&self.g, self.w, self.h).unwrap_or(crate::png::Pixels { w: 0, h: 0, data: Vec::new() })
     }
 
     pub fn waitable(&self) -> HANDLE {
-        self.chain.waitable
+        self.chain.waitable()
     }
 
     pub fn device_lost_hint(&self) -> bool {
@@ -1153,6 +1261,8 @@ impl Drop for Menu {
             self.glass.close();
             self.chain.release();
             self.mask.release();
+            // (the GPU tile goes too: nothing of ours may keep the device alive while the menu is closed - Order 051)
+            drop_tiles();
             // (the capture chain is the worker's: not touched here, it goes when the worker lets go of it)
             let _ = DestroyWindow(self.shadow);
             let _ = DestroyWindow(self.hwnd);
@@ -1230,7 +1340,25 @@ const TILE: i32 = 256;
 const TILE_STEP: i32 = TILE - 2;
 
 thread_local! {
-    static TILE_SURF: std::cell::RefCell<Option<sk::Surface>> = const { std::cell::RefCell::new(None) };
+    /// the tile surfaces: [CPU, GPU] (a tile is rastered on the same kind of surface as the layer it goes into)
+    static TILE_SURF: std::cell::RefCell<[Option<sk::Surface>; 2]> = const { std::cell::RefCell::new([None, None]) };
+}
+
+/// Let go of the tile surfaces (the GPU one holds the device).
+fn drop_tiles() {
+    TILE_SURF.with(|t| *t.borrow_mut() = [None, None]);
+}
+
+/// A tile surface of the same kind as `like` (GPU or CPU).
+fn with_tile<R>(like: &mut sk::Surface, f: impl FnOnce(&mut sk::Surface, &mut sk::Surface) -> R) -> R {
+    let k = like.recording_context().is_some() as usize;
+    TILE_SURF.with(|ts| {
+        let mut ts = ts.borrow_mut();
+        if ts[k].is_none() {
+            ts[k] = if k == 1 { like.new_surface_with_dimensions((TILE, TILE)) } else { None }.or_else(|| new_surface(TILE, TILE));
+        }
+        f(ts[k].as_mut().expect("tile surface"), like)
+    })
 }
 
 /// Raster one composited layer into `surf` (window-sized, device pixels) tile by tile, the layer's tile grid starting at
@@ -1245,9 +1373,7 @@ fn raster_tiled(g: &Gfx, surf: &mut sk::Surface, grid: (i32, i32), mut draw: imp
     draw();
     g.end();
     let Some(pic) = rec.finish_recording_as_picture(None) else { return };
-    TILE_SURF.with(|ts| {
-        let mut ts = ts.borrow_mut();
-        let tile = ts.get_or_insert_with(|| new_surface(TILE, TILE).expect("tile surface"));
+    with_tile(surf, |tile, surf| {
         // owned span of tile k along one axis, in layer pixels
         let span = |k: i32| (if k == 0 { 0 } else { TILE_STEP * k + 1 }, TILE_STEP * (k + 1) + 1);
         let range = |o: i32, n: i32| (((-o) - 1).div_euclid(TILE_STEP).max(0), (n - o).div_euclid(TILE_STEP));
@@ -1282,6 +1408,8 @@ fn raster_tiled(g: &Gfx, surf: &mut sk::Surface, grid: (i32, i32), mut draw: imp
 
 /// The separately rastered layers of the menu (window-sized, device pixels).
 struct Layers {
+    /// Order 051: the GPU the layers live on (None = CPU surfaces)
+    gpu: Option<Rc<Gpu>>,
     /// the page layer (the drawing's scrolling `.pg` layer + its scrollbar layer), static part
     page: sk::Surface,
     /// the second page while a page switch runs (the new one; `page` holds the old one then)
@@ -1312,6 +1440,31 @@ struct Layers {
     band_ct: i32,
     /// what the top row's picture was painted from (`Ui::dock_sig`): the same = it is not painted again
     dock_sig: Option<u64>,
+}
+
+impl Layers {
+    fn new(gpu: Option<Rc<Gpu>>, w: i32, h: i32) -> Result<Layers> {
+        let g = gpu.as_ref();
+        Ok(Layers {
+            page: surf_on(g, w, h)?,
+            page2: surf_on(g, w, h)?,
+            switch_key: None,
+            after: surf_on(g, w, h)?,
+            live: surf_on(g, w, h)?,
+            dock: surf_on(g, w, h)?,
+            rim: surf_on(g, w, h)?,
+            over: surf_on(g, w, h)?,
+            over_key: None,
+            no_band: false,
+            valid: false,
+            rim_valid: false,
+            after_valid: false,
+            band: None,
+            band_ct: 0,
+            dock_sig: None,
+            gpu,
+        })
+    }
 }
 
 /// Order 041 (smoothness, the owner Oct 8: "like its 60hz"): the shown page's content rastered in Chromium's tiles (256 px,
@@ -1351,7 +1504,7 @@ fn band_frame(g: &Gfx, f: &Frame, ui: &mut Ui, ly: &mut Layers, ct: i32, damage:
     let w = ly.page.width();
     let hb = (PAGE_H * s).ceil() as i32 + 2 + 4 * TILE;
     if ly.band.as_ref().is_none_or(|b| b.surf.width() != w || b.surf.height() != hb) {
-        let Some(surf) = new_surface(w, hb) else { return false };
+        let Ok(surf) = surf_on(ly.gpu.as_ref(), w, hb) else { return false };
         ly.band = Some(Band { surf, b0: i32::MIN, tab: usize::MAX, rows: Default::default(), ok: false });
     }
     let b = ly.band.as_mut().unwrap();
@@ -1432,9 +1585,8 @@ fn band_frame(g: &Gfx, f: &Frame, ui: &mut Ui, ly: &mut Layers, ct: i32, damage:
     g.end();
     let Some(pic) = rec.finish_recording_as_picture(None) else { return false };
     let b0 = b.b0;
-    TILE_SURF.with(|ts| {
-        let mut ts = ts.borrow_mut();
-        let tile = ts.get_or_insert_with(|| new_surface(TILE, TILE).expect("tile surface"));
+    let bs = &mut b.surf;
+    with_tile(bs, |tile, bs| {
         for &(ky, kx) in &todo {
             let (ox, oy) = (TILE_STEP * kx, TILE_STEP * ky);
             let (ax, bx) = tile_span(kx);
@@ -1455,7 +1607,7 @@ fn band_frame(g: &Gfx, f: &Frame, ui: &mut Ui, ly: &mut Layers, ct: i32, damage:
             let mut p = sk::Paint::default();
             p.set_blend_mode(sk::BlendMode::Src);
             let src = sk::Rect::from(own.with_offset((-ox, -oy)));
-            b.surf.canvas().draw_image_rect(img, Some((&src, sk::canvas::SrcRectConstraint::Strict)), sk::Rect::from(own.with_offset((0, -b0))), &p);
+            bs.canvas().draw_image_rect(img, Some((&src, sk::canvas::SrcRectConstraint::Strict)), sk::Rect::from(own.with_offset((0, -b0))), &p);
         }
     });
     for ky in k0..=k1 {
@@ -1490,8 +1642,64 @@ fn shadows() -> [Shadow; 3] {
     ]
 }
 
+/// A CPU surface (the shadow window's picture, test pictures, the CPU-only glass test modes).
 fn layer(w: i32, h: i32) -> Result<sk::Surface> {
     new_surface(w, h).ok_or_else(|| Error::from(E_OUTOFMEMORY))
+}
+
+/// A surface on the GPU when there is one (Order 051), else on the CPU.
+fn surf_on(gpu: Option<&Rc<Gpu>>, w: i32, h: i32) -> Result<sk::Surface> {
+    match gpu {
+        Some(g) => g.surface(w, h).ok_or_else(|| Error::new(E_OUTOFMEMORY, "no GPU surface")),
+        None => layer(w, h),
+    }
+}
+
+/// The window's edge (Order 013): Skia's anti-aliased coverage of the 14 px rounded shape - the same clip the drawing's
+/// backdrop is cut with - is the glass's mask. No window region: the menu window shows its whole rectangle exactly as the
+/// drawing's layer has it there (the outer shadow round the corners, and the page's scrollbar, which reaches 1 px past the
+/// curve at the bottom-right corner, measured).
+fn paint_mask(g: &Gfx, s: &mut sk::Surface) {
+    s.canvas().clear(sk::Color::TRANSPARENT);
+    g.begin(s.canvas());
+    g.clip_coverage(0.0, 0.0, WIN_W, WIN_H, RADIUS);
+    g.end();
+}
+
+/// The edge mask as CPU pixels (the CPU path's mask chain; test pictures).
+fn mask_raster(g: &Gfx, w: i32, h: i32) -> Result<crate::png::Pixels> {
+    let mut m = layer(w, h)?;
+    paint_mask(g, &mut m);
+    Ok(crate::png::from_surface(&mut m))
+}
+
+/// The menu's two swap chains (its frame and its edge mask, painted once): on the GPU when `gpu` is given and they can be
+/// made there, else on the CPU path (logged). Returns the GPU actually used.
+fn make_swaps(gpu: Option<Rc<Gpu>>, g: &Gfx, w: i32, h: i32) -> Result<(Option<Rc<Gpu>>, Swap, Swap)> {
+    if let Some(gp) = gpu {
+        let made = (|| -> Result<(Swap, Swap)> {
+            let chain = GpuChain::new(&gp, w as u32, h as u32)?;
+            let mut mask = GpuChain::new(&gp, w as u32, h as u32)?;
+            let mut ms = mask.back();
+            paint_mask(g, &mut ms);
+            mask.present()?;
+            Ok((Swap::Gpu(chain), Swap::Gpu(mask)))
+        })();
+        match made {
+            Ok((c, m)) => return Ok((Some(gp), c, m)),
+            Err(e) => {
+                if gp.lost() || gpu::is_lost_error(&e) {
+                    gpu::mark_lost();
+                }
+                timing::note(&format!("gpu path=cpu reason=swap chain {:08x} {}", e.code().0, e.message()));
+            }
+        }
+    }
+    let chain = Chain::new(w as u32, h as u32)?;
+    let mask = Chain::new_on(chain.d3d.clone(), w as u32, h as u32)?;
+    let px = mask_raster(g, w, h)?;
+    mask.present(&px.data, (w * 4) as u32)?;
+    Ok((None, Swap::Cpu(chain), Swap::Cpu(mask)))
 }
 
 fn sys_highlight() -> Rgba {

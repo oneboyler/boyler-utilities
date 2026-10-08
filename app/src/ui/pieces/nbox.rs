@@ -185,7 +185,7 @@ pub fn nbox(cx: &mut Cx, key: Key, text: &str, placeholder: &str, o: &Opts, cue:
     if focused && !selected {
         // the caret after the text (blinking 530 ms on / off, like the search field); its height is a guess (not proven)
         let caret_on = ((cx.now / 530.0) as i64) % 2 == 0;
-        cx.st.busy = true;
+        cx.wake_every(530.0, 0.0);
         if caret_on {
             let tw = if text.is_empty() { 0.0 } else { tb.width };
             let x = if text.is_empty() && !o.left { inner / 2.0 } else { (tx + tw).min(inner - 1.0) };

@@ -170,6 +170,144 @@ impl Display {
     }
 }
 
+/// Mode, main display, vibrance and the rules are read live (cheap); DDC/CI answers are slow, so those lines use the
+/// last noted value.
+fn current_of(rt: &Rt, item: &str) -> Option<Val> {
+    match Item::parse(item)? {
+        Item::Rules => rt.store.lock().ok().map(|s| rules_val(&s)),
+        Item::Mode(id) => {
+            let s = rt.svc.lock().ok()?;
+            let m = s.monitor(&id).ok()?.current;
+            Some(mode_val(&s, &id, &m))
+        }
+        Item::Main => {
+            let s = rt.svc.lock().ok()?;
+            let mons = s.monitors().ok()?;
+            let main = mons.iter().find(|m| m.is_main)?.id.clone();
+            Some(main_val(&mons, &main))
+        }
+        Item::Vib(id) => rt.svc.lock().ok()?.os_mut().vibrance_get(&id).ok().map(|v| vib_val(&v)),
+        Item::Ddc(..) => None,
+    }
+}
+
+/// Vibrance 50 % (the driver's normal level) on every monitor that has it; no "Switch automatically" rules.
+fn defaults_of(rt: &Rt) -> Vec<DefaultItem> {
+    let mut out = Vec::new();
+    if let Ok(mut s) = rt.svc.lock() {
+        let mons = s.monitors().unwrap_or_default();
+        for m in &mons {
+            if let Ok(v) = s.os_mut().vibrance_get(&m.id) {
+                let it = Item::Vib(m.id.clone());
+                out.push(DefaultItem { item: it.id(), label: it.label(&mon_name(m)), now: vib_val(&v), default: Val::new(&v.default.to_string(), "50 %") });
+            }
+        }
+    }
+    if let Ok(st) = rt.store.lock() {
+        out.push(DefaultItem { item: RULES.into(), label: RULES_LABEL.into(), now: rules_val(&st), default: Val::new(NO_RULES, "none") });
+    }
+    out
+}
+
+/// Put one item back on the runtime (any thread).
+fn apply_to(rt: &Arc<Rt>, item: &str, to: &Val) -> Result<(), String> {
+    if crate::testmode::real_read() {
+        return Err("A read-only test copy changes nothing".into());
+    }
+    let it = Item::parse(item).ok_or("Not a Display setting")?;
+    match it {
+        Item::Rules => {
+            {
+                let mut st = rt.store.lock().map_err(|e| e.to_string())?;
+                let Store { presets, rules } = &mut *st;
+                rules.set_rules_raw(&to.raw, presets).map_err(|e| e.to_string())?;
+            }
+            rt.save();
+            // rules may have gone: the watcher follows (no rules = no watcher)
+            rt.sync_watcher_soon();
+        }
+        it => {
+            let mut s = rt.svc.lock().map_err(|e| e.to_string())?;
+            let r = match it {
+                Item::Mode(id) => {
+                    if s.pending().is_some() {
+                        return Err("Keep or revert the new resolution first".into());
+                    }
+                    let m = Mode::from_raw(&to.raw).ok_or("Not a resolution")?;
+                    // stored as Windows' saved setting too (it is the user's own old mode)
+                    s.os_mut().apply_mode(&id, &m, true)
+                }
+                Item::Main => s.set_main(&MonitorId(to.raw.clone())).map(|_| ()),
+                Item::Ddc(id, vcp) => {
+                    if bu_display::picture::ddc_excluded(&id) {
+                        return Err(bu_display::DisplayError::DdcExcludedModel.to_string());
+                    }
+                    let v = to.raw.parse::<u32>().map_err(|_| "Not a monitor value")?;
+                    s.os_mut().ddc_set(&id, vcp, v)
+                }
+                Item::Vib(id) => {
+                    let v = to.raw.parse::<i32>().map_err(|_| "Not a vibrance level")?;
+                    s.os_mut().vibrance_set(&id, v)
+                }
+                Item::Rules => Ok(()),
+            };
+            r.map_err(|e| e.to_string())?;
+        }
+    }
+    rt.bump();
+    Ok(())
+}
+
+/// Order 047: Display's reset for a worker thread (`Resettable::detach`): the page's runtime, so a mode change, a
+/// DDC/CI write or a vibrance read of a reset never holds the menu.
+struct Away {
+    rt: Arc<Rt>,
+    /// test copies only: every read / put-back first sleeps this long (ms)
+    slow: u64,
+}
+
+impl Away {
+    fn wait(&self) {
+        if self.slow > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(self.slow));
+        }
+    }
+}
+
+impl Resettable for Away {
+    fn page_id(&self) -> &str {
+        PAGE
+    }
+    fn page_title(&self) -> &str {
+        "Display"
+    }
+    fn current(&self, item: &str) -> Option<Val> {
+        self.wait();
+        current_of(&self.rt, item)
+    }
+    fn windows_defaults(&self) -> Vec<DefaultItem> {
+        self.wait();
+        defaults_of(&self.rt)
+    }
+    fn apply(&mut self, item: &str, to: &Val) -> Result<(), String> {
+        self.wait();
+        apply_to(&self.rt, item, to)
+    }
+}
+
+impl Display {
+    /// An open page shows what is on the PC now (its picture values and monitors read again).
+    fn after_reset(&mut self) {
+        if self.rt.is_some() {
+            self.pic = vec![None; self.mons.len()];
+            self.pic_rx = None;
+            // (Order 047: the monitors are read on the page's worker; the page shows them when they land)
+            self.read_again(super::How::Fields);
+            self.read_picture(self.sel);
+        }
+    }
+}
+
 impl Resettable for Display {
     fn page_id(&self) -> &str {
         PAGE
@@ -177,100 +315,22 @@ impl Resettable for Display {
     fn page_title(&self) -> &str {
         "Display"
     }
-
-    /// Mode, main display, vibrance and the rules are read live (cheap); DDC/CI answers are slow, so those lines use the
-    /// last noted value.
     fn current(&self, item: &str) -> Option<Val> {
-        let rt = self.any_rt();
-        match Item::parse(item)? {
-            Item::Rules => rt.store.lock().ok().map(|s| rules_val(&s)),
-            Item::Mode(id) => {
-                let s = rt.svc.lock().ok()?;
-                let m = s.monitor(&id).ok()?.current;
-                Some(mode_val(&s, &id, &m))
-            }
-            Item::Main => {
-                let s = rt.svc.lock().ok()?;
-                let mons = s.monitors().ok()?;
-                let main = mons.iter().find(|m| m.is_main)?.id.clone();
-                Some(main_val(&mons, &main))
-            }
-            Item::Vib(id) => rt.svc.lock().ok()?.os_mut().vibrance_get(&id).ok().map(|v| vib_val(&v)),
-            Item::Ddc(..) => None,
-        }
+        current_of(&self.any_rt(), item)
     }
-
-    /// Vibrance 50 % (the driver's normal level) on every monitor that has it; no "Switch automatically" rules.
     fn windows_defaults(&self) -> Vec<DefaultItem> {
-        let rt = self.any_rt();
-        let mut out = Vec::new();
-        if let Ok(mut s) = rt.svc.lock() {
-            let mons = s.monitors().unwrap_or_default();
-            for m in &mons {
-                if let Ok(v) = s.os_mut().vibrance_get(&m.id) {
-                    let it = Item::Vib(m.id.clone());
-                    out.push(DefaultItem { item: it.id(), label: it.label(&mon_name(m)), now: vib_val(&v), default: Val::new(&v.default.to_string(), "50 %") });
-                }
-            }
-        }
-        if let Ok(st) = rt.store.lock() {
-            out.push(DefaultItem { item: RULES.into(), label: RULES_LABEL.into(), now: rules_val(&st), default: Val::new(NO_RULES, "none") });
-        }
-        out
+        defaults_of(&self.any_rt())
     }
-
     fn apply(&mut self, item: &str, to: &Val) -> Result<(), String> {
-        if crate::testmode::real_read() {
-            return Err("A read-only test copy changes nothing".into());
-        }
-        let it = Item::parse(item).ok_or("Not a Display setting")?;
-        let rt = self.any_rt();
-        match it {
-            Item::Rules => {
-                {
-                    let mut st = rt.store.lock().map_err(|e| e.to_string())?;
-                    let Store { presets, rules } = &mut *st;
-                    rules.set_rules_raw(&to.raw, presets).map_err(|e| e.to_string())?;
-                }
-                rt.save();
-                // rules may have gone: the watcher follows (no rules = no watcher)
-                rt.sync_watcher();
-            }
-            it => {
-                let mut s = rt.svc.lock().map_err(|e| e.to_string())?;
-                let r = match it {
-                    Item::Mode(id) => {
-                        if s.pending().is_some() {
-                            return Err("Keep or revert the new resolution first".into());
-                        }
-                        let m = Mode::from_raw(&to.raw).ok_or("Not a resolution")?;
-                        // stored as Windows' saved setting too (it is the user's own old mode)
-                        s.os_mut().apply_mode(&id, &m, true)
-                    }
-                    Item::Main => s.set_main(&MonitorId(to.raw.clone())).map(|_| ()),
-                    Item::Ddc(id, vcp) => {
-                        if bu_display::picture::ddc_excluded(&id) {
-                            return Err(bu_display::DisplayError::DdcExcludedModel.to_string());
-                        }
-                        let v = to.raw.parse::<u32>().map_err(|_| "Not a monitor value")?;
-                        s.os_mut().ddc_set(&id, vcp, v)
-                    }
-                    Item::Vib(id) => {
-                        let v = to.raw.parse::<i32>().map_err(|_| "Not a vibrance level")?;
-                        s.os_mut().vibrance_set(&id, v)
-                    }
-                    Item::Rules => Ok(()),
-                };
-                r.map_err(|e| e.to_string())?;
-            }
-        }
-        rt.bump();
-        // an open page shows what is on the PC now (its picture values read again)
-        if self.rt.is_some() {
-            self.pic = vec![None; self.mons.len()];
-            self.reload();
-            self.read_picture(self.sel);
-        }
+        apply_to(&self.any_rt(), item, to)?;
+        self.after_reset();
         Ok(())
+    }
+    /// Order 047: the review's reads and put-backs on a worker thread, on this page's runtime.
+    fn detach(&mut self) -> Option<crate::undo::Detached> {
+        Some(Box::new(Away { rt: self.any_rt(), slow: self.slow }))
+    }
+    fn reset_done(&mut self) {
+        self.after_reset();
     }
 }

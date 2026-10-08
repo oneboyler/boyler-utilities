@@ -12,7 +12,8 @@ pub mod lbhost;
 pub mod lightbox;
 pub mod overlay;
 
-use std::collections::HashMap;
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
@@ -103,6 +104,9 @@ const FAKE_PICK_MS: f64 = 700.0;
 
 /// Bumped by whoever saves a screenshot (the capture overlay): the page shows new shots the next frame it is open.
 static GALLERY_GEN: AtomicU64 = AtomicU64::new(0);
+/// Order 047: the newest gallery Copy (its number) and the lock that runs Copies one at a time (see `off_ui`).
+static COPY_GEN: AtomicU64 = AtomicU64::new(0);
+static COPY_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// A new screenshot was saved: an open Screenshots page reads its gallery again (the new one glides in at the front).
 pub fn gallery_changed() {
@@ -131,56 +135,84 @@ trait Api {
     fn pick_save_dir(&self) -> Result<PathBuf, ShotError>;
     fn shot_time(&self, s: &Shot) -> LocalTime;
     fn now_local(&self) -> LocalTime;
+    /// Order 047: an engine of its own (same OS layer, same folders) for a worker thread - the thumbnails, the lightbox's
+    /// whole picture, Copy and the shell calls run there, never on the menu's thread
+    fn worker(&self) -> Box<dyn Api + Send>;
 }
 
-impl<O: ScreenshotOs> Api for Engine<O> {
+/// bu-screenshot's engine with what it was made from (its OS layer and data folder), so the page can make another one just
+/// like it for a worker thread (`Api::worker`).
+pub(crate) struct Eng<O: ScreenshotOs> {
+    e: Engine<O>,
+    os: O,
+    dir: PathBuf,
+}
+
+impl<O: ScreenshotOs + Clone> Eng<O> {
+    pub(crate) fn new(os: O, dir: impl Into<PathBuf>) -> Self {
+        let dir = dir.into();
+        Eng { e: Engine::new(os.clone(), dir.clone()), os, dir }
+    }
+}
+
+impl<O: ScreenshotOs> std::ops::Deref for Eng<O> {
+    type Target = Engine<O>;
+    fn deref(&self) -> &Engine<O> {
+        &self.e
+    }
+}
+
+impl<O: ScreenshotOs + Clone + Send + 'static> Api for Eng<O> {
+    fn worker(&self) -> Box<dyn Api + Send> {
+        Box::new(Eng::new(self.os.clone(), self.dir.clone()))
+    }
     fn gallery(&self) -> Result<Vec<Shot>, ShotError> {
-        Engine::gallery(self)
+        Engine::gallery(&self.e)
     }
     fn thumbnail(&self, id: u64) -> Result<Image, ShotError> {
-        Engine::thumbnail(self, id)
+        Engine::thumbnail(&self.e, id)
     }
     fn load(&self, id: u64) -> Result<Image, ShotError> {
-        Engine::load(self, id)
+        Engine::load(&self.e, id)
     }
     fn delete(&self, ids: &[u64]) -> Result<(), ShotError> {
-        Engine::delete(self, ids)
+        Engine::delete(&self.e, ids)
     }
     fn copy_shots(&self, ids: &[u64]) -> Result<(), ShotError> {
-        Engine::copy_shots(self, ids)
+        Engine::copy_shots(&self.e, ids)
     }
     fn show_in_folder(&self, ids: &[u64]) -> Result<(), ShotError> {
-        Engine::show_in_folder(self, ids)
+        Engine::show_in_folder(&self.e, ids)
     }
     fn drag_paths(&self, ids: &[u64]) -> Result<Vec<PathBuf>, ShotError> {
-        Engine::drag_paths(self, ids)
+        Engine::drag_paths(&self.e, ids)
     }
     fn save_dir(&self) -> Result<PathBuf, ShotError> {
-        Engine::save_dir(self)
+        Engine::save_dir(&self.e)
     }
     fn saved_dir(&self) -> Result<Option<PathBuf>, ShotError> {
-        Engine::saved_dir(self)
+        Engine::saved_dir(&self.e)
     }
     fn default_save_dir(&self) -> Result<PathBuf, ShotError> {
-        Engine::default_save_dir(self)
+        Engine::default_save_dir(&self.e)
     }
     fn reset_save_dir(&self) -> Result<(), ShotError> {
-        Engine::reset_save_dir(self)
+        Engine::reset_save_dir(&self.e)
     }
     fn set_save_dir(&self, dir: &std::path::Path) -> Result<(), ShotError> {
-        Engine::set_save_dir(self, dir)
+        Engine::set_save_dir(&self.e, dir)
     }
     fn open_save_dir(&self) -> Result<(), ShotError> {
-        Engine::open_save_dir(self)
+        Engine::open_save_dir(&self.e)
     }
     fn pick_save_dir(&self) -> Result<PathBuf, ShotError> {
-        Engine::pick_save_dir(self)
+        Engine::pick_save_dir(&self.e)
     }
     fn shot_time(&self, s: &Shot) -> LocalTime {
-        Engine::shot_time(self, s)
+        Engine::shot_time(&self.e, s)
     }
     fn now_local(&self) -> LocalTime {
-        Engine::now_local(self)
+        Engine::now_local(&self.e)
     }
 }
 
@@ -193,11 +225,35 @@ enum Job {
     FakePick(Result<PathBuf, ShotError>),
 }
 
+/// Order 047: the REAL engine's Copy (the whole PNG decoded and encoded again, the clipboard), Show in folder and Open
+/// (Explorer) run on a worker; their toast comes with the answer. (The fake answers at once: the tests read its clipboard.)
+#[derive(Clone, Copy)]
+enum Shell {
+    Copy(usize),
+    Folder,
+    OpenDir,
+}
+
+/// Order 047: how many of the newest thumbnails are kept between two opens of the tab (shown at once the next time;
+/// 8 x 330 KB at most)
+const KEEP_THUMBS: usize = 8;
+
+thread_local! {
+    /// Order 047: the last decoded thumbnails of the first tiles (real copies), by shot id - the tab shows them at once
+    /// while its worker decodes the rest
+    static LAST_THUMBS: RefCell<HashMap<u64, sk::Image>> = RefCell::new(HashMap::new());
+}
+
+/// The dark box a broken / missing picture keeps (not asked for again).
+fn placeholder() -> Option<sk::Image> {
+    to_sk(&Image { width: 1, height: 1, bgra: vec![21, 15, 13, 255] })
+}
+
 #[cfg(windows)]
 /// `read_only` = a --real-read test copy: the engine refuses every change.
-fn real_engine(read_only: bool) -> Option<Engine<bu_screenshot::real::RealOs>> {
+fn real_engine(read_only: bool) -> Option<Eng<bu_screenshot::real::RealOs>> {
     let os = if read_only { bu_screenshot::real::RealOs::read_only() } else { bu_screenshot::real::RealOs::new() };
-    bu_screenshot::real::default_data_dir().map(|d| Engine::new(os, d))
+    bu_screenshot::real::default_data_dir().map(|d| Eng::new(os, d))
 }
 
 // ---------------------------------------------------------------- one gallery tile
@@ -205,8 +261,10 @@ struct View {
     id: u64,
     width: u32,
     height: u32,
+    /// the file (the lightbox's name + folder line)
+    path: PathBuf,
     cap: String,
-    /// the picture (decoded lazily: a few per frame) and whether it fills the box (the drawing's sample canvases) or is
+    /// the picture (decoded on a worker thread, Order 047) and whether it fills the box (the drawing's sample canvases) or is
     /// fitted inside it with dark bars (real thumbnails, the drawing's paintImg "contain")
     img: Option<sk::Image>,
     fill: bool,
@@ -284,6 +342,19 @@ pub struct Screenshots {
     /// a shot had focus and something else took it: if no element of the page was pressed, it was empty space
     blur_pending: bool,
     keymap: HashMap<Key, u64>,
+
+    /// Order 047: the thumbnails' worker answers (id, picture) and the ids already asked for
+    thumb_tx: Option<mpsc::Sender<(u64, Option<Image>)>>,
+    thumb_rx: Option<mpsc::Receiver<(u64, Option<Image>)>>,
+    asked: HashSet<u64>,
+    /// Order 047: the lightbox's whole picture being decoded on a worker (which shot, its answer)
+    full_rx: Option<(u64, mpsc::Receiver<Option<Image>>)>,
+    /// the lightbox waits for its whole picture before it opens (the shot had no thumbnail to show meanwhile)
+    lb_defer: Option<u64>,
+    /// the shot whose whole picture came in last (the lightbox shows it)
+    lb_full: Option<u64>,
+    /// Order 047: Copy / Show in folder / Open running on a worker (real engine)
+    shell: Vec<(mpsc::Receiver<Result<(), ShotError>>, Shell)>,
 }
 
 impl Screenshots {
@@ -299,7 +370,7 @@ impl Screenshots {
         self.toast = Some((t.into(), now));
     }
 
-    /// Reads the gallery from the engine (cheap: the small index file). Pictures are decoded later, a few per frame.
+    /// Reads the gallery from the engine (cheap: the small index file). Pictures are decoded later, on a worker (Order 047).
     fn load(&mut self, now: f64, animate_new: bool) {
         let Some(svc) = &self.svc else { return };
         let list = match svc.gallery() {
@@ -318,6 +389,7 @@ impl Screenshots {
             match old.remove(&s.id) {
                 Some(mut v) => {
                     v.cap = cap;
+                    v.path = s.path.clone();
                     if animate_new && old_idx.get(&s.id).is_some_and(|o| *o != i) {
                         self.moved.insert(s.id, (old_idx[&s.id], now));
                     }
@@ -327,7 +399,7 @@ impl Screenshots {
                     if animate_new {
                         self.appeared.insert(s.id, now);
                     }
-                    self.shots.push(View { id: s.id, width: s.width, height: s.height, cap, img: None, fill, gone_at: None });
+                    self.shots.push(View { id: s.id, width: s.width, height: s.height, path: s.path.clone(), cap, img: None, fill, gone_at: None });
                 }
             }
         }
@@ -335,19 +407,153 @@ impl Screenshots {
         self.sel.keep_only(&order);
     }
 
-    /// Decodes up to `n` missing thumbnails. Returns true while some are still missing.
-    fn decode_some(&mut self, n: usize) -> bool {
-        let Some(svc) = &self.svc else { return false };
-        let mut left = n;
-        for v in self.shots.iter_mut().filter(|v| v.img.is_none() && v.gone_at.is_none()) {
-            if left == 0 {
-                return true;
-            }
-            left -= 1;
-            // a broken / missing picture keeps the dark box (img stays None but is not retried every frame)
-            v.img = svc.thumbnail(v.id).ok().and_then(|i| to_sk(&i)).or_else(|| to_sk(&Image { width: 1, height: 1, bgra: vec![21, 15, 13, 255] }));
+    /// Order 047: the missing thumbnails are decoded on a worker thread, in gallery order (open() decoded 8 on the menu's
+    /// thread, then 2 per frame: 10-40 ms, 100+ ms each when one had to be made again from its PNG). The tiles show their
+    /// dark box (or the last decoded picture) meanwhile; `take_thumbs` puts each answer in as it comes.
+    fn request_thumbs(&mut self) {
+        let ids: Vec<u64> = self.shots.iter().filter(|v| v.img.is_none() && v.gone_at.is_none() && !self.asked.contains(&v.id)).map(|v| v.id).collect();
+        if ids.is_empty() {
+            return;
         }
-        false
+        let Some(w) = self.svc.as_ref().map(|s| s.worker()) else { return };
+        if self.thumb_rx.is_none() {
+            let (tx, rx) = mpsc::channel();
+            self.thumb_tx = Some(tx);
+            self.thumb_rx = Some(rx);
+        }
+        let Some(tx) = self.thumb_tx.clone() else { return };
+        self.asked.extend(ids.iter().copied());
+        crate::offui::spawn("shot-thumbs", move || {
+            for id in ids {
+                let img = w.thumbnail(id).ok();
+                if tx.send((id, img)).is_err() {
+                    return; // the page closed
+                }
+                crate::services::Waker.wake();
+            }
+        });
+    }
+
+    /// The thumbnails the worker has decoded since the last look. True = a tile changed.
+    fn take_thumbs(&mut self) -> bool {
+        let got: Vec<(u64, Option<Image>)> = match &self.thumb_rx {
+            Some(rx) => rx.try_iter().collect(),
+            None => return false,
+        };
+        if got.is_empty() {
+            return false;
+        }
+        let real = self.fake.is_none();
+        let first: Vec<u64> = self.order().into_iter().take(KEEP_THUMBS).collect();
+        for (id, img) in got {
+            // a broken / missing picture keeps the dark box (not asked for again)
+            let decoded = img.as_ref().and_then(to_sk);
+            if let (true, Some(p)) = (real && first.contains(&id), &decoded) {
+                LAST_THUMBS.with(|c| c.borrow_mut().insert(id, p.clone()));
+            }
+            if let Some(v) = self.shots.iter_mut().find(|v| v.id == id) {
+                v.img = decoded.or_else(placeholder);
+            }
+        }
+        if real {
+            LAST_THUMBS.with(|c| c.borrow_mut().retain(|id, _| first.contains(id)));
+        }
+        true
+    }
+
+    /// Order 047: the lightbox's whole picture (a full-size PNG decode, 50-300 ms) on a worker; `take_full` hands it over.
+    fn request_full(&mut self, id: u64) {
+        let Some(w) = self.svc.as_ref().map(|s| s.worker()) else { return };
+        let (tx, rx) = mpsc::channel();
+        self.full_rx = Some((id, rx));
+        self.lb_full = None;
+        crate::offui::spawn("shot-full", move || {
+            let _ = tx.send(w.load(id).ok());
+        });
+    }
+
+    /// The whole picture came in: the lightbox shows it (or opens with it). True = it came.
+    fn take_full(&mut self, now: f64) -> bool {
+        let Some((id, rx)) = &self.full_rx else { return false };
+        let id = *id;
+        let r = match rx.try_recv() {
+            Ok(r) => r,
+            Err(mpsc::TryRecvError::Empty) => return false,
+            Err(mpsc::TryRecvError::Disconnected) => None,
+        };
+        self.full_rx = None;
+        let deferred = self.lb_defer == Some(id);
+        self.lb_defer = None;
+        match r.as_ref().and_then(to_sk) {
+            Some(pic) => {
+                self.lb_full = Some(id);
+                if deferred {
+                    self.show_lightbox(id, pic, now);
+                } else if self.lb.map(|l| l.0) == Some(id) {
+                    // the lightbox opened with the thumbnail scaled up: now the real pixels
+                    lbhost::set_picture(pic);
+                }
+            }
+            None => {
+                if deferred && self.fake.is_none() {
+                    self.show_toast("Couldn’t open the picture", now);
+                }
+            }
+        }
+        true
+    }
+
+    /// Order 047: a call of the REAL engine that may take long (Copy) or wait on the shell (Explorer) runs on a worker;
+    /// its toast comes with the answer (`take_shell`). False = not started (the fake: the caller does it at once).
+    fn off_ui(&mut self, what: Shell, f: impl FnOnce(&dyn Api) -> Result<(), ShotError> + Send + 'static) -> bool {
+        if self.fake.is_some() {
+            return false;
+        }
+        let Some(w) = self.svc.as_ref().map(|s| s.worker()) else { return false };
+        let (tx, rx) = mpsc::channel();
+        // Order 047: Copies run one at a time and only the newest one is carried out - two quick Copies (a big shot, then a
+        // small one) never end with the older picture on the clipboard; a skipped one answers nothing (no toast)
+        let copy = matches!(what, Shell::Copy(_)).then(|| COPY_GEN.fetch_add(1, Ordering::AcqRel) + 1);
+        crate::offui::spawn("shot-shell", move || {
+            let Some(gen) = copy else {
+                let _ = tx.send(f(&*w));
+                return;
+            };
+            let _one = COPY_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+            if COPY_GEN.load(Ordering::Acquire) == gen {
+                let _ = tx.send(f(&*w));
+            }
+        });
+        self.shell.push((rx, what));
+        true
+    }
+
+    fn after_shell(&mut self, what: Shell, r: Result<(), ShotError>, now: f64) {
+        match (what, r) {
+            (Shell::Copy(n), Ok(())) => self.show_toast(if n > 1 { format!("{n} screenshots copied") } else { "Copied to clipboard".into() }, now),
+            (Shell::Copy(_), Err(e)) => self.show_toast(format!("Not copied · {e}"), now),
+            (Shell::Folder, Err(e)) => self.show_toast(format!("Can't show it in its folder · {e}"), now),
+            (Shell::OpenDir, Err(e)) => self.show_toast(format!("Can't open the folder · {e}"), now),
+            _ => {}
+        }
+    }
+
+    /// The shell calls' answers. True = one came in.
+    fn take_shell(&mut self, now: f64) -> bool {
+        let mut done = Vec::new();
+        self.shell.retain(|(rx, what)| match rx.try_recv() {
+            Ok(r) => {
+                done.push((*what, r));
+                false
+            }
+            Err(mpsc::TryRecvError::Empty) => true,
+            Err(mpsc::TryRecvError::Disconnected) => false,
+        });
+        let any = !done.is_empty();
+        for (what, r) in done {
+            self.after_shell(what, r, now);
+        }
+        any
     }
 
     // ---- actions
@@ -368,6 +574,8 @@ impl Screenshots {
             std::thread::spawn(move || {
                 let r = real_engine(ro).map(|e| e.delete(&worker_ids)).unwrap_or(Err(ShotError::BadData("no data folder".into())));
                 let _ = tx.send(r);
+                // Order 047: the page waits on no frames - the answer wakes the menu
+                crate::services::Waker.wake();
             });
             self.wait = Some((now, Job::Delete(rx, ids)));
         }
@@ -436,14 +644,15 @@ impl Screenshots {
             }
             CtxItem::Open => {
                 self.lb = Some((ids[0], now));
-                if self.fake.is_none() {
-                    self.open_lightbox(ids[0], now);
-                }
+                self.open_lightbox(ids[0], now);
             }
             CtxItem::Copy => self.copy(ids, now),
             CtxItem::Folder => {
-                if let Some(Err(e)) = self.svc.as_ref().map(|s| s.show_in_folder(&ids)) {
-                    self.show_toast(format!("Can't show it in its folder · {e}"), now);
+                let job = ids.clone();
+                if !self.off_ui(Shell::Folder, move |s| s.show_in_folder(&job)) {
+                    if let Some(Err(e)) = self.svc.as_ref().map(|s| s.show_in_folder(&ids)) {
+                        self.after_shell(Shell::Folder, Err(e), now);
+                    }
                 }
             }
         }
@@ -475,14 +684,13 @@ impl Screenshots {
         if ids.is_empty() {
             return;
         }
-        let r = self.svc.as_ref().map(|s| s.copy_shots(&ids)).unwrap_or(Ok(()));
-        match r {
-            Ok(()) => {
-                let n = ids.len();
-                self.show_toast(if n > 1 { format!("{n} screenshots copied") } else { "Copied to clipboard".into() }, now);
-            }
-            Err(e) => self.show_toast(format!("Not copied · {e}"), now),
+        let n = ids.len();
+        let job = ids.clone();
+        if self.off_ui(Shell::Copy(n), move |s| s.copy_shots(&job)) {
+            return;
         }
+        let r = self.svc.as_ref().map(|s| s.copy_shots(&ids)).unwrap_or(Ok(()));
+        self.after_shell(Shell::Copy(n), r, now);
     }
 
     fn refresh_dir(&mut self) {
@@ -512,6 +720,8 @@ impl Screenshots {
             std::thread::spawn(move || {
                 let r = real_engine(ro).map(|e| e.pick_save_dir()).unwrap_or(Err(ShotError::BadData("no data folder".into())));
                 let _ = tx.send(r);
+                // Order 047: the page waits on no frames - the answer wakes the menu
+                crate::services::Waker.wake();
             });
             self.wait = Some((now, Job::Pick(rx)));
         }
@@ -611,15 +821,31 @@ impl Screenshots {
 
     /// The lightbox window for shot `id` (real copies): the whole picture, its name + "W × H · folder", grown out of the
     /// thumbnail's box on screen.
+    /// Order 047: the whole picture is decoded on a worker (it was a full-size PNG decode on the menu's thread, 50-300 ms);
+    /// the lightbox opens at once with the tile's thumbnail scaled up (the picture grows out of the thumbnail anyway) and
+    /// gets the real pixels when they are in. A shot without a thumbnail opens when its picture is decoded.
     fn open_lightbox(&mut self, id: u64, now: f64) {
-        let Some(shot) = self.svc.as_ref().and_then(|s| s.gallery().ok()).and_then(|g| g.into_iter().find(|s| s.id == id)) else { return };
-        let Some(img) = self.svc.as_ref().and_then(|s| s.load(id).ok()).and_then(|i| to_sk(&i)) else {
-            self.show_toast("Couldn’t open the picture", now);
+        self.request_full(id);
+        // (the dark 1 x 1 box of a broken thumbnail is no picture to show)
+        let thumb = self.shots.iter().find(|v| v.id == id).and_then(|v| v.img.clone()).filter(|i| i.width() > 1);
+        match thumb {
+            Some(t) => self.show_lightbox(id, t, now),
+            None => self.lb_defer = Some(id),
+        }
+    }
+
+    /// The lightbox window for shot `id` showing `img` (real copies only; a test copy never opens it).
+    fn show_lightbox(&mut self, id: u64, img: sk::Image, now: f64) {
+        if self.fake.is_some() {
+            return;
+        }
+        let Some((name, info, size)) = self.shots.iter().find(|v| v.id == id).map(|v| {
+            let name = v.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            let dir = v.path.parent().map(|p| gallery::short_dir(p, self.profile.as_deref())).unwrap_or_default();
+            (name, format!("{} × {} · {}", v.width, v.height, dir), (v.width, v.height))
+        }) else {
             return;
         };
-        let name = shot.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-        let dir = shot.path.parent().map(|p| gallery::short_dir(p, self.profile.as_deref())).unwrap_or_default();
-        let info = format!("{} × {} · {}", shot.width, shot.height, dir);
         let Some((mr, sc)) = key::menu_window() else { return };
         let th = self.link_box.get(&sub(sub(K_SHOT, &id.to_string()), "th")).copied();
         let thumb = th.map(|b| windows::Win32::Foundation::RECT {
@@ -628,7 +854,7 @@ impl Screenshots {
             right: mr.left + ((b.0 + b.2) * sc).round() as i32,
             bottom: mr.top + ((b.1 + b.3) * sc).round() as i32,
         });
-        match lbhost::open(img, (shot.width, shot.height), name, info, mr, thumb) {
+        match lbhost::open(img, size, name, info, mr, thumb) {
             Ok(()) => self.lb_up = lbhost::is_open(),
             Err(e) => self.show_toast(e, now),
         }
@@ -759,7 +985,11 @@ impl Screenshots {
             let p = ((now - t0) / 170.0).clamp(0.0, 1.0);
             let e = EASE_IN.ease(p) as f32;
             tile = tile.opacity(1.0 - e).scale(1.0 - 0.1 * e).no_hit();
-            cx.st.busy = true;
+            // Order 047: frames only while it fades; at its end the page is built again (it leaves, the rest glide)
+            if p < 1.0 {
+                cx.st.busy = true;
+            }
+            cx.wake_at(t0 + 170.0);
         }
         tile
     }
@@ -775,11 +1005,13 @@ impl Screenshots {
         let op = cx.tr(K_DLG_BODY, 1, if waiting { 0.55 } else { 1.0 }, 200.0, EASE);
         let col = match self.dir_new_at {
             Some(t) if now - t < 1400.0 => {
-                cx.st.busy = true;
                 let p = ((now - t) / 1400.0) as f32;
                 if p <= 0.4 {
+                    // Order 047: held at the first colour (0-40 %): no frames, built again when the fade starts
+                    cx.wake_at(t + 560.0);
                     ICO_ON()
                 } else {
+                    cx.st.busy = true;
                     cmix(ICO_ON(), FG2(), EASE.ease(((p - 0.4) / 0.6) as f64) as f32)
                 }
             }
@@ -856,13 +1088,25 @@ impl Page for Screenshots {
             {
                 // a --real-read test copy only reads: the engine refuses every change and every capture
                 let os = if env.real_read { bu_screenshot::real::RealOs::read_only() } else { bu_screenshot::real::RealOs::new() };
-                self.svc = bu_screenshot::real::default_data_dir().map(|d| Box::new(Engine::new(os, d)) as Box<dyn Api>);
+                self.svc = bu_screenshot::real::default_data_dir().map(|d| Box::new(Eng::new(os, d)) as Box<dyn Api>);
             }
         }
         self.refresh_dir();
         self.load(now, false);
-        // the first row(s) at once (the gallery shows without a blink); the rest a few per frame (tick)
-        self.decode_some(8);
+        // Order 047: the last decoded thumbnails at once (the gallery shows without a blink the second time); every
+        // other one is decoded on a worker and comes in through `tick` (the tile's dark box meanwhile)
+        if self.fake.is_none() {
+            let shots = &mut self.shots;
+            LAST_THUMBS.with(|c| {
+                let c = c.borrow();
+                for v in shots.iter_mut() {
+                    if let Some(i) = c.get(&v.id) {
+                        v.img = Some(i.clone());
+                    }
+                }
+            });
+        }
+        self.request_thumbs();
         // test pictures of a state (a test copy only: crate::testmode::env is None in a normal copy)
         if env.test {
             if let Some(s) = crate::testmode::env("BU_TEST_PAGE_STATE").and_then(|s| s.strip_prefix("shot:").map(str::to_string)) {
@@ -879,23 +1123,40 @@ impl Page for Screenshots {
         // closed = nothing kept (pictures, selection, popups); a running picker / delete answers into nothing
         *self = Screenshots::default();
     }
+    /// Order 047: true only when something visible changed since the last tick (a picture came in, a job answered, the
+    /// lightbox went) - waiting on a worker is no frame (its answer wakes the menu).
     fn tick(&mut self, now: f64) -> bool {
-        let mut busy = false;
+        let mut changed = false;
         let up = lbhost::is_open();
         if up != self.lb_up {
             self.lb_up = up;
-            busy = true;
+            changed = true;
         }
         let g = GALLERY_GEN.load(Ordering::Relaxed);
         if g != self.gen_seen && self.svc.is_some() {
             self.gen_seen = g;
             self.load(now, true);
-            busy = true;
+            self.request_thumbs();
+            changed = true;
         }
-        busy |= self.decode_some(2);
-        busy |= self.poll(now);
+        changed |= self.take_thumbs();
+        changed |= self.take_full(now);
+        changed |= self.take_shell(now);
+        let had = self.wait.is_some();
+        let running = self.poll(now);
+        changed |= had && !running;
+        let n = self.shots.len();
         self.settle(now);
-        busy
+        changed |= self.shots.len() != n;
+        changed
+    }
+    /// Order 047: the fake folder picker answers after the drawing's 700 ms - the menu sleeps until then. Everything else
+    /// that waits (the workers) wakes the menu itself.
+    fn wake_at(&self, now: f64) -> Option<f64> {
+        match &self.wait {
+            Some((since, Job::FakePick(_))) => Some((since + FAKE_PICK_MS).max(now + 1.0)),
+            _ => None,
+        }
     }
     fn build(&mut self, cx: &mut Cx) -> Vec<El> {
         let now = cx.now;
@@ -968,9 +1229,8 @@ impl Page for Screenshots {
         kids.push(reset::reset_line(cx, K_RESET, Some("Windows defaults")));
 
         // (two or more selected: the selection bar is the page's window-fixed overlay - `Page::overlay`)
-        if self.wait.is_some() || self.shots.iter().any(|v| v.img.is_none()) {
-            cx.st.busy = true;
-        }
+        // (Order 047: a running job and pictures still decoding ask for no frames: their answers wake the menu - the
+        // workers' waker, the fake picker's `wake_at`)
         kids
     }
     fn event(&mut self, ev: &Ev, cx: &mut Cx) {
@@ -1025,9 +1285,8 @@ impl Page for Screenshots {
                     // double-click = open (the lightbox grows out of the thumbnail; its own window, real copies only)
                     self.lb = Some((id, now));
                     self.last_click = None;
-                    if self.fake.is_none() {
-                        self.open_lightbox(id, now);
-                    }
+                    // (a test copy decodes the picture too, but never opens the window: `show_lightbox`)
+                    self.open_lightbox(id, now);
                 } else {
                     self.sel.click(&order, id, m);
                     self.last_click = Some((id, now));
@@ -1085,8 +1344,10 @@ impl Page for Screenshots {
             // ---- the folder window
             Ev::Click(k) if *k == sub(K_DLG, "x") || *k == sub(K_DLG, "out") => self.dlg = None,
             Ev::Click(k) if *k == K_DLG_OPEN => {
-                if let Some(Err(e)) = self.svc.as_ref().map(|s| s.open_save_dir()) {
-                    self.show_toast(format!("Can't open the folder · {e}"), now);
+                if !self.off_ui(Shell::OpenDir, |s| s.open_save_dir()) {
+                    if let Some(Err(e)) = self.svc.as_ref().map(|s| s.open_save_dir()) {
+                        self.after_shell(Shell::OpenDir, Err(e), now);
+                    }
                 }
             }
             Ev::Click(k) if *k == K_DLG_CHANGE => self.change_dir(now),
@@ -1128,6 +1389,9 @@ impl Page for Screenshots {
         if self.lb_up {
             lbhost::close();
         }
+        // Order 047: a lightbox still waiting for its picture never pops up after Esc / a dismiss
+        self.lb_defer = None;
+        self.full_rx = None;
         self.ctx = None;
         self.dlg = None;
         // (the toast fades by itself: the frame also calls this on every page scroll while the selection bar's layer
@@ -1146,6 +1410,11 @@ impl Page for Screenshots {
             self.dragging.as_ref().map(|d| d.len()).unwrap_or(0),
             self.toast.as_ref().map(|t| t.0.as_str()).unwrap_or(""),
         )
+    }
+    /// Order 047: never opened ahead on a hover - an open page tells the capture overlay to fly its thumbnail into the
+    /// gallery (`key::SHOWN`), which must then be on screen.
+    fn preopen(&self) -> bool {
+        false
     }
     /// The reset line's items (below). Cheap: the engine is made only when a line needs it.
     fn resettable(&mut self) -> Option<&mut dyn crate::undo::Resettable> {
@@ -1209,6 +1478,54 @@ impl crate::undo::Resettable for Screenshots {
         // an open page shows the folder now
         self.refresh_dir();
         Ok(())
+    }
+    /// Order 047: the review reads the folder (a settings file, Windows' known-folder call) and puts it back (a folder check, a
+    /// file write) on a worker thread, with an engine of its own - the menu's thread only makes the copy (no reads).
+    fn detach(&mut self) -> Option<crate::undo::Detached> {
+        let (svc, profile) = self.any_engine();
+        Some(Box::new(FolderReset { svc: svc.worker(), profile: profile.map(|p| p.to_path_buf()) }))
+    }
+    /// The copy put the folder back: an open page shows it.
+    fn reset_done(&mut self) {
+        self.refresh_dir();
+    }
+}
+
+/// Order 047: the reset line's copy for a worker thread ([`crate::undo::Resettable::detach`]): the same reads and the same
+/// apply as the page, through its own engine (same OS layer, same folders).
+struct FolderReset {
+    svc: Box<dyn Api + Send>,
+    profile: Option<PathBuf>,
+}
+
+impl crate::undo::Resettable for FolderReset {
+    fn page_id(&self) -> &str {
+        PAGE
+    }
+    fn page_title(&self) -> &str {
+        "Screenshots"
+    }
+    fn current(&self, item: &str) -> Option<crate::undo::Val> {
+        if item != FOLDER {
+            return None;
+        }
+        Screenshots::folder_val(&*self.svc, self.profile.as_deref())
+    }
+    fn windows_defaults(&self) -> Vec<crate::undo::DefaultItem> {
+        let profile = self.profile.as_deref();
+        let (Some(now), Ok(def)) = (Screenshots::folder_val(&*self.svc, profile), self.svc.default_save_dir()) else { return Vec::new() };
+        let default = crate::undo::Val::new("", &gallery::short_dir(&def, profile));
+        vec![crate::undo::DefaultItem { item: FOLDER.into(), label: FOLDER_LABEL.into(), now, default }]
+    }
+    fn apply(&mut self, item: &str, to: &crate::undo::Val) -> Result<(), String> {
+        if item != FOLDER {
+            return Err("Not a Screenshots setting".into());
+        }
+        if crate::testmode::real_read() {
+            return Err("A read-only test copy changes nothing".into());
+        }
+        let r = if to.raw.is_empty() { self.svc.reset_save_dir() } else { self.svc.set_save_dir(std::path::Path::new(&to.raw)) };
+        r.map_err(|e| e.to_string())
     }
 }
 

@@ -261,3 +261,29 @@ fn the_list_follows_the_counter_and_says_when_nothing_is_counted_yet() {
     let l = Laid::new(&g, El::block().w(600.0).children(kids), 600.0, None);
     assert!(l.nodes.iter().any(|n| matches!(&n.el.content, crate::ui::el::Content::Text(t) if t.s.starts_with("Nothing counted yet"))));
 }
+
+/// Order 047: with counting on and the bars grown in, the tab asks for no frames (its numbers come with the ticker's
+/// wake-up every 10 s); only the bars' grow-in (a real motion) rebuilds it every frame.
+#[test]
+fn at_rest_with_counting_on_the_tab_asks_for_no_frames() {
+    let mut p = page();
+    click(&mut p, K_ON, 0.0);
+    assert!(p.on);
+    assert!(!p.tick(1.0), "nothing of the page moves by itself");
+    assert_eq!(p.wake_at(1.0), None);
+    let g = Gfx::new(1.0);
+    let mut st = State::default();
+    // the grow-in is running: built again every frame while it moves
+    let mut cx = Cx::new(100.0, true, &g, &mut st);
+    let _ = p.build(&mut cx);
+    drop(cx);
+    assert!(st.busy, "the bars grow in");
+    // long after: everything at rest
+    for now in [1e6, 2e6] {
+        st.busy = false;
+        let mut cx = Cx::new(now, true, &g, &mut st);
+        let _ = p.build(&mut cx);
+    }
+    assert!(!st.busy, "at rest nothing asks for frames");
+    assert!(!p.tick(2e6));
+}

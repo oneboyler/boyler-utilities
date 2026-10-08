@@ -4,17 +4,26 @@ use super::*;
 use crate::gfx::Gfx;
 use crate::ui::cx::State;
 
+/// The page opened on the fake, its open read landed (Order 047: the read runs on the page's worker).
 fn page() -> Tweaks {
     let mut p = Tweaks::default();
     p.open(&Env { test: true, ..Env::default() }, 0.0);
+    p.settle();
     p
 }
 
+/// The page's ONE service (the worker's too).
+fn lock_svc(p: &Tweaks) -> MutexGuard<'_, Svc> {
+    lock(p.svc.as_ref().unwrap())
+}
+
+/// A click, then its worker job's answer landed (Order 047).
 fn click(p: &mut Tweaks, k: Key) {
     let g = Gfx::new(1.0);
     let mut st = State::default();
     let mut cx = Cx::new(1000.0, false, &g, &mut st);
     p.event(&Ev::Click(k), &mut cx);
+    p.settle();
 }
 
 fn build(p: &mut Tweaks) -> usize {
@@ -40,7 +49,7 @@ fn opens_at_the_drawings_sample_values() {
     assert_eq!(d.browser.app.as_ref().unwrap().name, "Chrome");
     assert_eq!(d.file_types.len(), 8);
     // nothing was changed by opening the page
-    assert!(p.svc.as_ref().unwrap().fake().unwrap().log.is_empty());
+    assert!(lock_svc(&p).fake().unwrap().log.is_empty());
 }
 
 #[test]
@@ -59,7 +68,7 @@ fn a_switch_flips_reads_back_and_toasts() {
     click(&mut p, idx(K_TG, i));
     assert!(p.on(i));
     // the same through the crate: read back
-    assert_eq!(p.svc.as_ref().unwrap().read("clock_seconds").unwrap().value, Value::Switch(true));
+    assert_eq!(lock_svc(&p).read("clock_seconds").unwrap().value, Value::Switch(true));
     let j = row_ix("micacc").unwrap();
     click(&mut p, idx(K_TG, j));
     assert_eq!(p.toast.as_ref().unwrap().0, "No app can use your microphone now · Discord too");
@@ -78,8 +87,9 @@ fn admin_rows_say_so_and_change_nothing() {
 #[test]
 fn hibernate_off_in_windows_greys_fast_startup() {
     let mut p = page();
-    p.svc.as_mut().unwrap().fake_mut().unwrap().hibernate_on = false;
-    p.read_all();
+    lock_svc(&p).fake_mut().unwrap().hibernate_on = false;
+    p.refresh(false);
+    p.settle();
     let f = row_ix("fast").unwrap();
     assert!(!p.on(f));
     let fs = p.st[f].as_ref().unwrap();
@@ -134,7 +144,7 @@ fn games_window_add_switch_remove() {
     let cs = p.games.iter().position(|g| g.exe.ends_with("cs2.exe")).unwrap();
     click(&mut p, idx(K_FTG, cs));
     assert!(!p.games[cs].off, "switched back on stays in the list");
-    assert!(!p.svc.as_ref().unwrap().fso_games().unwrap().iter().any(|g| g.exe.ends_with("cs2.exe")));
+    assert!(!lock_svc(&p).fso_games().unwrap().iter().any(|g| g.exe.ends_with("cs2.exe")));
     click(&mut p, idx(K_FDEL, cs));
     assert_eq!(p.games.len(), 1);
     click(&mut p, sub(K_FDLG, "x"));
@@ -163,13 +173,13 @@ fn search_filters_rows_and_folds_stay() {
 fn default_apps_change_opens_windows_own_window() {
     let mut p = page();
     click(&mut p, idx(K_DPK, 1));
-    assert_eq!(p.svc.as_ref().unwrap().fake().unwrap().log.last().map(String::as_str), Some("open_with:.png"));
+    assert_eq!(lock_svc(&p).fake().unwrap().log.last().map(String::as_str), Some("open_with:.png"));
     p.pressed = (480.0, 300.0, 60.0, 22.0);
     click(&mut p, idx(K_DPK, 0));
     build(&mut p);
     // Edge (sorted: Chrome, Edge, Firefox)
     click(&mut p, idx(K_BMENU, 1));
-    assert!(p.svc.as_ref().unwrap().fake().unwrap().log.last().unwrap().starts_with("open_uri:ms-settings:defaultapps"));
+    assert!(lock_svc(&p).fake().unwrap().log.last().unwrap().starts_with("open_uri:ms-settings:defaultapps"));
 }
 
 #[test]
@@ -197,14 +207,18 @@ fn with_cx(p: &mut Tweaks, f: impl FnOnce(&mut Tweaks, &mut Cx)) {
 
 fn click_tgl(p: &mut Tweaks, k: Key) {
     with_cx(p, |p, cx| p.event(&Ev::Click(k), cx));
+    p.settle();
 }
 
 fn review(p: &Tweaks, kind: RKind) -> Review {
     crate::services::with(|s| Review::for_page(kind, p, &s.store)).unwrap()
 }
 
+/// The review applied; the open page's read after it landed (Order 047).
 fn apply(p: &mut Tweaks, rv: &Review) -> Vec<crate::undo::LineResult> {
-    crate::services::with(|s| rv.apply(&mut s.store, &mut [p as &mut dyn Resettable])).unwrap()
+    let r = crate::services::with(|s| rv.apply(&mut s.store, &mut [&mut *p as &mut dyn Resettable])).unwrap();
+    p.settle();
+    r
 }
 
 #[test]
@@ -231,7 +245,7 @@ fn a_switch_goes_into_the_change_log_with_its_old_value_and_back() {
     rv.toggle(0);
     assert_eq!(apply(&mut p, &rv)[0].outcome, Outcome::Ok);
     assert!(p.on(i), "back to how the PC was");
-    assert_eq!(p.svc.as_ref().unwrap().read("show_file_extensions").unwrap().value, Value::Switch(true));
+    assert_eq!(lock_svc(&p).read("show_file_extensions").unwrap().value, Value::Switch(true));
     assert!(review(&p, RKind::HowItWas).is_empty(), "nothing left to reset");
     crate::services::shutdown();
 }
@@ -242,6 +256,7 @@ fn a_time_goes_back_to_its_seconds() {
     let mut p = page();
     let i = row_ix("scroff").unwrap();
     with_cx(&mut p, |p, cx| p.set_time(i, 0, cx));
+    p.settle();
     let rv = review(&p, RKind::HowItWas);
     assert_eq!((rv.lines[0].item.as_str(), rv.lines[0].label.as_str()), ("scroff", "Screen off after"));
     assert_eq!(rv.lines[0].change_text(), "Never  →  10 min");
@@ -258,6 +273,7 @@ fn sleep_comes_back_with_its_own_time() {
     let after = row_ix("sleepafter").unwrap();
     let sleep = row_ix("sleep").unwrap();
     with_cx(&mut p, |p, cx| p.set_time(after, 3600, cx));
+    p.settle();
     click_tgl(&mut p, idx(K_TG, sleep));
     assert!(!p.on(sleep));
     let r = crate::services::with(|s| read_record(&s.store, "tgl", "sleep")).flatten().unwrap();
@@ -288,8 +304,9 @@ fn sleep_comes_back_with_its_own_time() {
 #[test]
 fn a_time_already_there_is_ok_and_both_power_values_come_back() {
     start();
-    let mut p = page();
-    let s = p.svc.as_mut().unwrap();
+    let p = page();
+    let mut g = lock_svc(&p);
+    let s = &mut *g;
     let sleep_id = ROWS[row_ix("sleep").unwrap()].crate_id;
     s.set(sleep_id, false).unwrap();
     assert_eq!(put(s, "sleepafter", &Val::new("0,900", "Never")), Ok(()), "already never: nothing to do, not a failure");
@@ -313,7 +330,7 @@ fn a_games_flag_goes_into_the_change_log_and_back() {
     assert_eq!((rv.lines[0].item.as_str(), rv.lines[0].label.as_str()), (item.as_str(), "Fullscreen optimizations · Counter-Strike 2"));
     assert_eq!(rv.lines[0].change_text(), "Off  →  On");
     assert_eq!(apply(&mut p, &rv)[0].outcome, Outcome::Ok);
-    assert!(!p.svc.as_ref().unwrap().fso_state(&cs).unwrap(), "the flag is gone again");
+    assert!(!lock_svc(&p).fso_state(&cs).unwrap(), "the flag is gone again");
     assert!(review(&p, RKind::HowItWas).is_empty());
     // switched off, then removed by hand: back where it was, nothing to reset
     click_tgl(&mut p, K_FADD);
@@ -407,4 +424,168 @@ fn ctrl_f_focuses_the_search() {
     p.event(&Ev::Key(crate::ui::cx::PAGE, 0x46), &mut cx);
     assert!(cx.used);
     assert_eq!(cx.st.focus, Some(K_SEARCH));
+}
+
+// ---------------------------------------------------------------- Order 047: the menu's thread never waits
+
+/// The page on a SLOW fake (every worker job sleeps 300 ms first - a stand-in for an Explorer restart, a settings
+/// broadcast, the shell opening Settings): its open must hand the menu's thread back within one frame.
+fn slow_page() -> Tweaks {
+    let mut p = Tweaks::default();
+    p.slow = 300;
+    let env = Env { test: true, ..Env::default() };
+    crate::offui::assert_quick("Tweaks open", || p.open(&env, 0.0));
+    p
+}
+
+/// A click that must not wait for its answer (the Cx is made outside the timed part).
+fn quick_click(p: &mut Tweaks, k: Key, what: &str) {
+    let g = Gfx::new(1.0);
+    let mut st = State::default();
+    let mut cx = Cx::new(1000.0, false, &g, &mut st);
+    crate::offui::assert_quick(what, || p.event(&Ev::Click(k), &mut cx));
+}
+
+/// The open's read (~50 rows, the games, the default apps) runs on the worker; the next open shows the last read at once.
+#[test]
+fn the_tab_opens_without_waiting_for_its_read() {
+    let mut p = slow_page();
+    assert!(p.st.is_empty() && !p.ready(), "the read is still on its way");
+    p.settle();
+    assert!(p.ready() && p.defaults.is_some() && p.games.len() == 1);
+    let keep = p.keep.clone();
+    p.close();
+    let mut q = Tweaks::default();
+    q.slow = 300;
+    let env = Env { test: true, keep, ..Env::default() };
+    crate::offui::assert_quick("Tweaks open again", || q.open(&env, 0.0));
+    assert!(q.ready() && q.st.len() == ROWS.len() && q.defaults.is_some() && q.games.len() == 1, "the last read at once");
+    q.settle();
+    assert_eq!(q.games.len(), 1);
+}
+
+/// The switches that restart Explorer (Classic right-click menu, Recommendations in Start) and one that broadcasts a
+/// settings change: the click returns at once, the switch flips when the worker's answer lands.
+#[test]
+fn a_slow_switch_never_holds_the_menu() {
+    let mut p = slow_page();
+    p.settle();
+    for id in ["ctx", "recs", "secs"] {
+        let i = row_ix(id).unwrap();
+        let was = p.on(i);
+        quick_click(&mut p, idx(K_TG, i), id);
+        assert_eq!(p.on(i), was, "{id}: the switch flips when Windows has answered");
+        p.settle();
+        assert_eq!(p.on(i), !was, "{id}: switched and read back");
+    }
+}
+
+/// A time picked in the list: set on the worker.
+#[test]
+fn a_time_never_holds_the_menu() {
+    let mut p = slow_page();
+    p.settle();
+    let i = row_ix("scroff").unwrap();
+    p.pressed = (400.0, 100.0, 128.0, 24.0);
+    click(&mut p, idx(K_TO, i));
+    build(&mut p);
+    quick_click(&mut p, idx(K_TMENU, time_row(9)), "Screen off after › Never");
+    p.settle();
+    assert_eq!(p.value(i), Some(&Value::Timeout(Timeout::Never)));
+    assert_eq!(p.toast.as_ref().unwrap().0, "The screen stays on");
+}
+
+/// Default apps' "Change" (Windows' "Open with") and the browser list's pick (Settings): opened from the worker.
+#[test]
+fn opening_windows_settings_never_holds_the_menu() {
+    let mut p = slow_page();
+    p.settle();
+    quick_click(&mut p, idx(K_DPK, 1), "Default apps › Change");
+    p.pressed = (480.0, 300.0, 60.0, 22.0);
+    click(&mut p, idx(K_DPK, 0));
+    build(&mut p);
+    quick_click(&mut p, idx(K_BMENU, 1), "the browser list's pick");
+    p.settle();
+    let log = lock_svc(&p).fake().unwrap().log.clone();
+    assert!(log.iter().any(|l| l == "open_with:.png"), "{log:?}");
+    assert!(log.last().is_some_and(|l| l.starts_with("open_uri:ms-settings:defaultapps")), "{log:?}");
+}
+
+/// The games window: its list read and "Add game" on the worker.
+#[test]
+fn the_games_window_never_holds_the_menu() {
+    let mut p = slow_page();
+    p.settle();
+    quick_click(&mut p, K_FSO, "Fullscreen optimizations › games");
+    assert!(matches!(p.pop, Some(Pop::Games(_))));
+    build(&mut p);
+    quick_click(&mut p, K_FADD, "Add game");
+    p.settle();
+    assert_eq!(p.games.len(), 2);
+    assert_eq!(p.toast.as_ref().unwrap().0, "Counter-Strike 2 added · off from its next start");
+}
+
+/// Nothing moving = no frames: `tick` is false and `wake_at` None; a toast at rest only asks to be woken when it has gone.
+#[test]
+fn idle_page_asks_for_no_frames() {
+    let mut p = page();
+    // the quick fixes' restore point line lands once (its own thread)
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    let mut n = 0;
+    while p.tick(5000.0) && n < 10 {
+        n += 1;
+    }
+    assert!(!p.tick(5000.0), "nothing moves: no frames");
+    assert_eq!(p.wake_at(5000.0), None);
+    p.show_toast("hi", 6000.0);
+    assert!(!p.tick(6100.0), "a toast at rest needs no frames");
+    let w = p.wake_at(6100.0).expect("wakes when the toast has gone");
+    assert!(w > 6100.0);
+    assert!(!p.tick(w));
+    assert!(p.toast.is_none() && p.wake_at(w).is_none());
+}
+
+/// Wait (10 s at most) for a worker's answer.
+fn wait_for<T>(mut f: impl FnMut() -> Option<T>) -> T {
+    let t0 = std::time::Instant::now();
+    loop {
+        if let Some(v) = f() {
+            return v;
+        }
+        assert!(t0.elapsed().as_secs() < 10, "the worker never answered");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
+/// Order 047: the reset review reads and puts back through the page's worker copy (`detach`, the page's ONE service):
+/// with a slow copy (300 ms a call) its open and its Reset hand the menu's thread back within one frame, the row still
+/// goes back, and the open page reads it again (`reset_done`).
+#[test]
+fn the_reset_review_never_holds_the_menu() {
+    use crate::undo::{Applied, Opened};
+    start();
+    let mut p = page();
+    let i = row_ix("ext").unwrap();
+    click_tgl(&mut p, idx(K_TG, i));
+    assert!(!p.on(i));
+    p.slow = 300;
+    let review = {
+        let mut pages: [&mut dyn Resettable; 1] = [&mut p];
+        let opened = crate::services::with(|s| crate::offui::assert_quick("the review opens", || Review::open(RKind::HowItWas, false, &mut pages, &s.store))).unwrap();
+        let Opened::Reading(mut job) = opened else { panic!("read on a worker thread") };
+        wait_for(|| job.take())
+    };
+    assert_eq!(review.lines.len(), 1);
+    assert_eq!(review.lines[0].change_text(), "Off  →  On");
+    let res = {
+        let mut pages: [&mut dyn Resettable; 1] = [&mut p];
+        let applied = crate::offui::assert_quick("Reset", || review.start_apply(&mut pages));
+        let Applied::Running(mut job) = applied else { panic!("put back on a worker thread") };
+        wait_for(|| job.take())
+    };
+    assert!(res.iter().all(|r| r.outcome == Outcome::Ok), "{res:?}");
+    p.reset_done();
+    p.settle();
+    assert!(p.on(i), "back to how the PC was");
+    crate::services::shutdown();
 }

@@ -265,3 +265,75 @@ fn a_reset_asks_for_admin_once_for_all_its_admin_lines() {
         }
     }
 }
+
+/// Order 047: a page whose reset reads and puts back slowly (a WMI read, a display mode change, an admin prompt) hands a
+/// Send copy (`detach`): the review is read and the reset applied on a worker thread - the menu's thread is back within one
+/// frame each time - and both still happen (the lines in the pages' order, the values put back, every line's result). A
+/// quick page without a copy beside it is read and put back on the menu's thread as before.
+#[test]
+fn a_detached_page_is_read_and_reset_off_the_menus_thread() {
+    use std::sync::{Arc, Mutex};
+    /// The "PC": shared values; every read and every write takes 300 ms.
+    #[derive(Clone)]
+    struct Slow {
+        values: Arc<Mutex<BTreeMap<String, String>>>,
+    }
+    impl Resettable for Slow {
+        fn page_id(&self) -> &str {
+            "dsp"
+        }
+        fn page_title(&self) -> &str {
+            "Display"
+        }
+        fn current(&self, item: &str) -> Option<Val> {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            self.values.lock().unwrap().get(item).map(|v| Val::plain(v))
+        }
+        fn apply(&mut self, item: &str, to: &Val) -> Result<(), String> {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            self.values.lock().unwrap().insert(item.into(), to.raw.clone());
+            Ok(())
+        }
+        fn detach(&mut self) -> Option<Detached> {
+            Some(Box::new(self.clone()))
+        }
+    }
+    fn wait<T>(mut f: impl FnMut() -> Option<T>) -> T {
+        let t0 = std::time::Instant::now();
+        loop {
+            if let Some(v) = f() {
+                return v;
+            }
+            assert!(t0.elapsed().as_secs() < 10, "the worker never answered");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+    let s = Scratch::new("undo-detach");
+    let mut st = SettingsStore::open(s.dir());
+    let values = Arc::new(Mutex::new(BTreeMap::from([("hz".to_string(), "144".to_string())])));
+    let mut slow = Slow { values: values.clone() };
+    record(&mut st, "dsp", "hz", "Refresh rate", &Val::plain("60"), &Val::plain("144")).unwrap();
+    let mut quick = FakePage::new("mouse", "Mouse").with("speed", "10");
+    quick.change(&mut st, "speed", "Pointer speed", "12");
+    {
+        let mut pages: [&mut dyn Resettable; 2] = [&mut slow, &mut quick];
+        let opened = crate::offui::assert_quick("opening the review", || Review::open(Kind::HowItWas, true, &mut pages, &st));
+        let Opened::Reading(mut job) = opened else { panic!("the slow page is read on a worker thread") };
+        let review = wait(|| job.take());
+        assert!(review.all);
+        let got: Vec<(String, String)> = review.lines.iter().map(|l| (l.page.clone(), l.change_text())).collect();
+        assert_eq!(got, [("dsp".to_string(), "144  →  60".to_string()), ("mouse".to_string(), "12  →  10".to_string())], "in the pages' order");
+        let applied = crate::offui::assert_quick("Reset", || review.start_apply(&mut pages));
+        let Applied::Running(mut job) = applied else { panic!("the slow page is put back on a worker thread") };
+        assert_eq!(job.away, ["dsp"]);
+        let res = wait(|| job.take());
+        assert_eq!(res.len(), 2);
+        assert!(res.iter().all(|r| r.outcome == Outcome::Ok), "{res:?}");
+        assert_eq!(reset_toast(Kind::HowItWas, 2, &res), "Back to how it was \u{b7} 2 settings reset");
+    }
+    assert_eq!(values.lock().unwrap()["hz"], "60", "put back by the worker");
+    assert_eq!(quick.applied, [("speed".to_string(), "10".to_string())], "the quick page on this thread");
+    // the quick page's ok line was noted here (the worker's go to the app's one queue)
+    flush(&mut st);
+    assert_eq!(read_record(&st, "mouse", "speed").unwrap().now.raw, "10");
+}

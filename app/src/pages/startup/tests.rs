@@ -26,6 +26,16 @@ fn build(p: &mut Startup) -> Vec<El> {
     k
 }
 
+/// Order 047: wait (5 s at most) until the list read again on its helper thread has reached the page (`tick` takes it).
+fn settle(p: &mut Startup) {
+    let t0 = std::time::Instant::now();
+    while p.relist.is_some() && t0.elapsed().as_secs() < 5 {
+        p.tick(1000.0);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert!(p.relist.is_none(), "the list read again never arrived");
+}
+
 fn ix(p: &Startup, name: &str) -> usize {
     p.list.as_ref().unwrap().entries.iter().position(|e| e.name == name).unwrap_or_else(|| panic!("no {name}"))
 }
@@ -214,6 +224,7 @@ fn a_switch_goes_into_the_change_log_with_its_old_value_and_back() {
     rv.toggle(0);
     let res = crate::services::with(|s| rv.apply(&mut s.store, &mut [&mut p as &mut dyn Resettable])).unwrap();
     assert_eq!(res[0].outcome, Outcome::Ok);
+    settle(&mut p);
     let i = ix(&p, "Steam");
     assert!(p.list.as_ref().unwrap().entries[i].enabled, "back to how the PC was");
     assert!(review(&p).is_empty(), "nothing left to reset");
@@ -236,6 +247,7 @@ fn a_hidden_task_says_on_off_and_goes_back() {
     assert_eq!(rv.lines[0].change_text(), "Off  →  On");
     let res = crate::services::with(|s| rv.apply(&mut s.store, &mut [&mut p as &mut dyn Resettable])).unwrap();
     assert_eq!(res[0].outcome, Outcome::Ok);
+    settle(&mut p);
     assert!(p.list.as_ref().unwrap().entries[ix(&p, "Adobe Acrobat Update Task")].enabled);
     crate::services::shutdown();
 }
@@ -316,4 +328,88 @@ fn proof_042_startup_real_icons() {
         let root = El::block().w(600.0).h(560.0).pad(2.0, 26.0, 18.0, 26.0).children(kids);
         crate::ui::lay::proof_png(root, 600.0, 560.0, 2.0, &format!("{name}.png"));
     }
+}
+
+// ---------------------------------------------------------------- Order 047: the menu's thread never waits
+
+/// A switch hands the menu's thread back at once (the row shows its new state), and the list read again after it - slow
+/// here (`offui::set_test_delay`), like Task Scheduler / the services on a real PC - still arrives through `tick`.
+#[test]
+fn a_switch_never_waits_for_the_list_read_again() {
+    let mut p = page();
+    let i = ix(&p, "Steam");
+    let g = Gfx::new(1.0);
+    let mut st = State::default();
+    let mut cx = Cx::new(1000.0, false, &g, &mut st);
+    crate::offui::set_test_delay(300);
+    crate::offui::assert_quick("Startup switch", || p.event(&Ev::Click(idx(K_TG, i)), &mut cx));
+    crate::offui::set_test_delay(0);
+    assert!(!p.list.as_ref().unwrap().entries[i].enabled, "the row shows its new state at once");
+    assert!(p.relist.is_some(), "the list is read again on a helper thread");
+    settle(&mut p);
+    let l = p.list.as_ref().unwrap();
+    assert!(!l.entries[ix(&p, "Steam")].enabled, "the list read again says off too");
+    assert_eq!(l.entries.len(), 15);
+}
+
+/// Nothing moving = no frames: `tick` is false, and a shown toast only asks to be woken when it has gone.
+#[test]
+fn idle_page_asks_for_no_frames() {
+    let mut p = page();
+    assert!(!p.tick(0.0));
+    assert_eq!(p.wake_at(0.0), None);
+    p.show_toast("hi", 100.0);
+    assert!(!p.tick(200.0), "a toast at rest needs no frames");
+    let w = p.wake_at(200.0).expect("wakes when the toast has gone");
+    assert!(w > 200.0);
+    assert!(!p.tick(w));
+    assert!(p.toast.is_none() && p.wake_at(w).is_none());
+}
+
+/// Order 047: the reset review (Settings › Reset / the reset line) reads and puts back through the page's worker copy
+/// (`detach`): with a slow copy (300 ms a call) its open and its Reset hand the menu's thread back within one frame, the
+/// row still goes back, and the open page reads it again (`reset_done`).
+#[test]
+fn the_reset_review_never_holds_the_menu() {
+    use crate::undo::{Applied, Opened};
+    start();
+    let mut p = page();
+    let i = ix(&p, "Steam");
+    click_sup(&mut p, idx(K_TG, i));
+    assert!(!p.list.as_ref().unwrap().entries[i].enabled);
+    p.slow = 300;
+    let wait = |t0: std::time::Instant| assert!(t0.elapsed().as_secs() < 10, "the worker never answered");
+    let review = {
+        let mut pages: [&mut dyn Resettable; 1] = [&mut p];
+        let opened = crate::services::with(|s| crate::offui::assert_quick("the review opens", || crate::undo::Review::open(RKind::HowItWas, false, &mut pages, &s.store))).unwrap();
+        let Opened::Reading(mut job) = opened else { panic!("read on a worker thread") };
+        let t0 = std::time::Instant::now();
+        loop {
+            if let Some(r) = job.take() {
+                break r;
+            }
+            wait(t0);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    };
+    assert_eq!(review.lines.len(), 1);
+    assert_eq!(review.lines[0].change_text(), "Off  →  Starts with Windows");
+    let res = {
+        let mut pages: [&mut dyn Resettable; 1] = [&mut p];
+        let applied = crate::offui::assert_quick("Reset", || review.start_apply(&mut pages));
+        let Applied::Running(mut job) = applied else { panic!("put back on a worker thread") };
+        let t0 = std::time::Instant::now();
+        loop {
+            if let Some(r) = job.take() {
+                break r;
+            }
+            wait(t0);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    };
+    assert!(res.iter().all(|r| r.outcome == Outcome::Ok), "{res:?}");
+    p.reset_done();
+    settle(&mut p);
+    assert!(p.list.as_ref().unwrap().entries[ix(&p, "Steam")].enabled, "back to how the PC was");
+    crate::services::shutdown();
 }

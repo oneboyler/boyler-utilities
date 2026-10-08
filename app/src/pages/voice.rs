@@ -20,6 +20,8 @@ use crate::ui::pieces::mitems::{self, It, Place, Row};
 use crate::ui::pieces::{self, group, keyfield, link};
 use crate::ui::{cmix, ACC, CTL, CTL_H, FG, FG2, FG3, GREEN, HAIR, PAGE_H, RED, WHITE};
 
+use std::sync::{Arc, Mutex};
+
 use bu_voice::{Dictation, Language, State, VoiceError};
 
 const K_KEY: Key = key("vtt.key");
@@ -107,9 +109,45 @@ pub struct Voice {
     ph_since: f64,
     ph_was: bool,
     pub reqs: Vec<TempReq>,
+    /// Order 047: Windows' languages + what stops every dictation, being read on a worker thread (`open`); `tick` takes
+    /// the answer. None = nothing being read.
+    reading: Option<Arc<Mutex<Option<WinRead>>>>,
+    /// the settings store's language (read on the first build): picked again once the languages are in
+    saved_lang: Option<String>,
+    /// test-only: the read in `open` takes this long more and goes through the worker like a real copy's (0 = the fake's
+    /// quick read right in `open`)
+    #[cfg(test)]
+    slow_read_ms: u64,
+}
+
+/// Order 047: what `open` reads of Windows - the dictation languages (WinRT: `SpeechRecognizer::SupportedTopicLanguages`)
+/// and what stops every dictation (the privacy switches in the registry, the default microphone through Core Audio):
+/// 50-300 ms, so on a worker thread; the last answer is kept in the app's store and shown at once on the next open.
+#[derive(Clone, Debug)]
+struct WinRead {
+    langs: Vec<Language>,
+    blocked: Option<VoiceError>,
+}
+
+/// The key of the last read in the app's store (`env.keep`).
+const KEEP_READ: &str = "vtt.read";
+
+fn read_windows(e: &dyn bu_voice::Engine) -> WinRead {
+    WinRead { langs: e.languages().unwrap_or_default(), blocked: e.check().err().filter(|e| e.blocks()) }
 }
 
 impl Voice {
+    /// Windows' languages and blocker are in: the saved language when Windows has it, else the first one.
+    fn take_read(&mut self, r: WinRead) {
+        self.langs = r.langs;
+        self.blocked = r.blocked;
+        if let Some(k) = self.saved_lang.as_ref().filter(|k| self.langs.iter().any(|l| &l.tag == *k)) {
+            self.lang = k.clone();
+        } else if !self.langs.iter().any(|l| l.tag == self.lang) {
+            self.lang = self.langs.first().map(|l| l.tag.clone()).unwrap_or_default();
+        }
+    }
+
     fn lang(&self) -> Option<&Language> {
         self.langs.iter().find(|l| l.tag == self.lang).or(self.langs.first())
     }
@@ -121,6 +159,11 @@ impl Voice {
 
     fn mic(&mut self, now: f64) {
         let Some(lang) = self.lang().cloned() else {
+            // Order 047: Windows' languages are still being read (the first open): it starts once they are in
+            if self.reading.is_some() {
+                self.start_on_build = true;
+                return;
+            }
             self.say("Add a speech language in Windows Settings", now);
             return;
         };
@@ -176,11 +219,38 @@ impl Page for Voice {
         } else {
             Dictation::new(Box::new(bu_voice::real::WinSpeech::new()), Box::new(bu_voice::real::WinClipboard))
         };
-        // quick reads, no audio: Windows' dictation languages, and whether a Windows switch / no microphone stops it
-        self.langs = dict.languages().unwrap_or_default();
-        self.blocked = dict.check().err().filter(|e| e.blocks());
-        if !self.langs.iter().any(|l| l.tag == self.lang) {
-            self.lang = self.langs.first().map(|l| l.tag.clone()).unwrap_or_default();
+        // no audio: Windows' dictation languages, and whether a Windows switch / no microphone stops it. Order 047: a real
+        // copy reads them on a worker thread (WinRT + registry + Core Audio, 50-300 ms per tab switch on the menu's thread
+        // before) and shows the last answer at once; the fake answers right here
+        #[cfg(test)]
+        let slow = self.slow_read_ms;
+        #[cfg(not(test))]
+        let slow = 0u64;
+        if env.fake() && slow == 0 {
+            let r = WinRead { langs: dict.languages().unwrap_or_default(), blocked: dict.check().err().filter(|e| e.blocks()) };
+            self.take_read(r);
+        } else {
+            if let Some(r) = env.keep.get::<WinRead>(KEEP_READ) {
+                self.take_read(r);
+            }
+            let slot: Arc<Mutex<Option<WinRead>>> = Arc::new(Mutex::new(None));
+            let s2 = slot.clone();
+            let eng: Box<dyn bu_voice::Engine> = if env.fake() { Box::new(bu_voice::fake::FakeEngine::drawing()) } else { Box::new(bu_voice::real::WinSpeech::new()) };
+            let waker = env.waker();
+            // a plain thread, not `offui::spawn`: the engine's reads set up COM in the multithreaded apartment themselves
+            let started = std::thread::Builder::new().name("bu-vtt-read".into()).spawn(move || {
+                if slow > 0 {
+                    std::thread::sleep(std::time::Duration::from_millis(slow));
+                }
+                let r = read_windows(&*eng);
+                if let Ok(mut g) = s2.lock() {
+                    *g = Some(r);
+                }
+                waker.wake();
+            });
+            if started.is_ok() {
+                self.reading = Some(slot);
+            }
         }
         self.dict = Some(dict);
         self.ph_since = now;
@@ -193,9 +263,22 @@ impl Page for Voice {
         *self = Voice { env, ..Voice::default() };
     }
 
+    /// Order 047: no last read to show yet - the frame holds the switch (0.4 s at most) for the worker's answer.
+    fn ready(&self) -> bool {
+        self.reading.is_none() || !self.langs.is_empty() || self.blocked.is_some()
+    }
+
     fn tick(&mut self, now: f64) -> bool {
-        let Some(d) = self.dict.as_mut() else { return false };
-        let mut changed = d.poll();
+        // Order 047: the worker's read of Windows' languages is in (it woke the menu)
+        let mut read_in = false;
+        if let Some(r) = self.reading.as_ref().and_then(|s| s.lock().ok().and_then(|mut g| g.take())) {
+            self.reading = None;
+            self.env.keep.put(KEEP_READ, r.clone());
+            self.take_read(r);
+            read_in = true;
+        }
+        let Some(d) = self.dict.as_mut() else { return read_in };
+        let mut changed = d.poll() || read_in;
         if let Some(e) = d.take_error() {
             let t = match e {
                 e if e.blocks() => {
@@ -229,20 +312,28 @@ impl Page for Voice {
             None => (String::new(), String::new(), 0),
         };
         let has_text = words > 0;
-        if matches!(st, State::Listening | State::Finishing) || self.lv > 0.0 || self.caret.is_some() {
+        if matches!(st, State::Listening | State::Finishing) || self.lv > 0.0 {
             cx.st.busy = true;
         }
+        // Order 047: the fixing caret only blinks (530 ms on / off): built again at each flip, no frames between
+        if self.caret.is_some() {
+            cx.wake_every(530.0, self.caret_at);
+        }
 
-        // the chosen language from the settings store (kept over a restart), once per open
+        // the chosen language from the settings store (kept over a restart), once per open (Order 047: kept, so it is
+        // picked again when Windows' languages arrive from the worker)
         if !self.lang_loaded {
             self.lang_loaded = true;
             let kept = cx.get_str("lang", "");
             if self.langs.iter().any(|l| l.tag == kept) {
-                self.lang = kept;
+                self.lang = kept.clone();
             }
+            self.saved_lang = Some(kept);
         }
-        // the key: the dictation starts (the menu opened here) or, while it listens, stops - like the mic button
-        if std::mem::take(&mut self.start_on_build) {
+        // the key: the dictation starts (the menu opened here) or, while it listens, stops - like the mic button (Order
+        // 047: once Windows' languages are in - the worker's answer builds the page again)
+        if self.start_on_build && (self.reading.is_none() || !self.langs.is_empty()) {
+            self.start_on_build = false;
             self.mic(now);
         }
         // what was said goes to the frame's toast (above the page, never blocking it)
@@ -342,8 +433,9 @@ impl Page for Voice {
         // ---- `.vctl{flex:none;display:flex;flex-direction:column;align-items:center;justify-content:flex-end;padding:14px 0 6px}`
         // `.vrow{display:flex;align-items:center;gap:30px}`: Clear (red trash) · mic · Copy
         let copied = self.copied_at.map(|t| now - t < 1400.0).unwrap_or(false);
-        if copied {
-            cx.st.busy = true;
+        // Order 047: the check mark goes back to the copy icon at a known moment (its fade is the buttons' transitions)
+        if let Some(t) = self.copied_at.filter(|_| copied) {
+            cx.wake_at(t + 1400.0);
         }
         let clr = vbt(cx, K_CLR, "trash", Tone::Red, !has_text).tip("Clear");
         let cpy = vbt(cx, K_CPY, if copied { "check2" } else { "copy" }, if copied { Tone::Done } else if st == State::Done && has_text { Tone::Acc } else { Tone::Plain }, !has_text).tip("Copy");
@@ -414,6 +506,7 @@ impl Page for Voice {
                     self.lang = self.langs[i].tag.clone();
                     // kept at once in the settings store (over a restart too)
                     cx.set_str("lang", &self.lang);
+                    self.saved_lang = Some(self.lang.clone());
                 } else {
                     self.say("Windows Settings \u{203a} Speech opens \u{b7} add a language there", now);
                     self.reqs.push(TempReq::SpeechSettings);
@@ -1008,5 +1101,48 @@ mod tests {
         let vbox = laid.nodes.iter().find(|n| n.rect.3 == 316.0).expect("the 316 px words box");
         assert_eq!((vbox.rect.0, vbox.rect.1, vbox.rect.2), (26.0, 42.0, 548.0));
         assert_eq!(laid.nodes[0].rect.3, 464.0);
+    }
+
+    /// Order 047: the tab's read of Windows (languages, privacy switches, the microphone: 50-300 ms on a real PC) never holds
+    /// the menu's thread - `open` returns at once, the answer comes in through `tick`; the next open shows the last answer
+    /// at once (the app's store) while it is read again.
+    #[test]
+    fn open_reads_windows_languages_off_the_menus_thread() {
+        let env = Env { test: true, ..Env::default() };
+        let mut v = Voice::default();
+        v.slow_read_ms = 300;
+        crate::offui::assert_quick("Voice open with a 300 ms read of Windows' languages", || v.open(&env, 0.0));
+        assert!(v.langs.is_empty() && !v.ready(), "nothing known yet: the frame holds the switch for it");
+        let t0 = std::time::Instant::now();
+        let mut ticked = false;
+        while v.langs.is_empty() && t0.elapsed().as_secs() < 5 {
+            ticked = v.tick(1.0);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(ticked, "the answer paints the page once");
+        assert!(v.ready() && v.describe().contains("lang=en-US langs=en-US"), "{}", v.describe());
+        assert!(!v.tick(2.0), "then nothing moves");
+        let mut v2 = Voice::default();
+        v2.slow_read_ms = 300;
+        crate::offui::assert_quick("Voice open again", || v2.open(&env, 3.0));
+        assert!(v2.ready() && v2.describe().contains("lang=en-US langs=en-US"), "the last read at once: {}", v2.describe());
+    }
+
+    /// Order 047: at rest the page asks for no frames; a stopped dictation's fixing caret wakes the menu only at its
+    /// blink flips (530 ms) instead of a rebuild every frame.
+    #[test]
+    fn at_rest_nothing_asks_for_frames_and_the_caret_only_wakes_at_its_flips() {
+        let (mut v, g) = page();
+        assert!(!v.tick(1.0), "idle: no frames");
+        assert_eq!(v.wake_at(1.0), None);
+        v.dict.as_mut().unwrap().set_text("one two");
+        ev(&mut v, &g, Ev::Press(K_TXT, 1000.0, 20.0, (0.0, 0.0, 544.0, 316.0)), 100.0);
+        assert!(!v.tick(200.0), "a stopped dictation with the caret: nothing moves by itself");
+        let mut st = CssState::default();
+        let mut cx = Cx::new(200.0, false, &g, &mut st);
+        let _ = v.build(&mut cx);
+        drop(cx);
+        assert!(!st.busy, "no rebuild every frame for the caret");
+        assert_eq!(st.wake, Some(630.0), "built again at the caret's next flip");
     }
 }

@@ -190,6 +190,65 @@ fn on_screen_switch_pills_and_never_a_window_in_tests() {
     assert!(t.page.describe().contains("window=false timer=false"));
 }
 
+/// Order 049: the on-screen window sleeps until a pill looks different - a time's next whole second, a countdown line's next
+/// quarter pixel - and not at all when nothing on screen runs.
+#[test]
+fn pills_wake_only_when_they_change() {
+    let mut t = T::new(true);
+    t.m(|m| {
+        m.type_time(3, "4s");
+        m.toggle(3);
+    });
+    // the line: 4 s over 176 px x 4 quarter steps; the text: the left time's next whole second (4.000 s left: in 1 s)
+    assert_eq!(t.m(|m| m.next_change(false, 176.0)), Some(Duration::from_secs(4).div_f64(704.0)));
+    assert_eq!(t.m(|m| m.next_change(false, 0.0)), Some(Duration::from_secs(1)));
+    t.advance(300);
+    assert_eq!(t.m(|m| m.next_change(false, 0.0)), Some(Duration::from_millis(700)));
+    // paused: nothing moves by itself
+    t.m(|m| m.toggle(3));
+    assert_eq!(t.m(|m| m.next_change(false, 176.0)), None);
+    // running again until zero (before the end alarm finished it): nothing moves either, no frames at the line rate
+    t.m(|m| m.toggle(3));
+    t.advance(3_700);
+    assert_eq!(t.m(|m| m.next_change(false, 176.0)), None);
+    // a place on screen: its next minute
+    t.click(sub(idx(K_PLACE, 0), "sb"));
+    let d = t.m(|m| m.next_change(false, 176.0)).unwrap();
+    assert!(d > Duration::ZERO && d <= Duration::from_secs(60), "{d:?}");
+    // never an ask or a window in a test
+    overlay::sync();
+    assert!(!overlay::window_exists() && !overlay::timer_armed());
+}
+
+/// Order 049: a 5-minute countdown on screen for a minute, driven the way the window is (wake at `next_change`, paint only
+/// a different picture): how many wake-ups and paints - before it was 600 full repaints a minute (every 100 ms).
+#[test]
+fn a_running_countdown_repaints_only_when_it_changes() {
+    let mut t = T::new(true);
+    t.m(|m| {
+        m.type_time(3, "5m");
+        m.toggle(3);
+    });
+    for scale in [1.0f32, 1.5] {
+        let (mut wakes, mut paints, mut ms) = (0u32, 0u32, 0u64);
+        let mut last = t.m(|m| m.pills(false));
+        while ms < 60_000 {
+            let d = t.m(|m| m.next_change(false, overlay::line_px(scale))).expect("it runs");
+            let step = (d.as_secs_f64() * 1000.0).ceil().max(1.0) as u64;
+            t.advance(step);
+            ms += step;
+            wakes += 1;
+            let now = t.m(|m| m.pills(false));
+            if !overlay::same_picture(&last, &now, scale) {
+                paints += 1;
+            }
+            last = now;
+        }
+        println!("5:00 countdown on screen, scale {scale}: {wakes} wake-ups, {paints} paints in 60 s (before: 600 + 600)");
+        assert!(paints <= wakes && wakes < 400 && paints >= 60, "{wakes} {paints}");
+    }
+}
+
 #[test]
 fn new_timer_names_remove_and_pick() {
     let mut t = T::new(true);
@@ -400,4 +459,83 @@ fn a_timer_key_is_the_keys_managers_and_works_anywhere() {
     drop_action(id0);
     assert!(!crate::services::with(|s| s.has_action(&key_action(id0))).unwrap());
     crate::services::shutdown();
+}
+
+/// Order 049 proof (run by hand: `cargo test -p bu-app --release pill_paint_cost -- --ignored --nocapture`): one pill
+/// paint, the old way (a new Skia surface, copied out, a new DC + DIB, copied in, deleted) vs the kept DIB Skia draws into.
+/// Off-screen: no window, nothing shown (the hand-over to the window is the same call both ways and is left out).
+#[test]
+#[ignore]
+fn pill_paint_cost() {
+    use windows::Win32::Graphics::Gdi::*;
+    let t = T::new(true);
+    t.m(|m| {
+        m.type_time(3, "5m");
+        m.toggle(3);
+    });
+    let pills = t.m(|m| m.pills(false));
+    let (g, icons, s) = (Gfx::new(1.5), crate::icons::Icons::new(), 1.5f32);
+    let size = (overlay::PILL_W, overlay::PILL_H);
+    let (bw, bh) = (((size.0 + 96.0) * s).ceil() as i32, ((size.1 + 96.0) * s).ceil() as i32);
+    let n = 500;
+    let t0 = crate::timing::now();
+    for _ in 0..n {
+        let mut surf = crate::gfx::new_surface(bw, bh).unwrap();
+        g.begin(surf.canvas());
+        overlay::paint_stack(&g, &icons, &pills, false, false, 48.0, 48.0, None);
+        g.end();
+        let px = crate::png::from_surface(&mut surf);
+        unsafe {
+            let screen = GetDC(None);
+            let mem = CreateCompatibleDC(Some(screen));
+            let bi = BITMAPINFO { bmiHeader: BITMAPINFOHEADER { biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32, biWidth: bw, biHeight: -bh, biPlanes: 1, biBitCount: 32, ..Default::default() }, ..Default::default() };
+            let mut bits = std::ptr::null_mut();
+            let bmp = CreateDIBSection(Some(mem), &bi, DIB_RGB_COLORS, &mut bits, None, 0).unwrap();
+            std::ptr::copy_nonoverlapping(px.data.as_ptr(), bits as *mut u8, px.data.len());
+            let old = SelectObject(mem, bmp.into());
+            SelectObject(mem, old);
+            let _ = DeleteObject(bmp.into());
+            let _ = DeleteDC(mem);
+            ReleaseDC(None, screen);
+        }
+    }
+    let before = (crate::timing::now() - t0) / n as f64;
+    let mut dib = crate::dib::Dib::new();
+    let t0 = crate::timing::now();
+    for _ in 0..n {
+        let mut surf = dib.surface(bw, bh).unwrap();
+        g.begin(surf.canvas());
+        overlay::paint_stack(&g, &icons, &pills, false, false, 48.0, 48.0, None);
+        g.end();
+    }
+    let after = (crate::timing::now() - t0) / n as f64;
+    println!("one pill paint at 150 %: before {before:.3} ms, after {after:.3} ms ({bw}x{bh} px)");
+}
+
+/// Order 049: the kept DIB gives the window exactly the pixels the old fresh surface did (no window, nothing shown).
+#[test]
+fn kept_pixels_are_the_same_picture() {
+    let t = T::new(true);
+    t.m(|m| {
+        m.type_time(3, "5m");
+        m.toggle(3);
+    });
+    let pills = t.m(|m| m.pills(true));
+    let (g, icons) = (Gfx::new(1.25), crate::icons::Icons::new());
+    let (bw, bh) = (380, 260);
+    let mut fresh = crate::gfx::new_surface(bw, bh).unwrap();
+    g.begin(fresh.canvas());
+    overlay::paint_stack(&g, &icons, &pills, true, false, 48.0, 48.0, None);
+    g.end();
+    let want = crate::png::from_surface(&mut fresh);
+    let mut dib = crate::dib::Dib::new();
+    // twice: the second paint reuses (and first clears) the same pixels
+    for _ in 0..2 {
+        let mut s = dib.surface(bw, bh).unwrap();
+        g.begin(s.canvas());
+        overlay::paint_stack(&g, &icons, &pills, true, false, 48.0, 48.0, None);
+        g.end();
+        let got = crate::png::from_surface(&mut s);
+        assert!(got.data == want.data, "byte for byte");
+    }
 }

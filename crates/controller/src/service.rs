@@ -17,8 +17,15 @@ use crate::os::SteamOs;
 use crate::parts::{PadKind, Part};
 use crate::prefs::{PrefSetting, Prefs};
 use crate::settings::{Change, PadView};
-use crate::steam::{configset_entry, configset_put_entry, configset_to_autosave, Game, LayoutSource, SteamPaths, DESKTOP_APPID};
+use crate::steam::{configset_entry, configset_put_entry, configset_to_autosave, Game, LayoutSource, Names, SteamPaths, DESKTOP_APPID};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
+
+/// Order 047: how long the game names (every appmanifest of every library, the shortcuts, localconfig.vdf - MBs on a big
+/// library) are kept before they are read again. One read serves every question of a page view and of a write (the game
+/// list was read 4-5 times per click); the configset - which layout each game uses - is still read fresh every time.
+pub const NAMES_KEEP: Duration = Duration::from_secs(30);
 
 /// One undoable step: every file it changed with its bytes before (None = the file did not exist) and after.
 #[derive(Debug, Clone)]
@@ -43,17 +50,19 @@ pub struct ControllerService<O: SteamOs> {
     steam: SteamPaths,
     backups: PathBuf,
     undo: Vec<Step>,
+    /// the game names read last and when (Order 047, `NAMES_KEEP`)
+    names: Mutex<Option<(Instant, Names)>>,
 }
 
 impl<O: SteamOs> ControllerService<O> {
     /// Find Steam + the account. `backups` = the app's own folder for original copies (never inside Steam).
     pub fn new(os: O, backups: impl Into<PathBuf>) -> Result<Self> {
         let steam = SteamPaths::find(&os)?;
-        Ok(ControllerService { os, steam, backups: backups.into(), undo: Vec::new() })
+        Ok(ControllerService { os, steam, backups: backups.into(), undo: Vec::new(), names: Mutex::new(None) })
     }
 
     pub fn with_paths(os: O, steam: SteamPaths, backups: impl Into<PathBuf>) -> Self {
-        ControllerService { os, steam, backups: backups.into(), undo: Vec::new() }
+        ControllerService { os, steam, backups: backups.into(), undo: Vec::new(), names: Mutex::new(None) }
     }
 
     pub fn os(&self) -> &O {
@@ -68,7 +77,27 @@ impl<O: SteamOs> ControllerService<O> {
 
     /// The games with a layout for this controller type (the game popup).
     pub fn games(&self, kind: PadKind) -> Result<Vec<Game>> {
-        self.steam.games(&self.os, kind)
+        let names = self.names();
+        self.steam.games_named(&self.os, kind, &names)
+    }
+
+    /// The game names (Order 047): read once, then kept for `NAMES_KEEP` (or until `forget_names`) - every `game` /
+    /// `open` / `has_original` of one view or one write asks for the game list again.
+    fn names(&self) -> Names {
+        let mut m = self.names.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some((at, n)) = &*m {
+            if at.elapsed() < NAMES_KEEP {
+                return n.clone();
+            }
+        }
+        let n = self.steam.names(&self.os);
+        *m = Some((Instant::now(), n.clone()));
+        n
+    }
+
+    /// Read the game names again at the next question (the page's tab opened, Steam started).
+    pub fn forget_names(&self) {
+        *self.names.lock().unwrap_or_else(|p| p.into_inner()) = None;
     }
 
     /// One game by its key (app id or shortcut name). The Desktop is refused (Steam keeps it in memory).
@@ -98,6 +127,12 @@ impl<O: SteamOs> ControllerService<O> {
     /// Read the layout Steam uses now for this game.
     pub fn open(&self, key: &str, kind: PadKind) -> Result<Opened> {
         let game = self.game(key, kind)?;
+        self.open_game(game, kind)
+    }
+
+    /// Read the layout Steam uses now for a game of `games` (Order 047: the page reads its whole view - action sets, the
+    /// view, Steam's own layout - from this one read).
+    pub fn open_game(&self, game: Game, kind: PadKind) -> Result<Opened> {
         let path = self.steam.active_file(&self.os, &game, kind).ok_or_else(|| Error::NoLayoutFile(game.name.clone()))?;
         if !self.os.exists(&path) {
             return Err(Error::LayoutMissing(path));
@@ -125,8 +160,17 @@ impl<O: SteamOs> ControllerService<O> {
     /// `exact` = Steam's text is going to be WRITTEN into the user's file: refuse (`NotUtf8`) instead of decoding lossily.
     fn steam_layout_read(&self, key: &str, kind: PadKind, exact: bool) -> Result<Layout> {
         let o = self.open(key, kind)?;
+        self.steam_layout_in(&o, exact)
+    }
+
+    /// Steam's own layout of a game opened before (Order 047: no second read of the game list).
+    pub fn steam_layout_of(&self, o: &Opened) -> Result<Layout> {
+        self.steam_layout_in(o, false)
+    }
+
+    fn steam_layout_in(&self, o: &Opened, exact: bool) -> Result<Layout> {
         if o.game.source != LayoutSource::Autosave {
-            return Ok(o.layout);
+            return Ok(o.layout.clone());
         }
         let prog = o.layout.header().progenitor;
         let path = self.steam.progenitor_file(&self.os, &prog).ok_or(Error::NoSteamDefault)?;

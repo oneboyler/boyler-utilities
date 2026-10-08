@@ -247,10 +247,15 @@ impl Addons {
         match (a.id, v.busy, v.got) {
             ("acc", Some(Phase::Download { .. }), _) => addons::cancel_acc(cx),
             (_, Some(_), _) => {}
+            // Order 047: its take-over still runs (off the menu's thread): a second Get waits for it
+            ("obs", None, false) if addons::taking_over() => {}
             ("obs", None, false) => {
                 // (the original NotificationsForOBS taken over: that line instead)
-                let t = addons::set("obs", true).unwrap_or_else(|| format!("{} is in the top row", a.name));
-                cx.toast(&t);
+                let t = addons::set("obs", true);
+                // Order 047: a take-over runs off the menu's thread - its line comes as the page's notice when it ends
+                if !addons::taking_over() {
+                    cx.toast(&t.unwrap_or_else(|| format!("{} is in the top row", a.name)));
+                }
             }
             ("obs", None, true) => {
                 addons::set("obs", false);
@@ -322,6 +327,12 @@ impl Page for Addons {
 
     fn close(&mut self) {
         self.dlg = None;
+    }
+
+    /// Order 047: a Get's take-over ended (its worker woke the menu): the feature starts, the page shows it. Nothing
+    /// else moves here by itself (a job's progress wakes the menu itself).
+    fn tick(&mut self, _now: f64) -> bool {
+        addons::poll_take_over()
     }
 
     fn build(&mut self, cx: &mut Cx) -> Vec<El> {

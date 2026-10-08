@@ -11,7 +11,7 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use taffy::style::AlignItems;
@@ -136,14 +136,181 @@ pub(super) fn on_key(action: &str, down: bool, fake: bool) {
         return;
     }
     let m = service(fake, false, false);
-    let r = match action {
+    if fake {
+        // a test copy's fake mic answers at once: in place, as before
+        if let Ok(st) = press(&m, action) {
+            CHANGED.store(true, Ordering::Relaxed);
+            sync_icon(st.muted, false, false, true);
+        }
+        return;
+    }
+    let a = match action {
+        A_MUTE => A_MUTE,
+        A_UNMUTE => A_UNMUTE,
+        _ => A_ONE,
+    };
+    send_press(m, a, true);
+}
+
+/// Order 047: the Audio page's mic button / Mute settings' pill: muted <-> live. The fake (a test copy) in place: its new
+/// state. A real mic (Core Audio: a fresh device enumerator a call, 10-50 ms) on the key's worker, like the key - the
+/// state to show at once is the flip of the one shown (`shown`); the worker's answer follows (`CHANGED`, and with `icon`
+/// the on-screen icon / the tray badge).
+pub fn toggle_now(m: &MicMute, shown: bool, fake: bool, icon: bool) -> Option<bool> {
+    if fake {
+        return m.toggle().ok().map(|s| s.muted);
+    }
+    send_press(m.clone(), A_ONE, icon);
+    Some(!shown)
+}
+
+/// The key's own work: mute / unmute / toggle the chosen mic (with its sound).
+fn press(m: &MicMute, action: &str) -> bu_micmute::Result<bu_micmute::MicState> {
+    match action {
         A_MUTE => m.mute(),
         A_UNMUTE => m.unmute(),
         _ => m.toggle(),
-    };
-    if let Ok(st) = r {
-        CHANGED.store(true, Ordering::Relaxed);
-        sync_icon(st.muted, false, false, true);
+    }
+}
+
+/// Order 047: the mute key's Core Audio work (find the mic, read its flag, set it, list the devices: 10-50 ms) held the
+/// menu's thread - every key press froze the menu's painting for it. It now runs on one worker thread of its own, fed in
+/// order (two quick presses toggle twice, never at the same time); the mute itself happens there at once, with its sound.
+/// The menu's thread only hands the press over, and takes the answer for the on-screen icon / the tray badge (they live
+/// on the menu's thread) with a 10 ms Windows timer that stops once no press is on its way.
+static KEYQ: std::sync::OnceLock<std::sync::Mutex<std::sync::mpsc::Sender<KeyJob>>> = std::sync::OnceLock::new();
+/// presses handed over and not yet done
+static KEY_PENDING: AtomicUsize = AtomicUsize::new(0);
+/// the last press's answer (muted?) for the icon, taken on the menu's thread
+static KEY_DONE: std::sync::Mutex<Option<bool>> = std::sync::Mutex::new(None);
+/// the mic's last known state (any read or press): what an opening page shows until its own read is in
+static LAST_MUTED: AtomicBool = AtomicBool::new(false);
+
+/// One job of the key worker - presses, state reads and the watch's start / stop, done one after another in the order
+/// given (so an older read can never land after a newer one, a watch never starts after its stop).
+enum KeyJob {
+    Press(MicMute, &'static str),
+    Read(MicMute, Arc<std::sync::Mutex<Option<bool>>>),
+    Watch(MicMute, bool),
+}
+
+thread_local! {
+    /// the menu thread's timer that takes the key's answer (0 = none armed)
+    static KEY_TIMER: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The mic's last known state (Order 047: an opening Audio page shows it at once; its own read follows).
+pub fn last_muted() -> bool {
+    LAST_MUTED.load(Ordering::Relaxed)
+}
+
+fn run_job(j: KeyJob) {
+    match j {
+        KeyJob::Press(m, a) => {
+            if let Ok(st) = press(&m, a) {
+                LAST_MUTED.store(st.muted, Ordering::Relaxed);
+                CHANGED.store(true, Ordering::Relaxed);
+                if let Ok(mut d) = KEY_DONE.lock() {
+                    *d = Some(st.muted);
+                }
+            }
+            KEY_PENDING.fetch_sub(1, Ordering::AcqRel);
+        }
+        KeyJob::Read(m, slot) => {
+            let v = mic_muted(&m);
+            if let Ok(mut s) = slot.lock() {
+                *s = Some(v);
+            }
+        }
+        KeyJob::Watch(m, true) => watch(&m),
+        KeyJob::Watch(m, false) => unwatch(&m),
+    }
+    // an open Audio page shows the new state (it reads `CHANGED` / its read slot)
+    crate::services::Waker.wake();
+}
+
+/// Hand one job to the key worker (made on the first job); Err = no worker (its thread could not start): the job back.
+fn key_job(j: KeyJob) -> Result<(), KeyJob> {
+    let q = KEYQ.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::channel::<KeyJob>();
+        let _ = std::thread::Builder::new().name("bu-mic-key".into()).spawn(move || {
+            // (the real layer sets COM up itself on every call)
+            for j in rx {
+                run_job(j);
+            }
+        });
+        std::sync::Mutex::new(tx)
+    });
+    match q.lock() {
+        Ok(tx) => tx.send(j).map_err(|e| e.0),
+        Err(_) => Err(j),
+    }
+}
+
+/// Order 047: read the mic's state into `slot` on the key worker (Core Audio, 10-50 ms), in order with the presses.
+pub fn read_state(m: &MicMute, slot: Arc<std::sync::Mutex<Option<bool>>>) {
+    if let Err(j) = key_job(KeyJob::Read(m.clone(), slot)) {
+        run_job(j);
+    }
+}
+
+/// Order 047: start / stop the change watch on the key worker (it registers with Core Audio; stopping waits for its
+/// thread), in order with everything else there.
+pub fn watch_off(m: &MicMute, on: bool) {
+    if let Err(j) = key_job(KeyJob::Watch(m.clone(), on)) {
+        run_job(j);
+    }
+}
+
+/// Hand one press to the key worker; `arm` = the icon follows (off in unit tests: no timer, no icon window).
+fn send_press(m: MicMute, action: &'static str, arm: bool) {
+    KEY_PENDING.fetch_add(1, Ordering::AcqRel);
+    if let Err(KeyJob::Press(m, action)) = key_job(KeyJob::Press(m, action)) {
+        // no worker: in place, as before
+        KEY_PENDING.fetch_sub(1, Ordering::AcqRel);
+        if let Ok(st) = press(&m, action) {
+            LAST_MUTED.store(st.muted, Ordering::Relaxed);
+            CHANGED.store(true, Ordering::Relaxed);
+            if arm {
+                sync_icon(st.muted, false, false, true);
+            }
+        }
+        return;
+    }
+    if arm {
+        arm_key_timer();
+    }
+}
+
+/// Menu thread: the key worker's answer -> the icon and the tray badge. True = a press is still on its way.
+fn key_answer() -> bool {
+    // (read before taking the answer: the worker stores its answer before it counts the press done)
+    let waiting = KEY_PENDING.load(Ordering::Acquire) > 0;
+    if let Some(muted) = KEY_DONE.lock().ok().and_then(|mut d| d.take()) {
+        sync_icon(muted, false, false, true);
+    }
+    waiting
+}
+
+fn arm_key_timer() {
+    #[cfg(windows)]
+    {
+        use windows::Win32::UI::WindowsAndMessaging::{KillTimer, SetTimer};
+        unsafe extern "system" fn tick(_h: windows::Win32::Foundation::HWND, _m: u32, _id: usize, _t: u32) {
+            if !key_answer() {
+                let id = KEY_TIMER.with(|t| t.replace(0));
+                if id != 0 {
+                    unsafe {
+                        let _ = KillTimer(None, id);
+                    }
+                }
+            }
+        }
+        if KEY_TIMER.with(|t| t.get()) != 0 {
+            return;
+        }
+        let id = unsafe { SetTimer(None, 0, 10, Some(tick)) };
+        KEY_TIMER.with(|t| t.set(id));
     }
 }
 
@@ -331,19 +498,47 @@ pub struct MuteUi {
     played: Option<(Key, f64)>,
     stp_since: f64,
     monitors: Vec<String>,
+    /// Order 047: a real mic (Core Audio, 10-50 ms a read): its reads and the pill's toggle run off the menu's thread
+    real: bool,
+    /// the last read off the menu's thread, for the next `refresh`
+    read: Arc<std::sync::Mutex<Option<bool>>>,
 }
 
 /// How the mic is now (the Input row's icon and the pill).
 pub fn mic_muted(m: &MicMute) -> bool {
-    m.state().map(|s| s.muted).unwrap_or(false)
+    let v = m.state().map(|s| s.muted).unwrap_or(false);
+    LAST_MUTED.store(v, Ordering::Relaxed);
+    v
 }
 
 impl MuteUi {
     pub fn open(mic: MicMute, now: f64, frozen: bool) -> MuteUi {
         let muted = mic_muted(&mic);
+        MuteUi::make(mic, now, frozen, muted, false)
+    }
+
+    /// Order 047: a real mic - the popup opens at once on the page's last known state (`muted`); a fresh read runs off
+    /// the menu's thread and `refresh` shows it.
+    pub fn open_real(mic: MicMute, now: f64, frozen: bool, muted: bool) -> MuteUi {
+        let u = MuteUi::make(mic, now, frozen, muted, true);
+        u.read_off();
+        u
+    }
+
+    fn make(mic: MicMute, now: f64, frozen: bool, muted: bool, real: bool) -> MuteUi {
         let monitors = if frozen { vec!["Main (DELL 27)".into(), "Second (LG 24)".into(), "All monitors".into()] } else { monitors() };
         sync_icon(muted, true, false, false);
-        MuteUi { opened_at: now, mic, muted, list: None, rects: HashMap::new(), moving: false, played: None, stp_since: -1e9, monitors }
+        MuteUi { opened_at: now, mic, muted, list: None, rects: HashMap::new(), moving: false, played: None, stp_since: -1e9, monitors, real, read: Arc::default() }
+    }
+
+    /// Read the mic's state into `read`: off the menu's thread for a real mic, in place for the fake.
+    fn read_off(&self) {
+        if self.real {
+            // on the key worker: in order with the presses (an older read never lands last)
+            read_state(&self.mic, self.read.clone());
+        } else if let Ok(mut s) = self.read.lock() {
+            *s = Some(mic_muted(&self.mic));
+        }
     }
 
     pub fn muted(&self) -> bool {
@@ -515,8 +710,10 @@ impl MuteUi {
     fn pb(&mut self, cx: &mut Cx, k: Key, enabled: bool) -> El {
         let dir = if k == K_PV_MUTE { -1 } else { 1 };
         let since = self.played.filter(|(p, t)| *p == k && cx.now - t < rowbits::play_ms(dir)).map(|p| p.1);
-        if since.is_some() {
-            cx.st.busy = true;
+        if let Some(t) = since {
+            // Order 047: "playing" is a state with a known end, not motion - built again at its end (the button's own
+            // colour fade asks for its frames while it moves)
+            cx.wake_at(t + rowbits::play_ms(dir));
         }
         rowbits::pb(cx, k, since, dir, !enabled)
     }
@@ -741,8 +938,8 @@ impl MuteUi {
 
     /// Mute / unmute now (the Input row's mic icon, the pill): bu-micmute toggles the mic with its sound.
     pub fn toggle(&mut self, now: f64) {
-        if let Ok(st) = self.mic.toggle() {
-            self.muted = st.muted;
+        if let Some(m) = toggle_now(&self.mic, self.muted, !self.real, false) {
+            self.muted = m;
         }
         self.stp_since = self.stp_since.min(now - 1e6);
     }
@@ -752,12 +949,17 @@ impl MuteUi {
         self.list.take().is_some()
     }
 
-    pub fn refresh(&mut self) {
+    /// Another app (or the key / the button) changed the mic: its state read again - off the menu's thread for a real mic
+    /// (Order 047), shown at a later tick. True = the state shown changed.
+    pub fn refresh(&mut self) -> bool {
         if CHANGED.swap(false, Ordering::Relaxed) {
-            let was = self.muted;
-            self.muted = mic_muted(&self.mic);
-            sync_icon(self.muted, true, self.moving, was != self.muted);
+            self.read_off();
         }
+        let Some(v) = self.read.lock().ok().and_then(|mut s| s.take()) else { return false };
+        let was = self.muted;
+        self.muted = v;
+        sync_icon(self.muted, true, self.moving, was != self.muted);
+        was != self.muted
     }
 
     pub fn describe(&self) -> String {
@@ -886,3 +1088,80 @@ fn monitors() -> Vec<String> {
 
 #[allow(dead_code)]
 const _WHITE: Rgba = WHITE;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bu_micmute::os::{EventSink, Watch};
+    use bu_micmute::{MicDevice, MicOs};
+
+    /// The fake mic stack, as slow as Core Audio on a busy PC (30 ms a call).
+    struct SlowMic(FakeMicOs);
+    fn slow() {
+        std::thread::sleep(std::time::Duration::from_millis(30));
+    }
+    impl MicOs for SlowMic {
+        fn capture_devices(&self) -> bu_micmute::Result<Vec<MicDevice>> {
+            slow();
+            self.0.capture_devices()
+        }
+        fn default_capture(&self) -> bu_micmute::Result<Option<String>> {
+            slow();
+            self.0.default_capture()
+        }
+        fn is_muted(&self, id: &str) -> bu_micmute::Result<bool> {
+            slow();
+            self.0.is_muted(id)
+        }
+        fn set_muted(&self, id: &str, muted: bool) -> bu_micmute::Result<()> {
+            slow();
+            self.0.set_muted(id, muted)
+        }
+        fn watch_mute(&self, id: &str, sink: EventSink) -> bu_micmute::Result<Box<dyn Watch>> {
+            self.0.watch_mute(id, sink)
+        }
+        fn watch_devices(&self, sink: EventSink) -> bu_micmute::Result<Box<dyn Watch>> {
+            self.0.watch_devices(sink)
+        }
+    }
+
+    /// the key worker's counters are the app's own (one at a time here)
+    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn wait(f: impl Fn() -> bool) -> bool {
+        let t0 = std::time::Instant::now();
+        while !f() && t0.elapsed().as_secs() < 5 {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        f()
+    }
+
+    /// Order 047: the mute key hands its Core Audio work (here 4 slow calls = 120 ms) to its own thread - the menu's
+    /// thread is back within one frame - and the mic is still muted, then unmuted by the next press, in order.
+    #[test]
+    fn the_mute_key_never_holds_the_menu() {
+        let _one = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let f = FakeMicOs::new(&[("mv7", "Microphone (Shure MV7)")]);
+        let m = MicMute::new(Arc::new(SlowMic(f.clone())), Arc::new(FakeSoundOut::default()));
+        crate::offui::assert_quick("the mic mute key", || send_press(m.clone(), A_ONE, false));
+        assert!(wait(|| f.muted("mv7")), "the key still mutes");
+        crate::offui::assert_quick("the mic mute key again", || send_press(m.clone(), A_ONE, false));
+        assert!(wait(|| !f.muted("mv7") && KEY_PENDING.load(Ordering::Acquire) == 0), "the next press unmutes");
+        assert_eq!(f.sets(), vec![("mv7".to_string(), true), ("mv7".to_string(), false)], "one after another");
+        assert_eq!(KEY_DONE.lock().unwrap().take(), Some(false), "the icon gets the last answer");
+    }
+
+    /// Order 047: the Audio page's mic button (and Mute settings' pill) on a real mic: the flip shows at once, the
+    /// Core Audio work (here 120 ms) runs on the key's worker - the menu's thread is back within one frame - and the mic is
+    /// muted.
+    #[test]
+    fn the_mic_button_never_holds_the_menu() {
+        let _one = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let f = FakeMicOs::new(&[("mv7", "Microphone (Shure MV7)")]);
+        let m = MicMute::new(Arc::new(SlowMic(f.clone())), Arc::new(FakeSoundOut::default()));
+        let shown = crate::offui::assert_quick("the mic button", || toggle_now(&m, false, false, false));
+        assert_eq!(shown, Some(true), "the button shows Muted at once");
+        assert!(wait(|| f.muted("mv7") && KEY_PENDING.load(Ordering::Acquire) == 0), "the mic is muted by the worker");
+        KEY_DONE.lock().unwrap().take();
+    }
+}

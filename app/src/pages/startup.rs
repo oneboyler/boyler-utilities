@@ -118,6 +118,10 @@ pub struct Startup {
     icon_rx: Option<Receiver<Vec<(String, crate::png::Pixels)>>>,
     /// an admin row's switch waiting for Windows' admin prompt / the elevated copy: entry id, switched to, its answer
     admin_wait: Option<(String, bool, Receiver<AdminAnswer>)>,
+    /// Order 047: the list read again after a switch / a put-back, on a helper thread (`reload`); `tick` takes it
+    relist: Option<Receiver<StartupList>>,
+    /// test copies only: the reset copy's every read / put-back first sleeps this long (ms) - a stand-in for a slow Windows
+    slow: u64,
 }
 
 /// The app's own icon for a row (helper thread only: it asks the shell): the entry's icon file, else its program - a
@@ -224,10 +228,24 @@ impl Startup {
         self.toast = Some((t.into(), now));
     }
 
+    /// Read the list again. Order 047: on a helper thread (Task Scheduler, the services and every program's version info
+    /// take 0.2 - 1.5 s - the menu kept its old picture all that time); the rows show the new list when `tick` takes it.
+    /// A newer read replaces one still running (only the newest answer is taken).
     fn reload(&mut self) {
-        if let Some(s) = &self.svc {
-            let l = s.list();
-            self.set_list(l);
+        let Some(s) = &self.svc else { return };
+        let job = s.lister();
+        let (tx, rx) = channel();
+        crate::offui::spawn("startup-list", move || {
+            let _ = tx.send(job());
+        });
+        self.relist = Some(rx);
+    }
+
+    /// Order 047: the switched row shows its new state at once (as read back after the switch), before the list read
+    /// again (`reload`) arrives.
+    fn mark(&mut self, id: &str, on: bool) {
+        if let Some(e) = self.list.as_mut().and_then(|l| l.entries.iter_mut().find(|e| e.id == id)) {
+            e.enabled = on;
         }
     }
 
@@ -316,6 +334,7 @@ impl Startup {
             Ok((c, st)) => {
                 let (item, old, new) = log_vals(&c, st, on);
                 rec(&item, &e.name, &old, &new);
+                self.mark(&e.id, st.map_or(on, |s| s.is_on()));
                 self.reload();
                 let t = if on { format!("{} starts with Windows again", e.name) } else { format!("{} won’t start with Windows · switch it back any time", e.name) };
                 self.show_toast(t, now);
@@ -368,8 +387,11 @@ impl Startup {
         let f = p.file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default();
         self.opened.push(format!("select:{}", p.display()));
         if !self.test && !self.real_read {
-            // Explorer opens with the file selected (the user's own click)
-            let _ = std::process::Command::new("explorer.exe").arg(format!("/select,{}", p.display())).spawn();
+            // Explorer opens with the file selected (the user's own click) - Order 047: started off the menu's thread
+            let arg = format!("/select,{}", p.display());
+            crate::offui::spawn("startup-explorer", move || {
+                let _ = std::process::Command::new("explorer.exe").arg(arg).spawn();
+            });
         }
         self.show_toast(format!("Opens Explorer with {f} selected"), now);
     }
@@ -379,7 +401,11 @@ impl Startup {
         let url = format!("https://www.bing.com/search?q={q}");
         self.opened.push(url.clone());
         if !self.test && !self.real_read {
-            let _ = std::process::Command::new("explorer.exe").arg(&url).spawn();
+            // Order 047: started off the menu’s thread
+            let u = url.clone();
+            crate::offui::spawn("startup-search", move || {
+                let _ = std::process::Command::new("explorer.exe").arg(u).spawn();
+            });
         }
         self.show_toast(format!("Searches the web for “{}”", e.name), now);
     }
@@ -627,11 +653,27 @@ impl Page for Startup {
                 return true;
             }
         }
-        let toast = self.toast.as_ref().is_some_and(|(_, t)| now - t < toast::SHOW_MS + 300.0);
-        if !toast {
+        // Order 047: the list read again after a switch (`reload`)
+        if let Some(rx) = &self.relist {
+            match rx.try_recv() {
+                Ok(l) => {
+                    self.relist = None;
+                    self.set_list(l);
+                    return true;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => self.relist = None,
+                Err(_) => {}
+            }
+        }
+        // Order 047: a toast needs no frames of the page's own - it fades on its transitions and wakes the menu itself
+        // (`toast::toast`); here it is only forgotten once it has gone (`wake_at`)
+        if self.toast.as_ref().is_some_and(|(_, t)| now - t >= toast::SHOW_MS + 300.0) {
             self.toast = None;
         }
-        toast
+        false
+    }
+    fn wake_at(&self, now: f64) -> Option<f64> {
+        self.toast.as_ref().map(|(_, t)| (t + toast::SHOW_MS + 300.0).max(now + 1.0))
     }
     fn build(&mut self, cx: &mut Cx) -> Vec<El> {
         let rows: Vec<(usize, StartupEntry)> = self.entries().into_iter().map(|(i, e)| (i, e.clone())).collect();
@@ -740,6 +782,63 @@ impl Page for Startup {
 #[cfg(test)]
 mod tests;
 
+/// One row's state now, as the reset shows it.
+fn reset_current(s: &Svc, item: &str) -> Option<Val> {
+    let t = Target::from_text(item)?;
+    s.state_of(&t).ok().map(|st| val(&t, st))
+}
+
+/// Put one row back (the reset's apply): Err = the reason, as the toast says it.
+fn reset_put(s: Option<&Svc>, item: &str, to: &Val, real_read: bool) -> Result<(), String> {
+    if real_read || crate::testmode::real_read() {
+        return Err("A read-only test copy changes nothing".into());
+    }
+    let t = Target::from_text(item).ok_or("This entry isn’t known any more")?;
+    let st = SState::from_text(&to.raw).ok_or("This value isn’t known")?;
+    let s = s.ok_or("Startup can’t be read on this PC")?;
+    s.put_back(&t, st).map_err(|e| Startup::err_text(&e, &target_name(&t)))
+}
+
+/// Order 047: Startup's reset for a worker thread (`Resettable::detach`): the page's fake shared, or its own real
+/// service made on the worker (Task Scheduler / the services / the admin prompt never hold the menu).
+struct Away {
+    svc: std::cell::OnceCell<Option<Svc>>,
+    real_read: bool,
+    /// test copies only: every read / put-back first sleeps this long (ms)
+    slow: u64,
+}
+
+impl Away {
+    fn svc(&self) -> Option<&Svc> {
+        self.svc.get_or_init(fresh_svc).as_ref()
+    }
+    fn wait(&self) {
+        if self.slow > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(self.slow));
+        }
+    }
+}
+
+impl Resettable for Away {
+    fn page_id(&self) -> &str {
+        "sup"
+    }
+    fn page_title(&self) -> &str {
+        "Startup"
+    }
+    fn has_windows_defaults(&self) -> bool {
+        false
+    }
+    fn current(&self, item: &str) -> Option<Val> {
+        self.wait();
+        reset_current(self.svc()?, item)
+    }
+    fn apply(&mut self, item: &str, to: &Val) -> Result<(), String> {
+        self.wait();
+        reset_put(self.svc(), item, to, self.real_read)
+    }
+}
+
 /// The reset line (Order 036): "Back to how your PC was" from the ONE change log; Startup has no Windows defaults
 /// (Windows has no default startup list). Items are `Target` texts, values `SState` texts.
 impl Resettable for Startup {
@@ -753,21 +852,30 @@ impl Resettable for Startup {
         false
     }
     fn current(&self, item: &str) -> Option<Val> {
-        let t = Target::from_text(item)?;
-        self.with_svc(|s| s.state_of(&t).ok()).flatten().map(|st| val(&t, st))
+        self.with_svc(|s| reset_current(s, item)).flatten()
     }
     fn apply(&mut self, item: &str, to: &Val) -> Result<(), String> {
-        if self.real_read || crate::testmode::real_read() {
-            return Err("A read-only test copy changes nothing".into());
-        }
-        let t = Target::from_text(item).ok_or("This entry isn’t known any more")?;
-        let st = SState::from_text(&to.raw).ok_or("This value isn’t known")?;
-        let r = self.with_svc(|s| s.put_back(&t, st)).ok_or("Startup can’t be read on this PC")?;
-        r.map_err(|e| Self::err_text(&e, &target_name(&t)))?;
+        let r = self.with_svc(|s| reset_put(Some(s), item, to, self.real_read)).unwrap_or_else(|| reset_put(None, item, to, self.real_read));
+        r?;
         if self.list.is_some() {
             // the open page shows the value it was put back to
             self.reload();
         }
         Ok(())
+    }
+    /// Order 047: the review's reads and put-backs on a worker thread (the page's fake shared; a real copy makes its own
+    /// service there).
+    fn detach(&mut self) -> Option<crate::undo::Detached> {
+        let shared = self.with_svc(|s| s.share()).flatten();
+        let svc = std::cell::OnceCell::new();
+        if let Some(s) = shared {
+            let _ = svc.set(Some(s));
+        }
+        Some(Box::new(Away { svc, real_read: self.real_read, slow: self.slow }))
+    }
+    fn reset_done(&mut self) {
+        if self.list.is_some() {
+            self.reload();
+        }
     }
 }

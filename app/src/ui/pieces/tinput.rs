@@ -66,7 +66,7 @@ fn content(cx: &mut Cx, text: &str, placeholder: &str, font: Font, ph: (Font, Rg
         b = b.child(t);
     }
     if focused && !selected {
-        cx.st.busy = true;
+        cx.wake_every(530.0, 0.0);
         if ((cx.now / 530.0) as i64) % 2 == 0 {
             let tw = if text.is_empty() { 0.0 } else { tb.width };
             let x = if text.is_empty() && at == At::Centre { inner / 2.0 } else { (tx + tw).min(inner - 1.0) };

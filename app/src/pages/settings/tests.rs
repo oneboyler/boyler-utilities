@@ -62,7 +62,7 @@ fn updates_and_links_use_the_public_repo() {
     assert_eq!(update::REPO, "oneboyler/boyler-utilities");
     assert_eq!(update::page_url(true), "https://github.com/oneboyler/boyler-utilities/releases");
     assert_eq!(update::page_url(false), "https://github.com/oneboyler/boyler-utilities");
-    assert_eq!(VERSION, "1.0.0");
+    assert_eq!(VERSION, "1.0.1");
 }
 
 #[test]
@@ -765,4 +765,37 @@ fn the_updating_window_still_cancels_over_licences() {
     assert!(s.upd.as_ref().is_some_and(|u| u.cancel_asked), "{}", s.describe());
     assert!(s.describe().contains("lic=list:"), "Licences stays: {}", s.describe());
     run(&mut s, |s| s.upd.is_none(), now);
+}
+
+/// Order 047: at rest the page asks for no frames and no timed wake-up; while an update is shown, `tick` is true only when
+/// the updater's thread said something or a timed step came ("Installing…" 1.6 s, "Restarting…" 1.3 s - those are the
+/// only wake-ups), and once it has ended the page is at rest again.
+#[test]
+fn at_rest_the_page_asks_for_no_frames() {
+    let mut s = page(false);
+    assert!(!s.tick(0.0), "nothing moves");
+    assert!(s.wake_at(0.0).is_none());
+    // the fake's check finds v0.2.0 and the update starts on its own; run until update() has answered
+    s.driver = Some(Driver::fake("0.1.0", std::time::Duration::ZERO));
+    s.check();
+    // (the page clock stays at 0 while the worker answers in real time: no timed step can come due meanwhile)
+    let now = 0.0;
+    for _ in 0..3000 {
+        s.tick(now);
+        if s.upd.as_ref().is_some_and(|u| u.ready) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    assert!(s.upd.as_ref().is_some_and(|u| u.ready), "never got there: {}", s.describe());
+    assert!(!s.tick(now), "no new message, no step due: no frame");
+    let at = s.upd.as_ref().unwrap().stage_at;
+    assert_eq!(s.wake_at(now), Some(at + 1600.0), "woken for \"Restarting…\"");
+    assert!(s.tick(at + 1600.0), "the step shows");
+    let at2 = s.upd.as_ref().unwrap().stage_at;
+    assert_eq!(s.upd.as_ref().unwrap().stage, 2);
+    assert_eq!(s.wake_at(at2), Some(at2 + 1300.0));
+    assert!(s.tick(at2 + 1300.0), "the fake's update ends (the window closes)");
+    assert!(s.upd.is_none() && s.wake_at(at2 + 1300.0).is_none());
+    assert!(!s.tick(at2 + 1301.0), "at rest again");
 }

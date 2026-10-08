@@ -188,7 +188,8 @@ pub struct Mouse {
     reset: Option<(bool, Vec<bool>)>,
     test_rs: Option<Vec<SampleLine>>,
     /// a closed tab's service for the change log (Settings › Reset, the uninstaller's undo): made at its first use
-    cold: std::cell::RefCell<Option<Box<dyn svc::Restorer>>>,
+    /// (Order 047: shared with a detached reset copy, which uses it on the review's worker thread)
+    cold: Cold,
     /// TEST COPIES ONLY (`rename` test state): rename the first chip once the presets are there, and focus its field at the
     /// next build, as the pen click does
     test_rename: bool,
@@ -1413,10 +1414,8 @@ impl Page for Mouse {
         // a dismiss is for the press that follows it at once (no build in between); one by Esc / a scroll / a right-click
         // is over here - kept, it made the next click on that list's button do nothing
         self.dismissed = None;
-        if self.svc.as_ref().map(|s| s.pending > 0).unwrap_or(false) {
-            // answers on their way: keep frames coming so `tick` picks them up
-            cx.st.busy = true;
-        }
+        // Order 047: answers on their way no longer keep frames coming - the worker wakes the menu with each one
+        // (`svc::run`'s `send`) and `tick` takes it
         if let Some(n) = crate::addons::take_notice() {
             cx.toast(&n);
         }
@@ -1597,13 +1596,13 @@ impl crate::undo::Resettable for Mouse {
         if self.svc.is_some() {
             return self.v.vals.iter().find(|(i, _)| i == item).map(|(_, v)| v.clone());
         }
-        self.cold.borrow_mut().get_or_insert_with(svc::restorer).val(item)
+        with_cold(&self.cold, |c| c.val(item))
     }
     fn windows_defaults(&self) -> Vec<crate::undo::DefaultItem> {
         if self.svc.is_some() {
             return self.v.win_def.clone();
         }
-        self.cold.borrow_mut().get_or_insert_with(svc::restorer).defaults()
+        with_cold(&self.cold, |c| c.defaults())
     }
     fn apply(&mut self, item: &str, to: &crate::undo::Val) -> Result<(), String> {
         if crate::testmode::real_read() || (self.test && !self.fake && self.svc.is_some()) {
@@ -1612,7 +1611,7 @@ impl crate::undo::Resettable for Mouse {
         if self.svc.is_some() && !self.fake {
             // a real change ends with SPIF_SENDCHANGE, a broadcast to every window - this (UI) thread's too: waiting here
             // for the worker would stall both. So it is put back right here, and the open tab's worker reads it again.
-            let r = self.cold.get_mut().get_or_insert_with(svc::restorer).restore(item, &to.raw);
+            let r = with_cold(&self.cold, |c| c.restore(item, &to.raw));
             self.send(Cmd::Reread);
             return r;
         }
@@ -1622,7 +1621,76 @@ impl crate::undo::Resettable for Mouse {
             self.send(Cmd::Restore(item.to_string(), to.clone(), tx));
             return rx.recv_timeout(std::time::Duration::from_secs(20)).unwrap_or_else(|_| Err("The mouse settings didn\u{2019}t answer in time".into()));
         }
-        self.cold.get_mut().get_or_insert_with(svc::restorer).restore(item, &to.raw)
+        with_cold(&self.cold, |c| c.restore(item, &to.raw))
+    }
+    fn detach(&mut self) -> Option<crate::undo::Detached> {
+        let open = self.svc.is_some();
+        Some(Box::new(MouseReset {
+            seen: open.then(|| (self.v.vals.clone(), self.v.win_def.clone())),
+            worker: if open && self.fake { self.svc.as_ref().and_then(|s| s.sender()) } else { None },
+            cold: self.cold.clone(),
+            read_only: self.test && !self.fake && open,
+        }))
+    }
+    fn reset_done(&mut self) {
+        // the open tab's worker reads the put-back values again (the fake's worker made the change itself: its answer
+        // carries the new view)
+        if self.svc.is_some() && !self.fake {
+            self.send(Cmd::Reread);
+        }
+    }
+}
+
+/// A closed tab's service for the change log, made at its first use (Order 047: shared, a detached copy uses it on the
+/// review's worker thread).
+type Cold = std::sync::Arc<std::sync::Mutex<Option<Box<dyn svc::Restorer + Send>>>>;
+
+fn with_cold<R>(cold: &Cold, f: impl FnOnce(&mut (dyn svc::Restorer + Send)) -> R) -> R {
+    let mut g = cold.lock().unwrap_or_else(|e| e.into_inner());
+    f(g.get_or_insert_with(svc::restorer).as_mut())
+}
+
+/// Order 047: the Mouse tab's reset as a copy for the review's worker thread (`Resettable::detach`): the open tab's last
+/// read, the open FAKE tab's worker (its fake PC is the one the tab shows), the closed tab's service. A real put-back runs
+/// on the worker thread (it ends with SPIF_SENDCHANGE, a broadcast the menu's thread answers - it keeps pumping now).
+struct MouseReset {
+    seen: Option<(Vec<(String, crate::undo::Val)>, Vec<crate::undo::DefaultItem>)>,
+    worker: Option<std::sync::mpsc::Sender<Cmd>>,
+    cold: Cold,
+    read_only: bool,
+}
+
+impl crate::undo::Resettable for MouseReset {
+    fn page_id(&self) -> &str {
+        svc::PAGE
+    }
+    fn page_title(&self) -> &str {
+        "Mouse"
+    }
+    fn current(&self, item: &str) -> Option<crate::undo::Val> {
+        match &self.seen {
+            Some((vals, _)) => vals.iter().find(|(i, _)| i == item).map(|(_, v)| v.clone()),
+            None => with_cold(&self.cold, |c| c.val(item)),
+        }
+    }
+    fn windows_defaults(&self) -> Vec<crate::undo::DefaultItem> {
+        match &self.seen {
+            Some((_, d)) => d.clone(),
+            None => with_cold(&self.cold, |c| c.defaults()),
+        }
+    }
+    fn apply(&mut self, item: &str, to: &crate::undo::Val) -> Result<(), String> {
+        if crate::testmode::real_read() || self.read_only {
+            return Err("A read-only test copy changes nothing".into());
+        }
+        if let Some(tx) = &self.worker {
+            let (btx, rx) = std::sync::mpsc::channel();
+            if tx.send(Cmd::RestoreAway(item.to_string(), to.clone(), btx)).is_err() {
+                return Err("The mouse settings didn\u{2019}t answer in time".into());
+            }
+            return rx.recv_timeout(std::time::Duration::from_secs(20)).unwrap_or_else(|_| Err("The mouse settings didn\u{2019}t answer in time".into()));
+        }
+        with_cold(&self.cold, |c| c.restore(item, &to.raw))
     }
 }
 
@@ -1985,10 +2053,13 @@ impl Mouse {
             _ if k == K_OPEN => match &self.v.ra {
                 // its own window (rawaccel.exe in the folder found on the Desktop / Downloads / Documents); never from a test copy
                 Some(RawAccelStatus::Installed { dir: Some(d), .. }) if !fake => {
-                    let exe = d.join("rawaccel.exe");
-                    if exe.is_file() {
-                        let _ = std::process::Command::new(exe).current_dir(d).spawn();
-                    }
+                    // Order 047: the file check and the process start (10-40 ms) off the menu's thread
+                    let (exe, dir) = (d.join("rawaccel.exe"), d.to_path_buf());
+                    crate::offui::spawn("mouse-rawaccel", move || {
+                        if exe.is_file() {
+                            let _ = std::process::Command::new(exe).current_dir(dir).spawn();
+                        }
+                    });
                 }
                 Some(RawAccelStatus::Installed { dir: None, .. }) => self.say("Raw Accel\u{2019}s folder wasn\u{2019}t found on the Desktop, in Downloads or Documents", now),
                 _ => {}
@@ -2108,7 +2179,11 @@ fn open_url(url: &str, test: bool) {
     if test {
         return;
     }
-    let _ = std::process::Command::new("explorer").arg(url).spawn();
+    // Order 047: starting a process holds the thread 10-40 ms: off the menu's thread
+    let u = url.to_string();
+    crate::offui::spawn("mouse-url", move || {
+        let _ = std::process::Command::new("explorer").arg(u).spawn();
+    });
 }
 
 #[cfg(test)]

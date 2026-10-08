@@ -892,3 +892,30 @@ fn the_change_log_reads_whether_a_game_is_as_it_was_or_steams() {
     s.preferences_to_original(SERIAL).unwrap();
     assert!(s.preferences_are_original(SERIAL).unwrap());
 }
+
+/// Order 047: the game names (every appmanifest, the shortcuts, localconfig.vdf) are read once and serve every
+/// question after it - a page view or a write asked for the game list 4-5 times; the configset is read fresh each time,
+/// so which layout a game uses is never stale; `forget_names` reads them again.
+#[test]
+fn the_game_names_are_read_once_per_change() {
+    let s = service();
+    let reads = |s: &ControllerService<FakeSteam>| s.os().reads.load(Ordering::Relaxed);
+    let r0 = reads(&s);
+    let first = s.games(EDGE).unwrap();
+    let full = reads(&s) - r0;
+    let r1 = reads(&s);
+    let o = s.open("252950", EDGE).unwrap();
+    let _ = s.steam_layout_of(&o);
+    assert_eq!(s.games(EDGE).unwrap(), first);
+    let again = reads(&s) - r1;
+    assert!(again < full * 2, "names read once: {again} reads for open + Steam's layout + the list, one list alone was {full}");
+    // Steam switches a game (Yakuza) to another layout: seen at once (the configset is never kept)
+    let cs = text(&s, &configset_path()).replace("\"workshop\"\t\t\"3275392801\"", "\"template\"\t\t\"controller_ps5_fps.vdf\"");
+    s.os().put(configset_path(), &cs);
+    assert!(s.games(EDGE).unwrap().iter().any(|g| g.source == LayoutSource::Template("controller_ps5_fps.vdf".into())));
+    // forgotten: the whole list is read again
+    s.forget_names();
+    let r2 = reads(&s);
+    let _ = s.games(EDGE).unwrap();
+    assert_eq!(reads(&s) - r2, full);
+}

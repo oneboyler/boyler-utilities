@@ -1,31 +1,25 @@
 //! REAL keys OS layer, on the UI thread only. Never used by tests.
 //! - normal keys: RegisterHotKey / UnregisterHotKey on the app's window (WM_HOTKEY, wParam = slot);
-//! - modifier-only keys, mouse buttons 3 / 4 / 5 and release keys: Raw Input (boss A_014_01) — RegisterRawInputDevices
-//!   with RIDEV_INPUTSINK on the app's window (keyboard = usage page 1 / usage 6, mouse = 1 / 2), RIDEV_REMOVE when the
-//!   last such key goes. The app only listens: nothing is blocked or altered, there is NO hook anywhere;
-//! - the window procedure: `WM_INPUT => keys.on_wm_input(lparam, |action, down| …)`, then DefWindowProc as usual
-//!   (Windows wants it for WM_INPUT). [`KeysManager::on_wm_input`] = GetRawInputData into a stack RAWINPUT +
-//!   [`KeysManager::on_rawinput`] (= [`packet_of`] + `on_raw`), the exact path the benchmark test measures;
+//! - modifier-only keys, mouse buttons 3 / 4 / 5 and release keys: Raw Input (boss A_014_01), listen only
+//!   (RIDEV_INPUTSINK): nothing is blocked or altered, there is NO hook anywhere. Order 048: the registration and the
+//!   reading are bu-rawin's (the process's one Raw Input owner, on its own thread with a message-only window — so the
+//!   activity watcher's idle check can't take the devices away, and the 8000 mouse moves a second never wake the UI
+//!   thread). `raw_devices` = `bu_rawin::set_keys(keyboard, mouse, message window + WM_RAWKEYS)`;
+//! - the window procedure: `WM_RAWKEYS => services::raw_packets()` = `bu_rawin::take_packets()` (key packets, mouse
+//!   buttons / wheel; one wake-up per batch) → [`Packet`] → `KeysManager::on_raw`. [`packet_of`] /
+//!   [`KeysManager::on_rawinput`] stay for the benchmark test (a RAWINPUT → the router);
 //! - key names: the character the layout gives the key (MapVirtualKeyEx, upper-cased: Č Ć Ž Š Đ on Croatian), else
 //!   GetKeyNameText.
 
-use std::ffi::c_void;
-
-use windows::Win32::Foundation::{HWND, LPARAM};
+use windows::Win32::Foundation::HWND;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, GetKeyNameTextW, GetKeyboardLayout, MapVirtualKeyExW, RegisterHotKey, UnregisterHotKey,
     HOT_KEY_MODIFIERS, MAPVK_VK_TO_CHAR, MAPVK_VK_TO_VSC, MOD_ALT, MOD_CONTROL, MOD_NOREPEAT, MOD_SHIFT, MOD_WIN,
 };
-use windows::Win32::UI::Input::{
-    GetRawInputData, RegisterRawInputDevices, HRAWINPUT, RAWINPUT, RAWINPUTDEVICE, RAWINPUTHEADER, RIDEV_INPUTSINK, RIDEV_REMOVE,
-    RID_INPUT, RIM_TYPEKEYBOARD, RIM_TYPEMOUSE,
-};
+use windows::Win32::UI::Input::{RAWINPUT, RIM_TYPEKEYBOARD, RIM_TYPEMOUSE};
 
 use super::{is_nav_vk, Combo, KeysManager, KeysOs, Mods, Packet, VK_CONTROL, VK_LWIN, VK_MENU, VK_RWIN, VK_SHIFT};
-
-const USAGE_PAGE_GENERIC: u16 = 1;
-const USAGE_MOUSE: u16 = 2;
-const USAGE_KEYBOARD: u16 = 6;
+use crate::services::WM_RAWKEYS;
 
 pub struct RealKeysOs {
     hwnd: isize,
@@ -35,7 +29,7 @@ pub struct RealKeysOs {
 }
 
 impl RealKeysOs {
-    /// `hwnd` = the app's message window (gets WM_HOTKEY and WM_INPUT).
+    /// `hwnd` = the app's message window (gets WM_HOTKEY and bu-rawin's WM_RAWKEYS).
     pub fn new(hwnd: HWND) -> Self {
         RealKeysOs { hwnd: hwnd.0 as isize, registered: Vec::new(), raw: (false, false) }
     }
@@ -98,33 +92,22 @@ pub fn packet_of(raw: &RAWINPUT) -> Packet {
     }
 }
 
-impl<O: KeysOs> KeysManager<O> {
-    /// One RAWINPUT (already copied out of WM_INPUT): `fire(action id, down)` for every action it triggers.
+/// bu-rawin's packet → the router's (the same three fields).
+impl From<bu_rawin::RawPacket> for Packet {
     #[inline]
-    pub fn on_rawinput(&mut self, raw: &RAWINPUT, fire: impl FnMut(&str, bool)) {
-        self.on_raw(packet_of(raw), fire);
+    fn from(p: bu_rawin::RawPacket) -> Packet {
+        match p {
+            bu_rawin::RawPacket::Key { vk, make, flags } => Packet::Key { vk, make, flags },
+            bu_rawin::RawPacket::Mouse { buttons } => Packet::Mouse { buttons },
+        }
     }
 }
 
-impl KeysManager<RealKeysOs> {
-    /// WM_INPUT: read the packet (GetRawInputData into a stack RAWINPUT) and route it. The caller still passes the
-    /// message on to DefWindowProc.
-    pub fn on_wm_input(&mut self, lparam: LPARAM, fire: impl FnMut(&str, bool)) {
-        let mut raw = RAWINPUT::default();
-        let mut size = std::mem::size_of::<RAWINPUT>() as u32;
-        let n = unsafe {
-            GetRawInputData(
-                HRAWINPUT(lparam.0 as *mut c_void),
-                RID_INPUT,
-                Some(&mut raw as *mut RAWINPUT as *mut c_void),
-                &mut size,
-                std::mem::size_of::<RAWINPUTHEADER>() as u32,
-            )
-        };
-        if n == 0 || n == u32::MAX {
-            return; // not a keyboard / mouse packet that fits (only those two are registered)
-        }
-        self.on_rawinput(&raw, fire);
+impl<O: KeysOs> KeysManager<O> {
+    /// One RAWINPUT: `fire(action id, down)` for every action it triggers (the benchmark's path).
+    #[inline]
+    pub fn on_rawinput(&mut self, raw: &RAWINPUT, fire: impl FnMut(&str, bool)) {
+        self.on_raw(packet_of(raw), fire);
     }
 }
 
@@ -142,27 +125,10 @@ impl KeysOs for RealKeysOs {
     }
 
     fn raw_devices(&mut self, keyboard: bool, mouse: bool) -> Result<(), String> {
-        let mut list: Vec<RAWINPUTDEVICE> = Vec::with_capacity(2);
-        for (usage, want, have) in [(USAGE_KEYBOARD, keyboard, self.raw.0), (USAGE_MOUSE, mouse, self.raw.1)] {
-            if want && !have {
-                list.push(RAWINPUTDEVICE {
-                    usUsagePage: USAGE_PAGE_GENERIC,
-                    usUsage: usage,
-                    dwFlags: RIDEV_INPUTSINK,
-                    hwndTarget: self.hwnd(),
-                });
-            } else if !want && have {
-                list.push(RAWINPUTDEVICE {
-                    usUsagePage: USAGE_PAGE_GENERIC,
-                    usUsage: usage,
-                    dwFlags: RIDEV_REMOVE,
-                    hwndTarget: HWND(std::ptr::null_mut()),
-                });
-            }
-        }
-        if !list.is_empty() {
-            unsafe { RegisterRawInputDevices(&list, std::mem::size_of::<RAWINPUTDEVICE>() as u32) }.map_err(|e| e.message())?;
-        }
+        // bu-rawin registers (on its own thread) what all its clients need together and wakes this window with
+        // WM_RAWKEYS once per batch of packets that matter; nothing needed = no wake-ups
+        let notify = (keyboard || mouse).then_some((self.hwnd, WM_RAWKEYS));
+        bu_rawin::set_keys(keyboard, mouse, notify)?;
         self.raw = (keyboard, mouse);
         Ok(())
     }

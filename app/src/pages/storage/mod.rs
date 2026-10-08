@@ -572,7 +572,10 @@ impl Storage {
             return;
         }
         let arg = if file { format!("/select,\"{}\"", path.display()) } else { format!("\"{}\"", path.display()) };
-        let _ = std::process::Command::new("explorer.exe").raw_arg_compat(&arg).spawn();
+        // Order 047: starting a process holds the thread 10-40 ms (more with a busy disk): off the menu's thread
+        crate::offui::spawn("sto-explorer", move || {
+            let _ = std::process::Command::new("explorer.exe").raw_arg_compat(&arg).spawn();
+        });
     }
 }
 
@@ -692,13 +695,22 @@ impl Page for Storage {
         self.settle() || a
     }
 
+    /// Order 047: the staged parts end at known moments - the measured sizes become the plan at `size_t0 + 1000 ms`, the
+    /// countdown's toast and result come at its end. The last size arrives (and its shimmer stops) before that, so with
+    /// nothing moving the menu sleeps until then and `settle` runs at it. A walk's end wakes the menu by itself (`post`).
+    fn wake_at(&self, now: f64) -> Option<f64> {
+        [self.staged.as_ref().map(|_| self.size_t0 + SIZES_DONE_MS), self.countdown.as_ref().map(|c| c.end())]
+            .into_iter()
+            .flatten()
+            .reduce(f64::min)
+            .map(|t| t.max(now + 1.0))
+    }
+
     fn build(&mut self, cx: &mut Cx) -> Vec<El> {
         self.now = cx.now;
         self.rm = cx.rm;
-        // a running walk's progress line moves: frames while it runs (its end wakes the menu by itself)
-        if self.scans.values().any(|s| matches!(s, Scan::Running { .. })) {
-            cx.st.busy = true;
-        }
+        // Order 047: no frames just because a walk runs - the shown drive's walk draws its sweep (`view::scan_state`, real
+        // motion, asks for its own frames); a walk of a drive not shown has nothing on screen, and its end wakes the menu
         view::page(self, cx)
     }
 

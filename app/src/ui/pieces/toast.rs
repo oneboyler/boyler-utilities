@@ -20,8 +20,9 @@ pub fn toast(cx: &mut Cx, key: Key, text: &str, shown_at: f64, over_bar: bool) -
     let on = cx.now - shown_at < SHOW_MS;
     let op = cx.tr(key, 1, if on { 1.0 } else { 0.0 }, 160.0, EASE);
     let dy = cx.tr(key, 2, if on { 0.0 } else { 6.0 }, 220.0, RISE);
+    // Order 047: at rest it needs no frames - the menu wakes when it starts to fade (its transitions run the fades)
     if on {
-        cx.st.busy = true;
+        cx.wake_at(shown_at + SHOW_MS);
     }
     let font = Font::new(12.0, 600).ls(0);
     let w = cx.g.text_width(text, font) + 26.0;

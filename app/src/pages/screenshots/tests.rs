@@ -28,6 +28,26 @@ fn build(p: &mut Screenshots, now: f64) -> Laid {
     Laid::new(&g, root, 600.0, None)
 }
 
+/// Order 047: the thumbnails come from a worker thread - tick until every tile has its picture (5 s at most). True = a
+/// tick said "changed" on the way.
+fn wait_thumbs(p: &mut Screenshots) -> bool {
+    let t0 = std::time::Instant::now();
+    let mut now = 16.0;
+    let mut changed = false;
+    while p.shots.iter().any(|v| v.img.is_none()) && t0.elapsed().as_secs() < 5 {
+        changed |= p.tick(now);
+        now += 16.0;
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    changed
+}
+
+/// One tick with the gallery counter pinned (other tests save shots at the same time: `gallery_changed` is global).
+fn tick_pinned(p: &mut Screenshots, now: f64) -> bool {
+    p.gen_seen = GALLERY_GEN.load(Ordering::Relaxed);
+    p.tick(now)
+}
+
 fn tile_key(p: &Screenshots, i: usize) -> Key {
     sub(K_SHOT, &p.order()[i].to_string())
 }
@@ -36,7 +56,8 @@ fn tile_key(p: &Screenshots, i: usize) -> Key {
 fn opens_with_the_sample_gallery_and_drops_everything_on_close() {
     let mut p = page(0.0);
     assert_eq!(p.order().len(), 8);
-    assert!(p.shots.iter().all(|v| v.img.is_some()), "the first 8 pictures decode on open");
+    wait_thumbs(&mut p);
+    assert!(p.shots.iter().all(|v| v.img.is_some()), "the 8 pictures come in from the worker");
     assert_eq!(p.dir, r"Pictures\Screenshots");
     let caps: Vec<&str> = p.shots.iter().map(|v| v.cap.as_str()).collect();
     assert_eq!(caps, ["21:34", "21:31", "21:12", "20:47", "20:05", "Yesterday", "Yesterday", "Mon"]);
@@ -351,6 +372,47 @@ fn a_closed_page_is_cheap_and_resets_through_an_engine_made_on_first_need() {
     crate::services::shutdown();
 }
 
+/// Order 047: the folder line is read and put back on a worker thread (a settings file, Windows' known-folder call, a folder
+/// check and a write) - the menu's thread only opens the review and starts the reset.
+#[test]
+fn the_folder_reset_is_read_and_put_back_off_the_menus_thread() {
+    use crate::undo::{Applied, Kind, Opened, Outcome, Review, Val};
+    fn wait<T>(mut f: impl FnMut() -> Option<T>) -> T {
+        let t0 = std::time::Instant::now();
+        loop {
+            if let Some(v) = f() {
+                return v;
+            }
+            assert!(t0.elapsed().as_secs() < 10, "the worker never answered");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+    crate::services::init(windows::Win32::Foundation::HWND::default(), true);
+    let mut fresh = Screenshots::default();
+    let (os, eng) = gallery::sample_engine();
+    eng.set_save_dir(std::path::Path::new(r"D:\Clips\Screenshots")).unwrap();
+    let _ = fresh.lazy.set((Box::new(eng), gallery::profile_dir(true)));
+    crate::services::with(|s| crate::undo::record(&mut s.store, "shot", "folder", "Screenshots folder", &Val::new("", r"Pictures\Screenshots"), &Val::plain(r"D:\Clips\Screenshots")).unwrap());
+    let opened = crate::services::with(|s| {
+        let mut pages: [&mut dyn crate::undo::Resettable; 1] = [&mut fresh];
+        crate::offui::assert_quick("opening the review", || Review::open(Kind::HowItWas, false, &mut pages, &s.store))
+    })
+    .unwrap();
+    let Opened::Reading(mut job) = opened else { panic!("the folder is read on a worker thread") };
+    let rv = wait(|| job.take());
+    assert_eq!(rv.lines.len(), 1);
+    let applied = {
+        let mut pages: [&mut dyn crate::undo::Resettable; 1] = [&mut fresh];
+        crate::offui::assert_quick("Reset", || rv.start_apply(&mut pages))
+    };
+    let Applied::Running(mut job) = applied else { panic!("the folder is put back on a worker thread") };
+    let res = wait(|| job.take());
+    assert_eq!(res.len(), 1);
+    assert_eq!(res[0].outcome, Outcome::Ok);
+    assert_eq!(os.state().files.get(&PathBuf::from(gallery::FAKE_DATA).join("settings.txt")).map(|b| b.as_slice()), Some(&b"save_dir=\n"[..]), "put back by the worker");
+    crate::services::shutdown();
+}
+
 /// The reset links open the frame's ONE review under the link (no page-local popup any more).
 #[test]
 fn the_reset_links_open_the_frames_review() {
@@ -391,19 +453,95 @@ fn a_new_shot_from_the_capture_glides_in_at_the_front() {
 
 #[test]
 fn nothing_slow_on_open() {
-    // opening reads the small index and decodes the first 8 thumbnails; a big gallery decodes the rest 2 per frame
+    // Order 047: opening reads the small index only; every thumbnail is decoded on a worker thread (open() decoded 8 on
+    // the menu's thread before, then 2 per frame) - the tiles' dark boxes at once, the pictures as they come in
     let os = FakeOs::two_monitors();
-    let eng = Engine::new(os.clone(), PathBuf::from(r"C:\BU-test\big"));
+    let eng = Eng::new(os.clone(), PathBuf::from(r"C:\BU-test\big"));
     for i in 0..30u8 {
         os.state().unix_ms += 1000;
         eng.save(&Image { width: 2, height: 2, bgra: vec![i; 16] }).unwrap();
     }
     let mut p = Screenshots { svc: Some(Box::new(eng)), fake: Some(os), ..Default::default() };
-    p.load(0.0, false);
-    p.decode_some(8);
-    assert_eq!(p.shots.iter().filter(|v| v.img.is_some()).count(), 8);
-    assert!(p.tick(16.0));
-    assert_eq!(p.shots.iter().filter(|v| v.img.is_some()).count(), 10);
+    crate::offui::set_test_delay(200);
+    crate::offui::assert_quick("the gallery read + the thumbnails asked for", || {
+        p.load(0.0, false);
+        p.request_thumbs();
+    });
+    crate::offui::set_test_delay(0);
+    assert_eq!(p.shots.len(), 30);
+    // asked once: the next look asks for nothing more
+    let asked = p.asked.len();
+    p.request_thumbs();
+    assert_eq!((asked, p.asked.len()), (30, 30));
+    let came = wait_thumbs(&mut p);
+    assert!(came, "a picture coming in is a change (one frame)");
+    assert!(p.shots.iter().all(|v| v.img.is_some()), "every thumbnail was decoded (on the worker)");
+}
+
+/// Order 047: the tab's open() hands the thumbnails to a worker (a slow decode never holds the menu), and they show.
+#[test]
+fn open_never_waits_for_the_thumbnails() {
+    let mut p = Screenshots::default();
+    let env = Env { test: true, frozen: true, ..Env::default() };
+    crate::offui::set_test_delay(200);
+    crate::offui::assert_quick("the Screenshots tab's open()", || p.open(&env, 0.0));
+    crate::offui::set_test_delay(0);
+    assert_eq!(p.order().len(), 8, "the gallery (the small index) is there at once");
+    wait_thumbs(&mut p);
+    assert!(p.shots.iter().all(|v| v.img.is_some()), "the pictures came in from the worker");
+}
+
+/// Order 047: a double-click opens the lightbox at once; its whole picture (a full-size PNG decode) comes from a worker.
+#[test]
+fn double_click_decodes_the_whole_picture_off_the_menus_thread() {
+    let mut p = page(0.0);
+    wait_thumbs(&mut p);
+    build(&mut p, 0.0);
+    let k = tile_key(&p, 2);
+    let id = p.order()[2];
+    ev(&mut p, Ev::Click(k), 100.0);
+    let g = Gfx::new(1.0);
+    let mut st = State::default();
+    let mut cx = Cx::new(250.0, false, &g, &mut st);
+    crate::offui::set_test_delay(200);
+    crate::offui::assert_quick("the double-click (lightbox)", || p.event(&Ev::Click(k), &mut cx));
+    crate::offui::set_test_delay(0);
+    assert_eq!(p.lb.map(|l| l.0), Some(id));
+    let t0 = std::time::Instant::now();
+    let mut now = 266.0;
+    while p.lb_full != Some(id) && t0.elapsed().as_secs() < 5 {
+        p.tick(now);
+        now += 16.0;
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    assert_eq!(p.lb_full, Some(id), "the whole picture was decoded (on its worker)");
+}
+
+/// Order 047: with nothing moving the page asks for no frames (no 360 Hz loop) - tick false, no wake-up or one later;
+/// the fake folder picker's 700 ms wait is ONE wake-up, not frames.
+#[test]
+fn nothing_moving_asks_for_no_frames() {
+    let mut p = page(0.0);
+    wait_thumbs(&mut p);
+    let now = 10_000.0;
+    p.tick(now);
+    assert!(!tick_pinned(&mut p, now + 16.0), "nothing moves: no frames");
+    assert!(p.wake_at(now + 16.0).is_none_or(|t| t > now + 16.0));
+    // the fake picker waits by a wake-up
+    ev(&mut p, Ev::Click(K_DLG_CHANGE), now + 20.0);
+    assert!(p.wait.is_some());
+    assert!(!tick_pinned(&mut p, now + 36.0), "waiting for the picker is no frame");
+    let w = p.wake_at(now + 36.0).expect("the menu wakes when the picker answers");
+    assert!((w - (now + 20.0 + FAKE_PICK_MS)).abs() < 1.0 && w > now + 36.0, "{w}");
+    assert!(tick_pinned(&mut p, w), "the answer shows");
+    assert!(!tick_pinned(&mut p, w + 16.0));
+    assert_eq!(p.wake_at(w + 16.0), None);
+    // and a build asks for no frames while nothing moves (long after the new folder's highlight)
+    let g = Gfx::new(1.0);
+    let mut st = State::default();
+    let mut cx = Cx::new(w + 5000.0, false, &g, &mut st);
+    p.build(&mut cx);
+    assert!(!cx.st.busy, "the build asked for frames with nothing moving");
 }
 
 #[test]

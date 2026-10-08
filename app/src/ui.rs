@@ -154,6 +154,16 @@ pub const LIGHT: Pal = Pal {
     hl_v19: c(255, 255, 255, 0.75),
 };
 
+thread_local! {
+    /// Order 047: the tab the next `Ui::new` opens first (`set_first_tab`)
+    static FIRST_TAB: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+/// The next menu opens showing this tab (its page id) - the only page it opens (main.rs, before `Menu::new`).
+pub fn set_first_tab(id: Option<String>) {
+    FIRST_TAB.with(|f| *f.borrow_mut() = id);
+}
+
 #[cfg(not(test))]
 static LIGHT_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 // unit tests run in parallel threads: each test thread has its own theme
@@ -193,6 +203,11 @@ pub fn read_windows_theme() {
         None => crate::tray::apps_light(),
     };
     WIN_LIGHT.store(light, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Windows' app theme as last read (`read_windows_theme`).
+pub fn windows_light() -> bool {
+    WIN_LIGHT.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Test hook only: Windows' app theme as if it had just changed.
@@ -451,6 +466,8 @@ pub struct Ui {
     last_step: f64,
     /// the reset review a page opened (Req::Reset): the lines, where, which tab, when
     review: Option<ReviewState>,
+    /// Order 047: the review's reads / resets running off the menu's thread (`review_poll`)
+    review_bg: ReviewBg,
     /// the toast a page asked for (Req::Toast): text, since
     toast: Option<(String, f64)>,
     /// a page asked to scroll (Req::ScrollTo / ScrollY): done once its boxes are built again
@@ -478,12 +495,22 @@ pub struct Ui {
     focus_ring: bool,
     /// Order 045: the element files from Explorer are dragged over (`drag_over`)
     drag_over: Option<Key>,
+    /// Order 047 item 10: the tab whose page was opened ahead because the pointer rests on its icon (a click shows it at
+    /// once: its reads already ran) and when it is let go if not clicked
+    pre: Option<usize>,
+    pre_close_at: Option<f64>,
+    /// Order 047 (measuring): a tab was clicked at this time and its page is not shown yet (`switch_shown`)
+    switch_wait: Option<f64>,
+    /// Order 047: the clicked tab's page is in this frame - (click time, its values were in = not the HOLD_MS give-up)
+    pub switch_shown: Option<(f64, bool)>,
 }
 
 /// After a tab opens its transitions jump for this long (its real values arrive without a slide from the defaults).
 const SETTLE_MS: f64 = 500.0;
 /// The longest the frame waits for a tab that is not `ready` before showing it anyway.
 const HOLD_MS: f64 = 400.0;
+/// Order 047: a tab opened ahead on hover is closed this long after the pointer left the icons without a click
+const PRE_KEEP_MS: f64 = 1500.0;
 /// An add-on icon's pop-in (addons-v1: `cubic-bezier(.3,1.35,.5,1)`, 420 ms).
 const APPEAR: crate::anim::Bezier = crate::anim::Bezier::new(0.3, 1.35, 0.5, 1.0);
 
@@ -499,24 +526,41 @@ struct ReviewState {
     tab: usize,
 }
 
+/// Order 047: the reset review's work on worker threads: a review being read (where it opens, on which tab's page) and
+/// resets being put back (what was reset, how many lines: the toast's words).
+#[derive(Default)]
+struct ReviewBg {
+    reading: Option<(crate::undo::ReviewJob, f32, f32, &'static str)>,
+    applying: Vec<(crate::undo::ApplyJob, crate::undo::Kind, usize)>,
+}
+
 const K_REVIEW: Key = el::key("frame.review");
 const K_TOAST: Key = el::key("frame.toast");
 
 impl Ui {
-    /// The menu opens on Audio, opened like every tab (`Page::open` makes its service; `close` drops it).
+    /// The menu opens on its first tab: the one `set_first_tab` named (the tab shown last / a key's tab), else Audio -
+    /// opened like every tab (`Page::open` makes its service; `close` drops it).
     pub fn new(rm: bool, frozen: bool, now: f64) -> Ui {
         // an add-on's tab only while the add-on is on (Order 035)
-        Ui::with_pages(pages::all().into_iter().filter(|p| crate::addons::tab_visible(p.id())).collect(), rm, frozen, now)
+        let pages: Vec<Box<dyn Page>> = pages::all().into_iter().filter(|p| crate::addons::tab_visible(p.id())).collect();
+        let first = FIRST_TAB.with(|f| f.borrow_mut().take()).and_then(|id| pages.iter().position(|p| p.id() == id)).unwrap_or(0);
+        Ui::with_pages_on(pages, first, rm, frozen, now)
     }
 
-    fn with_pages(mut pages: Vec<Box<dyn Page>>, rm: bool, frozen: bool, now: f64) -> Ui {
+    fn with_pages(pages: Vec<Box<dyn Page>>, rm: bool, frozen: bool, now: f64) -> Ui {
+        Ui::with_pages_on(pages, 0, rm, frozen, now)
+    }
+
+    fn with_pages_on(mut pages: Vec<Box<dyn Page>>, first: usize, rm: bool, frozen: bool, now: f64) -> Ui {
         let n = pages.len();
         let env = Env { test: crate::testmode::on(), real_read: crate::testmode::real_read(), frozen, rm, keep: crate::keep::app() };
-        // the first tab = Audio, opened like every tab (it makes its own service; Order 014 item 1c for 018)
-        pages[0].open(&env, now);
+        // the first tab, opened like every tab (it makes its own service; Order 014 item 1c for 018). Order 047: the tab
+        // the menu shows first - it opened Audio every time and closed it again at once (its worker's first full read,
+        // 100-400 ms, on every open of another tab)
+        pages[first].open(&env, now);
         let mut ui = Ui {
             rm,
-            tab: 0,
+            tab: first,
             switch: None,
             open_t: now,
             close_t: None,
@@ -529,7 +573,7 @@ impl Ui {
             press_s: vec![tw(1.0); n],
             appear: vec![-1e9; n],
             addon_gen: crate::addons::gen(),
-            dot: tw((dock_x(0) + DT_W / 2.0) as f64),
+            dot: tw((dock_x(first) + DT_W / 2.0) as f64),
             ds_t: 0.0,
             ds: 0.0,
             ds_last: now,
@@ -568,6 +612,7 @@ impl Ui {
             frozen,
             last_step: now,
             review: None,
+            review_bg: ReviewBg::default(),
             toast: None,
             want_scroll: None,
             want_tab: None,
@@ -581,9 +626,14 @@ impl Ui {
             tip_shown: false,
             focus_ring: false,
             drag_over: None,
+            switch_wait: None,
+            switch_shown: None,
+            pre: None,
+            pre_close_at: None,
         };
         ui.st.settle_until = now + SETTLE_MS;
-        ui.on_t[0].jump(1.0);
+        ui.on_t[first].jump(1.0);
+        ui.reveal(first, false, now);
         ui.edges(now, true);
         ui
     }
@@ -603,6 +653,7 @@ impl Ui {
         self.last_step = now;
         self.env.frozen = self.frozen;
         self.apply_pending(now);
+        self.review_poll(now);
         self.sync_addon_tabs(now);
         // the top row follows its target (time-based ease, settles in ~160 ms)
         if (self.ds_t - self.ds).abs() > 0.0 {
@@ -628,6 +679,24 @@ impl Ui {
             }
             self.st.settle_until = self.st.settle_until.max(now + SETTLE_MS);
             self.dirty = true;
+        } else if let Some(t0) = self.switch_wait.take() {
+            // (measuring, Order 047) the clicked tab's page goes into this frame
+            self.switch_shown = Some((t0, self.pages[self.tab].ready()));
+        }
+        // Order 047 item 10: the pointer rests on a tab's icon (its name label is due, 120 ms): that page opens now - its
+        // service starts reading - so a click shows it at once; let go again if no click comes (PRE_KEEP_MS)
+        if self.close_t.is_none() {
+            if let Some(i) = self.lbl_i.filter(|&i| i != self.tab && now - self.lbl_since >= 120.0 && self.pre != Some(i)) {
+                if self.pages[i].preopen() && self.switch.is_none_or(|s| s.0 != i) {
+                    self.drop_pre();
+                    let env = self.env.clone();
+                    self.pages[i].open(&env, now);
+                    self.pre = Some(i);
+                }
+            }
+            if self.pre_close_at.is_some_and(|t| now >= t) {
+                self.drop_pre();
+            }
         }
         // a key, a key field or a job changed something (services.rs)
         if crate::services::take_dirty() {
@@ -676,7 +745,9 @@ impl Ui {
             // live content moving (meters): the page's boxes are built again for the live pass only - the static page
             // layer is not painted again (that is `dirty`)
             self.ticking = self.close_t.is_none() && self.pages[tab].tick(now);
-            if self.ticking {
+            // (Order 047: only the live boxes' own values moved - they read them when painted; the boxes stay)
+            let live_only = self.ticking && self.pages[tab].live_only() && self.layers.get(&tab).is_some_and(|l| l.laid.has_live() && !l.stale);
+            if self.ticking && !live_only {
                 self.live_dirty = true;
                 // a page whose moving content is NOT in live boxes (a stopwatch's digits, a clock: plain text) changes in
                 // its static layer: paint that again too, every tick - else it moved only when the mouse did (feedback F4)
@@ -738,13 +809,71 @@ impl Ui {
             return true;
         }
         // (a page's non-modal overlay alone - a selection bar - needs no frames)
-        if self.sb_hold.is_some() || self.modal || self.toast.is_some() || self.tips_busy {
+        // (Order 047: an open popup / dialog, a toast at rest, a tip waiting out its delay need no frames: their moving
+        // parts are transitions (`st.busy`) and their timed steps are wake-ups - `wake_at`)
+        if self.sb_hold.is_some() || self.tips_busy {
             return true;
         }
         if let Some(l) = self.pages[self.tab].legacy_ref() {
             return l.busy(now);
         }
         false
+    }
+
+    /// Order 047: while nothing moves (`animating` false), the next moment the menu must wake by itself - the shown
+    /// page's poll (`Page::wake_at`) or a picture that changes at a known time (`Cx::wake_at`, a toast's end, a tip's
+    /// delay, the top row's name label). None = only input or a waker wakes it (zero CPU).
+    pub fn wake_at(&self, now: f64) -> Option<f64> {
+        let min = |a: Option<f64>, b: Option<f64>| match (a, b) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        if self.close_t.is_some() {
+            return None;
+        }
+        let w = min(self.repaint_at(), self.pages[self.tab].wake_at(now));
+        // a tab opened ahead on hover is let go (`update`)
+        min(w, self.pre_close_at)
+    }
+
+    /// Order 047: close the page opened ahead on hover (unless it is shown now / still sliding out).
+    fn drop_pre(&mut self) {
+        self.pre_close_at = None;
+        if let Some(j) = self.pre.take() {
+            if j != self.tab && self.switch.is_none_or(|s| s.0 != j) {
+                self.pages[j].close();
+                self.layers.remove(&j);
+            }
+        }
+    }
+
+    /// The timed repaints (`wake_at` without the page's poll): the moment the picture changes by itself.
+    fn repaint_at(&self) -> Option<f64> {
+        let min = |a: Option<f64>, b: Option<f64>| match (a, b) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        let mut w = self.st.wake;
+        if let Some((_, at)) = &self.toast {
+            // it goes (`update`) after its fade-out (whose start the toast's own build asked for: `st.wake`)
+            w = min(w, Some(at + crate::ui::pieces::toast::SHOW_MS + 300.0));
+        }
+        w = min(w, self.tips.due());
+        if self.lbl_i.is_some() && self.lbl_t.target() < 0.5 {
+            w = min(w, Some(self.lbl_since + 120.0));
+        }
+        w
+    }
+
+    /// Order 047: the menu woke by itself (`wake_at` came): a timed repaint builds the page again; the page's poll runs
+    /// (`update` -> `tick`) and draws only if it says something changed.
+    pub fn wake(&mut self, now: f64) {
+        if self.repaint_at().is_some_and(|t| t <= now + 0.5) {
+            self.dirty = true;
+            let tab = self.tab;
+            self.mark_stale(tab);
+        }
+        self.update(now);
     }
 
     // ============================================================== open / close / tabs
@@ -786,6 +915,8 @@ impl Ui {
             return;
         }
         let cur = have[self.tab];
+        // (Order 047: a page opened ahead on hover is let go first - the indexes change)
+        self.drop_pre();
         // a running switch: its old page closes now (and is not closed twice below if it is the one leaving)
         let mut closed: Option<&'static str> = None;
         if let Some((from, _, _)) = self.switch.take() {
@@ -867,6 +998,7 @@ impl Ui {
     pub fn close(&mut self, now: f64) {
         if self.close_t.is_none() {
             self.close_t = Some(now);
+            self.drop_pre();
             self.dismiss_popup();
             crate::services::try_with(|s| s.stop_listening());
             self.lbl_i = None;
@@ -914,9 +1046,16 @@ impl Ui {
         self.st.clear();
         self.press_key = None;
         let env = self.env.clone();
-        self.pages[i].open(&env, now);
+        // (Order 047: a page opened ahead on hover is open already - its reads ran meanwhile)
+        if self.pre == Some(i) {
+            self.pre = None;
+            self.pre_close_at = None;
+        } else {
+            self.pages[i].open(&env, now);
+        }
         self.st.settle_until = now + SETTLE_MS;
         self.hold_until = now + HOLD_MS;
+        self.switch_wait = Some(now);
         self.scroll[i].jump(0.0);
         self.layers.remove(&i);
         let x = (dock_x(i) + DT_W / 2.0) as f64;
@@ -933,6 +1072,7 @@ impl Ui {
     /// switch animation (the first page shown is that one), then hands it `target` (`Page::jump`).
     pub fn start_on(&mut self, id: &str, target: Option<&str>, now: f64) {
         let Some(i) = self.pages.iter().position(|p| p.id() == id) else { return };
+        self.drop_pre();
         if i != self.tab {
             let old = self.tab;
             self.pages[old].close();
@@ -1257,6 +1397,12 @@ impl Ui {
             self.lbl_since = now;
             self.lbl_t.set(now, 0.0, 120.0, anim::EASE);
         }
+        // Order 047: a tab opened ahead on hover (`update`) is let go a while after the pointer leaves the icons
+        if dock_h(h).is_some() {
+            self.pre_close_at = None;
+        } else if self.pre.is_some() && self.pre_close_at.is_none() {
+            self.pre_close_at = Some(now + PRE_KEEP_MS);
+        }
         let cap = |x: Hit| match x {
             Hit::CapMin => Some(0),
             Hit::CapClose => Some(1),
@@ -1346,36 +1492,31 @@ impl Ui {
                 cx::Req::ScrollY(y) => self.want_scroll = Some(WantScroll::Y(y)),
                 cx::Req::ShowTab(id, target) => self.want_tab = Some((id, target)),
                 cx::Req::DragOut(paths) => drag = Some(paths),
+                // (the page's `resettable()` runs first: it may build its service; then the store, queued notes written first)
+                // Order 047: a page that hands a detached copy is read on a worker thread - the review opens when its lines
+                // are in (`review_poll`); the others are read here as before
                 cx::Req::Reset(kind, (x, y, _w, h)) => {
-                    // (the page's `resettable()` runs first: it may build its service; then the store, queued notes written first)
-                    let review = match self.pages[tab].resettable() {
-                        Some(p) => crate::services::with(|s| {
+                    let mut rs: Vec<&mut dyn crate::undo::Resettable> = self.pages[tab].resettable().into_iter().collect();
+                    let opened = if rs.is_empty() {
+                        None
+                    } else {
+                        crate::services::with(|s| {
                             crate::undo::flush(&mut s.store);
-                            crate::undo::Review::for_page(kind, p, &s.store)
-                        }),
-                        None => None,
+                            crate::undo::Review::open(kind, false, &mut rs, &s.store)
+                        })
                     };
-                    match review {
-                        Some(r) if !r.is_empty() => self.review = Some(ReviewState { review: r, x, y: y + h + 4.0, tab }),
-                        Some(_) => self.toast = Some(("Nothing to reset".to_string(), now)),
-                        None => {}
-                    }
+                    drop(rs);
+                    self.review_opened(opened, x, y + h + 4.0, tab, now);
                 }
                 // Settings › Reset: every tab's lines, in the top row's order, grouped by tab
                 cx::Req::ResetAll(kind, (x, y, _w, h)) => {
-                    let rs: Vec<&mut dyn crate::undo::Resettable> = self.pages.iter_mut().filter_map(|p| p.resettable()).collect();
-                    let refs: Vec<&dyn crate::undo::Resettable> = rs.iter().map(|r| &**r).collect();
-                    let review = crate::services::with(|s| {
+                    let mut rs: Vec<&mut dyn crate::undo::Resettable> = self.pages.iter_mut().filter_map(|p| p.resettable()).collect();
+                    let opened = crate::services::with(|s| {
                         crate::undo::flush(&mut s.store);
-                        crate::undo::Review::for_all(kind, &refs, &s.store)
+                        crate::undo::Review::open(kind, true, &mut rs, &s.store)
                     });
-                    drop(refs);
                     drop(rs);
-                    match review {
-                        Some(r) if !r.is_empty() => self.review = Some(ReviewState { review: r, x, y: y + h + 4.0, tab }),
-                        Some(_) => self.toast = Some(("Nothing to reset".to_string(), now)),
-                        None => {}
-                    }
+                    self.review_opened(opened, x, y + h + 4.0, tab, now);
                 }
             }
         }
@@ -1515,28 +1656,73 @@ impl Ui {
             // settings meanwhile); each ok line is recorded (queued notes first)
             let mut rp: Vec<&mut dyn crate::undo::Resettable> =
                 if all { self.pages.iter_mut().filter_map(|p| p.resettable()).collect() } else { self.pages[tab].resettable().into_iter().collect() };
-            let results = rs.review.apply_each(&mut rp, &mut |l| {
-                crate::undo::note(&l.page, &l.item, &l.label, &l.from, &l.to);
-                Ok(())
-            });
+            // Order 047: a page that hands a detached copy is put back on a worker thread (an admin prompt, a display mode
+            // change wait there); the toast comes when it has ended (`review_poll`)
+            let started = rs.review.start_apply(&mut rp);
             drop(rp);
-            let failed = results.iter().filter(|r| matches!(r.outcome, crate::undo::Outcome::Failed(_))).count();
-            let what = if rs.review.kind == crate::undo::Kind::HowItWas { "Back to how it was" } else { "Windows defaults" };
-            let t = if n == 0 {
-                "Nothing to reset".to_string()
-            } else if failed == 0 {
-                format!("{} · {} {} reset", what, n, if n == 1 { "setting" } else { "settings" })
-            } else {
-                format!("{} of {} reset · {} could not be changed", n - failed, n, failed)
-            };
-            self.toast = Some((t, now));
+            match started {
+                crate::undo::Applied::Done(results) => self.toast = Some((crate::undo::reset_toast(rs.review.kind, n, &results), now)),
+                crate::undo::Applied::Running(job) => self.review_bg.applying.push((job, rs.review.kind, n)),
+            }
             return true;
         }
         false
     }
 
+    /// Order 047: what `Review::open` gave: the review shows now, or when its worker has read the detached pages.
+    fn review_opened(&mut self, opened: Option<crate::undo::Opened>, x: f32, y: f32, tab: usize, now: f64) {
+        match opened {
+            Some(crate::undo::Opened::Ready(r)) if !r.is_empty() => self.review = Some(ReviewState { review: r, x, y, tab }),
+            Some(crate::undo::Opened::Ready(_)) => self.toast = Some(("Nothing to reset".to_string(), now)),
+            Some(crate::undo::Opened::Reading(job)) => self.review_bg.reading = Some((job, x, y, self.pages[tab].id())),
+            None => {}
+        }
+    }
+
+    /// Order 047: the reset review's work off the menu's thread came back (the worker woke the menu; called every step):
+    /// the review shows (still on its tab), a finished reset says how it went and its pages read their new state.
+    fn review_poll(&mut self, now: f64) {
+        if let Some((job, x, y, id)) = self.review_bg.reading.as_mut() {
+            if let Some(r) = job.take() {
+                let (x, y, id) = (*x, *y, *id);
+                self.review_bg.reading = None;
+                if self.pages[self.tab].id() == id {
+                    let tab = self.tab;
+                    if r.is_empty() {
+                        self.toast = Some(("Nothing to reset".to_string(), now));
+                    } else {
+                        self.review = Some(ReviewState { review: r, x, y, tab });
+                    }
+                    self.dirty = true;
+                    self.mark_stale(tab);
+                }
+            }
+        }
+        let mut i = 0;
+        while i < self.review_bg.applying.len() {
+            let Some(results) = self.review_bg.applying[i].0.take() else {
+                i += 1;
+                continue;
+            };
+            let (job, kind, n) = self.review_bg.applying.remove(i);
+            for p in self.pages.iter_mut() {
+                if let Some(r) = p.resettable() {
+                    if job.away.iter().any(|a| a == r.page_id()) {
+                        r.reset_done();
+                    }
+                }
+            }
+            self.toast = Some((crate::undo::reset_toast(kind, n, &results), now));
+            self.dirty = true;
+            let tab = self.tab;
+            self.mark_stale(tab);
+        }
+    }
+
     fn dismiss_popup(&mut self) {
         self.review = None;
+        // (Order 047: a review still being read is dropped too - it never pops up after the user moved on)
+        self.review_bg.reading = None;
         self.modal = false;
         if self.popup.take().is_some() {
             let tab = self.tab;
@@ -2068,6 +2254,7 @@ impl Ui {
         }
         if tab == self.tab {
             self.st.busy = false;
+            self.st.wake = None;
         }
         let page = self.pages[tab].id();
         let mut cx = Cx::new(now, self.rm, g, &mut self.st).for_page(page);
@@ -2454,7 +2641,7 @@ impl Ui {
             };
             let cached = self.dock_icons.get(&i).filter(|c| c.0 == sig).map(|c| c.1.clone());
             let img = cached.or_else(|| {
-                let mut surf = crate::gfx::new_surface((br - bl).max(1), (bb - bt).max(1))?;
+                let mut surf = g.surface_like((br - bl).max(1), (bb - bt).max(1))?;
                 surf.canvas().clear(sk::Color::TRANSPARENT);
                 g.begin(surf.canvas());
                 g.set_transform(&(tr * Matrix3x2::translation(-bl as f32 / gs, -bt as f32 / gs)));
@@ -3173,7 +3360,9 @@ mod tests {
         ui.mouse_move(60.0, PAGE_TOP + 2.0 + 30.0, t);
         ui.update_tips(&g, t);
         assert!(!ui.tip_shown, "not before 300 ms");
-        assert!(ui.static_busy(t), "the 300 ms timer keeps frames coming");
+        // Order 047: the 300 ms are waited out asleep - no frames, a wake-up when they end
+        assert!(!ui.static_busy(t), "no frames while the 300 ms timer runs");
+        assert!(ui.wake_at(t).is_some_and(|w| (w - (t + 300.0)).abs() < 1.0), "the menu wakes when the 300 ms end: {:?}", ui.wake_at(t));
         ui.update_tips(&g, t + 310.0);
         assert!(ui.tip_shown && ui.popup_open(), "the bubble shows");
         ui.wheel(-120.0, t + 400.0);
@@ -3235,6 +3424,113 @@ mod tests {
         assert!(ui.animating(t + 16.0), "the ticking page wants frames");
         ui.update(t + 32.0);
         assert!(ui.animating(t + 48.0), "and keeps wanting them");
+    }
+
+    /// Order 047 (~1.7 cores with the menu open): at rest - the open motion over, nothing hovered or
+    /// moving, a page that does not tick - the menu asks for NO frames and has nothing to wake for.
+    #[test]
+    fn at_rest_the_menu_draws_nothing() {
+        let g = Gfx::new(1.0);
+        let ready = std::rc::Rc::new(std::cell::Cell::new(true));
+        let mut ui = Ui::with_pages(probes(&ready, false), true, true, 0.0);
+        let t = 10_000.0;
+        ui.update(t);
+        ui.ensure_layer(&g, 0, t);
+        ui.dirty = false;
+        ui.update(t + 16.0);
+        // (`dirty` is not asserted: other tests' threads may wake the app-wide services flag meanwhile)
+        assert!(!ui.animating(t + 16.0), "no frames at rest");
+        assert_eq!(ui.wake_at(t + 16.0), None, "nothing to wake for");
+    }
+
+    /// Order 047: a toast at rest needs no frames - only its fade-out, at 1.8 s, wakes the menu (it rebuilds there).
+    #[test]
+    fn a_toast_at_rest_sleeps_until_its_fade() {
+        let g = Gfx::new(1.0);
+        let ready = std::rc::Rc::new(std::cell::Cell::new(true));
+        let mut ui = Ui::with_pages(probes(&ready, false), true, true, 0.0);
+        let t = 10_000.0;
+        ui.update(t);
+        ui.toast = Some(("Saved".into(), t));
+        ui.ensure_layer(&g, 0, t);
+        // its fade-in (transitions, reduced motion: 10 ms) runs out
+        ui.ensure_layer(&g, 0, t + 50.0);
+        ui.dirty = false;
+        ui.update(t + 60.0);
+        assert!(!ui.animating(t + 60.0), "no frames while it just shows");
+        let end = t + crate::ui::pieces::toast::SHOW_MS;
+        assert!(ui.wake_at(t + 60.0).is_some_and(|w| (w - end).abs() < 1.0), "wakes when it starts to fade: {:?}", ui.wake_at(t + 60.0));
+        ui.wake(end + 1.0);
+        assert!(ui.dirty, "the wake-up builds it again (its fade-out starts)");
+    }
+
+    /// Order 047: a page polled with `wake_at` that has nothing new asks for no frame when it is woken.
+    #[test]
+    fn a_woken_page_with_nothing_new_draws_nothing() {
+        struct Poll(std::rc::Rc<std::cell::Cell<u32>>);
+        impl Page for Poll {
+            fn id(&self) -> &'static str {
+                "poll"
+            }
+            fn name(&self) -> &'static str {
+                "poll"
+            }
+            fn icon(&self) -> &'static str {
+                ""
+            }
+            fn tick(&mut self, _now: f64) -> bool {
+                self.0.set(self.0.get() + 1);
+                false
+            }
+            fn wake_at(&self, now: f64) -> Option<f64> {
+                Some(now + 16.0)
+            }
+            fn build(&mut self, _cx: &mut Cx) -> Vec<El> {
+                vec![El::block().h(20.0)]
+            }
+        }
+        let g = Gfx::new(1.0);
+        let n = std::rc::Rc::new(std::cell::Cell::new(0));
+        let mut ui = Ui::with_pages(vec![Box::new(Poll(n.clone()))], true, true, 0.0);
+        let t = 10_000.0;
+        ui.update(t);
+        ui.ensure_layer(&g, 0, t);
+        ui.dirty = false;
+        let before = n.get();
+        let w = ui.wake_at(t).expect("it polls");
+        ui.wake(w);
+        assert!(n.get() > before, "the wake-up ran its tick");
+        assert!(!ui.animating(w), "and drew nothing");
+        assert!(ui.wake_at(w).is_some_and(|x| x > w), "the next look is later");
+    }
+
+    /// Order 047: the menu makes only the page it shows first (it used to open Audio on every open and close it again).
+    #[test]
+    fn the_menu_opens_only_its_first_tab() {
+        struct Count(&'static str, std::rc::Rc<std::cell::RefCell<Vec<&'static str>>>);
+        impl Page for Count {
+            fn id(&self) -> &'static str {
+                self.0
+            }
+            fn name(&self) -> &'static str {
+                self.0
+            }
+            fn icon(&self) -> &'static str {
+                ""
+            }
+            fn open(&mut self, _env: &Env, _now: f64) {
+                self.1.borrow_mut().push(self.0);
+            }
+            fn build(&mut self, _cx: &mut Cx) -> Vec<El> {
+                vec![]
+            }
+        }
+        let log = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let pages: Vec<Box<dyn Page>> = vec![Box::new(Count("aud", log.clone())), Box::new(Count("pad", log.clone()))];
+        let mut ui = Ui::with_pages_on(pages, 1, true, true, 0.0);
+        ui.start_on("pad", None, 0.0);
+        assert_eq!(*log.borrow(), vec!["pad"], "only the shown tab was opened");
+        assert_eq!(ui.tab_id(), "pad");
     }
 
     /// Feedback F3: re-opened during the close motion it stays on its tab.

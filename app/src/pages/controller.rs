@@ -14,13 +14,14 @@ mod hist;
 mod look;
 mod panel;
 mod pic;
+mod work;
 
 use std::collections::HashMap;
 
 use bu_controller::binding::{key_label, key_token, KEYS};
-use bu_controller::layout::{ActionSet, Press};
+use bu_controller::layout::{ActionSet, Layout, Press};
 use bu_controller::live::{LiveState, LiveView};
-use bu_controller::os::{PadInfo, PadOs};
+use bu_controller::os::PadInfo;
 use bu_controller::prefs::NOISE_STEPS;
 use bu_controller::settings::{radius_to_pct, GyroView, StickView, TouchpadView, TriggerView};
 use bu_controller::{
@@ -32,6 +33,7 @@ use taffy::style::{AlignItems, JustifyContent};
 use crate::anim::{Bezier, EASE, EASE_OUT, EASE_OUT_CSS};
 use crate::gfx::{sh, Font, Rgba};
 use crate::pages::{Env, Page};
+use crate::undo::Resettable;
 use crate::ui::cx::{Cx, Ev};
 use crate::ui::el::{idx, key, lh, sub, Cursor, El, Key};
 use crate::ui::pieces::ibtn;
@@ -42,6 +44,7 @@ use crate::ui::{cmix, ACC, FG, FG2, FG3, HAIR, HOV, POP, WHITE, WIN_W};
 
 use data::Svc;
 use look::ActShow;
+use work::{After, Job, Want, Wr};
 use pic::{Pic, Pid};
 
 const K_GAME: Key = key("pad.game");
@@ -208,8 +211,12 @@ struct Lv {
 
 /// Everything the open page holds (dropped on close).
 struct Open {
-    svc: Result<Svc, String>,
-    pads_os: Box<dyn PadOs>,
+    /// the Steam service: made and used on the tab's worker (Order 047), locked here only by the change log and tests
+    svc: data::Shared,
+    /// a `--real-read` copy (the change log's service is made the same way)
+    real_read: bool,
+    /// Steam's folder was found (the worker's first answer; None = not known yet)
+    svc_ok: Option<bool>,
     pads: Vec<PadInfo>,
     kind: PadKind,
     pic: Pic,
@@ -219,6 +226,22 @@ struct Open {
     sets: Vec<ActionSet>,
     view: Option<PadView>,
     steam: Option<PadView>,
+    /// the shown game's layout and Steam's own layout as last read: a change and another action set show at once from
+    /// them (Order 047), the files' truth follows with the worker's answer
+    lay: Option<Layout>,
+    steam_lay: Option<Layout>,
+    /// Steam's install folder (where `steam.exe` is), from the worker's first answer
+    steam_dir: Option<std::path::PathBuf>,
+    /// the worker's jobs and answers; the answers still out (jobs that read the view again / others)
+    jobs: Option<std::sync::mpsc::Sender<Job>>,
+    done: std::sync::mpsc::Receiver<work::Done>,
+    out_state: usize,
+    out_other: usize,
+    /// its real values are in (the worker's first answer, or the state kept from the last opening)
+    ready: bool,
+    /// Ctrl+Z / Ctrl+Y (redo = true) pressed while a change was still being written: done when its answer is in, so the
+    /// newest change is the one undone
+    undo_q: Vec<bool>,
     prefs: Vec<Prefs>,
     note: Option<String>,
     sel: Option<Pid>,
@@ -273,8 +296,33 @@ struct Open {
 pub struct Controller {
     o: Option<Box<Open>>,
     /// a closed tab's Steam service for the change log (Settings › Reset, the uninstaller): made at its first use
-    cold: std::cell::RefCell<Option<Result<Svc, String>>>,
+    cold: data::Shared,
+    /// a closed tab's worker answers still out (Order 047): the change-log entries of writes it was still making
+    tail: Vec<std::sync::mpsc::Receiver<work::Done>>,
 }
+
+/// What the tab showed when it closed (Order 047: kept in the app's `Keep`, shown at once on the next opening while the
+/// worker reads the files again).
+#[derive(Clone)]
+struct Snap {
+    kind: PadKind,
+    pads: Vec<PadInfo>,
+    prefs: Vec<Prefs>,
+    games: Vec<Game>,
+    gi: usize,
+    set: u32,
+    sets: Vec<ActionSet>,
+    lay: Option<Layout>,
+    steam_lay: Option<Layout>,
+    view: Option<PadView>,
+    steam: Option<PadView>,
+    note: Option<String>,
+    steam_dir: Option<std::path::PathBuf>,
+    steam_up: bool,
+}
+
+/// The `Keep` slot of `Snap`.
+const SNAP: &str = "pad.snap";
 
 // ------------------------------------------------------------------------------------------------ small helpers
 
@@ -395,17 +443,16 @@ fn pct(v: f64) -> String {
 
 impl Open {
     fn new(env: &Env, now: f64) -> Open {
-        let (svc, pads_os) = data::open(env.fake(), env.real_read);
-        let pads = pads_os.list_pads().unwrap_or_default();
-        let prefs = svc.as_ref().ok().and_then(|s| s.preferences().ok()).unwrap_or_default();
-        // the outline = the controller plugged in; none = the type of the controller Steam knows (else a DualSense)
-        let kind = pads.first().map(|p| p.kind).unwrap_or_else(|| {
-            prefs.iter().find_map(|p| if p.name.contains("Edge") { Some(PadKind::DualSenseEdge) } else { None }).unwrap_or(PadKind::DualSense)
-        });
+        // Order 047: nothing slow here - the tab's worker makes the Steam service (the registry), lists the controllers
+        // (one report per PlayStation pad for its battery), reads the files and starts the live view
+        let svc: data::Shared = Default::default();
+        let (jobs, done) = work::start(svc.clone(), env.fake(), env.waker());
+        let kind = PadKind::DualSense;
         let mut o = Open {
             svc,
-            pads_os,
-            pads,
+            real_read: env.real_read,
+            svc_ok: None,
+            pads: vec![],
             kind,
             pic: pic::pic(kind),
             games: vec![],
@@ -414,7 +461,16 @@ impl Open {
             sets: vec![],
             view: None,
             steam: None,
-            prefs,
+            lay: None,
+            steam_lay: None,
+            steam_dir: None,
+            jobs: Some(jobs),
+            done,
+            out_state: 0,
+            out_other: 0,
+            ready: false,
+            undo_q: Vec::new(),
+            prefs: vec![],
             note: None,
             sel: None,
             part_at: -1e9,
@@ -448,23 +504,70 @@ impl Open {
             launch_at: None,
             drift: None,
         };
-        // is Steam running: the real one watched while the tab is open (no Steam folder at all: the note says so, no glass)
-        if let Ok(s) = &o.svc {
-            if o.fake {
-                o.steam_up = s.steam_running();
-            } else {
-                let w = data::SteamWatch::start(o.waker);
-                o.steam_up = w.up();
-                o.steam_watch = Some(w);
-            }
+        // the last opening's state at once; the worker's answer fills in
+        if let Some(s) = env.keep.get::<Snap>(SNAP) {
+            o.restore(s);
         }
-        o.load_games();
-        o.start_live();
+        // is Steam running: the real one watched while the tab is open (the watch's own thread looks at the process list;
+        // no Steam folder at all: the note says so, no glass - the worker's first answer stops the watch); the fake's
+        // switch comes with the worker's answers
+        if !o.fake {
+            o.steam_watch = Some(data::SteamWatch::start(o.waker, o.steam_up));
+        }
+        o.send(Job::Open { real_read: env.real_read, slow: data::test_slow() });
         if o.frozen {
             // the drawing without motion (RM): LV.ls = [.32, -.12]
             o.lv.ls = (0.32, -0.12);
         }
         o
+    }
+
+    /// The state kept from the last opening, shown at once (Order 047). The tab opens on the first game's first action set
+    /// of the controller plugged in (as it always did): a kept state of another game / set / controller type shows only
+    /// its lists, the view waits for the worker.
+    fn restore(&mut self, s: Snap) {
+        let kind = work::open_kind(&s.pads, &s.prefs);
+        let first = s.sets.first().map(|x| x.id).unwrap_or(0);
+        self.kind = kind;
+        self.pic = pic::pic(kind);
+        self.pads = s.pads;
+        self.prefs = s.prefs;
+        self.steam_dir = s.steam_dir;
+        self.steam_up = s.steam_up;
+        if s.kind != kind {
+            return;
+        }
+        self.games = s.games;
+        if s.gi == 0 && s.set == first {
+            self.set = s.set;
+            self.sets = s.sets;
+            self.lay = s.lay;
+            self.steam_lay = s.steam_lay;
+            self.view = s.view;
+            self.steam = s.steam;
+            self.note = s.note;
+            self.ready = true;
+        }
+    }
+
+    /// What the tab shows now (kept when it closes).
+    fn snap(&self) -> Snap {
+        Snap {
+            kind: self.kind,
+            pads: self.pads.clone(),
+            prefs: self.prefs.clone(),
+            games: self.games.clone(),
+            gi: self.gi,
+            set: self.set,
+            sets: self.sets.clone(),
+            lay: self.lay.clone(),
+            steam_lay: self.steam_lay.clone(),
+            view: self.view.clone(),
+            steam: self.steam.clone(),
+            note: self.note.clone(),
+            steam_dir: self.steam_dir.clone(),
+            steam_up: self.steam_up,
+        }
     }
 
     fn xbox(&self) -> bool {
@@ -475,61 +578,299 @@ impl Open {
         self.games.get(self.gi)
     }
 
-    fn load_games(&mut self) {
-        let key = self.game().map(|g| g.key.clone());
-        self.games = match &self.svc {
-            Ok(s) => match s.games(self.kind) {
-                Ok(g) => g,
-                Err(e) => {
-                    self.note = Some(e.to_string());
-                    vec![]
-                }
-            },
-            Err(e) => {
-                self.note = Some(e.clone());
-                vec![]
+    // ---- the worker (Order 047): every Steam read / write and the controllers off the menu's thread
+
+    /// Hand a job to the tab's worker (its answer comes back through `drain`, in the order asked).
+    fn send(&mut self, j: Job) {
+        let state = j.is_state();
+        let Some(tx) = &self.jobs else { return };
+        if tx.send(j).is_ok() {
+            if state {
+                self.out_state += 1;
+            } else {
+                self.out_other += 1;
             }
-        };
-        // installed games first, the order Steam's index has them otherwise; keep the picked one
-        self.gi = key.and_then(|k| self.games.iter().position(|g| g.key == k)).unwrap_or(0);
-        self.set = 0;
-        self.load_view();
+        }
     }
 
-    fn load_view(&mut self) {
-        self.view = None;
-        self.steam = None;
-        let (Ok(svc), Some(g)) = (&self.svc, self.games.get(self.gi)) else { return };
-        let key = g.key.clone();
-        self.sets = svc.action_sets(&key, self.kind).unwrap_or_default();
-        if !self.sets.iter().any(|s| s.id == self.set) {
-            self.set = self.sets.first().map(|s| s.id).unwrap_or(0);
-        }
-        match svc.view(&key, self.kind, self.set) {
-            Ok(v) => {
-                self.view = Some(v);
-                self.note = None;
+    /// Nothing asked of the worker is still out.
+    fn idle(&self) -> bool {
+        self.out_state == 0 && self.out_other == 0 && self.undo_q.is_empty()
+    }
+
+    /// The game / controller type / action set shown.
+    fn want(&self) -> Want {
+        Want { kind: self.kind, key: self.game().map(|g| g.key.clone()), set: Some(self.set), fresh: false }
+    }
+
+    /// Read the shown game's files again (on the worker).
+    fn reload(&mut self) {
+        let w = self.want();
+        self.send(Job::Load(w));
+    }
+
+    /// The worker's answers that are in (nothing waiting = nothing done): true = something to show.
+    fn drain(&mut self, now: f64) -> bool {
+        let mut any = false;
+        while let Ok(d) = self.done.try_recv() {
+            any = true;
+            if d.is_state() {
+                self.out_state = self.out_state.saturating_sub(1);
+            } else {
+                self.out_other = self.out_other.saturating_sub(1);
             }
-            Err(e) => self.note = Some(e.to_string()),
+            self.take(d, now);
         }
-        self.steam = svc.steam_layout(&key, self.kind).ok().map(|l| {
-            let ss = if l.action_sets().iter().any(|s| s.id == self.set) { self.set } else { 0 };
-            l.pad_view(ss, self.kind)
-        });
-        if let Ok(p) = svc.preferences() {
+        // an undo / redo pressed meanwhile: now that every change is written and its step kept (one at a time - each
+        // one's write is waited for too)
+        while self.out_state == 0 && !self.undo_q.is_empty() {
+            let redo = self.undo_q.remove(0);
+            self.undo(redo, now);
+            any = true;
+        }
+        any
+    }
+
+    fn take(&mut self, d: work::Done, now: f64) {
+        // a read is shown only when it is the newest one asked for: an older one, under a change still being written,
+        // would show that change undone for a moment
+        let last = self.out_state == 0;
+        match d {
+            work::Done::Opened { pads, steam_dir, svc_ok, running, loaded, live } => {
+                self.pads = pads;
+                self.steam_dir = steam_dir;
+                self.svc_ok = Some(svc_ok);
+                if !svc_ok {
+                    // no Steam folder at all: the note says so, no glass
+                    self.steam_watch = None;
+                    self.steam_up = true;
+                } else if self.fake {
+                    self.steam_up = running;
+                }
+                self.live = live;
+                if last {
+                    if loaded.kind != self.kind {
+                        // the outline = the controller plugged in
+                        self.kind = loaded.kind;
+                        self.pic = pic::pic(loaded.kind);
+                        self.sel = None;
+                    }
+                    self.apply(loaded);
+                }
+                self.ready = true;
+            }
+            work::Done::Loaded(l) => {
+                if last {
+                    self.apply(l);
+                }
+            }
+            work::Done::Wrote { r, recs, loaded, after } => {
+                // the change log: written by the next build (`cx.record`)
+                self.rec_q.extend(recs);
+                match r {
+                    Ok(id) => self.wrote(after, id, &loaded, now),
+                    Err(e) => self.failed(after, e, now),
+                }
+                if last {
+                    self.apply(loaded);
+                }
+            }
+            work::Done::Live(l) => self.live = l,
+            work::Done::Said(t) => {
+                if let Some(t) = t {
+                    self.say(t, now);
+                }
+            }
+        }
+    }
+
+    /// Show what the worker read (the files' truth).
+    fn apply(&mut self, l: work::Loaded) {
+        if l.kind != self.kind {
+            return; // read for a controller type no longer shown (a newer read is on its way)
+        }
+        self.games = l.games;
+        // installed games first, the order Steam's index has them otherwise; the picked one kept
+        self.gi = l.gi;
+        self.set = l.set;
+        if let Some(s) = l.sets {
+            self.sets = s;
+        }
+        self.lay = l.lay;
+        self.steam_lay = l.steam_lay;
+        self.view = l.view;
+        self.steam = l.steam;
+        if let Some(p) = l.prefs {
             self.prefs = p;
         }
+        self.note = l.note;
     }
 
+    /// The view a read holds of this game on this controller type (the undo step of a write: before / after).
+    fn read_view<'a>(l: &'a work::Loaded, game: &str, kind: PadKind) -> Option<&'a PadView> {
+        if l.kind == kind && l.games.get(l.gi).is_some_and(|g| g.key == game) {
+            l.view.as_ref()
+        } else {
+            None
+        }
+    }
+
+    /// A write went through: its undo step (the view before it against the files read back after it) and its words.
+    fn wrote(&mut self, after: After, id: u32, l: &work::Loaded, now: f64) {
+        match after {
+            After::Layout { before, parts, game, kind, set, acting, fallback, say } => {
+                if let (Some(b), Some(a)) = (before, Self::read_view(l, &game, kind)) {
+                    let (bc, ac) = hist::layout_diff(&b, a, &parts, kind);
+                    self.acting = acting;
+                    self.remember(hist::What::Layout { game, kind, set, before: bc, after: ac }, &fallback);
+                }
+                self.acting = None;
+                self.say(say, now);
+            }
+            After::PartToSteam { before, part, game, kind, set, name } => {
+                if let (Some(b), Some(a)) = (before, Self::read_view(l, &game, kind)) {
+                    let (bc, ac) = hist::layout_diff(&b, a, &[part], kind);
+                    self.acting = Some((K_STEAMSET, format!("{name} \u{b7} Steam\u{2019}s setting")));
+                    self.remember(hist::What::Layout { game, kind, set, before: bc, after: ac }, &name);
+                }
+                self.say(format!("{name} · back to Steam\u{2019}s setting"), now);
+            }
+            After::NewSet { game, kind, from, title } => {
+                self.acting = Some((K_SET, "New action set".into()));
+                self.remember(hist::What::NewSet { game, kind, from, title: title.clone(), id }, "New action set");
+                let first = l.sets.as_ref().and_then(|s| s.first()).map(|s| s.title.clone()).unwrap_or_else(|| "Default".into());
+                self.say(format!("{title} made \u{b7} a copy of {first}"), now);
+            }
+            After::Prefs { before, label, acting } => {
+                if let Some(a) = l.prefs.as_ref().and_then(|p| p.iter().find(|p| p.serial == before.serial)) {
+                    let (b, a) = hist::prefs_diff(&before, a);
+                    self.acting = acting;
+                    self.remember(hist::What::Prefs { serial: before.serial.clone(), before: b, after: a }, &format!("Controller settings \u{b7} {label}"));
+                }
+                self.acting = None;
+                self.say("Saved · this controller, every game", now);
+            }
+            After::Replay { mut step, redo } => {
+                // a new action set made again gets a new id
+                if redo {
+                    if let hist::What::NewSet { id: sid, .. } = &mut step.what {
+                        *sid = id;
+                    }
+                }
+                self.say(format!("{} \u{b7} {}", if redo { "Redone" } else { "Undone" }, step.label), now);
+                if redo {
+                    self.hist.undo.push(step);
+                } else {
+                    self.hist.redo.push(step);
+                }
+            }
+        }
+    }
+
+    /// A write did not go through: its words; an undo / redo step goes back to its list (the files read again show what
+    /// is there).
+    fn failed(&mut self, after: After, e: String, now: f64) {
+        if let After::Replay { step, redo } = after {
+            if redo {
+                self.hist.redo.push(step);
+            } else {
+                self.hist.undo.push(step);
+            }
+        }
+        self.acting = None;
+        self.say(e, now);
+    }
+
+    /// Order 047: a change shows at once - made to the tab's own copy of the layout (the same edit bu-controller makes to
+    /// the file on the worker); the files read back after the write follow. A change that doesn't fit changes nothing here.
+    fn local(&mut self, changes: &[Change]) {
+        let Some(l) = &self.lay else { return };
+        let mut n = l.clone();
+        for c in changes {
+            if !c.fits(self.kind) || n.apply(self.set, c).is_err() {
+                return;
+            }
+        }
+        self.view = Some(n.pad_view(self.set, self.kind));
+        self.sets = n.action_sets();
+        self.lay = Some(n);
+    }
+
+    /// The same for the controller's own file (the values as the file will hold them; None = taken out).
+    fn local_prefs(&mut self, serial: &str, vals: &[(PrefSetting, Option<String>)]) {
+        if let Some(p) = self.prefs.iter_mut().find(|p| p.serial == serial) {
+            for (s, v) in vals {
+                if let Some(slot) = p.values.iter_mut().find(|x| x.0 == *s) {
+                    slot.1 = v.clone();
+                }
+            }
+        }
+    }
+
+    /// A new action set shown at once: the copy of `from` made in the tab's own copy of the layout.
+    fn local_new_set(&mut self, from: u32, title: &str) {
+        let Some(l) = &self.lay else { return };
+        let mut n = l.clone();
+        if let Ok(id) = n.add_action_set(from, title) {
+            self.set = id;
+            self.sets = n.action_sets();
+            self.view = Some(n.pad_view(id, self.kind));
+            self.steam = self.steam_lay.as_ref().map(|s| work::steam_view(s, id, self.kind));
+            self.lay = Some(n);
+        }
+    }
+
+    /// The tab's Steam service on this thread (the change log, tests): waits while the worker uses it; made here when the
+    /// worker has not made it yet.
+    fn svc_do<R>(&self, f: impl FnOnce(&mut Svc) -> R) -> Result<R, String> {
+        let mut g = self.svc.lock().unwrap_or_else(|p| p.into_inner());
+        if g.is_none() {
+            *g = Some(data::open_steam(self.fake, self.real_read));
+        }
+        match &mut *g {
+            Some(Ok(s)) => Ok(f(s)),
+            Some(Err(e)) => Err(e.clone()),
+            None => Err("No Steam".into()),
+        }
+    }
+
+    /// Another controller type: its game list read again (on the worker), the picked game kept when it has a layout there.
+    fn load_games(&mut self) {
+        self.set = 0;
+        self.clear_view();
+        self.reload();
+    }
+
+    /// The shown view goes (another game / controller type is read): the panels wait for the worker's answer.
+    fn clear_view(&mut self) {
+        self.view = None;
+        self.steam = None;
+        self.lay = None;
+        self.steam_lay = None;
+    }
+
+    /// Another action set: shown at once from the layouts read before; the files read again behind it.
+    fn load_view(&mut self) {
+        self.show_set();
+        self.reload();
+    }
+
+    fn show_set(&mut self) {
+        if let Some(l) = &self.lay {
+            self.view = Some(l.pad_view(self.set, self.kind));
+            self.steam = self.steam_lay.as_ref().map(|s| work::steam_view(s, self.set, self.kind));
+        }
+    }
+
+    /// The live view of the shown controller type: started on the worker (opening the device can wait), the old one
+    /// stopped there too.
     fn start_live(&mut self) {
-        self.live = None;
+        let old = self.live.take();
         if self.fake {
             return; // the drawing's made-up 6-second loop (tick)
         }
-        if let Some(p) = self.pads.iter().find(|p| p.kind == self.kind).cloned() {
-            let w = self.waker;
-            self.live = LiveView::start(self.pads_os.as_ref(), &p, Some(Box::new(move |_| w.wake()))).ok();
-        }
+        let pad = self.pads.iter().find(|p| p.kind == self.kind).cloned();
+        self.send(Job::Live { pad, old });
     }
 
     fn connected(&self) -> Option<&PadInfo> {
@@ -553,96 +894,25 @@ impl Open {
         self.toast = Some((t, now));
     }
 
-    // ---- the change log (Order 036): one entry per layout file / controller file, its value before = the bytes from
-    //      before the app's first change (the crate keeps them as backups in the app's folder, across restarts)
-
-    /// Did the app change this game's files before (a backup exists)?
-    fn had_layout(&self, key: &str) -> bool {
-        self.svc.as_ref().map(|s| s.has_original(key, self.kind)).unwrap_or(false)
-    }
-
-    fn had_prefs(&self, serial: &str) -> bool {
-        self.svc.as_ref().map(|s| s.has_preferences_original(serial)).unwrap_or(false)
-    }
-
-    /// A write to the game's layout went through: its entry (written by `event`). Nothing was written (no backup) = none.
-    fn log_layout(&mut self, g: &Game, had: bool) {
-        let Ok(s) = &self.svc else { return };
-        if !s.has_original(&g.key, self.kind) {
-            return;
-        }
-        let item = data::Item::Layout(self.kind, g.key.clone());
-        let new = s.log_val(&item).unwrap_or_else(|| crate::undo::Val::new(data::EDITS, "your edits"));
-        self.rec_q.push((item.id(), data::layout_label(&g.name, self.kind), data::orig_val(!had), new));
-    }
-
-    fn log_prefs(&mut self, serial: &str, had: bool) {
-        let Ok(s) = &self.svc else { return };
-        if !s.has_preferences_original(serial) {
-            return;
-        }
-        let item = data::Item::Prefs(serial.to_string());
-        let new = s.log_val(&item).unwrap_or_else(|| crate::undo::Val::new(data::EDITS, "your settings"));
-        let name = self.prefs.iter().find(|p| p.serial == serial).map(|p| p.name.clone()).unwrap_or_else(|| "this controller".into());
-        self.rec_q.push((item.id(), data::prefs_label(&name), data::orig_val(!had), new));
-    }
-
-    /// Write changes to the game's layout (one write, one undo step of the crate and of the tab), then read it back.
-    fn write(&mut self, changes: Vec<Change>, now: f64) {
+    /// Write changes to the game's layout (one write, one undo step of the crate and of the tab): shown at once, written
+    /// and read back on the worker (Order 047); the undo step and "Saved" come with its answer.
+    fn write(&mut self, changes: Vec<Change>, _now: f64) {
         let Some(g) = self.game().cloned() else { return };
         let (before, kind, set) = (self.view.clone(), self.kind, self.set);
-        match self.apply_layout(&changes) {
-            Ok(()) => {
-                if let (Some(b), Some(a)) = (before, self.view.clone()) {
-                    let (bc, ac) = hist::layout_diff(&b, &a, &hist::parts_of(&changes), kind);
-                    let fallback = self.sel.map(|p| self.pname(p)).unwrap_or_else(|| "Controller".into());
-                    self.remember(hist::What::Layout { game: g.key.clone(), kind, set, before: bc, after: ac }, &fallback);
-                }
-                self.acting = None;
-                self.say(format!("Saved · {} gets it when you click back into the game", g.name), now);
-            }
-            Err(e) => {
-                self.acting = None;
-                self.say(e, now);
-            }
-        }
-    }
-
-    /// The bu-controller write of a layout change (changes, undo and redo): one `apply_all` on the shown game / controller
-    /// type / action set, its change-log entry, the files read again.
-    fn apply_layout(&mut self, changes: &[Change]) -> Result<(), String> {
-        let g = self.game().cloned().ok_or("No Steam game")?;
-        let had = self.had_layout(&g.key);
-        let r = match &mut self.svc {
-            Ok(s) => s.apply_all(&g.key, self.kind, self.set, changes).map_err(|e| e.to_string()),
-            Err(e) => Err(e.clone()),
+        let fallback = self.sel.map(|p| self.pname(p)).unwrap_or_else(|| "Controller".into());
+        let after = After::Layout {
+            before,
+            parts: hist::parts_of(&changes),
+            game: g.key.clone(),
+            kind,
+            set,
+            acting: self.acting.take(),
+            fallback,
+            say: format!("Saved · {} gets it when you click back into the game", g.name),
         };
-        r?;
-        self.log_layout(&g, had);
-        self.load_games_keep();
-        Ok(())
-    }
-
-    /// Re-read after a write: the game list (a community layout became the user's own) + the view.
-    fn load_games_keep(&mut self) {
-        let set = self.set;
-        let key = self.game().map(|g| g.key.clone());
-        if let Ok(s) = &self.svc {
-            if let Ok(g) = s.games(self.kind) {
-                self.games = g;
-            }
-        }
-        self.gi = key.and_then(|k| self.games.iter().position(|g| g.key == k)).unwrap_or(0);
-        self.set = set;
-        self.load_view();
-    }
-
-    fn reload_prefs(&mut self) {
-        if let Ok(s) = &self.svc {
-            if let Ok(p) = s.preferences() {
-                self.prefs = p;
-            }
-        }
+        self.local(&changes);
+        let want = self.want();
+        self.send(Job::Write { wr: Wr::Layout { key: g.key, kind, set, changes, gone: false }, want, after });
     }
 
     /// Write values of the shown controller's own file (one write, one undo step of the crate and of the tab).
@@ -653,28 +923,10 @@ impl Open {
             return;
         };
         let serial = before.serial.clone();
-        let v: Vec<(PrefSetting, Option<&str>)> = vals.iter().map(|(s, v)| (*s, v.as_deref())).collect();
-        let had = self.had_prefs(&serial);
-        let r = match &mut self.svc {
-            Ok(s) => s.set_preferences(&serial, &v, label).map_err(|e| e.to_string()),
-            Err(e) => Err(e.clone()),
-        };
-        match r {
-            Ok(()) => {
-                self.log_prefs(&serial, had);
-                self.reload_prefs();
-                if let Some(after) = self.prefs.iter().find(|p| p.serial == serial).cloned() {
-                    let (b, a) = hist::prefs_diff(&before, &after);
-                    self.remember(hist::What::Prefs { serial, before: b, after: a }, &format!("Controller settings \u{b7} {label}"));
-                }
-                self.acting = None;
-                self.say("Saved · this controller, every game", now);
-            }
-            Err(e) => {
-                self.acting = None;
-                self.say(e, now);
-            }
-        }
+        let after = After::Prefs { before, label: label.to_string(), acting: self.acting.take() };
+        self.local_prefs(&serial, vals);
+        let want = self.want();
+        self.send(Job::Write { wr: Wr::Prefs { serial, vals: vals.to_vec(), label: label.to_string() }, want, after });
     }
 
     /// The layout change a value of a control makes (None: not a layout value, or a stick mode the list doesn't have -
@@ -823,43 +1075,57 @@ impl Open {
         }
     }
 
-    /// Every frame while the tab shows: the toast, Steam started / ended, the live view, the drift check.
+    /// Every frame step while the tab shows: the worker's answers, the toast, Steam started / ended, the live view, the
+    /// drift check. True only when something shown changed (Order 047: nothing moving = no frames).
     fn tick(&mut self, now: f64) -> bool {
+        let answers = self.drain(now);
         if let Some((_, at)) = &self.toast {
-            if now - at > toast::SHOW_MS + 400.0 {
+            if now - at >= toast::SHOW_MS + 400.0 {
                 self.toast = None;
             }
         }
         let steam = self.steam_tick();
         let live = self.live_tick(now);
         let drift = self.drift_tick(now);
-        // "Starting Steam…" (at most LAUNCH_WAIT_MS after the click): frames keep coming, so its end shows (Order 042 review)
+        // "Starting Steam…" (at most LAUNCH_WAIT_MS after the click): its end repaints (Order 042 review) - the menu sleeps
+        // until then (`wake_at`; Order 047: no frames while it waits)
         let launching = match self.launch_at {
             Some(a) if now - a >= LAUNCH_WAIT_MS => {
                 self.launch_at = None;
                 true
             }
-            Some(_) => true,
-            None => false,
+            _ => false,
         };
-        steam || live || drift || launching
+        answers || steam || live || drift || launching
     }
 
     /// Steam started or ended (the watch's thread woke the menu; the fake's switch in tests): the glass comes / goes.
+    /// Nothing is read here: the watch keeps its answer, the fake's switch is looked at only while the worker doesn't hold
+    /// the service.
     fn steam_tick(&mut self) -> bool {
-        let up = match (&self.steam_watch, &self.svc) {
-            (Some(w), _) => w.up(),
-            (None, Ok(s)) => s.steam_running(),
-            (None, Err(_)) => true,
+        // not known before the worker's first answer (no Steam folder = no glass)
+        if self.svc_ok != Some(true) {
+            return false;
+        }
+        let up = match &self.steam_watch {
+            Some(w) => w.up(),
+            None if self.fake => match self.fake_running() {
+                Some(up) => up,
+                None => return false,
+            },
+            None => return false,
         };
         if up == self.steam_up {
             return false;
         }
         self.steam_up = up;
         if up {
-            // Steam may have written its files while it started: read them again
+            // Steam may have written its files while it started: read them again - on the worker (Order 047: this read on
+            // the menu's thread was the black box after "Launch Steam"), the names too
             self.launch_at = None;
-            self.load_games_keep();
+            let mut w = self.want();
+            w.fresh = true;
+            self.send(Job::Load(w));
         } else {
             // nothing stays open under the glass
             self.sel = None;
@@ -872,6 +1138,16 @@ impl Open {
         true
     }
 
+    /// The fake Steam's process switch (test copies), looked at only while the worker doesn't hold the service (None).
+    fn fake_running(&self) -> Option<bool> {
+        let g = self.svc.try_lock().ok()?;
+        match &*g {
+            Some(Ok(s)) => Some(s.steam_running()),
+            Some(Err(_)) => Some(true),
+            None => None,
+        }
+    }
+
     /// "Launch Steam" (the glass's button): Steam's own `steam.exe` through Windows' shell, only on this click; a test
     /// copy starts nothing.
     fn launch_steam(&mut self, now: f64) {
@@ -879,8 +1155,9 @@ impl Open {
             return;
         }
         self.launch_at = Some(now);
-        let Ok(s) = &self.svc else { return };
-        let exe = s.steam_dir().join("steam.exe");
+        // Steam's folder: from the worker's first answer (none = no Steam)
+        let Some(dir) = &self.steam_dir else { return };
+        let exe = dir.join("steam.exe");
         if self.test {
             self.say("Starts Steam (a test copy starts nothing)", now);
         } else {
@@ -980,17 +1257,45 @@ impl Page for Controller {
         "pad"
     }
     fn open(&mut self, env: &Env, now: f64) {
+        // opened again while still open (a tab still sliding out shown again): closed first, so its writes' entries and
+        // its undo list are kept
+        if self.o.is_some() {
+            self.close();
+        }
+        self.drain_tail();
         self.o = Some(Box::new(Open::new(env, now)));
     }
     fn close(&mut self) {
         // drops the services, the live view's thread + device, the Steam watch's thread, every cached value; the undo /
-        // redo lists wait in the app's keep for the next opening
+        // redo lists and what the tab showed wait in the app's keep for the next opening; the worker ends after the
+        // writes still queued (Order 047: their change-log entries are taken at the next opening / reset)
         if let Some(o) = self.o.take() {
             o.keep.put(hist::KEEP, o.hist.clone());
+            // (a tab closed before its first answer has nothing to show next time)
+            if o.ready {
+                o.keep.put(SNAP, o.snap());
+            }
+            if !o.idle() {
+                let o = *o;
+                self.tail.push(o.done);
+            }
         }
+    }
+    fn ready(&self) -> bool {
+        self.o.as_ref().is_none_or(|o| o.ready)
     }
     fn tick(&mut self, now: f64) -> bool {
         self.o.as_mut().map(|o| o.tick(now)).unwrap_or(false)
+    }
+    fn wake_at(&self, _now: f64) -> Option<f64> {
+        let o = self.o.as_ref()?;
+        // "Starting Steam…" ends; the page's toast goes (the worker's answers wake the menu themselves)
+        let launch = o.launch_at.map(|a| a + LAUNCH_WAIT_MS);
+        let toast = o.toast.as_ref().map(|(_, at)| at + toast::SHOW_MS + 400.0);
+        match (launch, toast) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
     }
     fn build(&mut self, cx: &mut Cx) -> Vec<El> {
         if self.o.is_none() {
@@ -1037,30 +1342,62 @@ impl Page for Controller {
             o.sel.map(|p| p.name()).unwrap_or_else(|| "-".into()),
             o.pop.as_ref().map(|p| format!("{p:?}").split([' ', '(', '{']).next().unwrap_or("").to_string()).unwrap_or_else(|| "-".into()),
             o.dlg.is_some(),
-            o.svc.as_ref().map(|s| s.fake_writes().len()).unwrap_or(0)
+            o.svc_do(|s| s.fake_writes().len()).unwrap_or(0)
         )
     }
     fn resettable(&mut self) -> Option<&mut dyn crate::undo::Resettable> {
+        self.drain_tail();
         Some(self)
     }
 }
 
 impl Controller {
-    /// The Steam service the change log works through: the open tab's own (its view is read again after a reset), else
-    /// a closed tab's made at its first use (the fake in test copies and unit tests, read-only in a `--real-read` copy).
-    fn with_svc<R>(&self, f: impl FnOnce(&Svc) -> R) -> Option<R> {
-        if let Some(o) = &self.o {
-            return o.svc.as_ref().ok().map(f);
+    /// The tab's reset as a copy that works on any thread (Order 047: the Reset review reads and puts back off the menu's
+    /// thread): the Steam service the change log works through - the open tab's own (shared with its worker; the open tab
+    /// reads its view again when the reset ended, `reset_done`), else a closed tab's made at its first use (the fake in
+    /// test copies and unit tests, read-only in a `--real-read` copy) - and the game the open tab shows. Reads nothing.
+    fn away(&self) -> Away {
+        match &self.o {
+            Some(o) => Away {
+                svc: o.svc.clone(),
+                fake: o.fake,
+                real_read: o.real_read,
+                shown: o.game().cloned().map(|g| (o.kind, g)),
+                read_only: crate::testmode::real_read() || (o.test && !o.fake),
+            },
+            None => Away {
+                svc: self.cold.clone(),
+                fake: crate::testmode::on() || cfg!(test),
+                real_read: crate::testmode::real_read(),
+                shown: None,
+                read_only: crate::testmode::real_read(),
+            },
         }
-        let mut c = self.cold.borrow_mut();
-        let s = c.get_or_insert_with(|| data::open_steam(crate::testmode::on() || cfg!(test), crate::testmode::real_read()));
-        s.as_ref().ok().map(f)
+    }
+
+    /// A closed tab's worker answers that came in since (Order 047): the change-log entries of the writes it was still
+    /// making when the tab closed.
+    fn drain_tail(&mut self) {
+        let mut recs = Vec::new();
+        // every closed opening's worker, oldest first (one that has ended and was read to its end is let go)
+        self.tail.retain(|rx| loop {
+            match rx.try_recv() {
+                Ok(work::Done::Wrote { recs: r, .. }) => recs.extend(r),
+                Ok(_) => {}
+                Err(std::sync::mpsc::TryRecvError::Empty) => break true,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => break false,
+            }
+        });
+        for (i, l, old, new) in recs {
+            crate::services::try_with(|s| crate::undo::record(&mut s.store, data::PAGE, &i, &l, &old, &new));
+        }
     }
 }
 
 /// The change log's side of the Controller tab (Order 036): every game's layout file the app wrote ("Back to how your PC
 /// was" = the bytes from before the app's first change, kept by bu-controller in the app's folder), every controller's
-/// settings file; "Steam’s layout" = the tab's Windows defaults.
+/// settings file; "Steam’s layout" = the tab's Windows defaults. Order 047: the same answers from `Away` - here on the
+/// caller's thread, or on the review's worker through `detach`.
 impl crate::undo::Resettable for Controller {
     fn page_id(&self) -> &str {
         data::PAGE
@@ -1069,35 +1406,78 @@ impl crate::undo::Resettable for Controller {
         "Controller"
     }
     fn current(&self, item: &str) -> Option<crate::undo::Val> {
-        let it = data::Item::parse(item)?;
-        self.with_svc(|s| s.log_val(&it)).flatten()
+        self.away().current(item)
     }
     fn defaults_name(&self) -> Option<&str> {
         Some("Steam\u{2019}s layout")
     }
     fn windows_defaults(&self) -> Vec<crate::undo::DefaultItem> {
-        let shown = self.o.as_ref().and_then(|o| o.game().cloned().map(|g| (o.kind, g)));
-        self.with_svc(|s| s.steam_defaults(shown.as_ref().map(|(k, g)| (*k, g)))).unwrap_or_default()
+        self.away().windows_defaults()
     }
     fn apply(&mut self, item: &str, to: &crate::undo::Val) -> Result<(), String> {
-        if crate::testmode::real_read() || self.o.as_ref().is_some_and(|o| o.test && !o.fake) {
+        let r = self.away().apply(item, to);
+        // the open tab shows the files as they are now (read again on its worker)
+        self.reset_done();
+        r
+    }
+    fn detach(&mut self) -> Option<crate::undo::Detached> {
+        Some(Box::new(self.away()))
+    }
+    fn reset_done(&mut self) {
+        if let Some(o) = self.o.as_mut() {
+            o.reload();
+        }
+    }
+}
+
+/// The Controller's reset as a Send copy (`Controller::away`): its Steam service handle, the shown game.
+struct Away {
+    svc: data::Shared,
+    fake: bool,
+    real_read: bool,
+    shown: Option<(PadKind, Game)>,
+    read_only: bool,
+}
+
+impl Away {
+    /// The service (made here at its first use; waits while the open tab's worker uses it).
+    fn with<R>(&self, f: impl FnOnce(&mut Svc) -> R) -> Result<R, String> {
+        let mut g = self.svc.lock().unwrap_or_else(|p| p.into_inner());
+        if g.is_none() {
+            *g = Some(data::open_steam(self.fake, self.real_read));
+        }
+        match &mut *g {
+            Some(Ok(s)) => Ok(f(s)),
+            Some(Err(e)) => Err(e.clone()),
+            None => Err("No Steam".into()),
+        }
+    }
+}
+
+impl crate::undo::Resettable for Away {
+    fn page_id(&self) -> &str {
+        data::PAGE
+    }
+    fn page_title(&self) -> &str {
+        "Controller"
+    }
+    fn current(&self, item: &str) -> Option<crate::undo::Val> {
+        let it = data::Item::parse(item)?;
+        self.with(|s| s.log_val(&it)).ok().flatten()
+    }
+    fn defaults_name(&self) -> Option<&str> {
+        Some("Steam\u{2019}s layout")
+    }
+    fn windows_defaults(&self) -> Vec<crate::undo::DefaultItem> {
+        let shown = self.shown.as_ref().map(|(k, g)| (*k, g));
+        self.with(|s| s.steam_defaults(shown)).unwrap_or_default()
+    }
+    fn apply(&mut self, item: &str, to: &crate::undo::Val) -> Result<(), String> {
+        if self.read_only {
             return Err("A read-only test copy changes nothing".into());
         }
         let it = data::Item::parse(item).ok_or("Unknown setting")?;
-        if let Some(o) = self.o.as_mut() {
-            let r = match &mut o.svc {
-                Ok(s) => s.restore(&it, &to.raw),
-                Err(e) => Err(e.clone()),
-            };
-            // the open tab shows the files as they are now
-            o.load_games_keep();
-            return r;
-        }
-        let c = self.cold.get_mut().get_or_insert_with(|| data::open_steam(crate::testmode::on() || cfg!(test), crate::testmode::real_read()));
-        match c {
-            Ok(s) => s.restore(&it, &to.raw),
-            Err(e) => Err(e.clone()),
-        }
+        self.with(|s| s.restore(&it, &to.raw)).and_then(|r| r)
     }
 }
 
@@ -1106,6 +1486,10 @@ impl Open {
     fn build(&mut self, cx: &mut Cx) -> Vec<El> {
         for t in std::mem::take(&mut self.toast_q) {
             cx.toast(&t);
+        }
+        // the change log of the writes the worker made since (Order 047: they land in `tick`, after their click)
+        for (i, l, old, new) in std::mem::take(&mut self.rec_q) {
+            cx.record(&i, &l, &old, &new);
         }
         let head = self.header(cx);
         let rest = vec![self.pdq(cx), self.body(cx), reset::reset_line(cx, K_RESET, Some("Steam\u{2019}s layout"))];
@@ -1705,52 +2089,26 @@ impl Open {
         self.pop = if self.pop.as_ref() == Some(&p) { None } else { Some(p) };
     }
 
-    fn open_in_steam(&mut self, now: f64) {
+    /// "Open in Steam": the link (Steam's process list) and the shell's open on the worker (Order 047); its words come
+    /// with the answer.
+    fn open_in_steam(&mut self, _now: f64) {
         let Some(g) = self.game().cloned() else { return };
-        let link = match &self.svc {
-            Ok(s) => s.open_in_steam_link(&g),
-            Err(e) => {
-                let e = e.clone();
-                return self.say(e, now);
-            }
-        };
-        match link {
-            Ok(url) => {
-                if self.test {
-                    // a test copy never opens anything on the PC
-                    self.say(format!("Opens Steam\u{2019}s own controller screen for {}", g.name), now);
-                } else {
-                    shell_open(&url);
-                }
-            }
-            Err(bu_controller::Error::SteamClosed) => self.say("Steam is closed · start Steam first", now),
-            Err(e) => self.say(e.to_string(), now),
-        }
+        let test = self.test;
+        self.send(Job::OpenInSteam { game: g, test });
     }
 
-    fn part_to_steam(&mut self, now: f64) {
+    /// "Steam's setting for this": the part's values of Steam's own layout - shown at once, written on the worker.
+    fn part_to_steam(&mut self, _now: f64) {
         let (Some(id), Some(g)) = (self.sel, self.game().cloned()) else { return };
         let Some(part) = pid_part(id) else { return };
-        let had = self.had_layout(&g.key);
         let (before, kind, set) = (self.view.clone(), self.kind, self.set);
-        let r = match &mut self.svc {
-            Ok(s) => s.part_to_steam(&g.key, self.kind, self.set, part),
-            Err(_) => return,
-        };
-        match r {
-            Ok(()) => {
-                self.log_layout(&g, had);
-                self.load_games_keep();
-                let n = self.pname(id);
-                if let (Some(b), Some(a)) = (before, self.view.clone()) {
-                    let (bc, ac) = hist::layout_diff(&b, &a, &[part], kind);
-                    self.acting = Some((K_STEAMSET, format!("{n} \u{b7} Steam\u{2019}s setting")));
-                    self.remember(hist::What::Layout { game: g.key.clone(), kind, set, before: bc, after: ac }, &n);
-                }
-                self.say(format!("{n} · back to Steam\u{2019}s setting"), now);
-            }
-            Err(e) => self.say(e.to_string(), now),
+        let steams: Option<Vec<Change>> = self.steam.as_ref().map(|st| st.part_changes(part).into_iter().filter(|c| c.fits(kind)).collect());
+        if let Some(c) = steams {
+            self.local(&c);
         }
+        let after = After::PartToSteam { before, part, game: g.key.clone(), kind, set, name: self.pname(id) };
+        let want = self.want();
+        self.send(Job::Write { wr: Wr::PartToSteam { key: g.key, kind, set, part }, want, after });
     }
 
     // ============================================================================================ popups
@@ -1856,10 +2214,13 @@ impl Open {
         match p {
             Pop::Game => {
                 if i < self.games.len() && i != self.gi {
+                    // its files are read on the worker (Order 047): the panels wait for them
                     self.gi = i;
                     self.set = 0;
                     self.sel = None;
-                    self.load_view();
+                    self.clear_view();
+                    self.sets.clear();
+                    self.reload();
                 }
             }
             Pop::Dev => {
@@ -1881,24 +2242,11 @@ impl Open {
                 } else if i == ns {
                     if let Some(g) = self.game().cloned() {
                         let title = format!("Set {}", self.sets.len() + 1);
-                        let had = self.had_layout(&g.key);
-                        let r = match &mut self.svc {
-                            Ok(s) => s.add_action_set(&g.key, self.kind, self.set, &title),
-                            Err(_) => return true,
-                        };
-                        match r {
-                            Ok(id) => {
-                                let from = self.set;
-                                self.log_layout(&g, had);
-                                self.set = id;
-                                self.acting = Some((K_SET, "New action set".into()));
-                                self.remember(hist::What::NewSet { game: g.key.clone(), kind: self.kind, from, title: title.clone(), id }, "New action set");
-                                self.load_games_keep();
-                                let first = self.sets.first().map(|s| s.title.clone()).unwrap_or_else(|| "Default".into());
-                                self.say(format!("{title} made \u{b7} a copy of {first}"), now);
-                            }
-                            Err(e) => self.say(e.to_string(), now),
-                        }
+                        let (kind, from) = (self.kind, self.set);
+                        // shown at once (the same copy bu-controller makes in the file, on the worker)
+                        self.local_new_set(from, &title);
+                        let want = Want { kind, key: Some(g.key.clone()), set: None, fresh: false };
+                        self.send(Job::Write { wr: Wr::NewSet { key: g.key.clone(), kind, from, title: title.clone() }, want, after: After::NewSet { game: g.key, kind, from, title } });
                     }
                 }
             }
@@ -2282,14 +2630,10 @@ fn fmt(v: f64, f: Fmt) -> String {
 }
 
 /// Open a `steam://` link (only from a click, only while Steam runs - the crate refuses otherwise) or start `steam.exe`
-/// ("Launch Steam", only from its click) with Windows' shell.
+/// ("Launch Steam", only from its click) with Windows' shell - off the menu's thread (Order 047: Launch Steam froze the
+/// menu black until Steam opened).
 fn shell_open(url: &str) {
-    use windows::core::HSTRING;
-    use windows::Win32::UI::Shell::ShellExecuteW;
-    use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
-    unsafe {
-        let _ = ShellExecuteW(None, &HSTRING::from("open"), &HSTRING::from(url), None, None, SW_SHOWNORMAL);
-    }
+    crate::offui::shell_open(url);
 }
 
 #[cfg(test)]

@@ -271,3 +271,95 @@ fn ctrl_f_focuses_the_search() {
     assert!(cx.used);
     assert_eq!(cx.st.focus, Some(K_SEARCH));
 }
+
+/// Order 047: a real copy's worker in "Your PC"'s WMI read (here a fake that takes 400 ms): leaving the tab never waits for
+/// it - the worker is told to stop and ends on its own thread right after the read (it lets go of the OS layer).
+#[test]
+fn leaving_the_tab_never_waits_for_the_worker() {
+    use std::path::Path;
+    struct SlowSpecs(bu_perf::FakeOs);
+    impl bu_perf::PerfOs for SlowSpecs {
+        fn open_live(&self) -> bu_perf::Result<Box<dyn bu_perf::LiveSource>> {
+            self.0.open_live()
+        }
+        fn processes(&self) -> bu_perf::Result<Vec<bu_perf::RawProcess>> {
+            self.0.processes()
+        }
+        fn cpu_count(&self) -> u32 {
+            self.0.cpu_count()
+        }
+        fn specs(&self) -> bu_perf::Result<PcSpecs> {
+            std::thread::sleep(std::time::Duration::from_millis(400));
+            self.0.specs()
+        }
+        fn end_process(&self, pid: u32, how: bu_perf::EndHow) -> bu_perf::Result<()> {
+            self.0.end_process(pid, how)
+        }
+        fn set_priority(&self, pid: u32, p: Priority) -> bu_perf::Result<()> {
+            self.0.set_priority(pid, p)
+        }
+        fn open_file_location(&self, path: &Path) -> bu_perf::Result<()> {
+            self.0.open_file_location(path)
+        }
+        fn icon_rgba(&self, path: &Path, size: u32) -> bu_perf::Result<bu_perf::Icon> {
+            self.0.icon_rgba(path, size)
+        }
+        fn is_elevated(&self) -> bool {
+            self.0.is_elevated()
+        }
+    }
+    let os = Arc::new(SlowSpecs(bu_perf::FakeOs::new()));
+    let w = Worker::start(os.clone(), crate::services::Waker, None);
+    // (the worker is inside the slow read now)
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    crate::offui::assert_quick("leaving Performance", || drop(w));
+    let t0 = std::time::Instant::now();
+    while Arc::strong_count(&os) > 1 {
+        assert!(t0.elapsed().as_secs() < 5, "the worker never ended");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
+/// Order 047: Copy all's clipboard write (clip.exe, started and waited for) runs on its own thread - here a stand-in that
+/// takes 300 ms; "Copied" and the toast come with its answer.
+#[test]
+fn copy_all_runs_off_the_menus_thread() {
+    fn slow_clip(_: &str) -> bool {
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        true
+    }
+    let mut p = page();
+    p.clip = Some(slow_clip);
+    {
+        let g = Gfx::new(1.0);
+        let mut st = State::default();
+        let mut cx = Cx::new(1000.0, false, &g, &mut st);
+        crate::offui::assert_quick("Copy all", || p.event(&Ev::Click(K_COPY), &mut cx));
+    }
+    assert!(p.copied.is_none(), "not yet: the copy is still running");
+    let t0 = std::time::Instant::now();
+    let mut now = 1000.0;
+    while p.copied.is_none() {
+        assert!(t0.elapsed().as_secs() < 5, "the copy never answered");
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        now += 5.0;
+        p.tick(now);
+    }
+    assert_eq!(p.toast.as_ref().unwrap().0, "Your PC copied · paste it anywhere");
+    assert!(p.log.is_empty(), "the stand-in wrote, not the test log");
+}
+
+/// Order 047: at rest the page asks for no frames; a toast at rest only wakes the menu at its end (and is dropped there).
+#[test]
+fn at_rest_the_page_asks_for_no_frames() {
+    let mut p = page();
+    assert!(!p.tick(1000.0));
+    assert!(p.wake_at(1000.0).is_none());
+    p.show_toast("x", 1000.0);
+    assert!(!p.tick(1001.0), "a toast at rest is no motion");
+    let end = 1000.0 + toast::SHOW_MS + 300.0;
+    assert_eq!(p.wake_at(1001.0), Some(end));
+    assert!(p.tick(end), "at its end it goes (one more build)");
+    assert!(p.toast.is_none() && p.wake_at(end).is_none());
+    assert!(!p.tick(end + 1.0));
+}

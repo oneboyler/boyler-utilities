@@ -283,6 +283,15 @@ impl Svc {
         }
     }
 
+    /// Order 047: the snapshot's write count - the same = nothing new (no copy needed).
+    pub fn gen(&self) -> u64 {
+        match self {
+            #[cfg(windows)]
+            Svc::Real(p, _) => p.gen(),
+            Svc::Fake(p, ..) => p.gen(),
+        }
+    }
+
     fn notes(&self) -> Notes {
         match self {
             #[cfg(windows)]

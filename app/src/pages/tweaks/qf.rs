@@ -69,6 +69,8 @@ impl Qf {
             if let Ok(st) = o.restore_status() {
                 let _ = tx.send(restore::status_line(o.as_ref(), &st));
             }
+            // Order 047: the menu draws the line when it is in (no frames while it is read)
+            crate::services::Waker.wake();
         });
         Qf { os, for_one: None, runs: [None, None, None, None], done: [None, None, None, None], rp_line: None, rp_rx: Some(rx) }
     }
@@ -81,9 +83,15 @@ impl Qf {
         self.runs[i].is_some()
     }
 
-    /// Something moves (a run is going, the status read is pending): the page keeps painting.
-    pub fn busy(&self) -> bool {
-        self.runs.iter().any(|r| r.is_some()) || self.rp_rx.is_some()
+    /// Order 047: what the rows show now (progress, end line, own line) - the page draws again only when it changed.
+    pub fn picture(&self) -> Vec<String> {
+        (0..4).map(|i| format!("{:?}|{:?}|{}|{}", self.progress(i).map(|(t, s)| (t, (s * 1000.0) as i32)), self.done[i], self.line(i), self.running(i))).collect()
+    }
+
+    /// Order 047: when to look again while nothing else wakes the menu - a running Repair (its progress wakes the menu
+    /// itself; its end does not: looked at twice a second). The one-shot fixes and the status read wake it when they end.
+    pub fn wake_at(&self, now: f64) -> Option<f64> {
+        self.runs.iter().any(|r| matches!(r, Some(Run::Repair(_)))).then_some(now + 500.0)
     }
 
     /// The row's line now.
@@ -167,7 +175,8 @@ impl Qf {
                 }
                 Err(e) => Some(err_text(&e)),
             },
-            1 => match RepairRun::start(self.os_for(crate::admin::Purpose::Repair), |_| {}) {
+            // Order 047: each step of the progress wakes the menu (no frames in between)
+            1 => match RepairRun::start(self.os_for(crate::admin::Purpose::Repair), |_| crate::services::Waker.wake()) {
                 Ok(r) => {
                     self.runs[1] = Some(Run::Repair(r));
                     self.done[1] = None;
@@ -208,6 +217,8 @@ impl Qf {
             .name("bu-quickfix".into())
             .spawn(move || {
                 let _ = tx.send(f(os.as_ref()));
+                // Order 047: the menu draws the end when it is in
+                crate::services::Waker.wake();
             })
             .is_ok();
         if ok {

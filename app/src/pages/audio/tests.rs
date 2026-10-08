@@ -706,3 +706,73 @@ fn proof_045_unmute_listens() {
     }
     crate::ui::set_light(false);
 }
+
+/// Order 047: the frame's reset through the page's detached copy - the review opened and the Reset pressed each inside
+/// one frame (16 ms), the reads and the put-backs on the review's worker thread; then the page re-reads (`reset_done`).
+/// (The page's fake has no slow mode for these calls: the proof is that both run on the worker - `Reading` / `Running`.)
+fn reset_off_the_menu(p: &mut dyn Resettable, kind: Kind) -> (crate::undo::Review, Vec<crate::undo::LineResult>) {
+    fn wait<T>(mut f: impl FnMut() -> Option<T>) -> T {
+        let t0 = std::time::Instant::now();
+        loop {
+            if let Some(v) = f() {
+                return v;
+            }
+            assert!(t0.elapsed().as_secs() < 10, "the review's worker never answered");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+    let opened = crate::services::with(|s| {
+        crate::undo::flush(&mut s.store);
+        crate::offui::assert_quick("opening the review", || crate::undo::Review::open(kind, false, &mut [&mut *p], &s.store))
+    })
+    .unwrap();
+    let crate::undo::Opened::Reading(mut job) = opened else { panic!("the review is read on a worker thread") };
+    let rv = wait(|| job.take());
+    let applied = crate::offui::assert_quick("Reset", || rv.start_apply(&mut [&mut *p]));
+    let crate::undo::Applied::Running(mut job) = applied else { panic!("the reset is put back on a worker thread") };
+    let res = wait(|| job.take());
+    p.reset_done();
+    (rv, res)
+}
+
+/// Order 047: Audio's reset (Windows defaults: both switches off, every app at 100 %) is read and put back on the
+/// review's worker thread (a real PC: a Core Audio service made per call); the switches are saved on the menu's thread
+/// when it has ended. Same lines, same results.
+#[test]
+fn the_reset_review_reads_and_puts_back_off_the_menus_thread() {
+    crate::services::init(windows::Win32::Foundation::HWND::default(), true);
+    svc::set_rules(svc::Rules::default());
+    let mut a = page();
+    let (rv, res) = reset_off_the_menu(&mut a, Kind::WindowsDefaults);
+    let lines: Vec<String> = rv.lines.iter().map(|l| format!("{} · {}", l.label, l.change_text())).collect();
+    assert_eq!(lines[..2], ["Keep my devices · On  →  Off".to_string(), "New apps volume · On · 50 %  →  Off".to_string()]);
+    assert!(lines.contains(&"Chrome volume · Muted  →  100 %".to_string()), "{lines:?}");
+    assert_eq!(lines.len(), 7, "{lines:?}");
+    assert!(res.iter().all(|r| r.outcome == crate::undo::Outcome::Ok), "{res:?}");
+    assert!(!svc::rules().keep && !svc::rules().new_on, "the switches saved by reset_done");
+    wait(&mut a, 700);
+    let d = a.describe();
+    assert!(d.contains("keep=false newapps=false"), "{d}");
+    assert!(d.contains("app Chrome vol=100 muted=false") && d.contains("app Discord vol=100"), "{d}");
+    svc::set_rules(svc::Rules::default());
+    crate::services::shutdown();
+}
+
+/// Order 047: switching the default Output device (Core Audio's policy config, all three roles) never holds the menu -
+/// the pick only hands it to the page's worker and returns within one frame; the fake PC has the new default after.
+/// (The fake audio layer has no slow mode: the proof is the pick's own time and the change made by the worker.)
+#[test]
+fn a_default_output_pick_never_holds_the_menu() {
+    let g = Gfx::new(1.0);
+    let mut st = State::default();
+    let mut a = page();
+    click(&mut a, K_OUT_PICK, &g, &mut st);
+    let mut cx = Cx::new(1000.0, false, &g, &mut st).for_page("aud");
+    crate::offui::assert_quick("the Output pick", || a.event(&Ev::Click(k_dev(0)), &mut cx));
+    drop(cx);
+    let t0 = std::time::Instant::now();
+    while fake_default(&a, Flow::Output) != "spk" && t0.elapsed().as_secs() < 5 {
+        wait(&mut a, 20);
+    }
+    assert_eq!(fake_default(&a, Flow::Output), "spk", "the worker switched it");
+}

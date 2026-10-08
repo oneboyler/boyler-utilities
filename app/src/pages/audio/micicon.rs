@@ -383,6 +383,8 @@ struct State {
     pop_at: f64,
     pop_shown: bool,
     m: f32,
+    /// when `m` last moved (Order 049: the colour follows by time, not by frame - the frames now come at the screen's rate)
+    m_at: f64,
 }
 
 thread_local! {
@@ -392,7 +394,6 @@ thread_local! {
     /// one window per monitor the icon shows on ("Show on")
     #[cfg(windows)]
     static WIN: RefCell<Vec<real::Win>> = const { RefCell::new(Vec::new()) };
-    static TIMER: Cell<usize> = const { Cell::new(0) };
 }
 
 fn now() -> f64 {
@@ -407,9 +408,9 @@ pub fn window_exists() -> bool {
     false
 }
 
-/// Is a Windows timer armed for it (tests: never in a test copy).
+/// Is a frame of the animator asked for it (tests: never in a test copy).
 pub fn timer_armed() -> bool {
-    TIMER.with(|t| t.get() != 0)
+    crate::vsync::asked(crate::vsync::Client::Mic)
 }
 
 /// The page's services are fakes (set at every page open): the icon is then only a model, never on the screen.
@@ -438,8 +439,13 @@ pub fn update(want: Want, look: Look, spot: Spot, changed: bool) {
             pop_at: -1e9,
             pop_shown: false,
             m: if look.muted { 1.0 } else { 0.0 },
+            m_at: t,
         });
         let look_changed = st.look.style != look.style || st.look.size != look.size;
+        if st.look.muted != look.muted {
+            // the colour starts moving now
+            st.m_at = t;
+        }
         st.want = want;
         st.look = look;
         st.spot = spot;
@@ -469,23 +475,34 @@ fn frame() {
         return;
     }
     let t = now();
-    let Some((look, spot, fade, pop, m, busy, gone)) = ST.with(|s| {
+    let Some((look, spot, fade, pop, m, next, gone)) = ST.with(|s| {
         let mut s = s.borrow_mut();
         let st = s.as_mut()?;
-        // the colour follows the mic in .2 s
+        // the colour follows the mic in .2 s: 35 % of the way per 64 Hz tick before Order 049, now the same curve by time
         let target = if st.look.muted { 1.0 } else { 0.0 };
-        st.m += (target - st.m) * 0.35;
+        let dt = (t - st.m_at).clamp(0.0, 100.0);
+        st.m_at = t;
+        st.m += (target - st.m) * (1.0 - 0.65f32.powf((dt / 15.625) as f32));
         if (st.m - target).abs() < 0.01 {
             st.m = target;
         }
-        if st.shown && st.want.active && !st.want.always && !st.want.preview && !st.want.moving && t >= st.flash_until {
+        let flashing = st.shown && st.want.active && !st.want.always && !st.want.preview && !st.want.moving;
+        if flashing && t >= st.flash_until {
             st.shown = false;
             st.hid_at = t;
         }
         let fade = if st.shown { ((t - st.shown_at) / 180.0).clamp(0.0, 1.0) as f32 } else { 1.0 - ((t - st.hid_at) / 450.0).clamp(0.0, 1.0) as f32 };
         let pop = if st.shown { pop_scale(t - st.pop_at, st.pop_shown) } else { 0.96 + 0.04 * fade };
-        let busy = st.m != target || (st.shown && (t - st.shown_at < 200.0 || t - st.pop_at < 400.0)) || (!st.shown && fade > 0.0) || (st.shown && st.want.active && !st.want.always && !st.want.preview && !st.want.moving);
-        Some((st.look, st.spot, fade, pop, st.m, busy, !st.shown && fade <= 0.0))
+        // something moves: the next refresh; a "When it changes" flash that only waits: its end; else nothing
+        let moves = st.m != target || (st.shown && (t - st.shown_at < 200.0 || t - st.pop_at < 400.0)) || (!st.shown && fade > 0.0);
+        let next = if moves {
+            Some(t)
+        } else if st.shown && st.want.active && !st.want.always && !st.want.preview && !st.want.moving {
+            Some(st.flash_until)
+        } else {
+            None
+        };
+        Some((st.look, st.spot, fade, pop, st.m, next, !st.shown && fade <= 0.0))
     }) else {
         return;
     };
@@ -493,32 +510,16 @@ fn frame() {
     real::show(&look, spot, fade, pop, m, gone);
     #[cfg(not(windows))]
     let _ = (look, spot, fade, pop, m, gone);
-    aim((busy && !gone) || CHECK.with(|c| c.get()));
+    aim(if CHECK.with(|c| c.get()) { Some(t) } else if gone { None } else { next });
 }
 
-fn aim(on: bool) {
-    #[cfg(windows)]
-    {
-        use windows::Win32::UI::WindowsAndMessaging::{KillTimer, SetTimer};
-        unsafe extern "system" fn tick(_h: windows::Win32::Foundation::HWND, _m: u32, _id: usize, _t: u32) {
-            frame();
-        }
-        let old = TIMER.with(|t| t.get());
-        if on == (old != 0) {
-            return;
-        }
-        let id = if on {
-            unsafe { SetTimer(None, 0, 16, Some(tick)) }
-        } else {
-            unsafe {
-                let _ = KillTimer(None, old);
-            }
-            0
-        };
-        TIMER.with(|t| t.set(id));
+/// Order 049: the next frame from the app's vblank-paced animator at `when` (ms, the app clock), or none.
+fn aim(when: Option<f64>) {
+    use crate::vsync::{at, cancel, Client};
+    match when {
+        Some(w) => at(Client::Mic, w, frame),
+        None => cancel(Client::Mic),
     }
-    #[cfg(not(windows))]
-    let _ = on;
 }
 
 /// The page asks for the spot the user dragged the icon to (moving).
@@ -530,7 +531,7 @@ pub fn dragged_spot() -> Option<Spot> {
 mod real {
     use super::*;
     use windows::core::{w, BOOL};
-    use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
+    use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
     use windows::Win32::Graphics::Gdi::*;
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
@@ -549,6 +550,9 @@ mod real {
         size: (f32, f32),
         mon: Mon,
         drag: Option<(i32, i32, i32, i32)>,
+        /// Order 049: the window's pixels, kept, and what they show (the same picture is not painted again)
+        dib: crate::dib::Dib,
+        shown: Option<(Look, Spot, f32, f32, f32, (i32, i32))>,
     }
 
     /// Every monitor Windows has now, in the "Show on" order.
@@ -618,7 +622,7 @@ mod real {
                 let hwnd = unsafe { CreateWindowExW(ex, CLASS, w!("Mic"), WS_POPUP, mons[i].work.0, mons[i].work.1, 1, 1, None, None, GetModuleHandleW(None).ok().map(|h| h.into()), None) };
                 let Ok(hwnd) = hwnd else { continue };
                 let mon = mons[i];
-                WIN.with(|w| w.borrow_mut().push(Win { hwnd, g: Gfx::new(mon.scale), icons: Icons::new(), at: (0, 0), size: (0.0, 0.0), mon, drag: None }));
+                WIN.with(|w| w.borrow_mut().push(Win { hwnd, g: Gfx::new(mon.scale), icons: Icons::new(), at: (0, 0), size: (0.0, 0.0), mon, drag: None, dib: crate::dib::Dib::new(), shown: None }));
                 unsafe {
                     let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
                 }
@@ -645,34 +649,18 @@ mod real {
         let s = win.mon.scale;
         win.at = if let Some((_, _, l, t)) = win.drag { (l, t) } else { place_on(&win.mon, spot, size) };
         win.size = size;
+        let shown = (*look, spot, fade, pop, m, win.at);
+        if win.shown == Some(shown) {
+            return;
+        }
         let (bw, bh) = (((size.0 + 2.0 * PAD) * s).ceil() as i32, ((size.1 + 2.0 * PAD) * s).ceil() as i32);
-        let Some(mut surf) = crate::gfx::new_surface(bw, bh) else { return };
+        let Some(mut surf) = win.dib.surface(bw, bh) else { return };
         win.g.begin(surf.canvas());
         paint(&win.g, &win.icons, look, m, spot.v == 'B', PAD, PAD, fade, pop, None);
         win.g.end();
-        let px = crate::png::from_surface(&mut surf);
-        unsafe {
-            let screen = GetDC(None);
-            let mem = CreateCompatibleDC(Some(screen));
-            let bi = BITMAPINFO {
-                bmiHeader: BITMAPINFOHEADER { biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32, biWidth: bw, biHeight: -bh, biPlanes: 1, biBitCount: 32, ..Default::default() },
-                ..Default::default()
-            };
-            let mut bits = std::ptr::null_mut();
-            if let Ok(bmp) = CreateDIBSection(Some(mem), &bi, DIB_RGB_COLORS, &mut bits, None, 0) {
-                std::ptr::copy_nonoverlapping(px.data.as_ptr(), bits as *mut u8, px.data.len());
-                let old = SelectObject(mem, bmp.into());
-                let pos = POINT { x: win.at.0 - (PAD * s).round() as i32, y: win.at.1 - (PAD * s).round() as i32 };
-                let sz = SIZE { cx: bw, cy: bh };
-                let src = POINT::default();
-                let blend = BLENDFUNCTION { BlendOp: 0, BlendFlags: 0, SourceConstantAlpha: 255, AlphaFormat: 1 };
-                let _ = UpdateLayeredWindow(win.hwnd, Some(screen), Some(&pos), Some(&sz), Some(mem), Some(&src), Default::default(), Some(&blend), ULW_ALPHA);
-                SelectObject(mem, old);
-                let _ = DeleteObject(bmp.into());
-            }
-            let _ = DeleteDC(mem);
-            ReleaseDC(None, screen);
-        }
+        drop(surf);
+        win.dib.show(win.hwnd, POINT { x: win.at.0 - (PAD * s).round() as i32, y: win.at.1 - (PAD * s).round() as i32 });
+        win.shown = Some(shown);
     }
 
     unsafe extern "system" fn wndproc(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
@@ -750,11 +738,11 @@ mod real {
             // monitors with the windows and makes them again only when they differ (never inside this window's message)
             WM_DISPLAYCHANGE | WM_DPICHANGED => {
                 CHECK.with(|c| c.set(true));
-                aim(true);
+                aim(Some(now()));
             }
             WM_SETTINGCHANGE if wp.0 as u32 == SPI_SETWORKAREA.0 => {
                 CHECK.with(|c| c.set(true));
-                aim(true);
+                aim(Some(now()));
             }
             _ => {}
         }

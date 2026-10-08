@@ -13,6 +13,7 @@ use windows::core::{w, PCWSTR};
 
 static TEST: AtomicBool = AtomicBool::new(false);
 static REAL_READ: AtomicBool = AtomicBool::new(false);
+static DEMO: AtomicBool = AtomicBool::new(false);
 
 pub fn set(test: bool, real_read: bool) {
     TEST.store(test, Ordering::Relaxed);
@@ -27,6 +28,67 @@ pub fn on() -> bool {
 /// A test copy that reads the real services (measuring): nothing may change anything.
 pub fn real_read() -> bool {
     REAL_READ.load(Ordering::Relaxed)
+}
+
+/// `--demo-names` (Order 044, the README pictures): a test copy shows obviously made-up names instead of the sample data's
+/// real app, game and device names. Only in a test copy.
+pub fn set_demo(on: bool) {
+    DEMO.store(on && self::on(), Ordering::Relaxed);
+}
+
+/// Real name -> made-up name, longest first (substrings of a text are replaced).
+const DEMO_NAMES: [(&str, &str); 37] = [
+    ("DualSense Edge Wireless Controller", "Nova Pad Pro"),
+    ("DualSense Edge", "Nova Pad Pro"),
+    ("DualSense", "Nova Pad"),
+    ("Pulsar X2 CrazyLight", "Comet M2 Lite"),
+    ("Pulsar", "Comet"),
+    ("Headphones (Arctis Nova)", "Headphones (Nebula X7)"),
+    ("Microphone (Shure MV7)", "Microphone (Echo One)"),
+    ("Arctis Nova", "Nebula X7"),
+    ("Shure MV7", "Echo One"),
+    ("Rocket League", "Turbo Kart League"),
+    ("Counter-Strike 2", "Sector Strike"),
+    ("Call of Duty", "Frontline Ops"),
+    ("Apex Legends", "Rift Legends"),
+    ("Fortnite", "Skybuild"),
+    ("VALORANT", "STARFALL"),
+    ("Valorant", "Starfall"),
+    ("CS2", "Sector Strike"),
+    ("Spotifast", "Tunewave"),
+    ("Spotify", "Tunewave"),
+    ("Discord", "Chatterbox"),
+    ("Google Chrome", "Orbit Browser"),
+    ("Chrome", "Orbit"),
+    ("Steam Deck", "Pocket Deck"),
+    ("Riot Games", "Starfall Studio"),
+    ("Riot Vanguard", "Starfall Guard"),
+    ("Epic Games", "Skybuild Games"),
+    ("WireGuard", "Tunnel"),
+    ("Cloudflare", "Speedline"),
+    ("VirtualBox", "LabBox"),
+    ("AMD Ryzen 7 7800X3D", "Zentrix 8-core"),
+    ("Ryzen 7 7800X3D", "Zentrix 8-core"),
+    ("NVIDIA GeForce RTX 4070 SUPER", "Prism GX 70"),
+    ("RTX 4070 SUPER", "Prism GX 70"),
+    ("ASUS ROG STRIX B650E-F GAMING WIFI", "Meridian B6 Board"),
+    ("Samsung 990 PRO", "Swift NVMe 2TB"),
+    ("Wootility", "KeyForge"),
+    ("Adobe Premiere Pro 2026", "ClipStudio 2026"),
+];
+
+/// A text as the demo shows it (unchanged unless `--demo-names`).
+pub fn demo_text(s: String) -> String {
+    if !DEMO.load(Ordering::Relaxed) {
+        return s;
+    }
+    let mut s = s;
+    for (real, fake) in DEMO_NAMES {
+        if s.contains(real) {
+            s = s.replace(real, fake);
+        }
+    }
+    s
 }
 
 /// An environment test switch: honoured only in a test copy.

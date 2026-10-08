@@ -21,6 +21,8 @@ mod comp;
 mod effects;
 mod droptarget;
 mod gfx;
+mod gpu;
+mod shadercache;
 mod guides;
 mod icons;
 mod icons_v22;
@@ -36,6 +38,8 @@ mod svg;
 mod testmode;
 mod textparams;
 mod timing;
+mod vsync;
+mod dib;
 mod tray;
 mod ui;
 mod settings;
@@ -46,6 +50,7 @@ mod keep;
 mod addons;
 mod admin;
 mod obs;
+mod offui;
 mod welcome;
 
 use std::cell::RefCell;
@@ -57,7 +62,6 @@ use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::Com::*;
 use windows::Win32::System::DataExchange::COPYDATASTRUCT;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::System::ProcessStatus::K32EmptyWorkingSet;
 use windows::Win32::System::Threading::*;
 use windows::Win32::System::WinRT::*;
 use windows::Win32::UI::HiDpi::*;
@@ -99,6 +103,8 @@ enum Ev {
     Theme,
     /// the desktop's resolution changed (WM_DISPLAYCHANGE): the open menu goes back to its corner (Order 042)
     Display,
+    /// start the next page's background part (Order 048: one per wake-up, after the tray is up)
+    StartBg,
 }
 
 thread_local! {
@@ -156,6 +162,10 @@ const WARM_MS: u32 = 4000;
 /// one-shot (Order 042): the menu goes to its corner again a moment after a resolution change - Windows may still move
 /// windows and the taskbar's work area right after WM_DISPLAYCHANGE
 const TIMER_ANCHOR: usize = 8;
+/// one-shot (Order 048): the next page's background part starts (spread out after the start, `App::start_next_bg`)
+const TIMER_BG: usize = 9;
+/// the gap between two pages' background parts at the start
+const BG_GAP_MS: u32 = 40;
 
 fn push(e: Ev) {
     EVENTS.with(|q| q.borrow_mut().push_back((e, ui::cx::Mods::read())));
@@ -203,6 +213,13 @@ extern "system" fn wndproc(h: HWND, m: u32, w: WPARAM, l: LPARAM) -> LRESULT {
                 push(Ev::WarmTimeout);
                 return LRESULT(0);
             }
+            // Order 050: Windows is signing out - the settings writer's newest file goes to disk first (it is off the UI
+            // thread now; the process ends right after this message)
+            WM_ENDSESSION if w.0 != 0 && !is_menu => {
+                services::try_with(|s| s.store.wait_written(std::time::Duration::from_secs(2)));
+                wait_broadcasts();
+                return LRESULT(0);
+            }
             WM_COPYDATA => {
                 let cds = &*(l.0 as *const COPYDATASTRUCT);
                 if !cds.lpData.is_null() {
@@ -216,6 +233,11 @@ extern "system" fn wndproc(h: HWND, m: u32, w: WPARAM, l: LPARAM) -> LRESULT {
                 push(Ev::Display);
                 SetTimer(Some(h), TIMER_ANCHOR, 600, None);
             }
+            WM_TIMER if w.0 == TIMER_BG => {
+                let _ = KillTimer(Some(h), TIMER_BG);
+                push(Ev::StartBg);
+                return LRESULT(0);
+            }
             WM_TIMER if w.0 == TIMER_ANCHOR => {
                 let _ = KillTimer(Some(h), TIMER_ANCHOR);
                 push(Ev::Display);
@@ -228,10 +250,13 @@ extern "system" fn wndproc(h: HWND, m: u32, w: WPARAM, l: LPARAM) -> LRESULT {
                 push(Ev::Services);
                 return LRESULT(0);
             }
-            WM_INPUT if !is_menu => {
-                services::raw_input(l.0);
-                push(Ev::Services);
-                return DefWindowProcW(h, m, w, l);
+            // bu-rawin's thread reads Raw Input; it wakes this window only for packets that matter (keys, mouse
+            // buttons / wheel - never a move), once per batch (Order 048)
+            services::WM_RAWKEYS if !is_menu => {
+                if services::raw_packets() {
+                    push(Ev::Services);
+                }
+                return LRESULT(0);
             }
             // a job's progress or end (jobs/): the menu repaints
             services::WM_JOB => {
@@ -375,6 +400,8 @@ extern "system" fn wndproc(h: HWND, m: u32, w: WPARAM, l: LPARAM) -> LRESULT {
 struct Opts {
     /// a test copy (testmode.rs)
     test: bool,
+    /// `--demo-names`: made-up names in the sample data (README pictures, testmode.rs)
+    demo: bool,
     /// test copy reading the real services (measuring); refuses everything that would change something
     real_read: bool,
     offscreen: bool,
@@ -425,6 +452,7 @@ fn parse_args() -> Opts {
             // timing log: every presented frame, not only those of a page switch
             "--log-frames" => timing::frames_always(),
             "--frozen" => o.frozen = true,
+            "--demo-names" => o.demo = true,
             "--log" => {
                 o.log = Some(next(i));
                 i += 1;
@@ -490,6 +518,10 @@ struct App {
     open_on: Option<(String, Option<String>)>,
     /// the menu is open but another app was clicked: it sits behind (not topmost) until raised (feedback F1)
     behind: bool,
+    /// the pages whose background part has not started yet (Order 048: started one at a time after the tray is up -
+    /// the very first start after Setup ran them all on the UI thread before it answered anything) + what they get
+    bg_todo: Vec<Box<dyn pages::Page>>,
+    env: pages::Env,
 }
 
 fn reduced_motion() -> bool {
@@ -548,8 +580,14 @@ impl App {
             };
         }
         // (Audio makes its own service when it opens, like every page - Order 014 item 1c)
+        // Order 047 item 11: the graphics device is made on a worker meanwhile (started on tray hover, else now); the menu
+        // waits for that one when it gets to its swap chain
+        present::prepare_d3d();
         let (work, scale) = self.monitor();
         SCALE.with(|s| *s.borrow_mut() = scale);
+        // Order 047: the menu makes only the page it shows first (a key's tab, else the tab shown last)
+        let first = self.open_on.as_ref().map(|(id, _)| id.clone()).or_else(|| services::with(|s| s.store.get_str(settings::Scope::App, LAST_TAB).map(str::to_string)).flatten());
+        ui::set_first_tab(first);
         match menu::Menu::new(work, scale, self.opts.offscreen, self.opts.offscreen || self.opts.screen_test, reduced_motion(), self.opts.frozen, t) {
             Ok(mut m) => {
                 MENU_HWND.with(|h| *h.borrow_mut() = m.hwnd);
@@ -564,7 +602,8 @@ impl App {
                 self.behind = false;
                 // files / folders may be dropped on a page (Ev::Drop); Order 045: and their drag hover is seen (Ev::DragOver,
                 // Security's drop zone) - Windows' drop target; if it refuses, drops still come as WM_DROPFILES
-                let registered = droptarget::register(m.hwnd, move |e| {
+                // (Order 047, A_047_01: a test copy registers no drop target - its drops come from the `drop` test command)
+                let registered = self.opts.test || droptarget::register(m.hwnd, move |e| {
                     let s = SCALE.with(|s| *s.borrow()).max(0.01);
                     match e {
                         droptarget::DropEv::Over(x, y) => push(Ev::DragOver(Some((x as f32 / s, y as f32 / s)))),
@@ -623,12 +662,16 @@ impl App {
         if self.menu.is_some() {
             return;
         }
-        if present::KEPT_D3D.with(|k| k.borrow().is_none()) {
-            let t = timing::now();
-            if let Ok(d) = present::new_d3d() {
-                present::KEPT_D3D.with(|k| *k.borrow_mut() = Some(d));
-                timing::note(&format!("warm_up {:.1} ms", timing::now() - t));
-            }
+        // Order 051: the GPU device + Skia's GPU context (the menu draws on it); Order 047 item 11: the CPU path's Direct3D 11
+        // device (only when the GPU can't be used) is made on a worker thread - the open takes it
+        let (work, _) = self.monitor();
+        let mon = unsafe { MonitorFromPoint(POINT { x: (work.left + work.right) / 2, y: (work.top + work.bottom) / 2 }, MONITOR_DEFAULTTOPRIMARY) };
+        let t = timing::now();
+        gpu::warm(Some(mon));
+        if gpu::alive() {
+            timing::note(&format!("warm_up gpu {:.1} ms", timing::now() - t));
+        } else if present::prepare_d3d() {
+            timing::note("warm_up d3d worker started");
         }
         if menu::KEPT_GFX.with(|k| k.borrow().is_none()) {
             let t = timing::now();
@@ -647,12 +690,11 @@ impl App {
         unsafe {
             let _ = KillTimer(Some(self.msg), TIMER_WARM);
         }
-        let gfx_dropped = menu::KEPT_GFX.with(|k| k.borrow_mut().take()).is_some();
-        if (present::KEPT_D3D.with(|k| k.borrow_mut().take()).is_some() || gfx_dropped) && self.menu.is_none() {
+        let gfx_dropped = menu::KEPT_GFX.with(|k| k.borrow_mut().take()).is_some() | gpu::cool_down();
+        // Order 047 item 11: no K32EmptyWorkingSet any more (the next open and its tab switches faulted
+        // the pages back in); the kept device (or its worker) goes
+        if (present::drop_d3d() || gfx_dropped) && self.menu.is_none() {
             timing::note("cool_down");
-            unsafe {
-                let _ = K32EmptyWorkingSet(GetCurrentProcess());
-            }
         }
     }
 
@@ -681,14 +723,14 @@ impl App {
         }
         self.behind = false;
         if self.menu.take().is_some() {
+            // Order 051: the overlay may still draw on the same GPU device - the menu's GPU memory goes now
+            gpu::trim_current();
             MENU_HWND.with(|h| *h.borrow_mut() = HWND::default());
             admin::client::set_owner(0);
             self.tray.set_open(false);
             timing::flush();
-            // back to the resting state: hand the pages the menu used back to Windows
-            unsafe {
-                let _ = K32EmptyWorkingSet(GetCurrentProcess());
-            }
+            // (Order 047 item 11: the pages the menu used are no longer handed back to Windows here - K32EmptyWorkingSet
+            // made the next open and its tab switches fault them back in)
         }
     }
 
@@ -805,6 +847,40 @@ impl App {
                     if let Ok(((n, mx, first), (n2, mx2, first2))) = m.verify_incremental(timing::now()) {
                         timing::note(&format!("verify {} diff {} max {} first {:?} | vs whole-page raster: diff {} max {} first {:?}", arg, n, mx, first, n2, mx2, first2));
                     }
+                }
+            }
+            // test-only (Order 051): which path draws the menu (timing log), and a lost GPU device (ID3D12Device5::RemoveDevice)
+            "gpustate" => {
+                let st = self.menu.as_ref().map(|m| m.gpu_state()).unwrap_or_else(|| format!("menu closed device_alive={}", gpu::alive()));
+                let (hit, compiled) = shadercache::STATS.with(|s| s.get());
+                timing::note(&format!("gpustate {} {} shaders_cached {} shaders_compiled {}", arg, st, hit, compiled));
+            }
+            // test-only (Order 051): the capture overlay over a made-up picture - ovtest:<x>,<y>,<w>,<h> (one made-up monitor),
+            // ovdrag:<x0>,<y0>,<x1>,<y1>,<ms>[,<hz>] (a box dragged with posted mouse messages), ovstate, ovlose, ovclose
+            "ovtest" => {
+                let v: Vec<i32> = arg.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+                let (x, y, w, h) = if v.len() == 4 { (v[0], v[1], v[2].max(1) as u32, v[3].max(1) as u32) } else { (-20000, 0, 1920, 1080) };
+                let r = pages::screenshots::overlay::window::start_test(x, y, w, h);
+                timing::note(&format!("ovtest {:?}", r));
+            }
+            "ovdrag" => {
+                let v: Vec<i32> = arg.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+                if let (Some((hwnd, _)), true) = (pages::screenshots::overlay::window::test_window(), v.len() >= 5) {
+                    let hz = v.get(5).copied().unwrap_or(1000).max(1) as u32;
+                    pages::screenshots::overlay::gputest::drag(hwnd, (v[0], v[1]), (v[2], v[3]), v[4].max(1) as u32, hz);
+                }
+            }
+            "ovstate" => {
+                let st = pages::screenshots::overlay::window::test_window().map(|(_, g)| if g { "gpu" } else { "cpu" });
+                let (hit, compiled) = shadercache::STATS.with(|s| s.get());
+                timing::note(&format!("ovstate {} window={:?} device_alive={} shaders_cached {} shaders_compiled {}", arg, st, gpu::alive(), hit, compiled));
+            }
+            "ovlose" => pages::screenshots::overlay::window::test_lose_gpu(),
+            "ovclose" => pages::screenshots::overlay::window::test_close(),
+            "gpulose" => {
+                if let Some(m) = &self.menu {
+                    m.lose_gpu_for_test();
+                    m_dirty(&mut self.menu);
                 }
             }
             // test-only: wheel:<delta> = one mouse-wheel message over the page (120 = one notch up; the frame-rate proof)
@@ -972,8 +1048,13 @@ impl App {
                 }
             }
             "state" => {
+                // (a test reads every background part: the ones still waiting start now)
+                while !self.bg_todo.is_empty() {
+                    self.start_next_bg();
+                }
                 let mut s = match &self.menu {
-                    Some(m) => m.ui.describe(),
+                    // (Order 047: + the frames presented since the menu opened - the idle measurement counts them)
+                    Some(m) => format!("{}\nframes {}", m.ui.describe(), m.frames),
                     None => "closed".to_string(),
                 };
                 // the pages' background parts (Page::background), one line each
@@ -1032,11 +1113,17 @@ impl App {
             }
             Ev::TaskbarCreated => self.tray.add(),
             Ev::Theme => {
+                // Order 050: Windows broadcasts WM_SETTINGCHANGE for every change (the app's own too) - only a real theme /
+                // DPI change does anything (the icon reloads, the menu repaints)
                 self.tray.refresh();
                 // Match Windows follows Windows' app theme live (Order 033): the open menu switches on its next frame
+                let was = ui::windows_light();
                 ui::read_windows_theme();
-                self.theme_changed();
+                if ui::windows_light() != was {
+                    self.theme_changed();
+                }
             }
+            Ev::StartBg => self.start_next_bg(),
             Ev::Display => {
                 let (work, _) = self.monitor();
                 if let Some(m) = &mut self.menu {
@@ -1143,6 +1230,33 @@ impl App {
         }
     }
 
+    /// The next page's background part (the mute key's mic, the audio watcher, Activity's counter, Notifications for OBS):
+    /// one per wake-up, BG_GAP_MS apart, so the tray answers from the first moment (Order 048 item 5).
+    fn start_next_bg(&mut self) {
+        // pages without one return at once: go on to the next that has one
+        while let Some(p) = self.bg_todo.pop() {
+            let t = timing::now();
+            let b = p.background(&self.env);
+            let ms = timing::now() - t;
+            if ms >= 1.0 {
+                timing::note(&format!("start bg {} {:.1} ms", p.id(), ms));
+            }
+            if let Some(b) = b {
+                self.bg.push((p.id(), b));
+            }
+            if ms >= 1.0 {
+                break;
+            }
+        }
+        if !self.bg_todo.is_empty() {
+            unsafe {
+                SetTimer(Some(self.msg), TIMER_BG, BG_GAP_MS, None);
+            }
+        } else {
+            timing::note(&format!("start bg all {}", self.bg.iter().map(|b| b.0).collect::<Vec<_>>().join(" ")));
+        }
+    }
+
     fn drain(&mut self) {
         WAKE_POSTED.with(|w| *w.borrow_mut() = false);
         loop {
@@ -1199,10 +1313,13 @@ fn run(opts: Opts) -> Result<()> {
             }
         }
         timing::note(&format!("start test={} real_read={} offscreen={} tray={}", opts.test, opts.real_read, opts.offscreen, !opts.no_tray));
-        // the pages' background parts, once for the app's life (the menu may never open)
+        // the pages' background parts, once for the app's life (the menu may never open) - Order 048: not here any more,
+        // but one at a time once the loop runs (Ev::StartBg), in the pages' order (Audio's mute key first)
         let env = pages::Env { test: opts.test, real_read: opts.real_read, frozen: opts.frozen, rm: reduced_motion(), keep: keep::app() };
-        let bg = pages::all().iter().filter_map(|p| p.background(&env).map(|b| (p.id(), b))).collect();
-        let mut app = App { msg, tray, menu: None, opts: opts.clone(), dq: None, quit: false, bg, open_on: None, behind: false };
+        let mut bg_todo = pages::all();
+        bg_todo.reverse();
+        let mut app = App { msg, tray, menu: None, opts: opts.clone(), dq: None, quit: false, bg: Vec::new(), open_on: None, behind: false, bg_todo, env };
+        push(Ev::StartBg);
         for c in &opts.cmds {
             app.command_from(c, None);
         }
@@ -1210,20 +1327,40 @@ fn run(opts: Opts) -> Result<()> {
         loop {
             // pick how to wait: frames while the menu moves, otherwise only messages (zero CPU)
             let want = app.menu.as_ref().map(|m| m.ui.dirty || m.backdrop_dirty || m.ui.animating(timing::now())).unwrap_or(false);
-            if want {
+            // Order 051: the capture overlay's GPU windows that wait for their monitor's next refresh
+            let ov = pages::screenshots::overlay::window::frame_waitables();
+            if want || !ov.is_empty() {
                 // wait for room in the swap chain (its waitable) or a message; a fired waitable is kept in `slot` until a
                 // frame uses it, so a wake-up that draws nothing never loses it (lost, it froze the menu after a page switch)
-                let m = app.menu.as_ref().unwrap();
-                let h = [m.waitable()];
-                let r = if m.slot {
-                    MsgWaitForMultipleObjectsEx(None, 0, QS_ALLINPUT, MWMO_INPUTAVAILABLE)
+                let menu_slot = app.menu.as_ref().map(|m| m.slot).unwrap_or(false);
+                let menu_h = want && !menu_slot;
+                let mut h = Vec::with_capacity(1 + ov.len());
+                if menu_h {
+                    h.push(app.menu.as_ref().unwrap().waitable());
+                }
+                h.extend_from_slice(&ov);
+                let r = if want && menu_slot {
+                    MsgWaitForMultipleObjectsEx(if ov.is_empty() { None } else { Some(&ov) }, 0, QS_ALLINPUT, MWMO_INPUTAVAILABLE)
                 } else {
                     MsgWaitForMultipleObjectsEx(Some(&h), 100, QS_ALLINPUT, MWMO_INPUTAVAILABLE)
                 };
-                let timed_out = !m.slot && r == WAIT_TIMEOUT;
-                if !m.slot && r == WAIT_OBJECT_0 {
-                    app.menu.as_mut().unwrap().slot = true;
+                let timed_out = (!want || !menu_slot) && r == WAIT_TIMEOUT;
+                let fired = (r.0.wrapping_sub(WAIT_OBJECT_0.0)) as usize;
+                // (with the menu's slot already set, the wait was on `ov` alone)
+                let hs: &[HANDLE] = if want && menu_slot { &ov } else { &h };
+                if fired < hs.len() {
+                    if menu_h && fired == 0 {
+                        app.menu.as_mut().unwrap().slot = true;
+                    } else {
+                        pages::screenshots::overlay::window::on_waitable(Some(hs[fired]));
+                    }
                 }
+                if !ov.is_empty() {
+                    // a window whose refresh stayed away for 100 ms (a hidden monitor, a lost device): painted anyway
+                    pages::screenshots::overlay::window::overdue();
+                }
+                // the same for the menu while the overlay's handles keep the wait busy
+                let timed_out = timed_out || (want && !menu_slot && app.menu.as_ref().is_some_and(|m| timing::now() - m.last_frame > 100.0));
                 while PeekMessageW(&mut msgbuf, None, 0, 0, PM_REMOVE).as_bool() {
                     if msgbuf.message == WM_QUIT {
                         app.quit = true;
@@ -1236,7 +1373,7 @@ fn run(opts: Opts) -> Result<()> {
                     let now = timing::now();
                     let need = m.ui.switching(now) || m.ui.close_t.is_some() || m.ui.dirty || m.ui.animating(now);
                     // timed out: the compositor took no frame for 100 ms (window hidden) - draw anyway so nothing freezes
-                    if need && (m.slot || timed_out) {
+                    if want && need && (m.slot || timed_out) {
                         m.slot = false;
                         let _ = m.frame(now);
                         if timed_out {
@@ -1247,10 +1384,26 @@ fn run(opts: Opts) -> Result<()> {
                         timing::frames_off();
                     }
                 }
-            } else if let Some(due) = SCHED.with(|s| s.borrow().iter().map(|e| e.0).reduce(f64::min)) {
-                // a test copy's own timed commands (`after:`): wait for a message or the next one
+            } else if let Some((due, menu_due)) = {
+                // Order 047: nothing moves - sleep until the open menu's next timed step (a page's poll, a caret blink, a
+                // toast's end) or a test copy's own timed command (`after:`), whichever comes first; a message wakes sooner
+                let now = timing::now();
+                let menu = app.menu.as_ref().and_then(|m| m.ui.wake_at(now));
+                let sched = SCHED.with(|s| s.borrow().iter().map(|e| e.0).reduce(f64::min));
+                let due = match (menu, sched) {
+                    (Some(a), Some(b)) => Some(a.min(b)),
+                    (a, b) => a.or(b),
+                };
+                due.map(|d| (d, menu))
+            } {
                 let ms = (due - timing::now()).clamp(0.0, 1000.0).ceil() as u32;
                 let _ = MsgWaitForMultipleObjectsEx(None, ms, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+                let now = timing::now();
+                // the menu's own step came due (its time was asked BEFORE the sleep: a page answers "now + 16 ms", so asking
+                // again now would always be in the future and the page would never be polled)
+                if let Some(m) = app.menu.as_mut().filter(|_| menu_due.is_some_and(|t| t <= now + 0.5)) {
+                    m.ui.wake(now);
+                }
                 while PeekMessageW(&mut msgbuf, None, 0, 0, PM_REMOVE).as_bool() {
                     if msgbuf.message == WM_QUIT {
                         app.quit = true;
@@ -1284,6 +1437,8 @@ fn run(opts: Opts) -> Result<()> {
                     app.destroy_menu();
                 }
             }
+            // Order 047: Audio's switches put back by a Reset on its worker are saved here (menu open or not)
+            pages::audio::drain_pending_rules();
             // changes noted from other threads (`undo::note`) go into the change log
             if undo::pending() {
                 services::with(|s| undo::flush(&mut s.store));
@@ -1303,10 +1458,24 @@ fn run(opts: Opts) -> Result<()> {
         }
         app.destroy_menu();
         app.tray.remove();
+        // Order 047: the pages' last work runs on their own threads now (Audio's close, a take-over): wait for
+        // it (2 s at most), then their change-log notes go in before the store closes
+        offui::wait_idle(2000);
+        pages::audio::drain_pending_rules();
+        if undo::pending() {
+            services::with(|s| undo::flush(&mut s.store));
+        }
         timing::flush();
         let _ = DestroyWindow(app.msg);
     }
     Ok(())
+}
+
+/// The open menu paints its next frame.
+fn m_dirty(m: &mut Option<menu::Menu>) {
+    if let Some(m) = m {
+        m.ui.dirty = true;
+    }
 }
 
 fn main() {
@@ -1334,6 +1503,7 @@ fn main() {
     }
     let opts = parse_args();
     testmode::set(opts.test, opts.real_read);
+    testmode::set_demo(opts.demo);
     unsafe {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
         let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
@@ -1378,6 +1548,7 @@ fn main() {
     }
     let _ = run(opts);
     services::shutdown();
+    wait_broadcasts();
     drop(mutex);
 }
 
@@ -1403,6 +1574,7 @@ fn undo_windows(apply: bool, test: bool) -> i32 {
     pages::audio::load_for_undo();
     let mut all = pages::all();
     let (n, failed) = undo::undo_everything(&mut all, apply);
+    wait_broadcasts();
     drop(all);
     services::shutdown();
     if apply { failed.min(250) as i32 } else { n.min(250) as i32 }
@@ -1424,4 +1596,12 @@ mod tests {
         assert!(!closes_on_focus_loss(4242, 100, true));
         assert!(!closes_on_focus_loss(0, 100, true));
     }
+}
+
+/// Order 050: the WM_SETTINGCHANGE broadcasts of the last changes go out on workers - before the app ends, wait for them
+/// (1 s at most) so other apps still hear of every change.
+fn wait_broadcasts() {
+    let max = std::time::Duration::from_secs(1);
+    bu_toggles::real::wait_broadcasts(max);
+    bu_mouse::win::wait_broadcasts(max);
 }

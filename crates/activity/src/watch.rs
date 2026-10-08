@@ -7,10 +7,12 @@
 //!
 //! **Idle** has no Windows event, so it is the one timed wake: a one-shot timer aimed at "last input + 5 min"
 //! (`GetLastInputInfo`); when it fires and there was input meanwhile it re-aims — at most one wake per 5 minutes of
-//! activity, none while a game is in front. Once idle, the thread asks for raw keyboard / mouse input
-//! (`RegisterRawInputDevices`, RIDEV_INPUTSINK — read-only notifications) only until the first input arrives, then
-//! drops it again; and while away it re-checks `GetLastInputInfo` once every 5 min (and on any other wake), so idle
-//! ends even if raw input couldn't be registered or was taken over. Wakes: ≤ 1 per 5 min while active or away.
+//! activity, none while a game is in front. Once idle, the thread asks the process's one raw-input owner (`bu-rawin`,
+//! RIDEV_INPUTSINK — read-only notifications) for ONE message, `WM_ACT_INPUT`, on the first keyboard / mouse input;
+//! bu-rawin then drops that interest by itself. (Order 048: this thread used to register raw input to its own window,
+//! which took the keys manager's mouse / modifier keys away - Windows allows one target window per device per process.)
+//! While away it also re-checks `GetLastInputInfo` once every 5 min (and on any other wake), so idle ends even if raw
+//! input couldn't be registered. Wakes: ≤ 1 per 5 min while active or away.
 
 use crate::activity::{Activity, FgApp, IDLE_AFTER_MS};
 use crate::clock::{Clock, SystemClock};
@@ -30,7 +32,6 @@ use windows::Win32::System::SystemInformation::GetTickCount;
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetLastInputInfo, LASTINPUTINFO};
-use windows::Win32::UI::Input::{RegisterRawInputDevices, RAWINPUTDEVICE, RIDEV_INPUTSINK, RIDEV_REMOVE};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 pub type Shared = Arc<Mutex<Activity<FileStore>>>;
@@ -65,6 +66,8 @@ thread_local! {
 
 const IDLE_TIMER: usize = 1;
 const WM_POKE: u32 = WM_APP + 1;
+/// bu-rawin's one-shot "input came" while idle ([`set_raw`]).
+const WM_ACT_INPUT: u32 = WM_APP + 2;
 const WTS_SESSION_LOCK: usize = 7;
 const WTS_SESSION_UNLOCK: usize = 8;
 const PBT_APMSUSPEND: usize = 4;
@@ -239,12 +242,12 @@ fn arm_idle(c: &mut Ctx) {
     let since = ms_since_input() as i64;
     if idle {
         if since < IDLE_AFTER_MS {
-            // input came back without a WM_INPUT (raw input couldn't be registered, or another part of the process took
-            // it over): any wake ends idle — so idle can never stick
+            // input came back without a WM_ACT_INPUT (raw input couldn't be registered): any wake ends idle — so idle
+            // can never stick
             set_raw(c, false);
             lock(&c.shared).back_from_idle(SystemClock.now());
         } else {
-            // still away: one more check in 5 min (the fallback if no WM_INPUT ever arrives)
+            // still away: one more check in 5 min (the fallback if no WM_ACT_INPUT ever arrives)
             unsafe {
                 SetTimer(Some(c.hwnd), IDLE_TIMER, IDLE_AFTER_MS as u32, None);
             }
@@ -258,7 +261,7 @@ fn arm_idle(c: &mut Ctx) {
         let now = SystemClock.now();
         lock(&c.shared).went_idle(now.plus_ms(-since), now);
         set_raw(c, true);
-        // the fallback if no WM_INPUT ever arrives (raw input failed / taken over): re-check in 5 min
+        // the fallback if no WM_ACT_INPUT ever arrives (raw input failed): re-check in 5 min
         unsafe {
             SetTimer(Some(c.hwnd), IDLE_TIMER, IDLE_AFTER_MS as u32, None);
         }
@@ -269,18 +272,15 @@ fn arm_idle(c: &mut Ctx) {
     }
 }
 
-/// Raw keyboard + mouse notifications on (only while idle) / off.
+/// The first-input message on (only while idle) / off. bu-rawin, the process's one raw-input owner, listens to the
+/// keyboard and mouse for it (next to the keys manager's mouse / modifier keys, never instead of them), posts
+/// WM_ACT_INPUT once and disarms by itself.
 fn set_raw(c: &mut Ctx, on: bool) {
     if c.raw_on == on {
         return;
     }
-    let (flags, target) = if on { (RIDEV_INPUTSINK, c.hwnd) } else { (RIDEV_REMOVE, HWND::default()) };
-    let devs = [
-        RAWINPUTDEVICE { usUsagePage: 1, usUsage: 2, dwFlags: flags, hwndTarget: target },
-        RAWINPUTDEVICE { usUsagePage: 1, usUsage: 6, dwFlags: flags, hwndTarget: target },
-    ];
-    // SAFETY: a plain registration of two devices for our own window.
-    if unsafe { RegisterRawInputDevices(&devs, std::mem::size_of::<RAWINPUTDEVICE>() as u32) }.is_ok() {
+    let target = on.then_some((c.hwnd.0 as isize, WM_ACT_INPUT));
+    if bu_rawin::notify_on_input(target).is_ok() {
         c.raw_on = on;
     }
 }
@@ -295,14 +295,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             });
             LRESULT(0)
         }
-        WM_INPUT => {
+        WM_ACT_INPUT => {
             with_ctx(|c| {
                 c.stats.input_wakes.fetch_add(1, Ordering::Relaxed);
                 set_raw(c, false);
                 lock(&c.shared).back_from_idle(SystemClock.now());
                 arm_idle(c);
             });
-            unsafe { DefWindowProcW(hwnd, msg, wp, lp) }
+            LRESULT(0)
         }
         WM_WTSSESSION_CHANGE => {
             with_ctx(|c| {

@@ -5,9 +5,12 @@
 //!
 //! Real copies: one click-through, topmost, layered tool window (no taskbar button, never takes focus), made only when a
 //! pill must show and destroyed when none does; painted by the app's own painter (Skia) into the window with
-//! `UpdateLayeredWindow`; a thread timer (`SetTimer` with a TIMERPROC, dispatched by the app's message loop) repaints it
-//! every 100 ms only while something on it moves, and wakes the app when the next countdown ends (also with the menu
-//! closed). TEST copies never make the window or a timer: the pills are proven off-screen (`render`, the tests).
+//! `UpdateLayeredWindow` from pixels it keeps (`crate::dib`). Order 049: the app's vblank-paced animator (`crate::vsync`)
+//! wakes it only when a pill will look different (a time's next second, a countdown's line moving a quarter pixel, a
+//! place's next minute), on the screen's refresh, and it repaints only when the picture really changed (before: a full
+//! repaint into new buffers every 100 ms while a timer ran). A thread timer (`SetTimer` with a TIMERPROC) still wakes the
+//! app when the next countdown ends (also with the menu closed). TEST copies never make the window, an ask or a timer:
+//! the pills are proven off-screen (`render`, the tests).
 
 use std::cell::{Cell, RefCell};
 
@@ -187,8 +190,39 @@ thread_local! {
     /// the Timers page is open (preview: every "On screen" pill shows)
     static PREVIEW: Cell<bool> = const { Cell::new(false) };
     static WIN: RefCell<Option<Win>> = const { RefCell::new(None) };
-    /// the thread timers: (repaint id, alarm id)
-    static TIMERS: Cell<(usize, usize)> = const { Cell::new((0, 0)) };
+    /// the thread timer that wakes the app when the next countdown ends (its id)
+    static ALARM: Cell<usize> = const { Cell::new(0) };
+    /// when it fires (ms, the app clock)
+    static ALARM_AT: Cell<f64> = const { Cell::new(0.0) };
+}
+
+/// What a paint showed (Order 049: an equal one is not painted again): every pill with its line in quarter device pixels,
+/// moving, the spot, where the stack sat.
+#[derive(Clone, PartialEq)]
+struct Shown {
+    pills: Vec<(String, String, String, Rgba, bool, Option<i32>)>,
+    moving: bool,
+    spot: Spot,
+    at: (i32, i32),
+}
+
+impl Shown {
+    fn of(pills: &[Pill], moving: bool, spot: Spot, at: (i32, i32), scale: f32) -> Shown {
+        let q = |l: f32| (l * line_px(scale) * 4.0).round() as i32;
+        Shown { pills: pills.iter().map(|p| (p.key.clone(), p.name.clone(), p.time.clone(), p.colour, p.low, p.line.map(q))).collect(), moving, spot, at }
+    }
+}
+
+/// Tests: would these pills paint the same picture as those (Order 049: the window skips an equal one)?
+#[cfg(test)]
+pub fn same_picture(a: &[Pill], b: &[Pill], scale: f32) -> bool {
+    let s = Spot { h: 'C', dx: 0.0, v: 'T', dy: 24.0 };
+    Shown::of(a, false, s, (0, 0), scale) == Shown::of(b, false, s, (0, 0), scale)
+}
+
+/// A countdown line's full length in device px (`.tbf{left:10px;right:10px}` of a 196 px pill).
+pub fn line_px(scale: f32) -> f32 {
+    (PILL_W - 20.0) * scale
 }
 
 struct Win {
@@ -203,6 +237,11 @@ struct Win {
     work: (i32, i32, i32, i32),
     drag: Option<(i32, i32, i32, i32)>,
     last: Vec<Pill>,
+    /// the window's pixels, kept
+    #[cfg(windows)]
+    dib: crate::dib::Dib,
+    /// what they show
+    shown: Option<Shown>,
 }
 
 /// Is the on-screen window there (tests: never in a test copy).
@@ -210,9 +249,9 @@ pub fn window_exists() -> bool {
     WIN.with(|w| w.borrow().is_some())
 }
 
-/// Is a Windows timer armed (tests: never in a test copy).
+/// Is a Windows timer or a frame of the animator asked for (tests: never in a test copy).
 pub fn timer_armed() -> bool {
-    TIMERS.with(|t| t.get() != (0, 0))
+    ALARM.with(|t| t.get() != 0) || crate::vsync::asked(crate::vsync::Client::Timers)
 }
 
 /// The page is shown / left (or dropped with the menu).
@@ -224,8 +263,10 @@ pub fn set_preview(on: bool) {
 /// Bring the screen in line with the model: make / repaint / remove the window, aim the timers. Nothing in test copies.
 pub fn sync() {
     let preview = PREVIEW.with(|p| p.get());
-    let Some((test, pills, moving, spot, moving_any, next_end)) =
-        model::with_existing(|m| (m.test, m.pills(preview), m.moving, m.spot, m.any_running() || m.moving, m.next_end()))
+    // the line length of the window's monitor (its scale; 1 until the window is made)
+    let scale = WIN.with(|w| w.borrow().as_ref().map(|w| w.scale).unwrap_or(1.0));
+    let Some((test, pills, moving, spot, next_change, next_end)) =
+        model::with_existing(|m| (m.test, m.pills(preview), m.moving, m.spot, m.next_change(preview, line_px(scale)), m.next_end()))
     else {
         return;
     };
@@ -233,9 +274,9 @@ pub fn sync() {
         return;
     }
     #[cfg(windows)]
-    real::sync(pills, moving, spot, moving_any, next_end);
+    real::sync(pills, moving, spot, next_change, next_end);
     #[cfg(not(windows))]
-    let _ = (pills, moving, spot, moving_any, next_end);
+    let _ = (pills, moving, spot, next_change, next_end);
 }
 
 #[cfg(windows)]
@@ -243,7 +284,7 @@ mod real {
     use super::*;
     use std::time::Duration;
     use windows::core::w;
-    use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, SIZE, WPARAM};
+    use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
     use windows::Win32::Graphics::Gdi::*;
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
@@ -279,7 +320,7 @@ mod real {
         DONE.with(|d| d.set(true));
     }
 
-    pub(super) fn sync(pills: Vec<Pill>, moving: bool, spot: Spot, moving_any: bool, next_end: Option<Duration>) {
+    pub(super) fn sync(pills: Vec<Pill>, moving: bool, spot: Spot, next_change: Option<Duration>, next_end: Option<Duration>) {
         aim_alarm(next_end);
         if pills.is_empty() {
             WIN.with(|w| {
@@ -289,7 +330,7 @@ mod real {
                     }
                 }
             });
-            aim_repaint(false);
+            aim_repaint(None);
             return;
         }
         let made = WIN.with(|w| w.borrow().is_some());
@@ -300,7 +341,7 @@ mod real {
             let Ok(hwnd) = hwnd else { return };
             let (work, scale) = work_area();
             WIN.with(|w| {
-                *w.borrow_mut() = Some(Win { hwnd, g: Gfx::new(scale), icons: Icons::new(), at: (0, 0), size: (0.0, 0.0), scale, work, drag: None, last: Vec::new() })
+                *w.borrow_mut() = Some(Win { hwnd, g: Gfx::new(scale), icons: Icons::new(), at: (0, 0), size: (0.0, 0.0), scale, work, drag: None, last: Vec::new(), dib: crate::dib::Dib::new(), shown: None })
             });
             unsafe {
                 let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
@@ -320,7 +361,7 @@ mod real {
                 }
             }
         });
-        aim_repaint(moving_any);
+        aim_repaint(next_change);
     }
 
     fn paint(win: &mut Win, pills: &[Pill], moving: bool, spot: Spot) {
@@ -333,43 +374,33 @@ mod real {
         win.at = ((x * s).round() as i32, (y * s).round() as i32);
         win.size = size;
         win.last = pills.to_vec();
+        // Order 049: the same picture is not painted again
+        let shown = Shown::of(pills, moving, spot, win.at, s);
+        if win.shown.as_ref() == Some(&shown) {
+            return;
+        }
         let (bw, bh) = (((size.0 + 2.0 * PAD) * s).ceil() as i32, ((size.1 + 2.0 * PAD) * s).ceil() as i32);
-        let Some(mut surf) = crate::gfx::new_surface(bw, bh) else { return };
+        let Some(mut surf) = win.dib.surface(bw, bh) else { return };
         win.g.begin(surf.canvas());
         paint_stack(&win.g, &win.icons, pills, moving, spot.v == 'B', PAD, PAD, None);
         win.g.end();
-        let px = crate::png::from_surface(&mut surf);
-        unsafe {
-            let screen = GetDC(None);
-            let mem = CreateCompatibleDC(Some(screen));
-            let bi = BITMAPINFO {
-                bmiHeader: BITMAPINFOHEADER { biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32, biWidth: bw, biHeight: -bh, biPlanes: 1, biBitCount: 32, ..Default::default() },
-                ..Default::default()
-            };
-            let mut bits = std::ptr::null_mut();
-            if let Ok(bmp) = CreateDIBSection(Some(mem), &bi, DIB_RGB_COLORS, &mut bits, None, 0) {
-                std::ptr::copy_nonoverlapping(px.data.as_ptr(), bits as *mut u8, px.data.len());
-                let old = SelectObject(mem, bmp.into());
-                let pos = POINT { x: win.at.0 - (PAD * s).round() as i32, y: win.at.1 - (PAD * s).round() as i32 };
-                let sz = SIZE { cx: bw, cy: bh };
-                let src = POINT::default();
-                let blend = BLENDFUNCTION { BlendOp: 0, BlendFlags: 0, SourceConstantAlpha: 255, AlphaFormat: 1 };
-                let _ = UpdateLayeredWindow(win.hwnd, Some(screen), Some(&pos), Some(&sz), Some(mem), Some(&src), Default::default(), Some(&blend), ULW_ALPHA);
-                SelectObject(mem, old);
-                let _ = DeleteObject(bmp.into());
-            }
-            let _ = DeleteDC(mem);
-            ReleaseDC(None, screen);
-        }
+        drop(surf);
+        win.dib.show(win.hwnd, POINT { x: win.at.0 - (PAD * s).round() as i32, y: win.at.1 - (PAD * s).round() as i32 });
+        win.shown = Some(shown);
     }
 
-    unsafe extern "system" fn tick(_h: HWND, _m: u32, id: usize, _t: u32) {
-        let (rep, alarm) = TIMERS.with(|t| t.get());
-        if id == alarm && alarm != 0 {
+    /// The animator's frame: the pills as they are now.
+    fn frame() {
+        super::sync();
+    }
+
+    unsafe extern "system" fn alarm(_h: HWND, _m: u32, id: usize, _t: u32) {
+        let old = ALARM.with(|t| t.get());
+        if id == old && old != 0 {
             unsafe {
-                let _ = KillTimer(None, alarm);
+                let _ = KillTimer(None, old);
             }
-            TIMERS.with(|t| t.set((rep, 0)));
+            ALARM.with(|t| t.set(0));
             // a countdown reached zero: it finishes (chime); a toast waits for the page if it is open
             model::with_existing(|m| {
                 m.check();
@@ -382,33 +413,35 @@ mod real {
     }
 
     fn aim_alarm(next: Option<Duration>) {
-        let (rep, old) = TIMERS.with(|t| t.get());
+        // Order 049 review: the pills' frames come every few ms now - an alarm aimed at the same end is left alone
+        // (re-arming it each frame would never let it fire: SetTimer waits at least 10-16 ms)
+        let want = next.map(|d| crate::timing::now() + d.as_secs_f64() * 1000.0);
+        let (old, old_at) = (ALARM.with(|t| t.get()), ALARM_AT.with(|t| t.get()));
+        if let (true, Some(w)) = (old != 0, want) {
+            if (w - old_at).abs() < 5.0 {
+                return;
+            }
+        }
         if old != 0 {
             unsafe {
                 let _ = KillTimer(None, old);
             }
         }
         let id = match next {
-            Some(d) => unsafe { SetTimer(None, 0, (d.as_millis() as u32).clamp(1, 0x7fff_ffff), Some(tick)) },
+            Some(d) => unsafe { SetTimer(None, 0, (d.as_millis() as u32).clamp(1, 0x7fff_ffff), Some(alarm)) },
             None => 0,
         };
-        TIMERS.with(|t| t.set((rep, id)));
+        ALARM.with(|t| t.set(id));
+        ALARM_AT.with(|t| t.set(want.unwrap_or(0.0)));
     }
 
-    fn aim_repaint(on: bool) {
-        let (old, alarm) = TIMERS.with(|t| t.get());
-        if on == (old != 0) {
-            return;
+    /// Order 049: the next frame when a pill will look different (on the screen's refresh), none when nothing moves.
+    fn aim_repaint(next: Option<Duration>) {
+        use crate::vsync::{at, cancel, Client};
+        match next {
+            Some(d) => at(Client::Timers, crate::timing::now() + d.as_secs_f64() * 1000.0, frame),
+            None => cancel(Client::Timers),
         }
-        let id = if on {
-            unsafe { SetTimer(None, 0, 100, Some(tick)) }
-        } else {
-            unsafe {
-                let _ = KillTimer(None, old);
-            }
-            0
-        };
-        TIMERS.with(|t| t.set((id, alarm)));
     }
 
     unsafe extern "system" fn wndproc(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {

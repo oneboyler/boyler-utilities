@@ -327,7 +327,7 @@ impl Settings {
             d.cancel();
         }
         let msgs = d.poll();
-        let any = !msgs.is_empty();
+        let mut any = !msgs.is_empty();
         for m in msgs {
             match m {
                 Msg::Checked(r) => {
@@ -394,12 +394,15 @@ impl Settings {
             if u.ready && u.stage == 1 && now - u.stage_at >= 1600.0 {
                 u.stage = 2;
                 u.stage_at = now;
+                any = true;
             }
-            if u.ready && u.stage == 2 && now - u.stage_at >= 1300.0 {
+            if u.ready && u.stage == 2 && now - u.stage_at >= 1300.0 && !self.reqs.contains(&TempReq::ExitForUpdate) {
                 finish = Some(u.ver.clone());
             }
         }
         if let Some(ver) = finish {
+            // (Order 047: the page is built again with it - the window closes / the app is asked to exit)
+            any = true;
             if self.env.fake() {
                 // the fake can't restart anything: it ends like the drawing (the window closes, About says up to date)
                 self.upd = None;
@@ -533,16 +536,29 @@ impl Page for Settings {
         self.stash();
     }
 
+    /// Order 047: true only when the updater's thread said something (each message wakes the menu) or a timed step of
+    /// the Updating window came; the moving parts (the Checking… spinner, the indeterminate bar) run their own frames.
     fn tick(&mut self, now: f64) -> bool {
-        let changed = self.take(now);
-        changed || self.checking || self.upd.is_some()
+        self.take(now)
+    }
+
+    /// Order 047: the Updating window's timed steps ("Installing…" 1.6 s, then "Restarting…" 1.3 s), and while a Cancel
+    /// waits for update()'s answer it is asked again every 100 ms (an early Cancel is dropped by the updater).
+    fn wake_at(&self, now: f64) -> Option<f64> {
+        let u = self.upd.as_ref()?;
+        if u.cancel_asked {
+            return Some(now + 100.0);
+        }
+        match (u.ready, u.stage) {
+            (true, 1) => Some((u.stage_at + 1600.0).max(now + 1.0)),
+            (true, 2) if !self.reqs.contains(&TempReq::ExitForUpdate) => Some((u.stage_at + 1300.0).max(now + 1.0)),
+            _ => None,
+        }
     }
 
     fn build(&mut self, cx: &mut Cx) -> Vec<El> {
         let now = cx.now;
-        if self.checking || self.upd.is_some() {
-            cx.st.busy = true;
-        }
+        // (Order 047: no `st.busy` while checking / updating - the spinner and the bar ask for frames only while they move)
         // what the page said (a check's answer, "Nothing to reset"): the frame's toast, once
         if let Some((t, _)) = self.toast.as_ref().filter(|_| !self.toast_sent) {
             cx.toast(&t.clone());
@@ -759,7 +775,11 @@ impl Page for Settings {
             Ev::Click(k) if *k == K_NEWS || *k == K_GH => {
                 // the releases page / the repo in the user's browser - never from a test copy (no browser in tests)
                 if !self.env.test {
-                    let _ = std::process::Command::new("explorer").arg(update::page_url(*k == K_NEWS)).spawn();
+                    // Order 047: the program start (10-40 ms) runs off the menu's thread
+                    let url = update::page_url(*k == K_NEWS);
+                    crate::offui::spawn("set-link", move || {
+                        let _ = std::process::Command::new("explorer").arg(url).spawn();
+                    });
                 }
             }
             Ev::Click(k) if *k == K_LIC => match licences::View::new() {

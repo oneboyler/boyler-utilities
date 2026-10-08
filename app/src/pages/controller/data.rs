@@ -9,9 +9,15 @@ use bu_controller::fake::{FakePads, FakeSteam};
 use bu_controller::layout::ActionSet;
 use bu_controller::os::{Battery, Connection, PadInfo, PadOs, PadSource};
 use bu_controller::real::{RealPads, RealSteam};
+use bu_controller::service::Opened;
 use bu_controller::{Change, ControllerService, Game, Layout, PadKind, PadView, Part, PrefSetting, Prefs, Result};
 
 use crate::undo::{DefaultItem, Val};
+
+/// The tab's Steam service, shared by the page and its worker (Order 047): made on the worker (finding Steam reads the
+/// registry), locked by the worker for each read / write, by the page only for the change log and in tests. None = not
+/// made yet.
+pub type Shared = std::sync::Arc<std::sync::Mutex<Option<std::result::Result<Svc, String>>>>;
 
 /// The service over the real or the fake Steam.
 pub enum Svc {
@@ -31,6 +37,23 @@ macro_rules! with {
 impl Svc {
     pub fn games(&self, k: PadKind) -> Result<Vec<Game>> {
         with!(self, s => s.games(k))
+    }
+    /// Order 047: one read of the game list serves the whole view (`open_game` + `steam_layout_of`).
+    pub fn open_game(&self, g: Game, k: PadKind) -> Result<Opened> {
+        with!(self, s => s.open_game(g, k))
+    }
+    pub fn steam_layout_of(&self, o: &Opened) -> Result<Layout> {
+        with!(self, s => s.steam_layout_of(o))
+    }
+    /// The game names are read again at the next question (the tab opened, Steam started).
+    pub fn forget_names(&self) {
+        with!(self, s => s.forget_names())
+    }
+    /// Tests: the fake Steam answers this slowly (ms per read); the real one is never slowed.
+    pub fn set_fake_delay(&self, ms: u64) {
+        if let Svc::Fake(s) = self {
+            s.os().delay_ms.store(ms, std::sync::atomic::Ordering::Relaxed);
+        }
     }
     pub fn view(&self, key: &str, k: PadKind, set: u32) -> Result<PadView> {
         with!(self, s => s.view(key, k, set))
@@ -385,21 +408,23 @@ pub struct SteamWatch {
 pub const STEAM_POLL_MS: u64 = 1500;
 
 impl SteamWatch {
-    pub fn start(waker: crate::services::Waker) -> SteamWatch {
+    /// `last` = what the tab knew before (its kept state; true when it never knew): shown until the watch's first look,
+    /// which its own thread makes at once (Order 047: the process list is never read on the menu's thread).
+    pub fn start(waker: crate::services::Waker, last: bool) -> SteamWatch {
         use std::sync::atomic::Ordering;
         let running = || bu_controller::real::process_running("steam.exe");
-        let up = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(running()));
+        let up = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(last));
         let (tx, rx) = std::sync::mpsc::channel::<()>();
         let seen = up.clone();
         let _ = std::thread::Builder::new().name("pad-steam-watch".into()).spawn(move || loop {
+            let now = running();
+            if seen.swap(now, Ordering::AcqRel) != now {
+                waker.wake();
+            }
             match rx.recv_timeout(std::time::Duration::from_millis(STEAM_POLL_MS)) {
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
                 // the tab closed (its sender is gone)
                 _ => return,
-            }
-            let now = running();
-            if seen.swap(now, Ordering::AcqRel) != now {
-                waker.wake();
             }
         });
         SteamWatch { up, _stop: tx }
@@ -410,10 +435,27 @@ impl SteamWatch {
     }
 }
 
-/// The page's services for this copy: (Steam, controllers) - or why Steam could not be read.
-pub fn open(fake: bool, real_read: bool) -> (std::result::Result<Svc, String>, Box<dyn PadOs>) {
+/// The page's controllers for this copy (made on the tab's worker, Order 047). `slow` (tests) = the fake lists this slowly.
+pub fn pads(fake: bool, slow: u64) -> Box<dyn PadOs> {
     if fake {
-        return (open_steam(true, false), Box::new(FakePads { pads: vec![fake_pad()], ..Default::default() }));
+        return Box::new(FakePads { pads: vec![fake_pad()], delay_ms: slow, ..Default::default() });
     }
-    (open_steam(false, real_read), Box::new(RealPads::new()))
+    Box::new(RealPads::new())
+}
+
+#[cfg(test)]
+thread_local! {
+    /// test-only (Order 047): the fake Steam / controllers of a tab opened on this test's thread answer this slowly (ms)
+    pub static TEST_SLOW_MS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// How slowly the fakes of a tab opened now answer (tests; 0 otherwise).
+#[cfg(test)]
+pub fn test_slow() -> u64 {
+    TEST_SLOW_MS.with(|c| c.get())
+}
+
+#[cfg(not(test))]
+pub fn test_slow() -> u64 {
+    0
 }

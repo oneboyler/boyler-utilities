@@ -8,9 +8,10 @@ mod rows;
 mod svc;
 pub mod temp;
 
-use std::sync::Arc;
+use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::{Arc, Mutex, MutexGuard};
 
-use bu_toggles::defaults::{ChangeAction, DefaultApps};
+use bu_toggles::defaults::DefaultApps;
 use bu_toggles::{Applied, Badge, Error as TErr, RowState, Timeout, Value, TIMEOUT_CHOICES};
 use taffy::style::JustifyContent;
 
@@ -149,9 +150,157 @@ enum Pop {
     Ask(f32, f32),
 }
 
+/// Order 047: one change-log line a worker job made (written by the page when its answer lands, or by the worker itself
+/// when the page has closed meanwhile).
+struct Log {
+    item: String,
+    label: String,
+    old: Val,
+    new: Val,
+}
+
+/// The games window's change, as clicked (the exe; the list is matched by it when the answer lands).
+enum GameAct {
+    /// "1 game" opened the window: Windows' list read again
+    List,
+    Add(String),
+    /// the game's switch: optimizations off = true
+    Flip(String, bool),
+    Remove(String),
+}
+
+/// Order 047: what the page's worker thread answers (`Tweaks::run`). Every crate call of the open page runs there - an
+/// Explorer restart (1-6 s), a settings broadcast to every window, Settings / "Open with" opening, the open's read of
+/// ~50 rows + the games + the default apps - never on the menu's thread.
+enum Done {
+    /// every row, the games Windows has, the default apps (`fresh`: the tab's open read - the games list starts over)
+    All { st: Vec<Option<RowState>>, games: Vec<Game>, defaults: Option<Box<DefaultApps>>, fresh: bool },
+    /// a switch / a time on row i: its answer, its group read back, the change-log lines, the time picked
+    Row { i: usize, a: Result<Applied, TErr>, group: Vec<(usize, Option<RowState>)>, logs: Vec<Log>, secs: Option<u32> },
+    /// the games window: its answer, Windows' games list after it (when read)
+    Games { act: GameAct, r: Result<(), TErr>, real: Option<Vec<Game>>, logs: Vec<Log> },
+    /// Windows' Settings / "Open with" was opened (nothing to show)
+    Opened,
+}
+
+type Job = Box<dyn FnOnce(&mut Svc) -> Done + Send>;
+
+/// The last read the tab showed (`env.keep`, Order 047): shown at once when the tab opens again, while the fresh read runs.
+#[derive(Clone)]
+struct Snap {
+    st: Vec<Option<RowState>>,
+    games: Vec<Game>,
+    defaults: Option<DefaultApps>,
+}
+const KEEP: &str = "tgl.read";
+
+fn lock(s: &Mutex<Svc>) -> MutexGuard<'_, Svc> {
+    s.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// Write a job's change-log lines (the ONE change log, Order 036) under this page.
+fn note_logs(logs: &[Log]) {
+    for l in logs {
+        crate::undo::note("tgl", &l.item, &l.label, &l.old, &l.new);
+    }
+}
+
+/// The page's worker: one thread for the open page (COM ready, as the shell / WinRT calls want), its jobs one after
+/// another in click order on the page's ONE service (it remembers e.g. Sleep's time for switching Sleep on again). It
+/// ends when the page drops its sender (close); an answer the closed page can't take still writes its change-log lines.
+fn start_worker(svc: Arc<Mutex<Svc>>, slow: u64) -> (Sender<Job>, Receiver<Done>) {
+    let (jtx, jrx) = channel::<Job>();
+    let (dtx, drx) = channel::<Done>();
+    let _ = std::thread::Builder::new().name("bu-tweaks".into()).spawn(move || {
+        #[cfg(windows)]
+        let com = unsafe {
+            windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_APARTMENTTHREADED | windows::Win32::System::Com::COINIT_DISABLE_OLE1DDE).is_ok()
+        };
+        for job in jrx {
+            if slow > 0 {
+                // test copies only: a stand-in for a slow Windows call
+                std::thread::sleep(std::time::Duration::from_millis(slow));
+            }
+            let d = job(&mut lock(&svc));
+            if let Err(e) = dtx.send(d) {
+                if let Done::Row { logs, .. } | Done::Games { logs, .. } = &e.0 {
+                    note_logs(logs);
+                }
+            }
+            crate::services::Waker.wake();
+        }
+        #[cfg(windows)]
+        if com {
+            unsafe { windows::Win32::System::Com::CoUninitialize() };
+        }
+    });
+    (jtx, drx)
+}
+
+/// Row i's value for the change log (None: a row the log doesn't keep, `NO_LOG`).
+fn log_of(s: &Svc, i: usize) -> Option<Val> {
+    if NO_LOG.contains(&ROWS[i].id) {
+        return None;
+    }
+    row_val(s, i)
+}
+
+/// Row i was changed: its change-log line, old -> its value read back now (none when nothing changed).
+fn push_log(logs: &mut Vec<Log>, s: &Svc, i: usize, old: Option<Val>) {
+    if let (Some(old), Some(new)) = (old, log_of(s, i)) {
+        if old != new {
+            logs.push(Log { item: ROWS[i].id.into(), label: ROWS[i].title.into(), old, new });
+        }
+    }
+}
+
+/// A switch's / a time's end (worker): row i's group read back, then the Settings page the crate asks for opened.
+fn finish(s: &mut Svc, i: usize, a: Result<Applied, TErr>, logs: Vec<Log>, secs: Option<u32>) -> Done {
+    let g = ROWS[i].group;
+    let group = ROWS.iter().enumerate().filter(|(_, r)| r.group == g).map(|(j, r)| (j, s.read(r.crate_id).ok())).collect();
+    if let Ok(Some(act)) = a.as_ref().map(|a| a.open.clone()) {
+        let _ = s.open(&act);
+    }
+    Done::Row { i, a, group, logs, secs }
+}
+
+/// The games Windows has (worker).
+fn games_of(s: &Svc) -> Vec<Game> {
+    s.fso_games().unwrap_or_default().into_iter().map(|g| Game { exe: g.exe, off: g.fso_off }).collect()
+}
+
+/// A game's Fullscreen optimizations flag set (`off` = optimizations off) / removed (worker); the change-log line is
+/// `fso:<exe>` with the state before.
+fn fso_change(s: &mut Svc, exe: &str, off: bool, logs: &mut Vec<Log>) -> Result<(), TErr> {
+    let old = s.fso_state(exe).ok();
+    let r = s.fso_set(exe, off).map(|_| ());
+    if let (Ok(_), Some(old)) = (&r, old) {
+        if old != off {
+            logs.push(Log { item: format!("{FSO_ITEM}{exe}"), label: fso_label(exe), old: fso_val(old), new: fso_val(off) });
+        }
+    }
+    r
+}
+
 pub struct Tweaks {
     query: String,
-    svc: Option<Svc>,
+    /// the page's ONE crate service; the worker (`work`) uses it, the menu's thread only for the reset review
+    svc: Option<Arc<Mutex<Svc>>>,
+    /// Order 047: the worker's job line and its answers; jobs sent and not answered yet
+    work: Option<Sender<Job>>,
+    done: Option<Receiver<Done>>,
+    pending: usize,
+    /// rows whose switch / time waits for the worker (their clicks wait too)
+    wait: Vec<usize>,
+    /// the admin row whose switch is dimmed until its answer has landed (DESIGN "Admin flip")
+    dim: Option<usize>,
+    /// a games window change waits for the worker (its clicks wait too)
+    games_wait: usize,
+    /// the real Windows (not a test copy's fake)
+    real: bool,
+    keep: crate::keep::Keep,
+    /// test copies only: every worker job first sleeps this long (ms) - a stand-in for a slow Windows call
+    slow: u64,
     test: bool,
     st: Vec<Option<RowState>>,
     games: Vec<Game>,
@@ -168,7 +317,7 @@ pub struct Tweaks {
     real_read: bool,
     /// the crate service for the reset line while the page is CLOSED (Settings › Reset, the uninstaller): built on the
     /// first `current` / `apply` / `windows_defaults` that needs it (Order 036 addendum: `resettable()` stays cheap)
-    rs: std::cell::RefCell<Option<Svc>>,
+    rs: std::cell::RefCell<Option<Arc<Mutex<Svc>>>>,
     /// an admin row's switch waiting for Windows' admin prompt / the elevated copy (Order 039): row, its answer
     admin_wait: Option<(usize, std::sync::mpsc::Receiver<Result<Applied, TErr>>)>,
 }
@@ -178,6 +327,15 @@ impl Default for Tweaks {
         Tweaks {
             query: String::new(),
             svc: None,
+            work: None,
+            done: None,
+            pending: 0,
+            wait: Vec::new(),
+            dim: None,
+            games_wait: 0,
+            real: false,
+            keep: crate::keep::Keep::default(),
+            slow: 0,
             test: false,
             st: Vec::new(),
             games: Vec::new(),
@@ -361,18 +519,107 @@ impl Tweaks {
         self.toast = Some((t.into(), now));
     }
 
-    fn read_all(&mut self) {
-        let Some(s) = &self.svc else { return };
-        self.st = ROWS.iter().map(|r| s.read(r.crate_id).ok()).collect();
+    /// Order 047: hand a job to the page's worker (its answer lands in `tick`).
+    fn run(&mut self, job: impl FnOnce(&mut Svc) -> Done + Send + 'static) -> bool {
+        let sent = self.work.as_ref().is_some_and(|w| w.send(Box::new(job)).is_ok());
+        if sent {
+            self.pending += 1;
+        }
+        sent
     }
 
-    fn reread_group(&mut self, g: usize) {
-        let Some(s) = &self.svc else { return };
-        for (i, r) in ROWS.iter().enumerate() {
-            if r.group == g {
-                self.st[i] = s.read(r.crate_id).ok();
-            }
+    /// Read every row, the games and the default apps again (on the worker; `fresh` = the tab's open read).
+    fn refresh(&mut self, fresh: bool) {
+        self.run(move |s| Done::All { st: ROWS.iter().map(|r| s.read(r.crate_id).ok()).collect(), games: games_of(s), defaults: s.defaults().ok().map(Box::new), fresh });
+    }
+
+    /// Remember what the tab shows for its next open (`env.keep`): the rows, the games Windows has, the default apps.
+    fn remember(&self) {
+        if self.st.is_empty() {
+            return;
         }
+        let games = self.games.iter().filter(|g| g.off).cloned().collect();
+        self.keep.put(KEEP, Snap { st: self.st.clone(), games, defaults: self.defaults.clone() });
+    }
+
+    /// A worker's answer: the page shows it (and says how it went, as it did when the call ran here).
+    fn landed(&mut self, d: Done, now: f64) {
+        match d {
+            Done::All { st, games, defaults, fresh } => {
+                self.st = st;
+                if fresh {
+                    self.games.clear();
+                }
+                self.merge_games(games);
+                self.defaults = defaults.map(|d| *d);
+            }
+            Done::Row { i, a, group, logs, secs } => {
+                self.wait.retain(|&j| j != i);
+                if self.dim == Some(i) {
+                    self.dim = None;
+                }
+                for (j, s) in group {
+                    if let Some(x) = self.st.get_mut(j) {
+                        *x = s;
+                    }
+                }
+                note_logs(&logs);
+                let ok = a.is_ok();
+                self.after(i, a, now);
+                if let (true, Some(secs)) = (ok, secs) {
+                    // the drawing's own words (`cPopup` set): "The screen turns off after 10 min" / "The PC sleeps after 30 min"
+                    let l = time_label(Timeout::from_seconds(secs));
+                    let txt = match (ROWS[i].id, secs) {
+                        ("scroff", 0) => "The screen stays on".to_string(),
+                        ("scroff", _) => format!("The screen turns off after {l}"),
+                        (_, 0) => "The PC never sleeps by itself now".to_string(),
+                        _ => format!("The PC sleeps after {l}"),
+                    };
+                    self.show_toast(txt, now);
+                }
+            }
+            Done::Games { act, r, real, logs } => {
+                self.games_wait = self.games_wait.saturating_sub(1);
+                note_logs(&logs);
+                if let Some(v) = real {
+                    self.merge_games(v);
+                }
+                match (act, r) {
+                    (GameAct::List, _) => {}
+                    (GameAct::Add(exe), Ok(())) => {
+                        let (name, ..) = game_look(&exe);
+                        self.show_toast(format!("{name} added · off from its next start"), now);
+                    }
+                    (GameAct::Flip(exe, off), Ok(())) => {
+                        if let Some(g) = self.games.iter_mut().find(|g| g.exe == exe) {
+                            g.off = off;
+                        }
+                        let (name, ..) = game_look(&exe);
+                        let t = if off { format!("Off for {name} · from its next start") } else { format!("Back on for {name} · from its next start") };
+                        self.show_toast(t, now);
+                    }
+                    (GameAct::Remove(exe), Ok(())) => {
+                        self.games.retain(|g| g.exe != exe);
+                        let (name, ..) = game_look(&exe);
+                        self.show_toast(format!("{name} removed · back to normal"), now);
+                    }
+                    (_, Err(e)) => self.show_toast(Self::err_toast(&e), now),
+                }
+            }
+            Done::Opened => {}
+        }
+        self.remember();
+    }
+
+    /// Test copies (and proof pictures): wait (5 s at most) until every worker job has answered and landed.
+    #[cfg(test)]
+    pub fn settle(&mut self) {
+        let t0 = std::time::Instant::now();
+        while (self.pending > 0 || self.admin_wait.is_some()) && t0.elapsed().as_secs() < 5 {
+            self.tick(1000.0);
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert!(self.pending == 0, "a Tweaks job never answered");
     }
 
     fn value(&self, i: usize) -> Option<&Value> {
@@ -383,59 +630,29 @@ impl Tweaks {
         matches!(self.value(i), Some(Value::Switch(true)))
     }
 
-    /// Row i's value for the change log, read from the page's service now (None: a row the log doesn't keep, `NO_LOG`).
-    fn log_val(&self, i: usize) -> Option<Val> {
-        if NO_LOG.contains(&ROWS[i].id) {
-            return None;
-        }
-        self.svc.as_ref().and_then(|s| row_val(s, i))
-    }
-
-    /// Row i was changed: one entry in the ONE change log (Order 036), old → its value read back now.
-    fn log_row(&self, cx: &mut Cx, i: usize, old: Option<Val>) {
-        if let (Some(old), Some(new)) = (old, self.log_val(i)) {
-            if old != new {
-                cx.record(ROWS[i].id, ROWS[i].title, &old, &new);
-            }
-        }
-    }
-
-    /// A game's Fullscreen optimizations flag set (`off` = optimizations off) / removed; the change goes into the change
-    /// log as `fso:<exe>` with the state before.
-    fn fso_change(&mut self, cx: &mut Cx, exe: &str, off: bool) -> Option<Result<Applied, TErr>> {
-        let s = self.svc.as_mut()?;
-        let old = s.fso_state(exe).ok();
-        let r = s.fso_set(exe, off);
-        if let (Ok(_), Some(old)) = (&r, old) {
-            if old != off {
-                cx.record(&format!("{FSO_ITEM}{exe}"), &fso_label(exe), &fso_val(old), &fso_val(off));
-            }
-        }
-        Some(r)
-    }
-
     /// The crate service for the reset line: the open page's own one, else one built on first use (`rs`).
+    /// (The reset review runs on the menu's thread; the open page's worker may hold the service a moment.)
     fn with_svc<R>(&self, f: impl FnOnce(&Svc) -> R) -> Option<R> {
-        if let Some(s) = &self.svc {
-            return Some(f(s));
-        }
-        let mut c = self.rs.borrow_mut();
-        if c.is_none() {
-            *c = fresh_svc();
-        }
-        c.as_ref().map(f)
+        self.shared_svc().map(|s| f(&lock(&s)))
     }
 
     fn with_svc_mut<R>(&mut self, f: impl FnOnce(&mut Svc) -> R) -> Option<R> {
-        if let Some(s) = &mut self.svc {
-            return Some(f(s));
-        }
-        let c = self.rs.get_mut();
-        if c.is_none() {
-            *c = fresh_svc();
-        }
-        c.as_mut().map(f)
+        self.shared_svc().map(|s| f(&mut lock(&s)))
     }
+
+    /// The open page's service, else the closed page's (made on first need) - shared, so the reset's worker copy uses
+    /// the very same one (Order 047).
+    fn shared_svc(&self) -> Option<Arc<Mutex<Svc>>> {
+        if let Some(s) = &self.svc {
+            return Some(s.clone());
+        }
+        let mut c = self.rs.borrow_mut();
+        if c.is_none() {
+            *c = fresh_svc().map(|s| Arc::new(Mutex::new(s)));
+        }
+        c.clone()
+    }
+
 
     /// A crate error as the toast says it.
     fn err_toast(e: &TErr) -> String {
@@ -447,49 +664,42 @@ impl Tweaks {
         }
     }
 
+    /// A switch's / a time's answer, its group already read back (`landed`): the toast.
     fn after(&mut self, i: usize, a: Result<Applied, TErr>, now: f64) {
         let r = &ROWS[i];
         match a {
             Ok(a) => {
-                self.reread_group(r.group);
                 let on = self.on(i);
                 let t = a.toast.or_else(|| TGT.iter().find(|x| x.0 == r.id).map(|x| (if on { x.2 } else { x.1 }).to_string()));
                 if let Some(t) = t {
                     self.show_toast(t, now);
-                }
-                if let Some(act) = a.open {
-                    if let Some(s) = &mut self.svc {
-                        let _ = s.open(&act);
-                    }
                 }
             }
             Err(e) => self.show_toast(Self::err_toast(&e), now),
         }
     }
 
-    fn flip(&mut self, i: usize, cx: &mut Cx) {
-        let now = cx.now;
+    fn flip(&mut self, i: usize, _cx: &mut Cx) {
         let r = &ROWS[i];
         if self.st.get(i).and_then(|s| s.as_ref()).is_some_and(|s| !s.enabled) {
             return;
         }
-        if self.admin_wait.is_some() {
+        if self.admin_wait.is_some() || self.wait.contains(&i) || self.svc.is_none() {
             return;
         }
         let to = !self.on(i);
-        let old = self.log_val(i);
-        // Sleep off sets "Sleep after" to never (on: back to a time): that row is logged too
-        let also = if r.id == "sleep" { row_ix("sleepafter").map(|j| (j, self.log_val(j))) } else { None };
-        let Some(s) = &mut self.svc else { return };
+        // (the same kind of service the page has: a --real-read test copy's is read-only and changes nothing)
+        #[cfg(windows)]
+        let read_only = self.real_read;
         // an admin row on Windows: the change goes to the app's elevated copy behind Windows' admin prompt - off the UI
         // thread (the menu keeps painting; the switch dims until the answer). The worker logs the change itself: the menu
         // may have closed meanwhile.
         #[cfg(windows)]
-        if s.needs_admin(r.crate_id) && matches!(s, Svc::Real(_)) {
+        if self.real && bu_toggles::rows::find(r.crate_id).is_some_and(|c| c.needs_admin()) {
             let (tx, rx) = std::sync::mpsc::channel();
             let w = crate::services::Waker;
             let _ = std::thread::Builder::new().name("bu-tweaks-admin".into()).spawn(move || {
-                let mut s = Svc::real(false);
+                let mut s = Svc::real(read_only);
                 let old = if NO_LOG.contains(&ROWS[i].id) { None } else { row_val(&s, i) };
                 let a = s.set(ROWS[i].crate_id, to);
                 if let (true, Some(o), Some(n)) = (a.is_ok(), old, row_val(&s, i)) {
@@ -501,53 +711,81 @@ impl Tweaks {
                 w.wake();
             });
             self.admin_wait = Some((i, rx));
+            self.dim = Some(i);
+            self.wait.push(i);
             return;
         }
-        let a = s.set(r.crate_id, to);
-        if a.is_ok() {
-            self.log_row(cx, i, old);
-            if let Some((j, o)) = also {
-                self.log_row(cx, j, o);
+        // Order 047: the switch itself on the worker (an Explorer restart, a settings broadcast to every window); the
+        // switch flips when its answer lands, as it did when the menu waited for it
+        let id = r.crate_id;
+        // Sleep off sets "Sleep after" to never (on: back to a time): that row is logged too
+        let also = if r.id == "sleep" { row_ix("sleepafter") } else { None };
+        let sent = self.run(move |s| {
+            let old = log_of(s, i);
+            let also = also.map(|j| (j, log_of(s, j)));
+            let a = s.set(id, to);
+            let mut logs = Vec::new();
+            if a.is_ok() {
+                push_log(&mut logs, s, i, old);
+                if let Some((j, o)) = also {
+                    push_log(&mut logs, s, j, o);
+                }
             }
+            finish(s, i, a, logs, None)
+        });
+        if sent {
+            self.wait.push(i);
         }
-        self.after(i, a, now);
     }
 
-    fn set_time(&mut self, i: usize, secs: u32, cx: &mut Cx) {
-        let now = cx.now;
+    fn set_time(&mut self, i: usize, secs: u32, _cx: &mut Cx) {
         let t = Timeout::from_seconds(secs);
-        if self.value(i) == Some(&Value::Timeout(t)) {
+        if self.value(i) == Some(&Value::Timeout(t)) || self.wait.contains(&i) || self.svc.is_none() {
             return;
         }
-        let old = self.log_val(i);
-        let Some(s) = &mut self.svc else { return };
-        let a = s.set_timeout(ROWS[i].crate_id, t);
-        let ok = a.is_ok();
-        if ok {
-            self.log_row(cx, i, old);
-        }
-        self.after(i, a, now);
-        if ok {
-            // the drawing's own words (`cPopup` set): "The screen turns off after 10 min" / "The PC sleeps after 30 min"
-            let l = time_label(t);
-            let txt = match (ROWS[i].id, secs) {
-                ("scroff", 0) => "The screen stays on".to_string(),
-                ("scroff", _) => format!("The screen turns off after {l}"),
-                (_, 0) => "The PC never sleeps by itself now".to_string(),
-                _ => format!("The PC sleeps after {l}"),
-            };
-            self.show_toast(txt, now);
+        // Order 047: on the worker (power settings); the list shows the time when its answer lands
+        let id = ROWS[i].crate_id;
+        let sent = self.run(move |s| {
+            let old = log_of(s, i);
+            let a = s.set_timeout(id, t);
+            let mut logs = Vec::new();
+            if a.is_ok() {
+                push_log(&mut logs, s, i, old);
+            }
+            finish(s, i, a, logs, Some(secs))
+        });
+        if sent {
+            self.wait.push(i);
         }
     }
 
-    fn load_games(&mut self) {
-        let Some(s) = &self.svc else { return };
-        let real: Vec<Game> = s.fso_games().unwrap_or_default().into_iter().map(|g| Game { exe: g.exe, off: g.fso_off }).collect();
-        // keep the ones switched back on (Windows forgets them), add new ones Windows has
+    /// Windows' games list merged in: keep the ones switched back on (Windows forgets them), add new ones Windows has.
+    fn merge_games(&mut self, real: Vec<Game>) {
         let mut out: Vec<Game> = self.games.iter().filter(|g| !real.iter().any(|r| r.exe.eq_ignore_ascii_case(&g.exe))).map(|g| Game { off: false, ..g.clone() }).collect();
         out.extend(real);
         out.sort_by_key(|g| g.exe.to_lowercase());
         self.games = out;
+    }
+
+    /// A games window change on the worker (Order 047): the flag set, the change-log line, Windows' list read after an add.
+    fn game_job(&mut self, act: GameAct) {
+        let sent = self.run(move |s| {
+            let mut logs = Vec::new();
+            let (r, real) = match &act {
+                GameAct::List => (Ok(()), Some(games_of(s))),
+                GameAct::Add(exe) => {
+                    let r = fso_change(s, exe, true, &mut logs);
+                    let real = r.is_ok().then(|| games_of(s));
+                    (r, real)
+                }
+                GameAct::Flip(exe, off) => (fso_change(s, exe, *off, &mut logs), None),
+                GameAct::Remove(exe) => (fso_change(s, exe, false, &mut logs), None),
+            };
+            Done::Games { act, r, real, logs }
+        });
+        if sent {
+            self.games_wait += 1;
+        }
     }
 
     // ------------------------------------------------------------------ building
@@ -623,7 +861,7 @@ impl Tweaks {
                 dropdown::dropdown(cx, idx(K_TO, i), time_label(*t), Some(128.0))
             }
             // waiting for Windows' admin prompt (DESIGN "Admin flip": the switch dims, no clicks, then flips)
-            Some(Value::Switch(on)) if self.admin_wait.as_ref().is_some_and(|(j, _)| *j == i) => {
+            Some(Value::Switch(on)) if self.dim == Some(i) => {
                 toggle::toggle(cx, idx(K_TG, i), *on, false).opacity(0.55).no_hit()
             }
             Some(Value::Switch(on)) => toggle::toggle(cx, idx(K_TG, i), *on, false),
@@ -791,16 +1029,27 @@ impl Page for Tweaks {
     fn open(&mut self, env: &Env, _now: f64) {
         self.test = env.fake();
         self.real_read = env.real_read;
+        self.real = cfg!(windows) && !env.fake();
+        self.keep = env.keep.clone();
         #[cfg(windows)]
         let s = if env.fake() { Svc::sample() } else { Svc::real(env.real_read) };
         #[cfg(not(windows))]
         let s = Svc::sample();
+        let s = Arc::new(Mutex::new(s));
+        let (work, done) = start_worker(s.clone(), self.slow);
         self.svc = Some(s);
+        self.work = Some(work);
+        self.done = Some(done);
         self.picks = if self.test { svc::SAMPLE_PICKS.iter().map(|s| s.to_string()).collect() } else { Vec::new() };
-        self.read_all();
         self.games.clear();
-        self.load_games();
-        self.defaults = self.svc.as_ref().and_then(|s| s.defaults().ok());
+        // Order 047: the tab shows its last read at once (registry, power and SPI reads of ~50 rows, the Copilot package
+        // query, every file type's default app: 50-400 ms), the fresh one comes from the worker
+        if let Some(k) = env.keep.get::<Snap>(KEEP) {
+            self.st = k.st;
+            self.games = k.games;
+            self.defaults = k.defaults;
+        }
+        self.refresh(true);
         let fix: Arc<dyn bu_quickfix::FixOs> = if env.fake() {
             let f = bu_quickfix::fake::FakeFixOs::new();
             // the drawing's sample: "last one 2 Oct 2026, 18:04"
@@ -831,7 +1080,20 @@ impl Page for Tweaks {
     fn close(&mut self) {
         // a running fix keeps going on its own thread (the drawing: "keeps running when the menu closes"); its row
         // state is dropped with the page
+        // Order 047: answers already in but not taken still write their change-log lines; a job still running writes its
+        // own (its worker ends after it)
+        if let Some(rx) = &self.done {
+            while let Ok(d) = rx.try_recv() {
+                if let Done::Row { logs, .. } | Done::Games { logs, .. } = &d {
+                    note_logs(logs);
+                }
+            }
+        }
         *self = Tweaks { shut: self.shut, ..Tweaks::default() };
+    }
+    fn ready(&self) -> bool {
+        // Order 047: the last read (`env.keep`) or the fresh one is in
+        !self.st.is_empty()
     }
     fn build(&mut self, cx: &mut Cx) -> Vec<El> {
         if let Some(q) = &mut self.qf {
@@ -900,15 +1162,44 @@ impl Page for Tweaks {
             if let Some(a) = got {
                 let i = *i;
                 self.admin_wait = None;
-                self.after(i, a, now);
-                return true;
+                // its group read back (and a Settings page it asks for opened) on the worker; the switch stays dimmed
+                // until that lands
+                if !self.run(move |s| finish(s, i, a, Vec::new(), None)) {
+                    self.wait.retain(|&j| j != i);
+                    self.dim = None;
+                }
             }
         }
-        let toast = self.toast.as_ref().is_some_and(|(_, t)| now - t < toast::SHOW_MS + 300.0);
-        if !toast {
+        // Order 047: the worker's answers (it woke the menu)
+        let mut changed = false;
+        while let Some(d) = self.done.as_ref().and_then(|rx| rx.try_recv().ok()) {
+            self.pending = self.pending.saturating_sub(1);
+            self.landed(d, now);
+            changed = true;
+        }
+        // Quick fixes: only a real change of a row draws (a run's progress moved, a run ended, the restore point line came)
+        if let Some(q) = &mut self.qf {
+            let before = q.picture();
+            let mut toasts = q.poll();
+            changed |= !toasts.is_empty() || q.picture() != before;
+            if let Some(t) = toasts.pop() {
+                self.toast = Some((t, now));
+            }
+        }
+        // Order 047: a toast needs no frames of the page's own - it fades on its transitions and wakes the menu itself
+        // (`toast::toast`); here it is only forgotten once it has gone (`wake_at`)
+        if self.toast.as_ref().is_some_and(|(_, t)| now - t >= toast::SHOW_MS + 300.0) {
             self.toast = None;
         }
-        toast || self.qf.as_ref().is_some_and(|q| q.busy())
+        changed
+    }
+    fn wake_at(&self, now: f64) -> Option<f64> {
+        let t = self.toast.as_ref().map(|(_, t)| (t + toast::SHOW_MS + 300.0).max(now + 1.0));
+        let q = self.qf.as_ref().and_then(|q| q.wake_at(now));
+        match (t, q) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
     }
     fn event(&mut self, ev: &Ev, cx: &mut Cx) {
         let now = cx.now;
@@ -953,7 +1244,8 @@ impl Page for Tweaks {
             return;
         }
         if k == K_FSO {
-            self.load_games();
+            // Order 047: Windows' list read again on the worker; the window shows the list it has meanwhile
+            self.game_job(GameAct::List);
             self.pop = Some(Pop::Games(now));
             return;
         }
@@ -973,8 +1265,12 @@ impl Page for Tweaks {
             if i == 0 {
                 self.pop = Some(Pop::Browsers(bx, by + bh + 4.0));
             } else if let Some(f) = d.file_types.get(i - 1) {
-                if let (Some(a), Some(s)) = (&f.change, &mut self.svc) {
-                    let _ = s.open(a);
+                // Order 047: Windows' "Open with" opens from the worker (the shell can take seconds)
+                if let Some(a) = f.change.clone() {
+                    self.run(move |s| {
+                        let _ = s.open(&a);
+                        Done::Opened
+                    });
                 }
                 self.show_toast(bu_toggles::defaults::file_type_toast(&f.label), now);
             }
@@ -999,9 +1295,12 @@ impl Page for Tweaks {
                 let bs = self.defaults.as_ref().map(|d| d.browsers.clone()).unwrap_or_default();
                 if let Some(n) = (0..bs.len()).find(|&n| idx(K_BMENU, n) == k) {
                     if !bs[n].is_current {
-                        if let Some(s) = &mut self.svc {
-                            let _ = s.open(&bs[n].change);
-                        }
+                        // Order 047: Settings opens from the worker (the shell can take seconds)
+                        let a = bs[n].change.clone();
+                        self.run(move |s| {
+                            let _ = s.open(&a);
+                            Done::Opened
+                        });
                         self.show_toast(bu_toggles::defaults::browser_pick_toast(&bs[n].name), now);
                     }
                 } else {
@@ -1024,41 +1323,18 @@ impl Page for Tweaks {
                 } else if k == K_FADD {
                     // Windows' file picker (a test copy: the drawing's FSO_PICK games come back instead)
                     let picked = if self.test && !self.picks.is_empty() { Some(self.picks.remove(0)) } else { cx.pick_file("Pick the game", &[("Programs", "*.exe")]) };
+                    // Order 047: the flag is set on the worker; the list and the toast come when its answer lands
                     if let Some(exe) = picked {
-                        let (name, ..) = game_look(&exe);
-                        let ok = self.fso_change(cx, &exe, true);
-                        match ok {
-                            Some(Ok(_)) => {
-                                self.load_games();
-                                self.show_toast(format!("{name} added · off from its next start"), now);
-                            }
-                            Some(Err(e)) => self.show_toast(Self::err_toast(&e), now),
-                            None => {}
-                        }
+                        self.game_job(GameAct::Add(exe));
                     }
+                } else if self.games_wait > 0 {
+                    // a change of the list is on its way: a row's click waits for it (the rows may move)
                 } else if let Some(i) = (0..self.games.len()).find(|&i| idx(K_FTG, i) == k) {
                     let g = self.games[i].clone();
-                    let (name, ..) = game_look(&g.exe);
-                    match self.fso_change(cx, &g.exe, !g.off) {
-                        Some(Ok(_)) => {
-                            self.games[i].off = !g.off;
-                            let t = if !g.off { format!("Off for {name} · from its next start") } else { format!("Back on for {name} · from its next start") };
-                            self.show_toast(t, now);
-                        }
-                        Some(Err(e)) => self.show_toast(Self::err_toast(&e), now),
-                        None => {}
-                    }
+                    self.game_job(GameAct::Flip(g.exe, !g.off));
                 } else if let Some(i) = (0..self.games.len()).find(|&i| idx(K_FDEL, i) == k) {
                     let g = self.games[i].clone();
-                    let (name, ..) = game_look(&g.exe);
-                    match self.fso_change(cx, &g.exe, false) {
-                        Some(Ok(_)) => {
-                            self.games.remove(i);
-                            self.show_toast(format!("{name} removed · back to normal"), now);
-                        }
-                        Some(Err(e)) => self.show_toast(Self::err_toast(&e), now),
-                        None => {}
-                    }
+                    self.game_job(GameAct::Remove(g.exe));
                 }
             }
             None => {}
@@ -1135,6 +1411,62 @@ impl Page for Tweaks {
 #[cfg(test)]
 mod tests;
 
+/// Windows' own values of the rows that differ from them now (the reset's "Windows defaults").
+fn win_defaults(s: &Svc) -> Vec<DefaultItem> {
+    WIN_DEFAULT
+        .iter()
+        .filter_map(|(id, d)| {
+            let i = row_ix(id)?;
+            let Value::Switch(now) = s.read(ROWS[i].crate_id).ok()?.value else { return None };
+            Some(DefaultItem { item: id.to_string(), label: ROWS[i].title.into(), now: sw_val(now), default: sw_val(*d) })
+        })
+        .collect()
+}
+
+/// Order 047: Tweaks' reset for a worker thread (`Resettable::detach`): the page's ONE service (shared), so an Explorer
+/// restart, a settings broadcast or an admin prompt of a reset never holds the menu.
+struct Away {
+    svc: Arc<Mutex<Svc>>,
+    real_read: bool,
+    /// test copies only: every read / put-back first sleeps this long (ms)
+    slow: u64,
+}
+
+impl Away {
+    fn wait(&self) {
+        if self.slow > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(self.slow));
+        }
+    }
+}
+
+impl Resettable for Away {
+    fn page_id(&self) -> &str {
+        "tgl"
+    }
+    fn page_title(&self) -> &str {
+        "Tweaks"
+    }
+    fn current(&self, item: &str) -> Option<Val> {
+        self.wait();
+        item_val(&lock(&self.svc), item)
+    }
+    fn has_item(&self, item: &str) -> bool {
+        item.starts_with(FSO_ITEM) || row_ix(item).is_some()
+    }
+    fn windows_defaults(&self) -> Vec<DefaultItem> {
+        self.wait();
+        win_defaults(&lock(&self.svc))
+    }
+    fn apply(&mut self, item: &str, to: &Val) -> Result<(), String> {
+        if self.real_read || crate::testmode::real_read() {
+            return Err("A read-only test copy changes nothing".into());
+        }
+        self.wait();
+        put(&mut lock(&self.svc), item, to)
+    }
+}
+
 /// The reset line (Order 036): "Back to how your PC was" from the ONE change log, "Windows defaults" from `WIN_DEFAULT`.
 /// Items: the row ids (`ext`, `scroff`, `sleep`…) and `fso:<exe>` per game.
 impl Resettable for Tweaks {
@@ -1151,17 +1483,7 @@ impl Resettable for Tweaks {
         item.starts_with(FSO_ITEM) || row_ix(item).is_some()
     }
     fn windows_defaults(&self) -> Vec<DefaultItem> {
-        self.with_svc(|s| {
-            WIN_DEFAULT
-                .iter()
-                .filter_map(|(id, d)| {
-                    let i = row_ix(id)?;
-                    let Value::Switch(now) = s.read(ROWS[i].crate_id).ok()?.value else { return None };
-                    Some(DefaultItem { item: id.to_string(), label: ROWS[i].title.into(), now: sw_val(now), default: sw_val(*d) })
-                })
-                .collect()
-        })
-        .unwrap_or_default()
+        self.with_svc(win_defaults).unwrap_or_default()
     }
     fn apply(&mut self, item: &str, to: &Val) -> Result<(), String> {
         if self.real_read || crate::testmode::real_read() {
@@ -1170,9 +1492,19 @@ impl Resettable for Tweaks {
         let r = self.with_svc_mut(|s| put(s, item, to)).ok_or("Tweaks can’t be read on this PC")?;
         if self.svc.is_some() {
             // the open page shows the value it was put back to
-            self.read_all();
-            self.load_games();
+            // (Order 047: read again on the worker; the rows show it when it lands)
+            self.refresh(false);
         }
         r
+    }
+    /// Order 047: the review's reads and put-backs on a worker thread, on this page's own service.
+    fn detach(&mut self) -> Option<crate::undo::Detached> {
+        let svc = self.shared_svc()?;
+        Some(Box::new(Away { svc, real_read: self.real_read, slow: self.slow }))
+    }
+    fn reset_done(&mut self) {
+        if self.svc.is_some() {
+            self.refresh(false);
+        }
     }
 }

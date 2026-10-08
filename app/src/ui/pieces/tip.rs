@@ -175,10 +175,18 @@ impl Tips {
         }
     }
 
+    /// Frames only for a fade (Order 047: the delay is waited out asleep - `due`).
     fn busy(&self, now: f64) -> bool {
-        let timer = self.armed.is_some_and(|(k, t)| now - t < self.delay || self.shown.as_ref().map(|s| s.key) != Some(k));
+        let timer = self.armed.is_some_and(|(k, t)| now - t >= self.delay && self.shown.as_ref().map(|s| s.key) != Some(k));
         let fade = self.shown.as_ref().is_some_and(|s| now - s.on_at < 120.0 || s.off_at.is_some());
         timer || fade
+    }
+
+    /// Order 047: when the armed tip's delay ends (the menu wakes then and shows it), None = no timer running.
+    pub fn due(&self) -> Option<f64> {
+        let (k, t) = self.armed?;
+        let showing = self.shown.as_ref().is_some_and(|s| s.key == k && s.off_at.is_none());
+        (!showing).then_some(t + self.delay)
     }
 
     /// The bubble to draw (window coordinates), fading in / out over the drawing's .12 s ease.
@@ -310,7 +318,9 @@ mod tests {
         let layers = [(&laid, (0.0, 100.0))];
         let mut t = Tips::default();
         // the pointer rests on the tipped element: nothing for 300 ms, then the bubble, placed once
-        assert!(t.update(&g, &layers, &[a], 0.0, 600.0));
+        // (Order 047: the 300 ms are waited out asleep - no frames, `due` says when)
+        assert!(!t.update(&g, &layers, &[a], 0.0, 600.0));
+        assert_eq!(t.due(), Some(300.0));
         assert!(t.el(0.0).is_none());
         t.update(&g, &layers, &[a], 299.0, 600.0);
         assert!(t.el(299.0).is_none());

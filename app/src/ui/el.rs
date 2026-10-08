@@ -284,7 +284,8 @@ impl El {
     }
     /// An inline-level text run as its own box (Blink: an anonymous line box).
     pub fn text(s: impl Into<String>, font: Font, color: Rgba, lh: f32) -> El {
-        El { content: Content::Text(Text { s: s.into(), font, color, lh, wrap: Wrap::Line, align: Align::Left, underline: false }), ..El::default() }
+        let s = crate::testmode::demo_text(s.into());
+        El { content: Content::Text(Text { s, font, color, lh, wrap: Wrap::Line, align: Align::Left, underline: false }), ..El::default() }
     }
     pub fn icon(name: &str, size: f32, stroke_w: f32, color: Rgba) -> El {
         let mut e = El::default().w(size).h(size).shrink(0.0);

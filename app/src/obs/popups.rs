@@ -169,7 +169,7 @@ fn make_glass(h: HWND, m: &PopMsg, dpi: i32, scale: i32) -> Option<(Kind, i32, i
     g.end();
     let cp = crate::png::from_surface(&mut cs);
     chain.present(&cp.data, (ww * 4) as u32).ok()?;
-    let glass = crate::comp::Glass::new(h, &chain, &mask, None, ww as f32, wh as f32, super::glass::RADIUS * s, crate::comp::GlassMode::Host).ok()?;
+    let glass = crate::comp::Glass::new(h, (&chain.swap, chain.w, chain.h), &mask.swap, None, ww as f32, wh as f32, super::glass::RADIUS * s, crate::comp::GlassMode::Host).ok()?;
     glass.set_opacity(0.0);
     unsafe {
         let _ = SetWindowPos(h, None, 0, 0, ww, wh, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);

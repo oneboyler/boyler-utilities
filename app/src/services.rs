@@ -2,8 +2,8 @@
 //! stay (a key must work with the menu closed):
 //! - the settings store (`settings/`): %APPDATA%\Boyler Utilities\settings.cfg; a test copy uses a scratch folder under
 //!   %TEMP% that is deleted at quit;
-//! - the keys manager (`keys/`): the REAL layer (RegisterHotKey + Raw Input on the message window) in normal runs, the
-//!   FAKE one in every test copy (a test never registers a real key); its key-field capture;
+//! - the keys manager (`keys/`): the REAL layer (RegisterHotKey on the message window + Raw Input through bu-rawin) in
+//!   normal runs, the FAKE one in every test copy (a test never registers a real key); its key-field capture;
 //! - the job runner (`jobs/`): it owns the process's one `Clicks`, so a job starts only from a click being delivered;
 //! - the actions' handlers (what a key does), registered by the pages at start (`Page::start`).
 //!
@@ -23,6 +23,8 @@ use crate::settings::{GlassStyle, Scope, SettingsStore};
 
 /// The message a finished / progressing job posts to the message window (the menu repaints).
 pub const WM_JOB: u32 = WM_APP + 7;
+/// bu-rawin (the Raw Input thread) has key packets / mouse buttons for the keys manager (one per batch; Order 048).
+pub const WM_RAWKEYS: u32 = WM_APP + 8;
 
 /// A job or a key changed something the menu shows (read and cleared by the menu each frame).
 static DIRTY: AtomicBool = AtomicBool::new(false);
@@ -149,7 +151,7 @@ thread_local! {
     static S: RefCell<Option<Services>> = const { RefCell::new(None) };
 }
 
-/// Start the services (once, at app start). `hwnd` = the message window (WM_HOTKEY, WM_INPUT, job wake-ups).
+/// Start the services (once, at app start). `hwnd` = the message window (WM_HOTKEY, WM_RAWKEYS, job wake-ups).
 pub fn init(hwnd: HWND, test: bool) {
     init_with(Some(hwnd), test);
 }
@@ -169,7 +171,12 @@ fn init_with(hwnd: Option<HWND>, test: bool) {
     } else {
         (SettingsStore::default_folder().unwrap_or_else(|| std::env::temp_dir().join("Boyler Utilities")), None)
     };
-    let store = SettingsStore::open(folder);
+    let mut store = SettingsStore::open(folder);
+    // Order 050: the app's writes go to one background writer - a change never waits for the disk on the UI thread (unit
+    // tests keep writing at once: they read the file back right after)
+    if !cfg!(test) {
+        store.write_in_background();
+    }
     let os: Box<dyn KeysOs> = match hwnd {
         Some(hwnd) if !test => Box::new(RealKeysOs::new(hwnd)),
         _ => Box::new(FakeKeysOs::new()),
@@ -460,25 +467,24 @@ pub fn hotkey(wparam: usize) {
     });
 }
 
-/// WM_INPUT on the message window (keys watched with Raw Input: mouse buttons, modifier-only keys).
-pub fn raw_input(lparam: isize) {
-    use std::ffi::c_void;
-    use windows::Win32::UI::Input::{GetRawInputData, HRAWINPUT, RAWINPUT, RAWINPUTHEADER, RID_INPUT};
-    let mut raw = RAWINPUT::default();
-    let mut size = std::mem::size_of::<RAWINPUT>() as u32;
-    let n = unsafe {
-        GetRawInputData(HRAWINPUT(lparam as *mut c_void), RID_INPUT, Some(&mut raw as *mut RAWINPUT as *mut c_void), &mut size, std::mem::size_of::<RAWINPUTHEADER>() as u32)
-    };
-    if n == 0 || n == u32::MAX {
-        return;
+/// WM_RAWKEYS on the message window (keys watched with Raw Input: mouse buttons, modifier-only keys, release keys): the
+/// packets bu-rawin kept since the last one - key packets, mouse buttons / wheel; a mouse move never comes here.
+/// true = something was fed to the keys manager.
+pub fn raw_packets() -> bool {
+    let packets = bu_rawin::take_packets();
+    if packets.is_empty() {
+        return false;
     }
     with(|s| {
         let mut fired: Vec<(String, bool)> = Vec::new();
-        s.keys.on_rawinput(&raw, |id, down| fired.push((id.to_string(), down)));
-        for (id, down) in fired {
-            s.fire(&id, down);
+        for p in packets {
+            s.keys.on_raw(p.into(), |id, down| fired.push((id.to_string(), down)));
+            for (id, down) in fired.drain(..) {
+                s.fire(&id, down);
+            }
         }
-    });
+    })
+    .is_some()
 }
 
 #[cfg(test)]

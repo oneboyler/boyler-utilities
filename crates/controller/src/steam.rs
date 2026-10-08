@@ -69,6 +69,15 @@ impl Game {
     }
 }
 
+/// The names Steam has for the games on this PC (read-only): app id → name (appmanifests), the shortcuts' names
+/// (shortcuts.vdf), the Steam Input switch per app (localconfig.vdf).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Names {
+    pub apps: BTreeMap<u32, String>,
+    pub shortcuts: Vec<String>,
+    pub switches: BTreeMap<String, String>,
+}
+
 /// Steam on this PC + the account whose layouts are shown.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SteamPaths {
@@ -254,11 +263,20 @@ impl SteamPaths {
         out
     }
 
+    /// The names behind the game list (every appmanifest of every library, the shortcuts, localconfig.vdf).
+    pub fn names(&self, os: &dyn SteamOs) -> Names {
+        Names { apps: self.app_names(os), shortcuts: self.shortcut_names(os), switches: self.steam_input_switches(os) }
+    }
+
     /// Every game with a layout for this controller type (the game popup's list).
     pub fn games(&self, os: &dyn SteamOs, kind: PadKind) -> Result<Vec<Game>> {
-        let names = self.app_names(os);
-        let shortcuts = self.shortcut_names(os);
-        let switches = self.steam_input_switches(os);
+        self.games_named(os, kind, &self.names(os))
+    }
+
+    /// The game list from names read before (Order 047: the names are the slow part - MBs on a big library - and change
+    /// only when a game is installed; the configset, which layout each game uses, is read here every time).
+    pub fn games_named(&self, os: &dyn SteamOs, kind: PadKind, n: &Names) -> Result<Vec<Game>> {
+        let (names, shortcuts, switches) = (&n.apps, &n.shortcuts, &n.switches);
         let mut out = Vec::new();
         for (key, source) in self.configset(os, kind)? {
             let appid = key.parse::<u32>().ok();

@@ -5,6 +5,7 @@ use crate::error::{Error, Result};
 use crate::os::{Entry, LiveEvent, LiveSource, PadInfo, PadOs, SteamOs};
 use std::collections::{BTreeMap, VecDeque};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 
@@ -27,6 +28,10 @@ pub struct FakeSteam {
     pub fail_on: Mutex<Option<String>>,
     /// Tests: removing a path ending with this text fails.
     pub fail_remove: Mutex<Option<String>>,
+    /// Tests (Order 047): every read and listing first waits this long (ms) - a slow disk / a big Steam library.
+    pub delay_ms: AtomicU64,
+    /// How many files were read so far (tests: the game names are read once per change, not once per question).
+    pub reads: AtomicU64,
 }
 
 impl FakeSteam {
@@ -46,6 +51,12 @@ impl FakeSteam {
     pub fn writes(&self) -> Vec<String> {
         self.log.lock().unwrap().clone()
     }
+    fn wait(&self) {
+        let d = self.delay_ms.load(Ordering::Relaxed);
+        if d > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(d));
+        }
+    }
 }
 
 impl SteamOs for FakeSteam {
@@ -56,6 +67,8 @@ impl SteamOs for FakeSteam {
         self.active
     }
     fn read(&self, path: &Path) -> Result<Vec<u8>> {
+        self.wait();
+        self.reads.fetch_add(1, Ordering::Relaxed);
         self.get(path).ok_or_else(|| Error::io(format!("read {}", path.display()), std::io::Error::from(std::io::ErrorKind::NotFound)))
     }
     fn exists(&self, path: &Path) -> bool {
@@ -65,6 +78,7 @@ impl SteamOs for FakeSteam {
         f.contains_key(&k) || f.keys().any(|x| x.starts_with(&pre))
     }
     fn list(&self, dir: &Path) -> Result<Vec<Entry>> {
+        self.wait();
         let pre = format!("{}\\", key(dir));
         let f = self.files.lock().unwrap();
         let mut out: BTreeMap<String, bool> = BTreeMap::new();
@@ -129,10 +143,15 @@ pub struct FakePads {
     pub script: Mutex<VecDeque<LiveEvent>>,
     /// How many live sources are open right now (the page-closed = nothing-open proof).
     pub open_now: Arc<Mutex<usize>>,
+    /// Tests (Order 047): listing waits this long (ms) - a real list reads one report per PlayStation pad (its battery).
+    pub delay_ms: u64,
 }
 
 impl PadOs for FakePads {
     fn list_pads(&self) -> Result<Vec<PadInfo>> {
+        if self.delay_ms > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(self.delay_ms));
+        }
         Ok(self.pads.clone())
     }
     fn open_live(&self, pad: &PadInfo) -> Result<Box<dyn LiveSource>> {

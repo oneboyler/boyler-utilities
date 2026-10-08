@@ -5,7 +5,43 @@
 use bu_screenshot::{Frozen, Image, Rect, ScreenshotOs, Screenshots, Shot, Target};
 
 use super::compose;
-use super::model::{Finish, Keep, Model, Out, Pt};
+use super::model::{Ann, Finish, Keep, Model, Out, Pt};
+
+/// A Copy / Save to carry out off the UI thread (Order 048: grabbing, the PNG encode, the file and the clipboard can take
+/// long, and the overlay's topmost windows must never wait on them): everything the picture needs, owned.
+pub struct FinishJob {
+    pub kind: Finish,
+    /// the picture to crop (None = this moment: Live, or a Snap still on its way - the job grabs the screen first)
+    pub frozen: Option<Frozen>,
+    /// the box (desktop px)
+    pub sel: Rect,
+    pub anns: Vec<Ann>,
+}
+
+/// Carry out a Copy / Save (any thread; `svc` = that thread's own engine). The same steps the overlay's `apply` takes.
+pub fn run_finish<O: ScreenshotOs>(svc: &Screenshots<O>, job: FinishJob) -> bu_screenshot::Result<Done> {
+    let frozen = match job.frozen {
+        Some(f) => f,
+        None => svc.capture_all()?,
+    };
+    let r = job.sel.intersect(&frozen.area).ok_or(bu_screenshot::Error::BadRegion("is outside the desktop"))?;
+    let image = compose::compose(&frozen, &r, &job.anns)?;
+    drop(frozen);
+    let size = format!("{}×{}", image.width, image.height);
+    match job.kind {
+        Finish::Copy => {
+            // Copy: the clipboard, and the gallery (the drawing: "Both land in the gallery" - a gallery entry is a saved file)
+            svc.copy(&image)?;
+            let shot = Some(svc.save(&image)?);
+            Ok(Done { image, shot, title: "Screenshot copied", sub: size, flash: None })
+        }
+        Finish::Save => {
+            let shot = svc.save(&image)?;
+            let dir = shot.path.parent().map(|p| p.display().to_string()).unwrap_or_default();
+            Ok(Done { image, shot: Some(shot), title: "Screenshot saved", sub: format!("{size} · {dir}"), flash: None })
+        }
+    }
+}
 
 /// A shot that is done: its picture, its gallery entry, and the capture toast's two lines.
 #[derive(Clone, Debug)]
@@ -42,8 +78,27 @@ impl<O: ScreenshotOs> Capture<O> {
     /// The Screenshot key: every monitor is captured at once (frozen by default), then the overlay opens on it.
     pub fn start(svc: Screenshots<O>, pointer: Pt, now: f64, keep: Option<Keep>) -> bu_screenshot::Result<Self> {
         let frozen = svc.capture_all()?;
+        Ok(Self::with_frozen(svc, frozen, pointer, now, keep))
+    }
+
+    /// The same with the picture already taken (Order 048: the overlay grabs on a worker thread, then opens on it).
+    pub fn with_frozen(svc: Screenshots<O>, frozen: Frozen, pointer: Pt, now: f64, keep: Option<Keep>) -> Self {
         let model = Model::new(frozen.monitors.clone(), pointer, now, keep);
-        Ok(Capture { svc, frozen, model })
+        Capture { svc, frozen, model }
+    }
+
+    /// Copy / Save as a job for another thread (None = no box yet: nothing to take). `fresh` = a new picture is still on
+    /// its way (a Snap / Live off on a worker): the job takes this moment itself instead of the old picture. The frozen
+    /// picture moves into the job (the overlay only fades out after a finish; its monitors' slices are separate copies).
+    pub fn finish_job(&mut self, kind: Finish, fresh: bool) -> Option<FinishJob> {
+        let sel = self.model.sel.and_then(|s| s.rect())?;
+        let frozen = if self.model.live || fresh {
+            None
+        } else {
+            let empty = Frozen { area: self.frozen.area, image: Image { width: 0, height: 0, bgra: Vec::new() }, monitors: Vec::new(), color: Vec::new(), timing: Default::default() };
+            Some(std::mem::replace(&mut self.frozen, empty))
+        };
+        Some(FinishJob { kind, frozen, sel, anns: self.model.anns.clone() })
     }
 
     /// Carry out what the model asked for.
@@ -58,33 +113,16 @@ impl<O: ScreenshotOs> Capture<O> {
                 Ok(Step::Stay)
             }
             Out::Finish(kind) => {
-                let Some(r) = self.model.sel.and_then(|s| s.rect()) else { return Ok(Step::Stay) };
+                let Some(sel) = self.model.sel.and_then(|s| s.rect()) else { return Ok(Step::Stay) };
                 if self.model.live {
                     // Live: the picture is this moment (coFinish: deskSnap())
                     self.frozen = self.svc.capture_all()?;
                 }
-                let r = r.intersect(&self.frozen.area).ok_or(bu_screenshot::Error::BadRegion("is outside the desktop"))?;
-                let image = compose::compose(&self.frozen, &r, &self.model.anns)?;
-                let size = format!("{}×{}", image.width, image.height);
-                match kind {
-                    Finish::Copy => {
-                        let shot = self.copy_and_keep(&image)?;
-                        Ok(Step::Shot(Done { image, shot, title: "Screenshot copied", sub: size, flash: None }))
-                    }
-                    Finish::Save => {
-                        let shot = self.svc.save(&image)?;
-                        let dir = shot.path.parent().map(|p| p.display().to_string()).unwrap_or_default();
-                        Ok(Step::Shot(Done { image, shot: Some(shot), title: "Screenshot saved", sub: format!("{size} · {dir}"), flash: None }))
-                    }
-                }
+                // the same steps the overlay's worker runs (`run_finish`), here on the calling thread
+                let job = FinishJob { kind, frozen: Some(self.frozen.clone()), sel, anns: self.model.anns.clone() };
+                Ok(Step::Shot(run_finish(&self.svc, job)?))
             }
         }
-    }
-
-    /// Copy: the clipboard, and the gallery (the drawing: "Both land in the gallery" - a gallery entry is a saved file).
-    fn copy_and_keep(&self, image: &Image) -> bu_screenshot::Result<Option<Shot>> {
-        self.svc.copy(image)?;
-        Ok(Some(self.svc.save(image)?))
     }
 
     /// The region a Target means (for callers that capture without the overlay, e.g. a later "whole screen" key).
@@ -230,5 +268,31 @@ mod tests {
         os.state().capture_error = Some(bu_screenshot::Error::Cancelled);
         let svc = Screenshots::new(os.clone(), PathBuf::from(DATA));
         assert!(Capture::start(svc, (0.0, 0.0), 0.0, None).is_err());
+    }
+
+    /// Order 048: the job the overlay hands its worker gives exactly the shot `apply` gives, and takes this moment when a
+    /// new picture is still on its way.
+    #[test]
+    fn a_finish_job_on_another_engine_makes_the_same_shot() {
+        let (os, mut c) = cap();
+        boxed(&mut c);
+        let want = c.frozen.crop(&Rect::new(100, 100, 200, 150)).unwrap();
+        let job = c.finish_job(Finish::Copy, false).expect("a box");
+        assert!(job.frozen.is_some(), "the frozen picture moves into the job");
+        let worker = Screenshots::new(os.clone(), PathBuf::from(DATA));
+        let d = run_finish(&worker, job).unwrap();
+        assert_eq!((d.image.clone(), d.title, d.sub.as_str()), (want, "Screenshot copied", "200×150"));
+        assert!(matches!(os.state().clipboard, Some(Clip::Picture { .. })));
+        assert!(d.shot.is_some(), "Copy joins the gallery too");
+        // a Snap on its way: the job grabs the screen itself
+        let job = c.finish_job(Finish::Save, true).unwrap();
+        assert!(job.frozen.is_none());
+        os.change_screens();
+        let d = run_finish(&worker, job).unwrap();
+        assert_eq!(d.image, os.screen(1).crop(&Rect::new(100, 100, 200, 150)).unwrap(), "this moment, not the old picture");
+        assert_eq!(d.title, "Screenshot saved");
+        // no box: no job
+        let (_os, mut c2) = cap();
+        assert!(c2.finish_job(Finish::Copy, false).is_none());
     }
 }

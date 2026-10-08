@@ -155,6 +155,11 @@ pub struct Performance {
     toast: Option<(String, f64)>,
     /// "Copy all" turned into "Copied" at
     copied: Option<f64>,
+    /// Order 047: Copy all's clipboard write runs on its own thread (clip.exe is started and waited for: 50-150 ms) - its
+    /// answer (copied?) arrives here, `tick` takes it
+    copying: Option<Arc<std::sync::Mutex<Option<bool>>>>,
+    /// the clipboard write (None = Windows' clip.exe; a test hands a slow stand-in)
+    clip: Option<fn(&str) -> bool>,
     pressed: (f32, f32, f32, f32),
     /// rows being ended (key, since): they fold away (height 36 -> 0, 220 ms)
     ending: Vec<(String, f64)>,
@@ -202,6 +207,16 @@ impl Performance {
 
     fn show_toast(&mut self, t: impl Into<String>, now: f64) {
         self.toast = Some((t.into(), now));
+    }
+
+    /// Copy all's answer: "Copied" + its toast, or Windows' refusal.
+    fn copy_done(&mut self, ok: bool, now: f64) {
+        if ok {
+            self.copied = Some(now);
+            self.show_toast("Your PC copied · paste it anywhere", now);
+        } else {
+            self.show_toast("Windows didn’t take the copy", now);
+        }
     }
 
     fn refresh_fake(&mut self) {
@@ -492,8 +507,9 @@ impl Performance {
         let grid = El::grid().cols(2).bg(GRP()).radius(10.0).inset(&rim).children(kids);
         // the header's small button `.mbtn` ("Copy all" -> "Copied" for 1.6 s)
         let done = self.copied.is_some_and(|t| cx.now - t < mbtn::DONE_MS);
-        if done {
-            cx.st.busy = true;
+        // Order 047: "Copied" goes back to "Copy all" at a known moment - built again then, no frames until it
+        if let Some(t) = self.copied.filter(|_| done) {
+            cx.wake_at(t + mbtn::DONE_MS);
         }
         let btn = mbtn::mbtn(cx, K_COPY, if done { Mb::Done("Copied") } else { Mb::Text("Copy all") }, false);
         let gh = mbtn::gh_with("Your PC", vec![], vec![btn]);
@@ -635,7 +651,10 @@ impl Performance {
             if let Some((_, at)) = self.ending.iter().find(|(key, _)| *key == r.key) {
                 let k2 = ((cx.now - at) / 220.0).clamp(0.0, 1.0);
                 let v = EASE_OUT.ease(k2) as f32;
-                cx.st.busy = k2 < 1.0;
+                // (real motion, only while it folds; Order 047: never clears what another part asked for)
+                if k2 < 1.0 {
+                    cx.st.busy = true;
+                }
                 row = row.h(36.0 * (1.0 - v)).opacity(1.0 - v).clip();
             }
             list = list.child(row);
@@ -735,12 +754,23 @@ impl Page for Performance {
             }
             changed = true;
         }
-        self.ending.retain(|(k, at)| now - at < 1500.0 && self.snap.rows.iter().any(|r| r.key == *k));
-        let toast = self.toast.as_ref().is_some_and(|(_, t)| now - t < toast::SHOW_MS + 300.0);
-        if !toast {
-            self.toast = None;
+        // Order 047: Copy all's answer from its thread (it woke the menu)
+        if let Some(ok) = self.copying.as_ref().and_then(|s| s.lock().ok().and_then(|mut g| g.take())) {
+            self.copying = None;
+            self.copy_done(ok, now);
+            changed = true;
         }
-        changed || toast
+        self.ending.retain(|(k, at)| now - at < 1500.0 && self.snap.rows.iter().any(|r| r.key == *k));
+        // Order 047: a toast at rest needs no frames (the toast piece wakes the menu when it fades); it goes at its end
+        if self.toast.as_ref().is_some_and(|(_, t)| now - t >= toast::SHOW_MS + 300.0) {
+            self.toast = None;
+            changed = true;
+        }
+        changed
+    }
+    /// Order 047: the toast's end (it is dropped then); nothing else here is timed.
+    fn wake_at(&self, now: f64) -> Option<f64> {
+        self.toast.as_ref().map(|(_, t)| (t + toast::SHOW_MS + 300.0).max(now + 1.0))
     }
     fn build(&mut self, cx: &mut Cx) -> Vec<El> {
         vec![pieces::header(self.name(), Some(badge::live_note("Live only while this page is open"))), self.tiles(), self.your_pc(cx), self.processes(cx)]
@@ -794,18 +824,25 @@ impl Page for Performance {
                 return;
             }
             let text = self.snap.specs.as_ref().map(PcSpecs::copy_text).unwrap_or_default();
-            let ok = if self.test || self.real_read {
+            if (self.test || self.real_read) && self.clip.is_none() {
                 self.log.push(format!("copy:{}", text.lines().count()));
-                true
-            } else {
-                to_clipboard(&text)
-            };
-            if ok {
-                self.copied = Some(now);
-                self.show_toast("Your PC copied · paste it anywhere", now);
-            } else {
-                self.show_toast("Windows didn’t take the copy", now);
+                self.copy_done(true, now);
+                return;
             }
+            // Order 047: clip.exe is started and waited for on its own thread; "Copied" / the toast come with its answer
+            if self.copying.is_some() {
+                return;
+            }
+            let slot = Arc::new(std::sync::Mutex::new(None));
+            let out = slot.clone();
+            let clip = self.clip.unwrap_or(to_clipboard as fn(&str) -> bool);
+            crate::offui::spawn("pc-copy", move || {
+                let ok = clip(&text);
+                if let Ok(mut s) = out.lock() {
+                    *s = Some(ok);
+                }
+            });
+            self.copying = Some(slot);
             return;
         }
         if k == K_LIVE {

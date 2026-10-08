@@ -1,6 +1,7 @@
 //! Real measurement of the per-app trigger, with hidden throw-away `ping` processes we start ourselves (never a game):
-//! how long the watcher takes to start (incl. the admin trace being refused), which source it ends up on, and how
-//! long after a process starts / ends the event lands. Changes nothing.
+//! how long the watcher takes to start, which source it ends up on, and how long after a process starts / ends the event
+//! lands. A hidden ping makes no window, so `bu_procwatch::rescan()` stands in for the window a game would create (the
+//! start delay measured is the snapshot path; a real game is seen when it creates its first window). Changes nothing.
 //!
 //!   cargo run -p bu-display --example display-trigger -- [runs]
 
@@ -18,7 +19,8 @@ fn system32(exe: &str) -> std::path::PathBuf {
 
 fn main() {
     let runs: usize = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(10);
-    // How fast WMI refuses (or accepts) the admin-only trace on its own — the REFUSE_WAIT in win::wmi is 1.5 s.
+    // How fast WMI refuses (or accepts) the admin-only trace on its own — the REFUSE_WAIT in win::wmi is 1.5 s. The
+    // watcher itself only tries it when elevated.
     for i in 1..=3 {
         let t = Instant::now();
         let r = WmiStartTrace.start(&["ping.exe".into()], Arc::new(|_, _| {}), Arc::new(|_| {}));
@@ -35,6 +37,7 @@ fn main() {
     })
     .expect("watcher");
     println!("watcher started in {} ms, source: {:?}", t.elapsed().as_millis(), w.active_source());
+    std::thread::sleep(Duration::from_millis(300)); // its first snapshot (what already runs) is taken
     let (mut starts, mut stops) = (vec![], vec![]);
     for i in 0..runs {
         let spawned = Instant::now();
@@ -54,6 +57,9 @@ fn main() {
                 if let Ok(Some(_)) = child.try_wait() {
                     ended_at = Some(Instant::now());
                 }
+            }
+            if started.is_none() {
+                bu_procwatch::rescan();
             }
             if let Ok((e, at)) = rx.recv_timeout(Duration::from_millis(5)) {
                 match e {

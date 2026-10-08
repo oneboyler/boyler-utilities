@@ -137,3 +137,20 @@ fn our_index_is_kept_only_when_marked_whole() {
     assert!(host::INI.contains("service_pipe_name=\\\\.\\PIPE\\Everything Service\r\n"), "{}", host::INI);
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// Order 049: our instance keeps only what the query needs (size + date modified, no sorted copies, no recent changes)
+/// and leaves out the big folders, in Everything.ini's list form.
+#[test]
+fn our_everything_settings_are_lean() {
+    use bu_search::real::host;
+    let ini = host::ini(r"D:\Win\");
+    for line in ["index_size=1", "index_date_modified=1", "fast_size_sort=0", "fast_date_modified_sort=0", "fast_path_sort=0", "fast_extension_sort=0", "index_recent_changes=0", "run_on_system_startup=0"] {
+        assert!(ini.contains(&format!("{line}\r\n")), "{line} in {ini}");
+    }
+    let want = concat!(r#"exclude_folders="D:\\Win\\WinSxS","*:\\$Recycle.Bin","*\\node_modules","*\\target\\debug","*\\target\\release""#, "\r\n");
+    assert!(ini.ends_with(want), "{ini}");
+    // the install passes our transform (it leaves out Everything's all-users start at sign-in)
+    let p = host::msi_params(std::path::Path::new(r"C:\t\e.msi"), std::path::Path::new(r"C:\t\n.mst"));
+    assert_eq!(p, r#"/i "C:\t\e.msi" TRANSFORMS="C:\t\n.mst" /qn /norestart"#);
+    assert!(host::NO_STARTUP_MST.len() > 1000 && host::NO_STARTUP_MST.starts_with(&[0xD0, 0xCF, 0x11, 0xE0]), "an MSI transform (OLE file)");
+}

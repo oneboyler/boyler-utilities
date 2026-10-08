@@ -18,8 +18,25 @@ impl T {
         let mut p = Controller::default();
         p.open(&Env { test: true, frozen: true, ..Env::default() }, 0.0);
         let mut t = T { p, g: Gfx::new(1.0), st: State::default(), now: 1000.0 };
+        t.settle();
         t.build();
         t
+    }
+    /// Order 047: the tab's worker reads and writes off the menu's thread - wait (frame steps, as the menu makes them)
+    /// until every answer asked for so far is in.
+    fn settle(&mut self) {
+        let t0 = std::time::Instant::now();
+        // nothing asked = no frame step at all (a test's own ticks - the drift check - stay the only ones)
+        while self.p.o.as_ref().is_some_and(|o| !o.idle()) {
+            let now = self.now;
+            self.p.tick(now);
+            assert!(t0.elapsed().as_secs() < 20, "the tab's worker never answered");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+    /// The tab's fake Steam answers this slowly from now on (ms per file read).
+    fn slow(&mut self, ms: u64) {
+        self.o().svc_do(|s| s.set_fake_delay(ms)).unwrap();
     }
     fn o(&mut self) -> &mut Open {
         self.p.o.as_mut().unwrap()
@@ -34,6 +51,7 @@ impl T {
     fn ev(&mut self, e: Ev) {
         let mut cx = Cx::new(self.now, false, &self.g, &mut self.st).for_page("pad");
         self.p.event(&e, &mut cx);
+        self.settle();
         self.build();
     }
     fn click(&mut self, k: Key) {
@@ -62,13 +80,13 @@ impl T {
         self.ev(Ev::Release(k));
     }
     fn writes(&mut self) -> Vec<String> {
-        self.o().svc.as_ref().unwrap().fake_writes()
+        self.o().svc_do(|s| s.fake_writes()).unwrap()
     }
     fn rl(&mut self) -> String {
-        self.o().svc.as_ref().unwrap().fake_text(&data::config().join(r"252950\controller_ps5.vdf")).unwrap()
+        self.o().svc_do(|s| s.fake_text(&data::config().join(r"252950\controller_ps5.vdf"))).unwrap().unwrap()
     }
     fn prefs(&mut self) -> String {
-        self.o().svc.as_ref().unwrap().fake_text(&data::config().join(format!("preferences_{}.vdf", data::SERIAL))).unwrap()
+        self.o().svc_do(|s| s.fake_text(&data::config().join(format!("preferences_{}.vdf", data::SERIAL)))).unwrap().unwrap()
     }
     fn toast(&mut self) -> String {
         self.o().toast.clone().map(|t| t.0).unwrap_or_default()
@@ -330,6 +348,7 @@ impl T {
         let mut p = Controller::default();
         p.open(&Env { test: true, ..Env::default() }, 0.0);
         let mut t = T { p, g: Gfx::new(1.0), st: State::default(), now: 1000.0 };
+        t.settle();
         t.build();
         t
     }
@@ -428,7 +447,7 @@ fn a_closed_tab_resets_through_its_own_service() {
     let _s = Sv::start();
     let mut p = Controller::default();
     assert!(p.resettable().is_some());
-    assert!(p.cold.borrow().is_none() && p.o.is_none(), "nothing made by resettable()");
+    assert!(p.cold.lock().unwrap().is_none() && p.o.is_none(), "nothing made by resettable()");
     // the PC as an earlier run left it: Rocket League changed (its backup kept), the entry in the change log
     let mut svc = data::open_steam(true, false).unwrap();
     let rl = data::config().join(r"252950\controller_ps5.vdf");
@@ -436,7 +455,7 @@ fn a_closed_tab_resets_through_its_own_service() {
     let c = bu_controller::Change::ButtonSetting { button: ButtonId::Cross, setting: bu_controller::PressSetting::HoldToRepeat, value: Some(1) };
     svc.apply_all("252950", PadKind::DualSenseEdge, 0, &[c]).unwrap();
     assert_ne!(svc.fake_text(&rl).unwrap(), original);
-    *p.cold.borrow_mut() = Some(Ok(svc));
+    *p.cold.lock().unwrap() = Some(Ok(svc));
     let label = data::layout_label("Rocket League", PadKind::DualSenseEdge);
     crate::services::with(|s| crate::undo::record(&mut s.store, "pad", RL_ITEM, &label, &data::orig_val(true), &crate::undo::Val::new("edits", "your edits")))
         .unwrap()
@@ -444,7 +463,10 @@ fn a_closed_tab_resets_through_its_own_service() {
     let rv = review(&p, crate::undo::Kind::HowItWas);
     assert_eq!(rv.lines.len(), 1);
     assert!(reset(&mut p, &rv).iter().all(|r| r.outcome == crate::undo::Outcome::Ok));
-    let now = p.cold.borrow().as_ref().unwrap().as_ref().unwrap().fake_text(&rl).unwrap();
+    let now = match &*p.cold.lock().unwrap() {
+        Some(Ok(s)) => s.fake_text(&rl).unwrap(),
+        _ => panic!("no service"),
+    };
     assert_eq!(now, original);
     assert!(review(&p, crate::undo::Kind::HowItWas).is_empty());
     // the closed tab's "Steam’s layout": the games the app changed (Rocket League is the user's own layout, not Steam's)
@@ -564,8 +586,9 @@ fn a_stick_mode_the_list_doesnt_have_is_never_rewritten() {
     // a layout whose right stick is in a mode the page doesn't list (written straight through the crate, like Steam would)
     let key = t.o().game().unwrap().key.clone();
     let other = StickMode::Other("mouse_region".into());
-    t.o().svc.as_mut().unwrap().apply_all(&key, PadKind::DualSenseEdge, 0, &[Change::StickMode { side: Side::Right, mode: other.clone() }]).unwrap();
-    t.o().load_view();
+    t.o().svc_do(|s| s.apply_all(&key, PadKind::DualSenseEdge, 0, &[Change::StickMode { side: Side::Right, mode: other.clone() }])).unwrap().unwrap();
+    t.o().reload();
+    t.settle();
     let before = t.rl();
     t.click_part(Pid::Stick(Side::Right));
     t.click(Open::k("rs.mode"));
@@ -592,8 +615,9 @@ fn the_dead_zone_stays_under_full_at() {
 /// Straight into the fake Steam's file (like Steam or another program would write it), then read back.
 fn steam_writes(t: &mut T, c: Vec<Change>) {
     let key = t.o().game().unwrap().key.clone();
-    t.o().svc.as_mut().unwrap().apply_all(&key, PadKind::DualSenseEdge, 0, &c).unwrap();
-    t.o().load_view();
+    t.o().svc_do(|s| s.apply_all(&key, PadKind::DualSenseEdge, 0, &c)).unwrap().unwrap();
+    t.o().reload();
+    t.settle();
     t.build();
 }
 
@@ -894,6 +918,7 @@ impl T {
         let mut cx = Cx::new(self.now, false, &self.g, &mut self.st).for_page("pad");
         cx.mods = crate::ui::cx::Mods { ctrl, shift, alt: false };
         self.p.event(&Ev::Key(crate::ui::cx::PAGE, vk), &mut cx);
+        self.settle();
         self.build();
     }
     fn undo(&mut self) {
@@ -907,18 +932,28 @@ impl T {
     }
     /// The fake Steam started / closed (its process switch), seen by the tab's next frame.
     fn steam_running(&mut self, on: bool) {
+        self.set_steam(on, 0);
+        let now = self.now;
+        self.p.tick(now);
+        self.settle();
+        self.build();
+    }
+    /// The fake Steam started / closed (its process switch), its files answering `slow` ms per read from now on; seen by
+    /// the tab's next frame step.
+    fn set_steam(&mut self, on: bool, slow: u64) {
         let mut f = data::fake_steam();
         f.running = on;
+        let slot = self.o().svc.clone();
+        let mut g = slot.lock().unwrap();
         // the same files as now (what the tab wrote so far stays)
-        if let Ok(data::Svc::Fake(s)) = &self.o().svc {
+        if let Some(Ok(data::Svc::Fake(s))) = &*g {
             for (p, b) in s.os().files.lock().unwrap().values() {
                 f.put(p, b);
             }
         }
-        self.o().svc = Ok(data::Svc::Fake(bu_controller::ControllerService::new(f, data::BACKUPS).unwrap()));
-        let now = self.now;
-        self.p.tick(now);
-        self.build();
+        let s = data::Svc::Fake(bu_controller::ControllerService::new(f, data::BACKUPS).unwrap());
+        s.set_fake_delay(slow);
+        *g = Some(Ok(s));
     }
     /// The page as the frame lays it out (window x / y of the page's content box).
     fn page_laid(&mut self) -> crate::ui::lay::Laid {
@@ -978,7 +1013,7 @@ fn steam_closed_covers_the_tab_and_nothing_under_it_changes() {
 /// at once (its channel closes); reading the process list changes nothing.
 #[test]
 fn the_steam_watch_ends_with_the_tab() {
-    let w = data::SteamWatch::start(crate::services::Waker);
+    let w = data::SteamWatch::start(crate::services::Waker, true);
     let _ = w.up();
     let t0 = std::time::Instant::now();
     drop(w);
@@ -1089,12 +1124,14 @@ fn undo_survives_closing_the_tab() {
     let mut t = T::new();
     t.p.close();
     t.p.open(&env, 0.0);
+    t.settle();
     t.build();
     t.click_part(Pid::Stick(Side::Left));
     let orig = t.left_stick();
     t.slide("ls.dz", 0.5);
     t.p.close();
     t.p.open(&env, 0.0);
+    t.settle();
     t.build();
     assert_eq!(t.o().hist.undo.len(), 1);
     t.undo();
@@ -1307,4 +1344,183 @@ fn proof_045_controller_panels() {
         }
     }
     crate::ui::set_light(false);
+}
+
+// ------------------------------------------------------------------------------------------------ Order 047 (test 3)
+
+/// the "Launch Steam" freeze (a big black box until Steam opened): the "Launch Steam" click and the moment Steam runs (its files read again - Steam writes them
+/// while it starts) hand the menu's thread back within a frame, even with a slow Steam library; the files are still read.
+#[test]
+fn launch_steam_and_steam_starting_never_hold_the_menu() {
+    let mut t = T::new();
+    t.steam_running(false);
+    assert!(!t.o().steam_up, "the glass");
+    {
+        let mut cx = Cx::new(t.now, false, &t.g, &mut t.st).for_page("pad");
+        crate::offui::assert_quick("the Launch Steam click", || t.p.event(&Ev::Click(K_LAUNCH), &mut cx));
+    }
+    assert!(t.o().launch_at.is_some(), "Starting Steam\u{2026}");
+    // Steam starts; its files answer slowly (40 ms per read)
+    t.set_steam(true, 40);
+    let now = t.now;
+    let shown = crate::offui::assert_quick("Steam started: its files read again", || t.p.tick(now));
+    assert!(shown && t.o().steam_up && t.o().launch_at.is_none(), "the glass goes at once");
+    assert!(!t.o().idle(), "the files are read on the tab's worker");
+    t.settle();
+    t.build();
+    assert_eq!(t.o().game().map(|g| g.name.clone()).as_deref(), Some("Rocket League"));
+    assert!(t.o().view.is_some());
+}
+
+/// Order 047: a setting's click (one write + its backup + the files read back, on the worker) hands the menu's thread back
+/// within a frame and the panel shows the new value at once; the file has it when the answer is in ("Saved"). Two quick
+/// clicks are written in their order.
+#[test]
+fn a_setting_click_never_holds_the_menu_and_shows_at_once() {
+    let mut t = T::new();
+    t.click_part(Pid::B(ButtonId::Cross));
+    t.slow(40);
+    let k = Open::k("cross.turbo");
+    let before = t.o().view.clone();
+    {
+        let mut cx = Cx::new(t.now, false, &t.g, &mut t.st).for_page("pad");
+        crate::offui::assert_quick("a setting click", || t.p.event(&Ev::Click(k), &mut cx));
+    }
+    assert_ne!(t.o().view, before, "the panel shows it at once");
+    assert!(!t.o().idle(), "written on the tab's worker");
+    t.settle();
+    assert!(t.rl().contains("\"hold_repeats\"\t\t\"1\""), "{}", t.rl());
+    assert!(t.toast().starts_with("Saved"));
+    t.build();
+    // off, then on again at once: the file ends on
+    for _ in 0..2 {
+        {
+            let mut cx = Cx::new(t.now, false, &t.g, &mut t.st).for_page("pad");
+            crate::offui::assert_quick("a quick second click", || t.p.event(&Ev::Click(k), &mut cx));
+        }
+        t.build();
+    }
+    t.settle();
+    t.slow(0);
+    assert!(t.rl().contains("\"hold_repeats\"\t\t\"1\""), "written in the clicks' order: {}", t.rl());
+}
+
+/// Order 047: opening the tab hands the menu's thread back within a frame even with a slow Steam library and a slow
+/// controller list (the worker makes the Steam service, lists the controllers, reads the files); until its answer the
+/// frame keeps the old page a moment (`ready`), then the tab fills in. The next opening shows the kept state at once.
+#[test]
+fn opening_the_tab_never_holds_the_menu() {
+    let env = Env { test: true, frozen: true, ..Env::default() };
+    data::TEST_SLOW_MS.with(|c| c.set(40));
+    let mut p = Controller::default();
+    crate::offui::assert_quick("opening the Controller tab", || p.open(&env, 0.0));
+    assert!(!p.ready(), "nothing read yet");
+    let mut t = T { p, g: Gfx::new(1.0), st: State::default(), now: 1000.0 };
+    t.settle();
+    assert!(t.p.ready());
+    assert_eq!(t.o().game().map(|g| g.name.clone()).as_deref(), Some("Rocket League"));
+    assert!(t.o().view.is_some() && t.o().connected().is_some());
+    // again (the menu closed and opened): the last state at once, read again behind it
+    t.p.close();
+    crate::offui::assert_quick("opening the Controller tab again", || t.p.open(&env, 0.0));
+    assert!(t.p.ready() && t.o().view.is_some(), "the kept state, at once");
+    assert!(!t.o().idle());
+    data::TEST_SLOW_MS.with(|c| c.set(0));
+    t.settle();
+    assert_eq!(t.o().game().map(|g| g.name.clone()).as_deref(), Some("Rocket League"));
+}
+
+/// Order 047 (~1.7 cores with the menu just open): with nothing moving the tab asks for no frames - `tick` says
+/// nothing changed and `wake_at` names no time, or one still to come (a toast's end), never one already past.
+#[test]
+fn nothing_moving_asks_for_no_frames() {
+    let mut t = T::new();
+    let now = t.now + 16.0;
+    assert!(!t.p.tick(now), "nothing changed");
+    assert!(t.p.wake_at(now).is_none_or(|w| w > now));
+    // a change: its answer is shown once, then only the toast's end is waited for
+    t.click_part(Pid::B(ButtonId::Cross));
+    t.click(Open::k("cross.turbo"));
+    let now = t.now + 16.0;
+    assert!(!t.p.tick(now), "the answer was shown already");
+    let w = t.p.wake_at(now);
+    assert!(w.is_none_or(|w| w > now), "{w:?}");
+    if let Some(w) = w {
+        t.p.tick(w);
+        assert!(t.p.wake_at(w).is_none_or(|x| x > w));
+    }
+}
+
+/// Order 047: the open tab's Reset review is read and put back on a worker thread (`detach`; the tab's Steam service
+/// answering slowly here): opening the review and Reset hand the menu's thread back within a frame; its line and the
+/// outcome are as before, and the tab reads its files again when the reset has ended (`reset_done`).
+#[test]
+fn the_reset_review_reads_and_resets_off_the_menus_thread() {
+    use crate::undo::{Applied, Kind, Opened, Review};
+    let _s = Sv::start();
+    let mut t = T::live();
+    let original = t.rl();
+    t.click_part(Pid::B(ButtonId::Cross));
+    t.click(Open::k("cross.turbo"));
+    assert_ne!(t.rl(), original);
+    t.slow(30);
+    let review = {
+        let mut pages: [&mut dyn Resettable; 1] = [&mut t.p];
+        let opened = crate::offui::assert_quick("opening the review", || crate::services::with(|s| Review::open(Kind::HowItWas, false, &mut pages, &s.store)).unwrap());
+        let Opened::Reading(mut job) = opened else { panic!("the tab's lines are read on a worker thread") };
+        let t0 = std::time::Instant::now();
+        loop {
+            if let Some(r) = job.take() {
+                break r;
+            }
+            assert!(t0.elapsed().as_secs() < 20, "the review was never read");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    };
+    assert_eq!(review.lines.len(), 1);
+    assert_eq!(review.lines[0].from.text, "your edits");
+    let res = {
+        let mut pages: [&mut dyn Resettable; 1] = [&mut t.p];
+        let applied = crate::offui::assert_quick("Reset", || review.start_apply(&mut pages));
+        let Applied::Running(mut job) = applied else { panic!("the tab's line is put back on a worker thread") };
+        let t0 = std::time::Instant::now();
+        loop {
+            if let Some(r) = job.take() {
+                break r;
+            }
+            assert!(t0.elapsed().as_secs() < 20, "the reset never ended");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    };
+    assert!(res.iter().all(|r| r.outcome == crate::undo::Outcome::Ok), "{res:?}");
+    t.p.reset_done();
+    t.slow(0);
+    t.settle();
+    assert_eq!(t.rl(), original, "the bytes from before");
+}
+
+/// Order 047 review: Ctrl+Z pressed while the newest change is still being written undoes THAT change (it waits for its
+/// answer), not the one before it.
+#[test]
+fn ctrl_z_during_a_write_undoes_the_newest_change() {
+    let mut t = T::new();
+    t.click_part(Pid::B(ButtonId::Cross));
+    t.click(Open::k("cross.turbo")); // change A, written
+    assert!(t.rl().contains("\"hold_repeats\"\t\t\"1\""));
+    t.click_part(Pid::Stick(Side::Left));
+    let orig = t.left_stick();
+    t.slow(30);
+    // change B and Ctrl+Z at once (no answer in between)
+    let k = Open::k("ls.dz");
+    let mut cx = Cx::new(t.now, false, &t.g, &mut t.st).for_page("pad");
+    t.p.event(&Ev::Press(k, 108.0, 10.0, (0.0, 0.0, 216.0, 20.0)), &mut cx);
+    t.p.event(&Ev::Release(k), &mut cx);
+    cx.mods = crate::ui::cx::Mods { ctrl: true, shift: false, alt: false };
+    t.p.event(&Ev::Key(crate::ui::cx::PAGE, 0x5A), &mut cx);
+    drop(cx);
+    t.settle();
+    t.slow(0);
+    assert_eq!(t.left_stick(), orig, "B undone");
+    assert!(t.rl().contains("\"hold_repeats\"\t\t\"1\""), "A kept");
+    assert_eq!(t.toast(), "Undone \u{b7} Left stick \u{b7} Dead zone");
 }

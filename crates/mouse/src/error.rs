@@ -56,7 +56,7 @@ pub enum Error {
     #[error("read-only OS layer refused: {0}")]
     ReadOnly(String),
 
-    /// The app start / stop watcher could not start (WMI refused every source).
+    /// The app start / stop watcher could not start (every source refused).
     #[error("app watcher: {0}")]
     Watcher(String),
 

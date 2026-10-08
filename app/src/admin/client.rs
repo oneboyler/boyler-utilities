@@ -55,6 +55,11 @@ impl Launcher for Real {
             let sid = wire::process_user_sid(std::process::id()).unwrap_or_default();
             return Ok(in_process(purpose, Box::new(move || Box::new(super::exec::RealSys::new(&sid)) as Box<dyn super::exec::Sys>)));
         }
+        // Order 047: the prompt waits for the user (seconds) and the copy's line up to 60 s: never on the menu's thread (the
+        // services live there) - a caller that still does it is named in the timing log, so it can be found and moved
+        if crate::services::in_use() || crate::services::try_with(|_| ()).is_some() {
+            crate::timing::note(&format!("admin prompt on the menu's thread ({}) - Order 047: move its caller off it", purpose.name()));
+        }
         let server = wire::Server::create().map_err(|e| AdminError::Failed(format!("The admin helper could not start ({e})")))?;
         let exe = std::env::current_exe().map_err(|e| AdminError::Failed(e.to_string()))?;
         let child = run_as(&exe, &format!("{} {} {}", super::ARG, purpose.name(), server.id()))?;

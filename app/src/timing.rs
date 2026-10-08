@@ -72,6 +72,11 @@ pub fn frame(t: f64) {
     }
 }
 
+/// Order 051: one capture-overlay window's frame (test copies, BU_PROF): when, its UI-thread CPU, which window, GPU or CPU path.
+pub fn ov_frame(t: f64, cpu: f64, win: usize, gpu: bool) {
+    line(format!("ovframe {:.3} done {:.3} cpu {:.3} win {} gpu {}", t, now(), cpu, win, gpu as u8));
+}
+
 /// A frame with the CPU time this thread spent on it (ms, `thread_cpu_ms`): what the frame costs, whatever else the PC
 /// is doing (Order 041: other jobs' builds made the clock time useless).
 pub fn frame_cpu(t: f64, cpu: f64) {

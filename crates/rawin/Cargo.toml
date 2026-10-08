@@ -1,0 +1,28 @@
+[package]
+name = "bu-rawin"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Boyler Utilities - the process's ONE Raw Input owner (Order 048): its own thread + message-only window, batched reads; feeds the keys manager and the activity watcher. No UI."
+
+[lib]
+name = "bu_rawin"
+
+[target.'cfg(windows)'.dependencies.windows]
+version = "0.62"
+features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_System_LibraryLoader",
+    "Win32_UI_Input",
+    "Win32_UI_WindowsAndMessaging",
+]
+
+# Order 048's proof: a fast mouse's cost to the UI thread, before / after, on synthetic packets (no real Raw Input)
+[[example]]
+name = "rawin-bench"
+path = "examples/bench.rs"
+
+[target.'cfg(windows)'.dev-dependencies.windows]
+version = "0.62"
+features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_System_LibraryLoader", "Win32_System_Threading", "Win32_System_WindowsProgramming", "Win32_UI_WindowsAndMessaging"]

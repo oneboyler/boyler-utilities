@@ -12,6 +12,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 
 [target.'cfg(windows)'.dependencies]
+# Order 048: the shared window-creation start watcher + SYNCHRONIZE exit waits (replaces the WMI creation / deletion events)
+bu-procwatch = { path = "../procwatch" }
 windows-core = "0.62"
 windows = { version = "0.62", features = [
     "Win32_Foundation",

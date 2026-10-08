@@ -512,3 +512,94 @@ fn a_closed_page_resets_through_its_own_service() {
     assert!(review(&n, Kind::HowItWas).is_empty());
     crate::services::shutdown();
 }
+
+/// Order 047 (idle cost): with nothing moving the page asks for no frames - `tick` is false, `wake_at` is None, a build
+/// does not ask for the next frame; "Flushed" asks to be built again at its end (not every frame); a running speed test
+/// is polled for its end at a future time.
+#[test]
+fn nothing_moving_asks_for_no_frames() {
+    let mut n = opened();
+    let mut st = State::default();
+    let _ = build(&mut n, &mut st, 0.0);
+    // (the connection ping lands once a second: right after open nothing new is in)
+    n.tick(10.0);
+    assert!(!n.tick(20.0), "nothing new: no repaint");
+    assert_eq!(n.wake_at(20.0), None);
+    let mut st = State::default();
+    let _ = build(&mut n, &mut st, 30.0);
+    assert!(!st.busy, "an idle page asks for no frames");
+    // Flush DNS: the green "Flushed" stays 1.6 s - one build at its end, no frames in between
+    click(&mut n, &mut st, K_FLUSH, 40.0);
+    assert!(wait_for(&mut n, 2000, |n| n.flushed_at.is_some()));
+    let at = n.flushed_at.unwrap();
+    n.toast = None;
+    let mut st = State::default();
+    let _ = build(&mut n, &mut st, at + 500.0);
+    assert!(!st.busy, "\"Flushed\" is not motion");
+    assert_eq!(st.wake, Some(at + crate::ui::pieces::mbtn::DONE_MS));
+    // a running speed test: polled for its end at a future time (its samples wake the menu themselves)
+    click(&mut n, &mut st, K_START, 50.0);
+    assert!(n.speed_running);
+    assert!(n.wake_at(60.0).is_some_and(|t| t > 60.0));
+}
+
+/// Order 047: the frame's reset through the page's detached copy - the review opened and the Reset pressed each inside
+/// one frame (16 ms), the reads and the put-backs on the review's worker thread; then the page re-reads (`reset_done`).
+/// (The page's fake has no slow mode for these calls: the proof is that both run on the worker - `Reading` / `Running`.)
+fn reset_off_the_menu(p: &mut dyn Resettable, kind: Kind) -> (crate::undo::Review, Vec<crate::undo::LineResult>) {
+    fn wait<T>(mut f: impl FnMut() -> Option<T>) -> T {
+        let t0 = std::time::Instant::now();
+        loop {
+            if let Some(v) = f() {
+                return v;
+            }
+            assert!(t0.elapsed().as_secs() < 10, "the review's worker never answered");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+    let opened = crate::services::with(|s| {
+        crate::undo::flush(&mut s.store);
+        crate::offui::assert_quick("opening the review", || crate::undo::Review::open(kind, false, &mut [&mut *p], &s.store))
+    })
+    .unwrap();
+    let crate::undo::Opened::Reading(mut job) = opened else { panic!("the review is read on a worker thread") };
+    let rv = wait(|| job.take());
+    let applied = crate::offui::assert_quick("Reset", || rv.start_apply(&mut [&mut *p]));
+    let crate::undo::Applied::Running(mut job) = applied else { panic!("the reset is put back on a worker thread") };
+    let res = wait(|| job.take());
+    p.reset_done();
+    (rv, res)
+}
+
+/// Order 047: Network's reset (Windows defaults: the two adapters switched off go On) is read and put back on the
+/// review's worker thread - the IP Helper reads and the admin-proxied switch never hold the menu; same lines, same results.
+#[test]
+fn the_reset_review_reads_and_puts_back_off_the_menus_thread() {
+    crate::services::init(windows::Win32::Foundation::HWND::default(), true);
+    let mut n = elevated();
+    let (rv, res) = reset_off_the_menu(&mut n, Kind::WindowsDefaults);
+    let lines: Vec<String> = rv.lines.iter().map(|l| format!("{} · {}", l.label, l.change_text())).collect();
+    assert_eq!(lines, ["VirtualBox Host-Only · Off  →  On", "Bluetooth Network · Off  →  On"]);
+    assert!(res.iter().all(|r| r.outcome == crate::undo::Outcome::Ok), "{res:?}");
+    assert_eq!(crate::undo::reset_toast(Kind::WindowsDefaults, 2, &res), "Windows defaults \u{b7} 2 settings reset");
+    assert!(wait_for(&mut n, 2000, |n| n.conn.as_ref().unwrap().adapters.iter().all(|a| a.enabled)), "the open page shows it");
+    crate::services::shutdown();
+}
+
+/// Order 047: picking a DNS server (an IP Helper write behind Windows' admin prompt) never holds the menu: the click
+/// hands it to a change thread (here made 200 ms slow) and returns within one frame; the new DNS shows when it is done.
+#[test]
+fn a_dns_pick_never_holds_the_menu() {
+    SLOW_CHANGE_MS.with(|c| c.set(Some(200)));
+    let mut n = elevated();
+    let mut st = State::default();
+    n.pop = Some(Pop::Dns);
+    let g = Gfx::new(1.0);
+    let mut cx = Cx::new(20.0, false, &g, &mut st);
+    crate::offui::assert_quick("the DNS pick", || n.event(&Ev::Click(idx(K_DNSM, 1)), &mut cx));
+    drop(cx);
+    assert!(n.dns_wait, "waiting for the change thread");
+    assert!(wait_for(&mut n, 3000, |n| !n.dns_wait), "the change ends");
+    assert_ne!(n.dns.as_ref().unwrap().current, DnsCurrent::Automatic, "the new DNS shows");
+    SLOW_CHANGE_MS.with(|c| c.set(None));
+}

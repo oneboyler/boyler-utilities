@@ -3,10 +3,9 @@
 //! One thread per subscription sets up an ASYNC notification query and then blocks until it is told to stop — WMI calls
 //! our sink when an event happens, so our side never wakes up on a timer.
 //! - `Win32_ProcessStartTrace` (kernel trace, exact, at process creation) — needs ADMIN (the later elevated helper).
-//! - `__InstanceCreationEvent WITHIN 1 … Win32_Process` — no admin; WMI itself re-checks the process list every second
-//!   (bu-display measured the cost: ~1.3 % of one core in WmiPrvSE while a rule is on, A_004_02), so the event lands
-//!   0–1 s after the start.
-//! - `__InstanceDeletionEvent WITHIN 1 … ProcessId = n` — exit fallback when a process refuses a SYNCHRONIZE handle.
+//!   Used only when this process runs elevated (Order 048). The no-admin WMI creation / deletion events (WMI re-read
+//!   the process list every second, ~1.3 % of a core in WmiPrvSE, A_004_02) were replaced by `bu_procwatch` (window
+//!   creation + process snapshot; SYNCHRONIZE exit waits).
 //!
 //! Difference to bu-display (its review REVIEW_004_done_4c59204 found it): a refusal that arrives AFTER the first
 //! 1.5 s wait is not lost — the subscription thread keeps listening for WMI's final status and reports a late failure
@@ -17,13 +16,13 @@ use std::sync::mpsc;
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Duration;
-use windows::core::{implement, Interface, Ref, BSTR, HRESULT, PCWSTR};
+use windows::core::{implement, Ref, BSTR, HRESULT, PCWSTR};
 use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CoSetProxyBlanket, CoUninitialize, CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, EOAC_NONE,
     RPC_C_AUTHN_LEVEL_CALL, RPC_C_IMP_LEVEL_IMPERSONATE,
 };
 use windows::Win32::System::Rpc::{RPC_C_AUTHN_WINNT, RPC_C_AUTHZ_NONE};
-use windows::Win32::System::Variant::{VariantClear, VARIANT, VT_BSTR, VT_I4, VT_UI4, VT_UNKNOWN};
+use windows::Win32::System::Variant::{VariantClear, VARIANT, VT_BSTR, VT_I4, VT_UI4};
 use windows::Win32::System::Wmi::{
     IWbemClassObject, IWbemLocator, IWbemObjectSink, IWbemObjectSink_Impl, IWbemServices, WbemLocator, WBEM_FLAG_SEND_STATUS,
     WBEM_STATUS_COMPLETE,
@@ -161,10 +160,9 @@ pub(crate) fn subscribe(query: String, on_object: OnObject, on_dead: OnDead) -> 
 pub(crate) enum Prop {
     Int(u32),
     Str(String),
-    Obj(IWbemClassObject),
 }
 
-/// Reads a property; `None` if missing / null. Integers come as VT_I4 or VT_UI4, strings as VT_BSTR, objects as VT_UNKNOWN.
+/// Reads a property; `None` if missing / null. Integers come as VT_I4 or VT_UI4, strings as VT_BSTR.
 pub(crate) fn get(obj: &IWbemClassObject, name: &str) -> Option<Prop> {
     let wname: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
     let mut v = VARIANT::default();
@@ -175,7 +173,6 @@ pub(crate) fn get(obj: &IWbemClassObject, name: &str) -> Option<Prop> {
             VT_I4 => Some(Prop::Int(inner.Anonymous.lVal as u32)),
             VT_UI4 => Some(Prop::Int(inner.Anonymous.ulVal)),
             VT_BSTR => Some(Prop::Str(inner.Anonymous.bstrVal.to_string())),
-            VT_UNKNOWN => inner.Anonymous.punkVal.as_ref().and_then(|u| u.cast::<IWbemClassObject>().ok()).map(Prop::Obj),
             _ => None,
         }
     };
@@ -193,13 +190,6 @@ pub(crate) fn get_int(obj: &IWbemClassObject, name: &str) -> Option<u32> {
 pub(crate) fn get_str(obj: &IWbemClassObject, name: &str) -> Option<String> {
     match get(obj, name)? {
         Prop::Str(s) => Some(s),
-        _ => None,
-    }
-}
-
-pub(crate) fn get_obj(obj: &IWbemClassObject, name: &str) -> Option<IWbemClassObject> {
-    match get(obj, name)? {
-        Prop::Obj(o) => Some(o),
         _ => None,
     }
 }

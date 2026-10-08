@@ -1,33 +1,41 @@
 //! The app start / stop signal for the per-app acceleration switch — bu-display's approach (Order 004 + A_004_01 /
-//! A_004_02), re-written here (no dependency on bu-display). Event-driven on our side, nothing injected.
+//! A_004_02), with the shared `bu_procwatch` watcher since Order 048 (one watcher for Display and Mouse). Event-driven,
+//! nothing injected, no WMI and no polling on a normal start.
 //!
-//! START = the app's PROCESS starting. Sources, tried in order:
-//! 1. `Win32_ProcessStartTrace` (WMI over the kernel trace) — exact, at creation, needs ADMIN (the later elevated helper).
-//! 2. WMI `__InstanceCreationEvent WITHIN 1` on `Win32_Process` — no admin; lands 0–1 s after the start.
-//!    A source that WMI ends later (late refusal) is replaced by the next one automatically.
+//! START = the app's PROCESS starting, before its window is on screen ("never mid-game", NOTE_004_01). Sources, tried
+//! in order:
+//! 1. `Win32_ProcessStartTrace` (WMI over the kernel trace) — exact, at creation, needs ADMIN; only tried when this
+//!    process runs elevated (checked on the token), so a normal start never touches WMI at all.
+//! 2. `WindowCreationStarts` — bu-procwatch: a new top-level window anywhere makes it take one process snapshot and
+//!    report every new process with a watched exe name. A game's first window is created before it is shown or goes
+//!    fullscreen, so this still lands in time. It replaced WMI `__InstanceCreationEvent WITHIN 1`, which made WMI
+//!    re-read the process list every second (~1.3 % of a core in WmiPrvSE).
+//!    A source that ends later (late refusal) is replaced by the next one automatically.
 //!
-//! Only exe names from the user's rows are in the query. With no rows there is no subscription at all.
+//! Only exe names from the user's rows are listened for. With no rows there is no subscription at all.
 //!
 //! LATE = when the start is reported, the process already shows a visible top-level window (`EnumWindows`; no handle to
 //! the app). Reported as `has_window: true`; the switcher then does NOT switch ("never mid-game").
 //!
-//! STOP = `OpenProcess(SYNCHRONIZE)` ONLY (what A_004_01 approved: no read, no write, no query) + `WaitForMultipleObjects`
-//! — Windows wakes us when it ends. If even that is refused: WMI `__InstanceDeletionEvent WITHIN 1` for that process id.
+//! STOP = `bu_procwatch::wait_exit`: `OpenProcess(SYNCHRONIZE)` ONLY (what A_004_01 approved: no read, no write, no
+//! query), waited on by the Windows thread pool (no thread of ours per app). Already gone when its start is handled →
+//! Stopped at once. If even SYNCHRONIZE is refused: process snapshots decide (at every snapshot and when one of its
+//! windows is destroyed).
 
 use crate::accel::switch::AppEvent;
 use crate::error::{Error, Result};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use windows::core::BOOL;
-use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND, LPARAM, WAIT_OBJECT_0};
-use windows::Win32::System::Threading::{CreateEventW, OpenProcess, SetEvent, WaitForMultipleObjects, INFINITE, PROCESS_SYNCHRONIZE};
+use windows::Win32::Foundation::{HWND, LPARAM};
 use windows::Win32::UI::WindowsAndMessaging::{EnumWindows, GetWindowThreadProcessId, IsWindowVisible};
 
 use super::wmi;
 
 /// Called by a source for every matching process start: (pid, exe path or file name).
 pub type StartSink = Arc<dyn Fn(u32, String) + Send + Sync>;
-/// Called by a source when WMI ends it after it was running.
+/// Called by a source when it ends after it was running (e.g. WMI refused it late).
 pub type DeadSink = Arc<dyn Fn(String) + Send + Sync>;
 
 /// One way of hearing about process starts.
@@ -39,8 +47,8 @@ pub trait ProcessStartSource: Send + Sync {
 
 /// Source 1: kernel process-start trace through WMI. Needs admin.
 pub struct WmiStartTrace;
-/// Source 2: WMI instance-creation events (WITHIN 1). No admin.
-pub struct WmiCreationEvents;
+/// Source 2: a new top-level window anywhere + one process snapshot (bu-procwatch, shared with the Display tab). No admin.
+pub struct WindowCreationStarts;
 
 fn name_filter(field: &str, names: &[String]) -> String {
     names.iter().map(|n| format!("{field} = {}", wmi::wql_str(n))).collect::<Vec<_>>().join(" OR ")
@@ -65,39 +73,24 @@ impl ProcessStartSource for WmiStartTrace {
     }
 }
 
-impl ProcessStartSource for WmiCreationEvents {
+impl ProcessStartSource for WindowCreationStarts {
     fn name(&self) -> &'static str {
-        "__InstanceCreationEvent WITHIN 1 (no admin)"
+        "window creation + process snapshot (no admin)"
     }
-    fn start(&self, names: &[String], on_start: StartSink, on_dead: DeadSink) -> Result<Box<dyn Send>> {
-        let q = format!(
-            "SELECT * FROM __InstanceCreationEvent WITHIN 1 WHERE TargetInstance ISA 'Win32_Process' AND ({})",
-            name_filter("TargetInstance.Name", names)
-        );
-        let sub = wmi::subscribe(
-            q,
-            Arc::new(move |o| {
-                let Some(ti) = wmi::get_obj(o, "TargetInstance") else { return };
-                let Some(pid) = wmi::get_int(&ti, "ProcessId") else { return };
-                let exe = wmi::get_str(&ti, "ExecutablePath").or_else(|| wmi::get_str(&ti, "Name")).unwrap_or_default();
-                on_start(pid, exe);
-            }),
-            on_dead,
-        )?;
-        Ok(Box::new(sub))
+    fn start(&self, names: &[String], on_start: StartSink, _on_dead: DeadSink) -> Result<Box<dyn Send>> {
+        Ok(Box::new(bu_procwatch::subscribe(names.to_vec(), on_start)))
     }
 }
 
-/// The default order: exact admin trace first, the no-admin events if that is refused.
+/// The default order: the exact admin trace only when we run elevated, then the window-creation watcher.
 pub fn default_sources() -> Vec<Arc<dyn ProcessStartSource>> {
-    vec![Arc::new(WmiStartTrace), Arc::new(WmiCreationEvents)]
+    let mut v: Vec<Arc<dyn ProcessStartSource>> = Vec::new();
+    if bu_procwatch::is_elevated() {
+        v.push(Arc::new(WmiStartTrace));
+    }
+    v.push(Arc::new(WindowCreationStarts));
+    v
 }
-
-/// Sendable wrapper for kernel handles (event / process handles may be waited on from any thread).
-#[derive(Clone, Copy)]
-struct Ev(HANDLE);
-unsafe impl Send for Ev {}
-unsafe impl Sync for Ev {}
 
 /// True when the process already shows a top-level window (`EnumWindows`; no handle to the process).
 pub fn has_visible_window(pid: u32) -> bool {
@@ -126,16 +119,18 @@ type EventSink = Arc<dyn Fn(AppEvent) + Send + Sync>;
 
 struct Inner {
     sink: EventSink,
-    cancel: Ev,
     sources: Vec<Arc<dyn ProcessStartSource>>,
     /// (subscription, its source's index, its name)
     running: Mutex<Running>,
     names: Mutex<Vec<String>>,
-    /// Exit fallbacks (WMI deletion events) for processes that refused a SYNCHRONIZE handle.
-    exit_subs: Mutex<HashMap<u32, Box<dyn Send>>>,
+    /// The exit waits of the started processes still running (by wait id, not pid: a pid can be reused).
+    exits: Mutex<HashMap<u64, bu_procwatch::ExitWait>>,
+    next_wait: AtomicU64,
+    /// The watcher was dropped: no Started goes out any more (a start being handled meanwhile is dropped).
+    stopped: AtomicBool,
 }
 
-/// The running watcher. Drop or `stop()` ends it (subscriptions cancelled, waiting threads released).
+/// The running watcher. Drop or `stop()` ends it (subscription and exit waits cancelled; no event after that).
 pub struct AppWatcher {
     inner: Arc<Inner>,
 }
@@ -147,50 +142,39 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 impl Inner {
     /// A matching process started (from any source).
     fn on_start(self: &Arc<Self>, pid: u32, exe: String) {
+        if self.stopped.load(Ordering::Acquire) {
+            return;
+        }
         let has_window = has_visible_window(pid);
-        let handle = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, false, pid) };
         (self.sink)(AppEvent::Started { pid, exe, has_window });
-        match handle {
-            Ok(h) => self.wait_exit(pid, h),
-            Err(_) => self.exit_fallback(pid),
-        }
+        // After Started: a process already gone is reported Stopped at once (from inside `wait_exit`), never before.
+        self.wait_exit(pid);
     }
 
-    fn wait_exit(&self, pid: u32, h: HANDLE) {
-        let cancel = self.cancel;
-        let sink = self.sink.clone();
-        let hp = Ev(h);
-        let spawned = std::thread::Builder::new().name("bu-mouse-exit".into()).spawn(move || {
-            let (hp, cancel) = (hp, cancel);
-            let r = unsafe { WaitForMultipleObjects(&[hp.0, cancel.0], false, INFINITE) };
-            let _ = unsafe { CloseHandle(hp.0) };
-            if r == WAIT_OBJECT_0 {
-                sink(AppEvent::Stopped { pid });
-            }
-        });
-        if spawned.is_err() {
-            let _ = unsafe { CloseHandle(h) };
-        }
-    }
-
-    fn exit_fallback(self: &Arc<Self>, pid: u32) {
-        let me = Arc::downgrade(self);
-        let q = format!("SELECT * FROM __InstanceDeletionEvent WITHIN 1 WHERE TargetInstance ISA 'Win32_Process' AND TargetInstance.ProcessId = {pid}");
-        let sub = wmi::subscribe(
-            q,
-            Arc::new(move |_| {
-                if let Some(me) = me.upgrade() {
+    /// Stopped comes from `bu_procwatch::wait_exit` (a SYNCHRONIZE handle only, A_004_01; snapshots if even that is
+    /// refused). The wait is kept until it fires or the watcher is dropped.
+    fn wait_exit(self: &Arc<Self>, pid: u32) {
+        let id = self.next_wait.fetch_add(1, Ordering::Relaxed);
+        let weak = Arc::downgrade(self);
+        let wait = bu_procwatch::wait_exit(
+            pid,
+            Box::new(move || {
+                if let Some(me) = weak.upgrade() {
+                    // Our own finished wait (dropping it from inside its callback is allowed); dropped after the event.
+                    let done = lock(&me.exits).remove(&id);
                     (me.sink)(AppEvent::Stopped { pid });
-                    // Cancel it off this WMI callback thread.
-                    let gone = lock(&me.exit_subs).remove(&pid);
-                    std::thread::spawn(move || drop(gone));
+                    drop(done);
                 }
             }),
-            Arc::new(|_| {}),
         );
-        if let Ok(s) = sub {
-            lock(&self.exit_subs).insert(pid, Box::new(s));
+        // Checked under the lock the callback takes too, so a wait that fired meanwhile is never kept.
+        let mut exits = lock(&self.exits);
+        if !wait.ended() {
+            exits.insert(id, wait);
+            return;
         }
+        drop(exits);
+        drop(wait);
     }
 
     /// (Re)subscribes, trying the sources from `first` on. Dropping the old subscription happens outside the lock.
@@ -211,7 +195,7 @@ impl Inner {
             });
             let weak: Weak<Inner> = Arc::downgrade(self);
             let on_dead: DeadSink = Arc::new(move |_why| {
-                // WMI ended this source late: move to the next one, off the WMI thread (it is being dropped).
+                // The source ended late: move to the next one, off its thread (it is being dropped).
                 if let Some(inner) = weak.upgrade() {
                     std::thread::spawn(move || {
                         let _ = inner.subscribe_from(i + 1);
@@ -238,15 +222,15 @@ impl AppWatcher {
 
     /// Same with explicit sources (tests; the elevated helper later).
     pub fn start_with(sources: Vec<Arc<dyn ProcessStartSource>>, names: Vec<String>, sink: impl Fn(AppEvent) + Send + Sync + 'static) -> Result<Self> {
-        let cancel = unsafe { CreateEventW(None, true, false, None) }.map_err(|e| Error::Watcher(e.to_string()))?;
         let w = Self {
             inner: Arc::new(Inner {
                 sink: Arc::new(sink),
-                cancel: Ev(cancel),
                 sources,
                 running: Mutex::new(None),
                 names: Mutex::new(Vec::new()),
-                exit_subs: Mutex::new(HashMap::new()),
+                exits: Mutex::new(HashMap::new()),
+                next_wait: AtomicU64::new(1),
+                stopped: AtomicBool::new(false),
             }),
         };
         w.set_names(names)?;
@@ -277,11 +261,15 @@ impl AppWatcher {
 
 impl Drop for AppWatcher {
     fn drop(&mut self) {
-        // Take them out first, drop them outside the locks (a WMI callback may be waiting for a lock meanwhile).
+        // No new Started from here on. Take them out first, drop them outside the locks (an exit callback may be waiting
+        // for a lock meanwhile). Order 048 review: dropping a wait waits for its running callback, and this may run on the
+        // UI thread - so the exit waits go on a short-lived thread; a late Stopped finds no watcher (weak) and does nothing.
+        self.inner.stopped.store(true, Ordering::Release);
         let running = lock(&self.inner.running).take();
-        let subs = std::mem::take(&mut *lock(&self.inner.exit_subs));
+        let exits = std::mem::take(&mut *lock(&self.inner.exits));
         drop(running);
-        drop(subs);
-        let _ = unsafe { SetEvent(self.inner.cancel.0) };
+        if !exits.is_empty() {
+            let _ = std::thread::Builder::new().name("bu-mouse-exit-drop".into()).spawn(move || drop(exits));
+        }
     }
 }

@@ -71,6 +71,10 @@ pub struct State {
     /// (`pieces::keyfield`); then when that drop-in started
     pub kf_listen: HashMap<Key, f64>,
     pub kf_set: HashMap<Key, f64>,
+    /// Order 047: the earliest moment (ms) the last build's picture changes by itself while nothing moves until then (a
+    /// caret's next blink, a toast's end, a clock's next minute): the menu sleeps until then and builds again at it.
+    /// `None` = nothing due. Cleared at each build of the shown page (`Cx::wake_at` sets it).
+    pub wake: Option<f64>,
 }
 
 impl State {
@@ -222,6 +226,20 @@ impl<'a> Cx<'a> {
             self.st.busy = true;
         }
         t.value(now) as f32
+    }
+
+    /// Order 047: build the page again at `t` (ms) - for a picture that changes at a known moment while nothing moves
+    /// before it (a caret's next blink, a countdown's next second, a toast's end). Unlike `st.busy` no frames run until
+    /// then: the menu sleeps (no CPU) and wakes at `t`.
+    pub fn wake_at(&mut self, t: f64) {
+        self.st.wake = Some(self.st.wake.map_or(t, |w| w.min(t)));
+    }
+
+    /// Order 047: build again at the next step of a clock that flips every `period` ms counted from `from` (a caret
+    /// blinking 530 ms on / off: `wake_every(530.0, 0.0)`).
+    pub fn wake_every(&mut self, period: f64, from: f64) {
+        let n = ((self.now - from) / period).floor() + 1.0;
+        self.wake_at(from + n * period);
     }
 
     /// 0..1 hover transition (`:hover` with `transition: <dur> <ease>`).

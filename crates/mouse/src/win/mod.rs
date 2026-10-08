@@ -159,7 +159,56 @@ impl RealOs {
     }
 }
 
-const PERSIST: SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS = SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(SPIF_UPDATEINIFILE.0 | SPIF_SENDCHANGE.0);
+
+/// Order 050: no SPIF_SENDCHANGE - that broadcast waits for every window on the caller's (the UI) thread, once per step of a
+/// slider drag. The setting is saved at once; its WM_SETTINGCHANGE goes out on one worker ([`broadcast_later`]).
+const PERSIST: SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS = SPIF_UPDATEINIFILE;
+
+/// SPI codes waiting for their WM_SETTINGCHANGE, and whether the worker runs.
+static PENDING: std::sync::Mutex<(Vec<u32>, bool)> = std::sync::Mutex::new((Vec::new(), false));
+
+/// Order 050: WM_SETTINGCHANGE (wParam = the SPI_SET* code) to every window, on one worker thread: SMTO_ABORTIFHUNG skips a
+/// hung window, 200 ms at most per window; a code asked again while it waits goes out once (a slider drag = one broadcast
+/// per setting, not one per step).
+fn broadcast_later(action: SYSTEM_PARAMETERS_INFO_ACTION) {
+    let Ok(mut p) = PENDING.lock() else { return };
+    if !p.0.contains(&action.0) {
+        p.0.push(action.0);
+    }
+    if p.1 {
+        return;
+    }
+    p.1 = true;
+    let spawned = std::thread::Builder::new().name("bu-mouse-broadcast".into()).spawn(|| loop {
+        let next = match PENDING.lock() {
+            Ok(mut p) if p.0.is_empty() => {
+                p.1 = false;
+                return;
+            }
+            Ok(mut p) => p.0.remove(0),
+            Err(_) => return,
+        };
+        unsafe {
+            SendMessageTimeoutW(HWND_BROADCAST, WM_SETTINGCHANGE, WPARAM(next as usize), LPARAM(0), SMTO_ABORTIFHUNG | SMTO_NORMAL, 200, None);
+        }
+    });
+    if spawned.is_err() {
+        p.1 = false;
+    }
+}
+
+/// Order 050: wait (at most `max`) until every WM_SETTINGCHANGE waiting for the worker went out - the app calls it before it
+/// ends (Quit, the uninstaller's `--undo-windows`), so the last change is still announced. true = all sent.
+pub fn wait_broadcasts(max: std::time::Duration) -> bool {
+    let end = std::time::Instant::now() + max;
+    while PENDING.lock().map(|p| p.1).unwrap_or(false) {
+        if std::time::Instant::now() >= end {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    true
+}
 
 impl MouseOs for RealOs {
     fn win_get(&self, s: WinSetting) -> Result<WinRaw> {
@@ -192,7 +241,15 @@ impl MouseOs for RealOs {
                 (s, v) => return Err(Error::range(format!("{s:?}"), format!("wrong value kind {v:?}"))),
             }
         };
-        r.map_err(|e| hr(&format!("SystemParametersInfo {s:?}"), e))
+        r.map_err(|e| hr(&format!("SystemParametersInfo {s:?}"), e))?;
+        broadcast_later(match s {
+            WinSetting::PointerSpeed => SPI_SETMOUSESPEED,
+            WinSetting::ScrollLines => SPI_SETWHEELSCROLLLINES,
+            WinSetting::Precision => SPI_SETMOUSE,
+            WinSetting::DoubleClick => SPI_SETDOUBLECLICKTIME,
+            WinSetting::SwapButtons => SPI_SETMOUSEBUTTONSWAP,
+        });
+        Ok(())
     }
 
     fn reg_read(&self, hive: Hive, path: &str, name: &str) -> Result<Option<RegValue>> {
@@ -280,7 +337,9 @@ impl MouseOs for RealOs {
         if !self.record_or_refuse("SPI_SETCURSORS".into())? {
             return Ok(());
         }
-        unsafe { SystemParametersInfoW(SPI_SETCURSORS, 0, None, PERSIST) }.map_err(|e| hr("SPI_SETCURSORS", e))
+        unsafe { SystemParametersInfoW(SPI_SETCURSORS, 0, None, PERSIST) }.map_err(|e| hr("SPI_SETCURSORS", e))?;
+        broadcast_later(SPI_SETCURSORS);
+        Ok(())
     }
 
     fn set_system_cursor(&mut self, file: &str, ocr_id: u32) -> Result<()> {

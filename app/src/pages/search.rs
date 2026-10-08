@@ -249,6 +249,9 @@ pub struct Search {
     tx: Option<mpsc::Sender<Msg>>,
     rx: Option<mpsc::Receiver<Msg>>,
     now: f64,
+    /// Order 047: what an open / a menu entry said back - the shell's call runs on its own thread (`crate::offui`, it
+    /// woke the menu); `tick` turns it into the toast
+    shell: Arc<std::sync::Mutex<Vec<String>>>,
 }
 
 impl Search {
@@ -433,11 +436,34 @@ impl Search {
         any
     }
 
+    /// Order 047: Enter / a click on a result opens it through the shell (ShellExecute: 0.1-3 s for a cold app or a network
+    /// path) on its own thread - the menu keeps painting; a failure comes back as the same toast (`take_shell`).
     fn open_item(&mut self, i: usize) {
         let flat = self.flat();
-        let (Some(it), Some(svc)) = (flat.get(i), self.svc.clone()) else { return };
-        if svc.open(it).is_err() {
-            self.toast = Some((format!("{} could not be opened", it.name), self.now));
+        let (Some(it), Some(svc)) = (flat.get(i).cloned(), self.svc.clone()) else { return };
+        let out = self.shell.clone();
+        crate::offui::spawn("srch-open", move || {
+            if svc.open(&it).is_err() {
+                if let Ok(mut v) = out.lock() {
+                    v.push(format!("{} could not be opened", it.name));
+                }
+            }
+        });
+    }
+
+    /// Order 047: the toast a shell call on its own thread asked for (the last one wins). True = one came in.
+    fn take_shell(&mut self) -> bool {
+        let t = self.shell.lock().ok().and_then(|mut v| {
+            let last = v.pop();
+            v.clear();
+            last
+        });
+        match t {
+            Some(t) => {
+                self.toast = Some((t, self.now));
+                true
+            }
+            None => false,
         }
     }
 
@@ -472,7 +498,7 @@ impl Search {
         // the caret blinks (530 ms); frozen test pictures leave it out (the drawing's capture has it off)
         if focused && !self.env.frozen {
             let on = ((cx.now / 530.0) as i64) % 2 == 0;
-            cx.st.busy = true;
+            cx.wake_every(530.0, 0.0);
             let tw = if empty { 0.0 } else { cx.g.text_width(&self.text, font) };
             if on {
                 q = q.child(El::block().abs(tw.round(), 12.0, f32::NAN, f32::NAN).size(1.0, 18.0).bg(FG()).no_hit());
@@ -886,11 +912,14 @@ impl Page for Search {
     }
     fn tick(&mut self, now: f64) -> bool {
         self.now = now;
-        self.pump()
+        // (Order 047: true only when an answer came in - every thread of the page wakes the menu, so no polling)
+        let shell = self.take_shell();
+        self.pump() || shell
     }
     fn build(&mut self, cx: &mut Cx) -> Vec<El> {
         self.now = cx.now;
         self.pump();
+        self.take_shell();
         if self.focus_once {
             // the drawing's srFocus: the field is focused when the tab opens, ready to type
             self.focus_once = false;
@@ -1002,11 +1031,21 @@ impl Page for Search {
                         for (j, a) in svc.menu_for(it).iter().enumerate() {
                             if *k == idx(K_MENU, j + 1) {
                                 self.menu = None;
-                                match svc.run_menu(it, *a) {
-                                    Ok(()) if *a == srch::MenuAction::CopyPath => self.toast = Some(("Path copied".into(), self.now)),
-                                    Ok(()) => {}
-                                    Err(_) => self.toast = Some((format!("{} \u{00b7} not possible", a.label()), self.now)),
-                                }
+                                // Order 047: Open file location (SHOpenFolderAndSelectItems) / Open with… (SHOpenWithDialog)
+                                // / Copy path hold their thread 0.1-3 s: on their own thread, the toast comes back
+                                // (`take_shell`). (Open with… is Windows' own dialog with no owner window: it stays up on
+                                // that thread until it is answered.)
+                                let (svc, it, a, out) = (svc.clone(), it.clone(), *a, self.shell.clone());
+                                crate::offui::spawn("srch-menu", move || {
+                                    let t = match svc.run_menu(&it, a) {
+                                        Ok(()) if a == srch::MenuAction::CopyPath => Some("Path copied".to_string()),
+                                        Ok(()) => None,
+                                        Err(_) => Some(format!("{} \u{00b7} not possible", a.label())),
+                                    };
+                                    if let (Some(t), Ok(mut v)) = (t, out.lock()) {
+                                        v.push(t);
+                                    }
+                                });
                                 return;
                             }
                         }
@@ -1096,6 +1135,16 @@ mod tests {
     fn fake(p: &Search) -> Arc<srch::FakeOs> {
         p.fake.clone().unwrap()
     }
+    /// Order 047: a shell call runs on its own thread - tick the page (like the menu does when it is woken) until `done`.
+    pub(super) fn wait_for(p: &mut Search, done: impl Fn(&Search) -> bool) {
+        let t0 = std::time::Instant::now();
+        while !done(p) {
+            assert!(t0.elapsed().as_secs() < 10, "the shell call never ended");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            let now = p.now;
+            p.tick(now);
+        }
+    }
     fn cx_run(f: impl FnOnce(&mut Cx)) {
         let g = Gfx::new(1.0);
         let mut st = State::default();
@@ -1173,6 +1222,8 @@ mod tests {
             p.event(&Ev::Key(K_FIELD, VK_ENTER), cx);
         });
         let it = p.flat()[1].clone();
+        // (Order 047: the open runs on its own thread)
+        wait_for(&mut p, |p| !fake(p).state().actions.is_empty());
         assert_eq!(fake(&p).state().actions, vec![format!("open {}", it.path)]);
         cx_run(|cx| p.event(&Ev::Key(K_FIELD, VK_ESC), cx));
         assert!(p.text.is_empty() && p.results.is_none());
@@ -1220,6 +1271,8 @@ mod tests {
         typ(&mut p, "autoexec");
         p.context_menu(0, 200.0, 200.0);
         click(&mut p, idx(K_MENU, 2)); // header, Open file location, Copy path
+        // (Order 047: the menu entry runs on its own thread; its toast comes back through `tick`)
+        wait_for(&mut p, |p| p.toast.is_some());
         assert_eq!(p.toast.as_ref().unwrap().0, "Path copied");
         let log = fake(&p).state().actions.clone();
         assert!(log[0].starts_with("copy C:\\Program Files (x86)\\Steam"), "{log:?}");
@@ -1532,5 +1585,85 @@ mod tests {
         step(&mut ui, &mut now);
         assert!(ui.describe().contains("text=\"val\""), "typed after a click: {}", ui.describe());
         snap(&mut ui, now, "srch_3_ready_typed");
+    }
+}
+
+/// Order 047: opening a result and the right-click menu's entries never hold the menu's thread (the shell's calls run
+/// through `crate::offui`); at rest the page asks for no frames.
+#[cfg(test)]
+mod offui_tests {
+    use super::*;
+    use crate::gfx::Gfx;
+    use crate::ui::cx::State;
+
+    fn page() -> Search {
+        let mut p = Search::default();
+        p.open(&Env { test: true, ..Env::default() }, 0.0);
+        p
+    }
+    fn ev(p: &mut Search, e: Ev) {
+        let g = Gfx::new(1.0);
+        let mut st = State::default();
+        let mut cx = Cx::new(0.0, false, &g, &mut st);
+        p.event(&e, &mut cx);
+    }
+    fn typ(p: &mut Search, s: &str) {
+        for c in s.chars() {
+            ev(p, Ev::Char(K_FIELD, c));
+        }
+    }
+    fn actions(p: &Search) -> Vec<String> {
+        p.fake.clone().unwrap().state().actions.clone()
+    }
+
+    /// Enter on a result with a shell that takes 300 ms: the key hands the thread back within one frame, the open still
+    /// happens (on its own thread), and the page asks for no frames once it is done.
+    #[test]
+    fn enter_opens_off_the_menus_thread() {
+        let mut p = page();
+        typ(&mut p, "steam");
+        let path = p.flat()[0].path.clone();
+        crate::offui::set_test_delay(300);
+        let g = Gfx::new(1.0);
+        let mut st = State::default();
+        let mut cx = Cx::new(0.0, false, &g, &mut st);
+        // (the painter is made before: only the key itself is timed)
+        crate::offui::assert_quick("Search › Enter on a result", || p.event(&Ev::Key(K_FIELD, VK_ENTER), &mut cx));
+        drop(cx);
+        super::tests::wait_for(&mut p, |p| !actions(p).is_empty());
+        crate::offui::set_test_delay(0);
+        assert_eq!(actions(&p), vec![format!("open app {path}")]);
+        // at rest: no frames, no timed wake-up in the past
+        assert!(!p.tick(5000.0), "nothing moves: no frames");
+        assert!(p.wake_at(5000.0).is_none_or(|t| t > 5000.0));
+    }
+
+    /// The right-click menu's Open file location with a slow shell: the click returns at once, Explorer is asked on its
+    /// own thread.
+    #[test]
+    fn a_menu_entry_runs_off_the_menus_thread() {
+        let mut p = page();
+        typ(&mut p, "autoexec");
+        p.context_menu(0, 200.0, 200.0);
+        crate::offui::set_test_delay(300);
+        let g = Gfx::new(1.0);
+        let mut st = State::default();
+        let mut cx = Cx::new(0.0, false, &g, &mut st);
+        crate::offui::assert_quick("Search › Open file location", || p.event(&Ev::Click(idx(K_MENU, 1)), &mut cx));
+        drop(cx);
+        assert!(p.menu.is_none(), "the menu closed at once");
+        super::tests::wait_for(&mut p, |p| !actions(p).is_empty());
+        crate::offui::set_test_delay(0);
+        assert!(actions(&p)[0].starts_with("reveal "), "{:?}", actions(&p));
+        assert!(p.toast.is_none(), "a reveal says nothing");
+    }
+
+    /// A tick with nothing new (no answer, no toast from a shell call) says "nothing moves".
+    #[test]
+    fn at_rest_tick_asks_for_no_frames() {
+        let mut p = page();
+        let _ = p.tick(10.0);
+        assert!(!p.tick(20.0), "no answer came in: no frames");
+        assert!(p.wake_at(20.0).is_none_or(|t| t > 20.0));
     }
 }

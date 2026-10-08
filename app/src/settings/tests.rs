@@ -190,3 +190,54 @@ fn theme_round_trips_and_match_windows_follows_windows() {
     assert!(!Theme::Dark.light(true) && Theme::Light.light(false));
     assert!(Theme::MatchWindows.light(true) && !Theme::MatchWindows.light(false));
 }
+
+/// Order 050: with the background writer a change never waits for the disk (the UI thread's part of a set stays under one
+/// frame, 16 ms, every time), and every change still reaches the file - at `wait_written` and when the store is dropped.
+#[test]
+fn background_writes_never_hold_the_caller_and_all_reach_the_disk() {
+    let s = Scratch::new("bgwrite");
+    {
+        let mut st = SettingsStore::open(s.dir());
+        st.write_in_background();
+        let mut worst = std::time::Duration::ZERO;
+        for i in 0..200 {
+            let t = std::time::Instant::now();
+            st.set_i64(Scope::Pc, &format!("item{}", i % 7), i).unwrap();
+            worst = worst.max(t.elapsed());
+        }
+        assert!(worst < std::time::Duration::from_millis(16), "a set held the caller {worst:?}");
+        assert!(st.wait_written(std::time::Duration::from_secs(10)));
+        let back = SettingsStore::open(s.dir());
+        assert_eq!(back.get_i64(Scope::Pc, "item3"), (0..200).filter(|i| i % 7 == 3).max());
+        st.set_str(Scope::App, "last", "on the way out").unwrap();
+    }
+    // dropped: the last change is on disk
+    let back = SettingsStore::open(s.dir());
+    assert_eq!(back.get_str(Scope::App, "last"), Some("on the way out"));
+    assert!(!s.dir().join(format!("{FILE_NAME}.tmp")).exists());
+}
+
+/// Order 050 measuring (not a check): the UI thread's time for one change's settings write, the old way (the whole file +
+/// flush to disk on the caller) vs the background writer. `cargo test -p bu-app --release measure_050 -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn measure_050_settings_write_ms() {
+    let s = Scratch::new("measure050");
+    let mut st = SettingsStore::open(s.dir());
+    for i in 0..150 {
+        st.set_list(Scope::Pc, &format!("page\u{1f}item{i}"), &["Label".into(), "1".into(), "1".into(), "2".into(), "2".into(), "0".into(), "0".into()]).unwrap();
+    }
+    let run = |st: &mut SettingsStore, tag: &str| {
+        let mut v = Vec::new();
+        for i in 0..40 {
+            let t = std::time::Instant::now();
+            st.set_i64(Scope::Page("m"), "v", i).unwrap();
+            v.push(t.elapsed().as_secs_f64() * 1000.0);
+        }
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        println!("{tag}: median {:.2} ms, worst {:.2} ms (40 sets, {} records in the file)", v[20], v[39], 150);
+    };
+    run(&mut st, "before (fsync on the caller)");
+    st.write_in_background();
+    run(&mut st, "after (background writer)");
+}

@@ -51,8 +51,10 @@ pub fn play_ms(dir: i8) -> f64 {
 /// background while disabled). The icon colour is the parent's (`#sw button{color:inherit}`): `FG`.
 pub fn pb(cx: &mut Cx, key: Key, playing_since: Option<f64>, dir: i8, disabled: bool) -> El {
     let playing = playing_since.is_some_and(|t| (0.0..play_ms(dir)).contains(&(cx.now - t)));
-    if playing {
-        cx.st.busy = true;
+    if let (true, Some(t)) = (playing, playing_since) {
+        // Order 047: "playing" is a state with a known end, not motion: built again at its end (the colour fade below
+        // asks for its own frames while it moves)
+        cx.wake_at(t + play_ms(dir));
     }
     let hv = cx.hover_t(key, 150.0, EASE);
     let pr = if disabled || cx.rm { 0.0 } else { cx.active_t(key, 120.0, EASE) };

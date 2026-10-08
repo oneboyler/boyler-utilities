@@ -44,6 +44,8 @@ fn proof_045_focus_ring() {
     both(|theme| {
         let mut p = crate::pages::display::Display::default();
         p.open(&env(), 0.0);
+        // Order 047: its monitors are read on the page's worker
+        p.settle(0.0);
         let mut st = State::default();
         let root = page_root(&mut p, &mut st, 5000.0);
         let g = Gfx::new(1.0);
@@ -223,6 +225,8 @@ fn proof_045_tweaks_sound() {
     both(|theme| {
         let mut p = crate::pages::tweaks::Tweaks::default();
         p.open(&env(), 0.0);
+        // Order 047: its rows are read on the page's worker
+        p.settle();
         let mut st = State::default();
         let _ = page_root(&mut p, &mut st, 100.0);
         let root = page_root(&mut p, &mut st, 5000.0);

@@ -101,6 +101,9 @@ impl Tray {
         }
         unsafe {
             self.icon = load_icon(self.hwnd);
+            if let Ok(mut k) = LAST_ICON_KEY.lock() {
+                *k = Some((taskbar_light(), GetDpiForWindow(self.hwnd)));
+            }
             let d = self.data();
             let _ = Shell_NotifyIconW(NIM_DELETE, &d);
             self.added = Shell_NotifyIconW(NIM_ADD, &d).as_bool();
@@ -112,6 +115,13 @@ impl Tray {
     /// Re-pick the icon (taskbar theme / DPI changed).
     pub fn refresh(&mut self) {
         if !self.added {
+            return;
+        }
+        // Order 050: Windows broadcasts "a setting changed" for every change (the app's own included); the icon only
+        // depends on the taskbar's theme and the DPI - nothing else reloads it (Shell_NotifyIcon waits for Explorer,
+        // which is busy with that same broadcast)
+        let key = (taskbar_light(), unsafe { GetDpiForWindow(self.hwnd) });
+        if LAST_ICON_KEY.lock().ok().is_some_and(|mut k| k.replace(key) == Some(key)) {
             return;
         }
         unsafe {
@@ -195,6 +205,9 @@ impl Drop for Tray {
 static TIP_EXTRA: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
 /// The tray icon's window (set by `Tray::new` when the icon is shown).
 static TRAY_HWND: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+/// Order 050: what the icon was last loaded for (taskbar light, DPI) - `Tray::refresh` reloads only when it changed.
+static LAST_ICON_KEY: std::sync::Mutex<Option<(bool, u32)>> = std::sync::Mutex::new(None);
+
 /// The menu is open (the tooltip is hidden meanwhile).
 static MENU_OPEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -238,7 +251,6 @@ struct Badge {
 }
 
 static BADGE: std::sync::Mutex<Badge> = std::sync::Mutex::new(Badge { on: false, cur: 0.0, anim: None, shown: false });
-const BADGE_TIMER: usize = 0xB4D6;
 const BADGE_MS: f32 = 220.0;
 
 /// The mic is muted / unmuted (the Audio tab's mute state, `mute::sync_icon`): the badge scales in / out.
@@ -258,19 +270,30 @@ pub fn set_muted(muted: bool) {
     let from = b.cur;
     b.anim = Some((from, std::time::Instant::now()));
     drop(b);
-    if h != 0 {
-        // a few icon changes only while the .22 s scale runs (a timer of the tray's own thread)
-        unsafe { SetTimer(Some(HWND(h as *mut _)), BADGE_TIMER, 16, Some(badge_tick)) };
+    // a few icon changes only while the .22 s scale runs - on their own short thread (Order 050: each is a wait for
+    // Explorer, ~14 of them per mute; they used to run on the UI thread's timer)
+    if BADGE_RUNNING.swap(true, std::sync::atomic::Ordering::AcqRel) {
+        return;
     }
-    badge_show();
+    let spawned = std::thread::Builder::new().name("bu-tray-badge".into()).spawn(|| loop {
+        badge_show();
+        if BADGE.lock().map(|b| b.anim.is_none()).unwrap_or(true) {
+            BADGE_RUNNING.store(false, std::sync::atomic::Ordering::Release);
+            // a new transition that started just now keeps going here
+            if BADGE.lock().map(|b| b.anim.is_none()).unwrap_or(true) || BADGE_RUNNING.swap(true, std::sync::atomic::Ordering::AcqRel) {
+                return;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(16));
+    });
+    if spawned.is_err() {
+        BADGE_RUNNING.store(false, std::sync::atomic::Ordering::Release);
+        badge_show();
+    }
 }
 
-unsafe extern "system" fn badge_tick(hwnd: HWND, _m: u32, id: usize, _t: u32) {
-    badge_show();
-    if BADGE.lock().map(|b| b.anim.is_none()).unwrap_or(true) {
-        let _ = unsafe { KillTimer(Some(hwnd), id) };
-    }
-}
+/// Order 050: the badge's animation thread runs.
+static BADGE_RUNNING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// The badge's scale `ms` ms into the transition from `from` toward on / off: `cubic-bezier(.3,.7,.2,1)` over .22 s.
 fn badge_scale(from: f32, on: bool, ms: f32) -> f32 {

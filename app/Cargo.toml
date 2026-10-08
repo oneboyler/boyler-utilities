@@ -1,6 +1,6 @@
 [package]
 name = "bu-app"
-version = "1.0.0"
+version = "1.0.1"
 edition = "2021"
 publish = false
 description = "Boyler Utilities - the tray app (the glass menu)"
@@ -13,8 +13,8 @@ path = "src/main.rs"
 bu-apps = { path = "../crates/apps" }
 windows-core = "0.62"
 windows-numerics = "0.3"
-# Skia (CPU raster) = the same drawing code Chromium uses; pinned (Order 003)
-skia-safe = { version = "=0.153.3", features = ["textlayout"] }
+# Skia = the same drawing code Chromium uses; pinned (Order 003); "d3d" = its Direct3D 12 GPU backend (Order 051)
+skia-safe = { version = "=0.153.3", features = ["textlayout", "d3d"] }
 # the pages' layout = CSS flexbox / grid with the web's rules (MIT; Order 014)
 # the Controller tab (Order 020)
 bu-controller = { path = "../crates/controller" }
@@ -44,6 +44,8 @@ bu-search = { path = "../crates/search" }
 bu-obs = { path = "../crates/obs" }
 # Order 037: add-ons (Raw Accel's official release: download, checks, its own installer through one admin prompt)
 bu-addons = { path = "../crates/addons" }
+# Order 048: the process's one Raw Input owner (its own thread; mouse moves never reach the UI thread)
+bu-rawin = { path = "../crates/rawin" }
 
 [dependencies.windows]
 version = "0.62"
@@ -61,6 +63,8 @@ features = [
   "Win32_Graphics_Direct2D_Common",
   "Win32_Graphics_Direct3D",
   "Win32_Graphics_Direct3D11",
+  "Win32_Graphics_Direct3D12",
+  "Win32_Graphics_DirectComposition",
   "Win32_Graphics_DirectWrite",
   "Win32_Graphics_Dwm",
   "Win32_Graphics_Dxgi",

@@ -5,9 +5,9 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
 use std::sync::Arc;
-use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use bu_perf::live::{Sampler, SamplerOptions};
@@ -46,7 +46,8 @@ pub enum Msg {
 pub struct Worker {
     tx: Sender<Option<Cmd>>,
     pub rx: Receiver<Msg>,
-    handle: Option<JoinHandle<()>>,
+    /// Order 047: the tab closed - the thread ends at its next step (it is not waited for)
+    stop: Arc<AtomicBool>,
 }
 
 impl Worker {
@@ -54,8 +55,11 @@ impl Worker {
     pub fn start(os: Arc<dyn PerfOs>, waker: crate::services::Waker, specs: Option<PcSpecs>) -> Worker {
         let (ctx, crx) = channel::<Option<Cmd>>();
         let (mtx, mrx) = channel();
-        let handle = std::thread::Builder::new().name("bu-perf-page".into()).spawn(move || run(os, crx, mtx, waker, specs)).ok();
-        Worker { tx: ctx, rx: mrx, handle }
+        let stop = Arc::new(AtomicBool::new(false));
+        let st = stop.clone();
+        // (its handle is not kept: nobody waits for the thread)
+        let _ = std::thread::Builder::new().name("bu-perf-page".into()).spawn(move || run(os, crx, mtx, waker, specs, st));
+        Worker { tx: ctx, rx: mrx, stop }
     }
     pub fn send(&self, c: Cmd) {
         let _ = self.tx.send(Some(c));
@@ -63,12 +67,12 @@ impl Worker {
 }
 
 impl Drop for Worker {
-    /// The tab closed: the worker stops at once (its sampler and counters with it) and is waited for.
+    /// The tab closed: the worker is told to stop (its sampler and counters with it) and is NOT waited for - Order 047: it
+    /// may be inside "Your PC"'s WMI read (1-3 s) or its first snapshot; it ends right after that, on its own thread, and
+    /// the menu's thread goes on at once.
     fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
         let _ = self.tx.send(None);
-        if let Some(h) = self.handle.take() {
-            let _ = h.join();
-        }
     }
 }
 
@@ -104,9 +108,19 @@ pub fn snap(os: &dyn PerfOs, sampler: Option<&Sampler>, mon: &mut ProcessMonitor
 }
 
 /// Every message wakes the menu (`waker`): it repaints once per snapshot, nothing in between.
-fn run(os: Arc<dyn PerfOs>, rx: Receiver<Option<Cmd>>, tx: Sender<Msg>, waker: crate::services::Waker, kept: Option<PcSpecs>) {
+fn run(os: Arc<dyn PerfOs>, rx: Receiver<Option<Cmd>>, tx: Sender<Msg>, waker: crate::services::Waker, kept: Option<PcSpecs>, stop: Arc<AtomicBool>) {
     let specs = kept.or_else(|| os.specs().ok());
+    // Order 047: the tab closed while "Your PC" was read: nothing more starts (the closed tab did not wait for this)
+    if stop.load(Ordering::Acquire) {
+        return;
+    }
     let sampler = Sampler::start(os.clone(), SamplerOptions::default()).ok();
+    if stop.load(Ordering::Acquire) {
+        if let Some(s) = sampler {
+            s.stop();
+        }
+        return;
+    }
     let mut mon = ProcessMonitor::for_this_pc();
     let mut show = false;
     let mut icons = HashMap::new();

@@ -186,6 +186,21 @@ unsafe extern "system" fn proc(h: HWND, m: u32, wp: WPARAM, lp: LPARAM) -> LRESU
     }
 }
 
+/// Order 047: the whole picture came in from the page's worker (the lightbox opened with the thumbnail scaled up): it is
+/// shown from the next frame on. Nothing open = nothing to do.
+pub fn set_picture(pic: sk::Image) {
+    LB.with(|l| {
+        if let Ok(mut b) = l.try_borrow_mut() {
+            if let Some(lb) = b.as_mut() {
+                lb.pic = pic;
+                unsafe {
+                    SetTimer(Some(lb.layer.hwnd()), TIMER, 15, None);
+                }
+            }
+        }
+    });
+}
+
 /// Starts the closing fade (Esc in the menu: the Screenshots page's popup dismiss).
 pub fn close() {
     LB.with(|l| {

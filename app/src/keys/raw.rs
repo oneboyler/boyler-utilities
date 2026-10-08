@@ -6,7 +6,8 @@
 //!   bound; mouse while a mouse-button key is bound, and also while a modifier-only key is bound (so Ctrl + click /
 //!   Ctrl + wheel don't count as a lone "Ctrl" tap). Nothing bound = nothing registered;
 //! - [`RawRouter::feed`] takes one parsed packet ([`Packet`]) and calls `fire(slot, down)`; a mouse move (no button
-//!   flags) returns at once — that is the 8000-a-second case.
+//!   flags) returns at once. (Since Order 048 moves don't even get here: bu-rawin's own thread reads Raw Input and
+//!   hands the UI thread only key packets and mouse buttons / wheel — the 8000-moves-a-second case stays there.)
 //!   Modifiers are tracked per side from the packets themselves; the manager re-reads them from Windows
 //!   (`KeysOs::mods_now`) only on a key-down / button-down packet, never on a move.
 
@@ -37,7 +38,7 @@ pub const VK_MBUTTON: u16 = 0x04;
 pub const VK_XBUTTON1: u16 = 0x05;
 pub const VK_XBUTTON2: u16 = 0x06;
 
-/// One WM_INPUT packet, parsed (the real layer fills it from RAWINPUT).
+/// One Raw Input packet, parsed (the real layer converts bu-rawin's `RawPacket`; the benchmark parses a RAWINPUT).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Packet {
     /// RAWKEYBOARD: VKey, MakeCode, Flags.

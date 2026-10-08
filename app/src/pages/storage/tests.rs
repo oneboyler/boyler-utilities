@@ -468,3 +468,30 @@ fn picture_of_the_read_with_admin_link() {
     }
     crate::ui::set_light(false);
 }
+
+/// Order 047 (idle cost): with nothing moving the page asks for no frames (`tick` false, `wake_at` None, a build not
+/// busy); the staged sizes become the plan at a known moment the menu sleeps until (no frames after the last shimmer).
+#[test]
+fn nothing_moving_asks_for_no_frames() {
+    let mut s = opened();
+    let mut st = State::default();
+    let _ = build(&mut s, &mut st, 0.0);
+    assert!(!st.busy, "an idle page asks for no frames");
+    s.tick(10.0);
+    assert!(!s.tick(20.0), "nothing new: no repaint");
+    assert_eq!(s.wake_at(20.0), None);
+    // Clean up's Measure: the sizes arrive, then at size_t0 + 1000 ms they are measured
+    click(&mut s, &mut st, K_CLN);
+    let t0 = std::time::Instant::now();
+    while s.staged.is_none() && t0.elapsed().as_secs() < 5 {
+        s.tick(0.0);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(s.staged.is_some());
+    let mut st = State::default();
+    let _ = build(&mut s, &mut st, 900.0);
+    assert!(!st.busy, "every size is in at 900 ms: nothing moves");
+    assert_eq!(s.wake_at(900.0), Some(s.size_t0 + SIZES_DONE_MS), "the menu wakes when they become the plan");
+    s.tick(s.size_t0 + SIZES_DONE_MS);
+    assert!(s.plan.is_some() && s.wake_at(1000.0).is_none());
+}

@@ -468,6 +468,43 @@ impl Model {
         self.timers.iter().filter_map(|t| t.cd.deadline()).map(|d| d.saturating_sub(now)).min()
     }
 
+    /// Order 049: how long until a pill of `pills(preview)` looks different - a running timer's time text (whole seconds), a
+    /// countdown's line moving a quarter of a device pixel (`line_px` = the line's full length in device px), a place's
+    /// minute. The on-screen window sleeps until then. None = nothing on screen will change by itself.
+    pub fn next_change(&self, preview: bool, line_px: f32) -> Option<Duration> {
+        let sec = Duration::from_secs(1);
+        let to_whole = |t: Duration| sec - Duration::from_nanos(u64::from(t.subsec_nanos()));
+        let mut next: Option<Duration> = None;
+        let mut take = |d: Duration| next = Some(next.map_or(d, |n| n.min(d)));
+        for t in &self.timers {
+            if !t.screen || !(t.busy() || preview || self.moving) || !t.running() {
+                continue;
+            }
+            match t.kind {
+                Kind::Sw => take(to_whole(t.sw.elapsed())),
+                Kind::Cd => {
+                    let left = t.cd.left();
+                    // at zero nothing moves any more: the end alarm finishes it
+                    if left.is_zero() {
+                        continue;
+                    }
+                    // the text is the left time rounded up: it changes when the left time passes a whole second
+                    let n = left.subsec_nanos();
+                    take(if n == 0 { sec } else { Duration::from_nanos(u64::from(n)) });
+                    if line_px > 0.0 {
+                        take(t.cd.set_time().div_f64(f64::from(line_px) * 4.0).max(Duration::from_millis(1)));
+                    }
+                }
+            }
+        }
+        if self.places.iter().any(|p| p.screen) {
+            let now = self.zones.utc_now();
+            let into = Duration::from_secs(now.as_secs() % 60) + Duration::from_nanos(u64::from(now.subsec_nanos()));
+            take(Duration::from_secs(60) - into);
+        }
+        next
+    }
+
     /// What the screen shows (`barsPaint`): every timer whose "On screen" is on while it is busy (or always while the
     /// Timers page is open = `preview`, or while moving), then every place whose "On screen" is on.
     pub fn pills(&self, preview: bool) -> Vec<Pill> {

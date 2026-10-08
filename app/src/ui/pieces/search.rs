@@ -29,7 +29,7 @@ pub fn search(cx: &mut Cx, key: Key, text: &str, placeholder: &str, small: bool)
     if focused {
         // the caret after the text (blinking: 530 ms on / off)
         let caret_on = ((cx.now / 530.0) as i64) % 2 == 0;
-        cx.st.busy = true;
+        cx.wake_every(530.0, 0.0);
         let tw = if text.is_empty() { 0.0 } else { cx.g.text_width(text, font) };
         if caret_on {
             q = q.child(El::block().abs(tw.round(), (h - 14.0) / 2.0, f32::NAN, f32::NAN).size(1.0, 14.0).bg(FG()).no_hit());

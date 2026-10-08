@@ -217,9 +217,10 @@ fn pause_drops_raw_input_and_resume_brings_it_back() {
 
 /// The WM_INPUT cost at 8 kHz mouse polling. Run once, by hand, in release:
 /// `cargo test --release -p bu-app wm_input_mouse_move_cost -- --ignored --nocapture`.
-/// 80,000 synthetic RAWINPUT mouse-move packets (10 s at 8000 Hz) go through `KeysManager::on_rawinput` — the exact
-/// function the window procedure calls after GetRawInputData (that one Windows call is not in this number: it needs a
-/// real WM_INPUT). Nothing real is registered or sent; a mouse key and a modifier-only key are bound (raw mouse on).
+/// 80,000 synthetic RAWINPUT mouse-move packets (10 s at 8000 Hz) go through `KeysManager::on_rawinput` (parse + the
+/// router). Since Order 048 the app's UI thread never sees a move (bu-rawin keeps them on its own thread), so this is
+/// the worst case the router would cost, not what the app pays. Nothing real is registered or sent; a mouse key and a
+/// modifier-only key are bound (raw mouse on).
 #[test]
 #[ignore]
 fn wm_input_mouse_move_cost() {
