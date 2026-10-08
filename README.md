@@ -49,8 +49,6 @@ Get **[Boyler-Utilities-Setup.exe](https://github.com/oneboyler/boyler-utilities
 
 Made for Windows 11, 64-bit.
 
-**Windows says "unknown publisher"?** The setup isn't code-signed, so Windows SmartScreen may warn you the first time. Click **More info**, then **Run anyway**.
-
 Updates: open Settings and click **Check for updates**. The app only goes online when you ask it to, or for things that need the internet (the speed test, game pings, voice to text, add-on downloads, installing Everything).
 
 ## Building from source
