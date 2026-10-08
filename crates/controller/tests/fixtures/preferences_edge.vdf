@@ -1,0 +1,13 @@
+"ControllerPersonalization"
+{
+	"name"		"DualSense Edge Wireless Controller"
+	"guide_brightness"		"0.5"
+	"antidrift_enabled_sw"		"0"
+	"gyro_stationary_noise_tolerance"		"0.5"
+	"rumble"		"-1"
+	"color_red"		"10"
+	"color_green"		"20"
+	"color_blue"		"30"
+	"stick_left_deadzone"		"-1"
+	"stick_right_deadzone"		"-1"
+}

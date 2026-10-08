@@ -1,0 +1,19 @@
+"UserLocalConfigStore"
+{
+	"Software"
+	{
+		"Valve"
+		{
+			"Steam"
+			{
+				"apps"
+				{
+					"252950"
+					{
+						"UseSteamControllerConfig"		"2"
+					}
+				}
+			}
+		}
+	}
+}

@@ -1,0 +1,46 @@
+[package]
+name = "bu-search"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Boyler Utilities - Search tab features (apps, folders and files on this PC: Everything when it runs, else Windows Search's index). No UI."
+
+[[example]]
+name = "search-show"
+path = "examples/show.rs"
+
+[dependencies]
+thiserror = "2"
+
+[target.'cfg(windows)'.dependencies.windows]
+version = "0.62"
+features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_Networking_WinHttp",
+    "Win32_Security",
+    "Win32_Security_Cryptography",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Com",
+    "Win32_System_DataExchange",
+    "Win32_System_JobObjects",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
+    "Win32_System_Ole",
+    "Win32_System_ProcessStatus",
+    "Win32_System_Registry",
+    "Win32_System_Search",
+    "Win32_System_Services",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+    "Win32_System_Time",
+    "Win32_System_Variant",
+    "Win32_UI_Shell",
+    "Win32_UI_Shell_Common",
+    "Win32_UI_Shell_PropertiesSystem",
+    "Win32_UI_WindowsAndMessaging",
+]
+
+# the `#[implement]` macro of the in-test pretend IRowset names the `windows_core` crate directly
+[target.'cfg(windows)'.dev-dependencies]
+windows-core = "0.62"

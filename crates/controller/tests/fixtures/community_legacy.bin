@@ -1,0 +1,139 @@
+"controller_mappings"
+{
+	"version"		"3"
+	"revision"		"12"
+	"title"		"Yakuza 0 - gyro aim"
+	"description"		"Community layout"
+	"creator"		"76561190000000000"
+	"controller_type"		"controller_ps5"
+	"Timestamp"		"-1617428950"
+	"actions"
+	{
+		"Default"
+		{
+			"title"		"Default"
+			"legacy_set"		"1"
+		}
+		"Preset_1000001"
+		{
+			"title"		"In menus"
+			"legacy_set"		"1"
+		}
+	}
+	"group"
+	{
+		"id"		"0"
+		"mode"		"four_buttons"
+		"inputs"
+		{
+			"button_a"
+			{
+				"activators"
+				{
+					"Full_Press"
+					{
+						"bindings"
+						{
+							"binding"		"xinput_button A"
+						}
+					}
+					"Long_Press"
+					{
+						"bindings"
+						{
+							"binding"		"key_press SPACE"
+						}
+						"settings"
+						{
+							"long_press_time"		"400"
+						}
+					}
+				}
+			}
+			"button_b"
+			{
+				"activators"
+				{
+					"Full_Press"
+					{
+						"bindings"
+						{
+							"binding"		"key_press LEFT_CONTROL"
+							"binding"		"key_press C"
+						}
+					}
+				}
+			}
+		}
+	}
+	"group"
+	{
+		"id"		"1"
+		"mode"		"joystick_camera"
+		"inputs"
+		{
+		}
+		"settings"
+		{
+			"sensitivity"		"150"
+		}
+	}
+	"group"
+	{
+		"id"		"2"
+		"mode"		"gyro_to_mouse"
+		"inputs"
+		{
+		}
+		"settings"
+		{
+			"gyro_button"		"5"
+			"gyro_sensitivity_scale"		"120"
+		}
+	}
+	"group"
+	{
+		"id"		"3"
+		"mode"		"dpad"
+		"inputs"
+		{
+			"dpad_north"
+			{
+				"activators"
+				{
+					"Full_Press"
+					{
+						"bindings"
+						{
+							"binding"		"key_press UP_ARROW"
+						}
+					}
+				}
+			}
+		}
+	}
+	"preset"
+	{
+		"id"		"0"
+		"name"		"Default"
+		"group_source_bindings"
+		{
+			"0"		"button_diamond active"
+			"1"		"right_joystick active"
+			"2"		"gyro active"
+		}
+	}
+	"preset"
+	{
+		"id"		"1"
+		"name"		"Preset_1000001"
+		"group_source_bindings"
+		{
+			"3"		"button_diamond active"
+			"2"		"gyro inactive"
+		}
+	}
+	"settings"
+	{
+	}
+}

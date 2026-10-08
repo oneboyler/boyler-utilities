@@ -1,0 +1,39 @@
+[package]
+name = "bu-audio"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Boyler Utilities - Audio tab features (devices, defaults, volumes, levels, app mixer, device on/off, Keep my devices, New apps volume). No UI."
+
+[[example]]
+name = "audio-show"
+path = "examples/show.rs"
+
+[[example]]
+name = "audio-listen"
+path = "examples/listen.rs"
+
+[dependencies]
+thiserror = "2"
+
+[target.'cfg(windows)'.dependencies]
+windows-core = "0.62"
+
+[target.'cfg(windows)'.dependencies.windows]
+version = "0.62"
+features = [
+    "Win32_Devices_FunctionDiscovery",
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_Graphics_Imaging",
+    "Win32_Media_Audio",
+    "Win32_Media_Audio_Endpoints",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Threading",
+    "Win32_System_Variant",
+    "Win32_System_WindowsProgramming",
+    "Win32_UI_Shell",
+    "Win32_UI_Shell_PropertiesSystem",
+]

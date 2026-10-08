@@ -1,0 +1,56 @@
+[package]
+name = "bu-display"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "Boyler Utilities - the Windows features behind the Display tab (no UI)"
+
+[dependencies]
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+# Order 019: the Display tab's presets + rules file (store.rs)
+serde_json = "1"
+
+[target.'cfg(windows)'.dependencies]
+windows-core = "0.62"
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Devices_Display",
+    "Win32_Graphics_Gdi",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Accessibility",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_Threading",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Registry",
+    "Win32_Security",
+    "Win32_System_Com",
+    "Win32_System_Ole",
+    "Win32_System_Variant",
+    "Win32_System_Wmi",
+    "Win32_System_Rpc",
+] }
+
+[dev-dependencies]
+serde_json = "1"
+
+# Workspace-unique example names (every crate's examples/show.rs would otherwise build to the same show.exe).
+[[example]]
+name = "display-show"
+path = "examples/show.rs"
+
+[[example]]
+name = "display-validate"
+path = "examples/validate.rs"
+
+[[example]]
+name = "display-idle"
+path = "examples/idle.rs"
+
+[[example]]
+name = "display-trigger"
+path = "examples/trigger.rs"

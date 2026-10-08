@@ -1,0 +1,3 @@
+# shell scripts must keep LF (Git Bash cannot run CRLF scripts; core.autocrlf=true would convert them)
+*.sh text eol=lf
+app/assets/licences.txt text eol=lf

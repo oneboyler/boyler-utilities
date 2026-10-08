@@ -1,0 +1,18 @@
+# Boyler Utilities — Rust workspace (fully native; decided Oct 7 2026).
+# Every feature lives in its own crate under crates/ (no UI in feature crates; the menu app uses them).
+[workspace]
+members = ["crates/*", "app"]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+
+[profile.dev]
+debug = "line-tables-only"   # keeps each lane's build folder small (disk is tight)
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+strip = true
+panic = "abort"

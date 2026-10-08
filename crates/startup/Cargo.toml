@@ -1,0 +1,36 @@
+[package]
+name = "bu-startup"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Boyler Utilities: everything that starts with Windows (Run keys, Startup folders, Store startup tasks, logon/boot tasks, Automatic services), switch on/off + undo. No UI."
+
+[dependencies]
+thiserror = "2"
+
+[target.'cfg(windows)'.dependencies.windows]
+version = "0.62"
+features = [
+    "ApplicationModel",
+    "Foundation",
+    "Foundation_Collections",
+    "Management_Deployment",
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Com",
+    "Win32_System_Environment",
+    "Win32_System_Ole",
+    "Win32_System_Registry",
+    "Win32_System_Services",
+    "Win32_System_SystemInformation",
+    "Win32_System_TaskScheduler",
+    "Win32_System_Threading",
+    "Win32_System_Variant",
+    "Win32_UI_Shell",
+]
+
+[[example]]
+name = "startup-show"
+path = "examples/show.rs"

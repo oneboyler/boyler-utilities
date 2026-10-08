@@ -1,0 +1,23 @@
+[package]
+name = "bu-timers"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Boyler Utilities - Timers tab features (stopwatch, countdown, on-screen timer bars state, end chime). No UI."
+
+[[example]]
+name = "timers-show"
+path = "examples/show.rs"
+
+[dependencies]
+thiserror = "2"
+
+[target.'cfg(windows)'.dependencies.windows]
+version = "0.62"
+features = [
+    "Win32_Foundation",
+    "Win32_Globalization",
+    "Win32_Media_Audio",
+    "Win32_System_Registry",
+    "Win32_System_Time",
+]

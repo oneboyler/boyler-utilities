@@ -1,0 +1,125 @@
+[package]
+name = "bu-app"
+version = "1.0.0"
+edition = "2021"
+publish = false
+description = "Boyler Utilities - the tray app (the glass menu)"
+
+[[bin]]
+name = "BoylerUtilities"
+path = "src/main.rs"
+
+[dependencies]
+bu-apps = { path = "../crates/apps" }
+windows-core = "0.62"
+windows-numerics = "0.3"
+# Skia (CPU raster) = the same drawing code Chromium uses; pinned (Order 003)
+skia-safe = { version = "=0.153.3", features = ["textlayout"] }
+# the pages' layout = CSS flexbox / grid with the web's rules (MIT; Order 014)
+# the Controller tab (Order 020)
+bu-controller = { path = "../crates/controller" }
+taffy = { version = "0.14", default-features = false, features = ["std", "taffy_tree", "flexbox", "grid", "block_layout", "content_size"] }
+# Order 019 (Lane Q): the Display, Screenshots and Mouse pages' feature crates
+bu-display = { path = "../crates/display" }
+bu-screenshot = { path = "../crates/screenshot" }
+bu-mouse = { path = "../crates/mouse" }
+bu-toggles = { path = "../crates/toggles" }
+bu-quickfix = { path = "../crates/quickfix" }
+bu-startup = { path = "../crates/startup" }
+bu-perf = { path = "../crates/perf" }
+# the self-update's install step + start confirmation (Order 017; main.rs, A_024_01)
+bu-updater = { path = "../crates/updater" }
+bu-activity = { path = "../crates/activity" }
+bu-timers = { path = "../crates/timers" }
+bu-audio = { path = "../crates/audio" }
+bu-micmute = { path = "../crates/micmute" }
+bu-network = { path = "../crates/network" }
+bu-storage = { path = "../crates/storage" }
+# Order 024 (Lane V): Voice to text + Settings - Check for updates
+bu-voice = { path = "../crates/voice" }
+# Order 030 (Lane D2): the Security and Search tabs on their real crates
+bu-security = { path = "../crates/security" }
+bu-search = { path = "../crates/search" }
+# Order 035: Notifications for OBS (ClipPing built in)
+bu-obs = { path = "../crates/obs" }
+# Order 037: add-ons (Raw Accel's official release: download, checks, its own installer through one admin prompt)
+bu-addons = { path = "../crates/addons" }
+
+[dependencies.windows]
+version = "0.62"
+features = [
+  "Foundation",
+  "Foundation_Numerics",
+  "Graphics_Effects",
+  "System",
+  "UI",
+  "UI_Composition",
+  "UI_Composition_Desktop",
+  "Win32_Foundation",
+  "Win32_Devices_FunctionDiscovery",
+  "Win32_Graphics_Direct2D",
+  "Win32_Graphics_Direct2D_Common",
+  "Win32_Graphics_Direct3D",
+  "Win32_Graphics_Direct3D11",
+  "Win32_Graphics_DirectWrite",
+  "Win32_Graphics_Dwm",
+  "Win32_Graphics_Dxgi",
+  "Win32_Graphics_Dxgi_Common",
+  "Win32_Graphics_Gdi",
+  "Win32_Graphics_Imaging",
+  "Win32_Media_Audio",
+  "Win32_Security",
+  "Win32_Security_Authorization",
+  "Win32_Security_Cryptography",
+  "Win32_Media_Audio_Endpoints",
+  "Win32_Storage_FileSystem",
+  "Win32_System_Com",
+  "Win32_System_Com_StructuredStorage",
+  "Win32_System_DataExchange",
+  "Win32_System_LibraryLoader",
+  "Win32_System_IO",
+  "Win32_System_Memory",
+  "Win32_System_Ole",
+  "Win32_System_Performance",
+  "Win32_System_Pipes",
+  "Win32_System_ProcessStatus",
+  "Win32_System_Registry",
+  "Win32_System_SystemServices",
+  "Win32_System_Threading",
+  "Win32_System_Variant",
+  "Win32_System_WinRT",
+  "Win32_System_WinRT_Composition",
+  "Win32_System_WinRT_Graphics_Direct2D",
+  "Win32_UI_Controls",
+  "Win32_UI_Controls_Dialogs",
+  "Win32_UI_HiDpi",
+  "Win32_UI_Input_KeyboardAndMouse",
+  "Win32_UI_Shell",
+  "Win32_UI_Shell_Common",
+  "Win32_UI_Shell_PropertiesSystem",
+  "Win32_UI_WindowsAndMessaging",
+]
+
+# Integrator 014-024 (Oct 8): lint findings that already existed on bakeoff-native (test A, 057922d), allowed at the
+# crate level so the workspace clippy -D warnings passes. Not fixed in the source: Order 013 edits the same files
+# right now, and none of them changes behaviour. Counts at merge: non_snake_case 48 (COM interface method names),
+# too_many_arguments 17, dead_code 11, deprecated 5 (skia-safe gradient / shaper calls), needless_range_loop 3,
+# manual_range_contains 3, unused_imports 1, mismatched_lifetime_syntaxes 1, type_complexity 1,
+# doc_lazy_continuation 1, self_named_constructors 1, needless_borrows_for_generic_args 1, map_entry 1.
+# Lane K (Order 014) owns the clean-up: fix them and delete the lines here.
+[lints.rust]
+non_snake_case = "allow"
+dead_code = "allow"
+deprecated = "allow"
+unused_imports = "allow"
+mismatched_lifetime_syntaxes = "allow"
+
+[lints.clippy]
+too_many_arguments = "allow"
+needless_range_loop = "allow"
+manual_range_contains = "allow"
+type_complexity = "allow"
+doc_lazy_continuation = "allow"
+self_named_constructors = "allow"
+needless_borrows_for_generic_args = "allow"
+map_entry = "allow"

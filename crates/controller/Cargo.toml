@@ -1,0 +1,30 @@
+[package]
+name = "bu-controller"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "Boyler Utilities - the Controller tab's features (Steam Input layouts per game, per-controller settings, connected controllers, live input). No UI."
+
+[dependencies]
+thiserror = "2"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Registry",
+    "Win32_System_Threading",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_Devices_HumanInterfaceDevice",
+    "Win32_Devices_DeviceAndDriverInstallation",
+    "Win32_UI_Input_XboxController",
+] }
+
+# Workspace-unique example name (examples of different crates share one output folder: LNK1104).
+[[example]]
+name = "controller-show"
+path = "examples/show.rs"

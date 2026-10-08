@@ -1,0 +1,39 @@
+[package]
+name = "bu-toggles"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Boyler Utilities - the Toggles tab's Windows features (DESIGN.md 3.6). No UI."
+
+[dependencies]
+thiserror = "2"
+
+[target.'cfg(windows)'.dependencies.windows]
+version = "0.62"
+features = [
+    "Wdk_Graphics_Direct3D",
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Registry",
+    "Win32_System_Threading",
+    "Win32_System_Power",
+    "Win32_System_RestartManager",
+    "Win32_System_LibraryLoader",
+    "Win32_Storage_FileSystem",
+    "Win32_Graphics_Gdi",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Accessibility",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Shell",
+    "Win32_UI_Shell_Common",
+    "Foundation",
+    "Foundation_Collections",
+    "Devices_Radios",
+    "ApplicationModel",
+    "Management_Deployment",
+]
+
+# example names must be unique across the workspace (every examples/show.rs would build to the same show.exe — LNK1104)
+[[example]]
+name = "toggles-show"
+path = "examples/show.rs"

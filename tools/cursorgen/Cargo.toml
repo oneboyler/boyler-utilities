@@ -1,0 +1,14 @@
+# Order 040: the Glass cursor set's generator. NOT part of the app or the main workspace (its own empty [workspace] table):
+# renders app/assets/cursors/glass/svg/*.svg at 32/48/64/96/128 px and writes the .cur / .ani files next to them, plus the
+# preview sheet. Run: tools/cursorgen/run.sh (see src/main.rs).
+[package]
+name = "cursorgen"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+resvg = "0.45"
+png = "0.17"

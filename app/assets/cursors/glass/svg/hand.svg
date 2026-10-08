@@ -1,0 +1,51 @@
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" viewBox="0 0 32 32" width="32" height="32" data-hotspot="14.55 2">
+  <!-- Boyler Utilities "Glass" cursor set: Link select (Hand): a pointing glass hand. Hotspot: the fingertip.
+       Style: a frosted, partly see-through white glass body, a crisp white rim (1 unit inside the edge), a thin dark line
+       (1 unit outside it) so it reads on light and dark, a soft top highlight and a soft drop shadow. 32-unit grid; the tool
+       (tools/cursorgen) renders it at 32 / 48 / 64 / 96 / 128 px. data-hotspot = the click point in grid units. -->
+  <defs>
+    <filter id="shadow" x="-8" y="-8" width="48" height="48" filterUnits="userSpaceOnUse"><feGaussianBlur stdDeviation="0.9"/></filter>
+    <filter id="soft" x="-8" y="-8" width="48" height="48" filterUnits="userSpaceOnUse"><feGaussianBlur stdDeviation="0.8"/></filter>
+    <linearGradient id="rim" gradientUnits="userSpaceOnUse" x1="0" y1="3" x2="0" y2="29">
+      <stop offset="0" stop-color="#ffffff"/><stop offset="1" stop-color="#edf2fa"/>
+    </linearGradient>
+    <linearGradient id="body" gradientUnits="userSpaceOnUse" x1="0" y1="3" x2="0" y2="29">
+      <stop offset="0" stop-color="#ffffff" stop-opacity=".93"/>
+      <stop offset=".55" stop-color="#eaf0f9" stop-opacity=".8"/>
+      <stop offset="1" stop-color="#d3dff1" stop-opacity=".72"/>
+    </linearGradient>
+    <linearGradient id="blue" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#5fb1ff" stop-opacity=".96"/><stop offset="1" stop-color="#0a6cf0" stop-opacity=".92"/>
+    </linearGradient>
+    <linearGradient id="red" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ff5c5c" stop-opacity=".97"/><stop offset="1" stop-color="#d4141c" stop-opacity=".95"/>
+    </linearGradient>
+    <linearGradient id="liquid" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#5aafff"/><stop offset="1" stop-color="#0b6cf2"/>
+    </linearGradient>
+    <linearGradient id="gloss" x1="0" y1="0" x2=".7" y2=".7">
+      <stop offset="0" stop-color="#ffffff" stop-opacity=".75"/><stop offset=".5" stop-color="#ffffff" stop-opacity="0"/>
+    </linearGradient>
+    <path id="H" d="M13 4.13c0-.946.688-1.634 1.548-1.634s1.548.688 1.548 1.634v6.966c.258-.688.86-1.118 1.634-1.118.86 0 1.548.688 1.548 1.548v.43c.258-.516.86-.86 1.462-.86.86 0 1.548.688 1.548 1.548v5.676c0 3.526-2.58 6.106-5.848 6.106h-.946c-1.892 0-3.526-.86-4.558-2.408l-3.096-4.816c-.516-.774-.344-1.806.43-2.236.688-.43 1.634-.258 2.15.344l2.58 2.666z" fill-rule="evenodd" clip-rule="evenodd"/>
+    <path id="H-hull" d="M13 4.13c0-.946.688-1.634 1.548-1.634s1.548.688 1.548 1.634v6.966c.258-.688.86-1.118 1.634-1.118.86 0 1.548.688 1.548 1.548v.43c.258-.516.86-.86 1.462-.86.86 0 1.548.688 1.548 1.548v5.676c0 3.526-2.58 6.106-5.848 6.106h-.946c-1.892 0-3.526-.86-4.558-2.408l-3.096-4.816c-.516-.774-.344-1.806.43-2.236.688-.43 1.634-.258 2.15.344l2.58 2.666z"/>
+    <mask id="H-sh" maskUnits="userSpaceOnUse" x="-8" y="-8" width="48" height="48">
+      <rect x="-8" y="-8" width="48" height="48" fill="#fff"/><use xlink:href="#H-hull" fill="#000"/>
+    </mask>
+    <clipPath id="H-in"><use xlink:href="#H"/></clipPath>
+    <mask id="H-out" maskUnits="userSpaceOnUse" x="-8" y="-8" width="48" height="48">
+      <rect x="-8" y="-8" width="48" height="48" fill="#fff"/><use xlink:href="#H" fill="#000"/>
+    </mask>
+    <mask id="H-inset" maskUnits="userSpaceOnUse" x="-8" y="-8" width="48" height="48">
+      <use xlink:href="#H" fill="#fff"/><use xlink:href="#H" fill="none" stroke="#000" stroke-width="2" stroke-linejoin="round"/>
+    </mask>
+  </defs>
+  <g mask="url(#H-sh)"><use xlink:href="#H-hull" transform="translate(0 1)" fill="#000" stroke="#000" stroke-width="2" stroke-linejoin="round" opacity=".34" filter="url(#shadow)"/></g>
+  <use xlink:href="#H" mask="url(#H-out)" fill="none" stroke="#0c111c" stroke-opacity=".8" stroke-width="2" stroke-linejoin="round"/>
+  <g mask="url(#H-inset)">
+    <use xlink:href="#H" fill="url(#body)"/>
+    <use xlink:href="#H" fill="none" stroke="#ffffff" stroke-opacity=".75" stroke-width="3.2" stroke-linejoin="round" filter="url(#soft)"/>
+    <use xlink:href="#H" fill="url(#gloss)" opacity="1"/>
+  </g>
+  <use xlink:href="#H" fill="none" stroke="url(#rim)" stroke-width="2" stroke-linejoin="round" clip-path="url(#H-in)"/>
+  <g clip-path="url(#H-in)"><path d="M16.1 11.2V14.2M19.28 12V14.5" fill="none" stroke="#0c111c" stroke-opacity=".5" stroke-width=".9" stroke-linecap="round"/></g>
+</svg>

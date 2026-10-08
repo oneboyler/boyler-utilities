@@ -1,0 +1,28 @@
+[package]
+name = "bu-updater"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Boyler Utilities - the updater (check GitHub releases only when asked, download, verify, replace the running app, roll back on failure). No UI."
+
+[[example]]
+name = "updater-show"
+path = "examples/show.rs"
+
+[[example]]
+name = "updater-fake-app"
+path = "examples/fake_app.rs"
+
+[dependencies]
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[target.'cfg(windows)'.dependencies.windows]
+version = "0.62"
+features = [
+    "Win32_Foundation",
+    "Win32_Networking_WinHttp",
+    "Win32_Security",
+    "Win32_System_Threading",
+]

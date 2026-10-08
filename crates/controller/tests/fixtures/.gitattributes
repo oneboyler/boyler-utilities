@@ -1,0 +1,2 @@
+# Steam-format fixtures: keep their bytes exactly (tabs, LF) - the tests compare bytes
+* -text

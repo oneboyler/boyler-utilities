@@ -1,0 +1,37 @@
+[package]
+name = "bu-addons"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Boyler Utilities - add-ons (Order 037): the things you download. Raw Accel's official release (pinned, SHA-256 + driver signature checked), its official installer / uninstaller through one elevated helper. No UI."
+
+[[example]]
+name = "addons-show"
+path = "examples/show.rs"
+
+[[example]]
+name = "addons-fake-tool"
+path = "examples/fake_tool.rs"
+
+[dependencies]
+bu-updater = { path = "../updater" }
+miniz_oxide = "0.8"
+
+[target.'cfg(windows)'.dependencies.windows]
+version = "0.62"
+features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Security_Cryptography",
+    "Win32_Security_WinTrust",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Com",
+    "Win32_System_Console",
+    "Win32_System_Pipes",
+    "Win32_System_Registry",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+]

@@ -1,0 +1,57 @@
+[package]
+name = "bu-mouse"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "Boyler Utilities - the Mouse tab's Windows features (DESIGN.md 3.4): your mouse, Raw Accel acceleration, Windows mouse settings, cursors. No UI."
+
+[dependencies]
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-core = "0.62"
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Environment",
+    "Win32_System_Registry",
+    "Win32_System_Threading",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_Com",
+    "Win32_System_Ole",
+    "Win32_System_Variant",
+    "Win32_System_Wmi",
+    "Win32_System_Rpc",
+    "Win32_Devices_HumanInterfaceDevice",
+    "Win32_Devices_DeviceAndDriverInstallation",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Input_KeyboardAndMouse",
+] }
+
+# Workspace-unique example names (every crate's examples/show.rs would otherwise build to the same show.exe — LNK1104).
+[[example]]
+name = "mouse-show"
+path = "examples/show.rs"
+
+# The ONE real read of the mouse approved in A_009_01 (allow-listed read requests only).
+[[example]]
+name = "mouse-read"
+path = "examples/read.rs"
+
+# Real proof of the per-app trigger: watches for a hidden `ping.exe` the example starts itself.
+[[example]]
+name = "mouse-trigger"
+path = "examples/trigger.rs"
+
+# Order 040: the Glass set's load test (tests/glass.rs) decodes the PNG entries itself and asks Windows to load + draw every
+# file off screen (LoadImageW / GetIconInfo / DrawIconEx into a memory DC; no system cursor is ever changed).
+[dev-dependencies]
+png = "0.18"
+
+[target.'cfg(windows)'.dev-dependencies]
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_UI_WindowsAndMessaging"] }

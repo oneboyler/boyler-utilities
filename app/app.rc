@@ -1,0 +1,28 @@
+// icons: 1 = dark tile (also the exe's icon), 2 = light tile (light taskbar)
+1 ICON "assets/pane_dark.ico"
+2 ICON "assets/pane_light.ico"
+1 24 "app.manifest"
+
+// the name Windows shows (Task Manager, the file's properties)
+1 VERSIONINFO
+FILEVERSION 1,0,0,0
+PRODUCTVERSION 1,0,0,0
+FILEOS 0x40004
+FILETYPE 0x1
+BEGIN
+  BLOCK "StringFileInfo"
+  BEGIN
+    BLOCK "040904B0"
+    BEGIN
+      VALUE "FileDescription", "Boyler Utilities"
+      VALUE "ProductName", "Boyler Utilities"
+      VALUE "OriginalFilename", "Boyler Utilities.exe"
+      VALUE "FileVersion", "1.0.0"
+      VALUE "ProductVersion", "1.0.0"
+    END
+  END
+  BLOCK "VarFileInfo"
+  BEGIN
+    VALUE "Translation", 0x409, 1200
+  END
+END

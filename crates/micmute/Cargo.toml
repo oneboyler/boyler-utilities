@@ -1,0 +1,31 @@
+[package]
+name = "bu-micmute"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Boyler Utilities - Mic mute (DESIGN.md 3.5): mute / unmute / toggle the chosen mic, change events, mute sounds. No UI, no keys."
+
+# example names must be unique across the workspace (every examples/show.rs would build to the same show.exe — LNK1104)
+[[example]]
+name = "micmute-show"
+path = "examples/show.rs"
+
+[dependencies]
+thiserror = "2"
+
+[target.'cfg(windows)'.dependencies]
+windows-core = "0.62"
+
+[target.'cfg(windows)'.dependencies.windows]
+version = "0.62"
+features = [
+    "Win32_Foundation",
+    "Win32_Devices_FunctionDiscovery",
+    "Win32_Devices_Properties",
+    "Win32_Media_Audio",
+    "Win32_Media_Audio_Endpoints",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Variant",
+    "Win32_UI_Shell_PropertiesSystem",
+]
