@@ -37,7 +37,7 @@ pub fn set_demo(on: bool) {
 }
 
 /// Real name -> made-up name, longest first (substrings of a text are replaced).
-const DEMO_NAMES: [(&str, &str); 37] = [
+const DEMO_NAMES: [(&str, &str); 44] = [
     ("DualSense Edge Wireless Controller", "Nova Pad Pro"),
     ("DualSense Edge", "Nova Pad Pro"),
     ("DualSense", "Nova Pad"),
@@ -64,8 +64,15 @@ const DEMO_NAMES: [(&str, &str); 37] = [
     ("Riot Games", "Starfall Studio"),
     ("Riot Vanguard", "Starfall Guard"),
     ("Epic Games", "Skybuild Games"),
+    ("DELL 27", "Aurora 27"),
+    ("LG 24", "Vista 24"),
+    ("Mullvad VPN", "Nimbus VPN"),
     ("WireGuard", "Tunnel"),
+    ("Sweden", "Northland"),
     ("Cloudflare", "Speedline"),
+    ("Zagreb (ZAG)", "Riverton (RVT)"),
+    ("Zagreb", "Riverton"),
+    ("MyHome", "Lighthouse-5G"),
     ("VirtualBox", "LabBox"),
     ("AMD Ryzen 7 7800X3D", "Zentrix 8-core"),
     ("Ryzen 7 7800X3D", "Zentrix 8-core"),

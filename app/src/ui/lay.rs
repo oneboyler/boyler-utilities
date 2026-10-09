@@ -6,7 +6,7 @@
 //! - Hit test: topmost box under a point (clip and pointer-events respected), with the chain of keyed boxes above it
 //!   (CSS `:hover` / `:active` apply to an element and all its ancestors).
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 
 use skia_safe as sk;
 use taffy::prelude::*;
@@ -34,6 +34,9 @@ pub struct Laid {
     pub nodes: Vec<Node>,
     /// the content's full height (scrolling pages)
     pub height: f32,
+    /// Order 055: where the live pass painted at its last paint (the union of the live boxes with their outer shadows, in
+    /// the tree's own coordinates) - the frame redraws only that area for moving meters
+    pub live_ink: Cell<Option<(f32, f32, f32, f32)>>,
 }
 
 fn lu(v: f32) -> f32 {
@@ -126,7 +129,7 @@ impl Laid {
         place(&tree, &mut nodes, 0, 0.0, 0.0);
         let root_l = tree.layout(nodes[0].tid).expect("layout");
         let height = root_l.size.height;
-        Laid { nodes, height }
+        Laid { nodes, height, live_ink: Cell::new(None) }
     }
 
     /// Children of `i` in paint order (z-index, then tree order).
@@ -284,6 +287,11 @@ impl Laid {
         let lives = RefCell::new(Vec::new());
         self.paint_node(g, icons, 0, base, &[], &lives, (0.0, 0.0));
         g.set_transform(&t0);
+        let u = lives.into_inner().into_iter().reduce(|a, b| {
+            let (l, t) = (a.0.min(b.0), a.1.min(b.1));
+            (l, t, (a.0 + a.2).max(b.0 + b.2) - l, (a.1 + a.3).max(b.1 + b.3) - t)
+        });
+        self.live_ink.set(u);
     }
 
     /// Order 042: the frame composites the live layer OVER the static page layer, so a box painted after a live box

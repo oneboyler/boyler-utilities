@@ -48,6 +48,11 @@ pub struct Qf {
     /// the restore point row's own line ("Only when you press it · last one …"), read off the UI thread at open
     rp_line: Option<String>,
     rp_rx: Option<Receiver<String>>,
+    /// Order 055: counts what the rows show changing (a run's progress step, a run ended, the restore point line, a press) -
+    /// `Tweaks::tick` compares this number instead of building the rows' texts twice per tick
+    ver: u64,
+    /// the Repair run's progress as last seen (phase, tenths of a percent): a new step is a change
+    seen: Option<(bu_quickfix::repair::Phase, Option<i32>)>,
 }
 
 impl Qf {
@@ -72,7 +77,7 @@ impl Qf {
             // Order 047: the menu draws the line when it is in (no frames while it is read)
             crate::services::Waker.wake();
         });
-        Qf { os, for_one: None, runs: [None, None, None, None], done: [None, None, None, None], rp_line: None, rp_rx: Some(rx) }
+        Qf { os, for_one: None, runs: [None, None, None, None], done: [None, None, None, None], rp_line: None, rp_rx: Some(rx), ver: 0, seen: None }
     }
 
     pub fn needs_admin(i: usize) -> bool {
@@ -83,9 +88,10 @@ impl Qf {
         self.runs[i].is_some()
     }
 
-    /// Order 047: what the rows show now (progress, end line, own line) - the page draws again only when it changed.
-    pub fn picture(&self) -> Vec<String> {
-        (0..4).map(|i| format!("{:?}|{:?}|{}|{}", self.progress(i).map(|(t, s)| (t, (s * 1000.0) as i32)), self.done[i], self.line(i), self.running(i))).collect()
+    /// Order 047 / 055: changes whenever what the rows show changes (progress, end line, own line, running) - the page draws
+    /// again only when it moved. A number, not the rows' texts: comparing it costs nothing.
+    pub fn version(&self) -> u64 {
+        self.ver
     }
 
     /// Order 047: when to look again while nothing else wakes the menu - a running Repair (its progress wakes the menu
@@ -112,10 +118,23 @@ impl Qf {
                 Ok(l) => {
                     self.rp_line = Some(l);
                     self.rp_rx = None;
+                    self.ver += 1;
                 }
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => self.rp_rx = None,
                 Err(_) => {}
             }
+        }
+        // the Repair run's progress (shared with its worker): only a new step counts
+        let seen = match &self.runs[1] {
+            Some(Run::Repair(r)) => {
+                let p = r.progress();
+                Some((p.phase, p.percent.map(|v| (v * 10.0) as i32)))
+            }
+            _ => None,
+        };
+        if seen != self.seen {
+            self.seen = seen;
+            self.ver += 1;
         }
         for i in 0..4 {
             let end = match &self.runs[i] {
@@ -129,6 +148,7 @@ impl Qf {
             };
             let Some(v) = end else { continue };
             let run = self.runs[i].take();
+            self.ver += 1;
             let v = match (run, v) {
                 (Some(Run::Repair(r)), None) => {
                     let rep = r.wait();
@@ -157,6 +177,7 @@ impl Qf {
     /// The row's button was pressed (the Rebuild row asks first: the page shows the confirm and calls this with
     /// `confirmed`). Returns the toast to show now, if any.
     pub fn press(&mut self, i: usize, confirmed: bool) -> Option<String> {
+        self.ver += 1;
         if let Some(r) = &self.runs[i] {
             // Cancel (Repair; a restore point / rebuild can't be stopped half-way: their button is disabled)
             if let Run::Repair(r) = r {
@@ -336,6 +357,31 @@ mod tests {
         let _ = wait(&mut q);
         assert!(f.spawned().is_empty() && f.chords_sent() == 0 && f.create_calls().is_empty());
         assert_eq!(f.events(), Vec::<String>::new());
+    }
+
+    /// Order 055: the version moves when a row's picture does (a press, a run's end, the restore point line), not otherwise.
+    #[test]
+    fn the_version_moves_only_when_the_rows_change() {
+        let f = FakeFixOs::new();
+        f.add_file("iconcache_32.db", 4096);
+        let mut q = Qf::new(Arc::new(f.clone()));
+        // (the restore point line comes from its own thread: wait for it first)
+        for _ in 0..400 {
+            q.poll();
+            if q.rp_rx.is_none() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let v = q.version();
+        q.poll();
+        q.poll();
+        assert_eq!(q.version(), v, "nothing new: the same number");
+        q.press(2, true);
+        assert_ne!(q.version(), v, "a press");
+        let v = q.version();
+        let _ = wait(&mut q);
+        assert_ne!(q.version(), v, "the run ended");
     }
 
     #[test]

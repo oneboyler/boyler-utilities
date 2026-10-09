@@ -26,6 +26,9 @@ use crate::ui::lay::Laid;
 pub const SETTING: &str = "welcomed";
 /// The words (the order's text, word for word).
 pub const TEXT: &str = "Boyler Utilities is here - double-click this icon";
+/// Order 049 item 9 (A_049_02): the short line before the tidy-up of the Everything v1.0.0 installed for all of Windows
+/// (the admin prompt comes only from the Search tab's button).
+pub const TIDY_TEXT: &str = "Search now keeps Everything inside the app - open Search to tidy up the old one";
 /// How long it stays (ms) before it fades by itself.
 const STAY_MS: f64 = 8000.0;
 const FADE_IN: f64 = 200.0;
@@ -54,6 +57,8 @@ struct Bubble {
 
 thread_local! {
     static B: RefCell<Option<Bubble>> = const { RefCell::new(None) };
+    /// the line the bubble says (`TEXT`, or Order 049's `TIDY_TEXT`)
+    static LINE: std::cell::Cell<&'static str> = const { std::cell::Cell::new(TEXT) };
 }
 
 fn now() -> f64 {
@@ -69,7 +74,7 @@ pub fn bubble() -> El {
         .bg(BG)
         .inset(&[sh(0.0, 0.0, 0.0, 0.5, c(255, 255, 255, 0.16))])
         .shadow(&[sh(0.0, 0.0, 0.0, 0.5, c(0, 0, 0, 0.5)), sh(0.0, 14.0, 36.0, 0.0, c(0, 0, 0, 0.4))])
-        .child(El::text(TEXT, Font::new(13.0, 600).ls(0), Rgba::rgb(255, 255, 255), 17.0).none())
+        .child(El::text(LINE.with(|l| l.get()), Font::new(13.0, 600).ls(0), Rgba::rgb(255, 255, 255), 17.0).none())
 }
 
 /// The bubble's size (DIPs) at this scale.
@@ -107,6 +112,11 @@ pub fn first_run(tray: Option<RECT>) {
     }
     let seen = crate::services::with(|s| s.store.bool_or(Scope::App, SETTING, false)).unwrap_or(true);
     if seen {
+        // Order 049 item 9: each start while v1.0.0's Everything is still there - one short line (two registry reads)
+        if bu_search::real::ours::v100_present() {
+            LINE.with(|l| l.set(TIDY_TEXT));
+            show(tray);
+        }
         return;
     }
     if show(tray) {

@@ -220,7 +220,7 @@ impl Layer {
                     let _ = g.dev.Commit();
                 }
             }
-            if let Err(e) = g.chain.present() {
+            if let Err(e) = g.chain.present(None) {
                 crate::timing::note(&format!("overlay present failed {:08x}", e.code().0));
                 if crate::gpu::is_lost_error(&e) || g.chain.gpu.lost() {
                     LOST.with(|l| l.set(true));
@@ -475,6 +475,44 @@ pub fn test_window() -> Option<(HWND, bool)> {
 /// Test copies: close without a shot.
 pub fn test_close() {
     close(None);
+}
+
+/// Test copies (`ovclick`, Order 054): a click on a button of the first window - the `i`-th of its shown buttons (× / Copy /
+/// Save left out: they end the overlay), or the one named `x` / `copy` / `save` - made of mouse messages posted to the window
+/// (the pointer slides onto it 1 px at a time first, as a hand does). The log says which button was aimed at; the window
+/// logs what the press reached (`ovclicked` / `ovpress`).
+pub fn test_click(which: &str) {
+    if !crate::testmode::on() {
+        return;
+    }
+    let aim = SESSION.with(|c| {
+        let b = c.try_borrow().ok()?;
+        let w = b.as_ref()?.wins.first()?;
+        let all = view::buttons(w.front.as_ref()?);
+        let ends = [K_X, K_COPY, K_SAVE];
+        let named = match which {
+            "x" => Some(K_X),
+            "copy" => Some(K_COPY),
+            "save" => Some(K_SAVE),
+            _ => None,
+        };
+        let (k, c) = match named {
+            Some(n) => *all.iter().find(|(k, _)| *k == n)?,
+            None => {
+                let list: Vec<_> = all.iter().filter(|(k, _)| !ends.contains(k)).copied().collect();
+                *list.get(which.parse::<usize>().ok()? % list.len().max(1))?
+            }
+        };
+        let sc = w.g.scale;
+        Some((w.layer.hwnd, k, ((c.0 * sc).round() as i32, (c.1 * sc).round() as i32), all.len()))
+    });
+    match aim {
+        Some((hwnd, k, p, n)) => {
+            crate::timing::note(&format!("ovclick {which} key={k:x} at {},{} of {n} buttons", p.0, p.1));
+            super::gputest::click(hwnd, p);
+        }
+        None => crate::timing::note(&format!("ovclick {which} no button")),
+    }
 }
 
 /// Test copies (`ovlose`): the overlay's GPU device removed, as a driver crash would.
@@ -1369,12 +1407,17 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
                     let Some((w, p, d)) = points(s, hwnd, lp) else { return };
                     let _ = SetCapture(hwnd);
                     let (keys, click, _) = hit(&s.wins[w], d);
+                    // a press left from a lost button-up must not take this press's release (the drag would stay stuck)
+                    s.pressed = None;
                     if let Some(k) = click {
                         s.pressed = Some(k);
                         s.wins[w].st.active = keys;
                     } else if keys.iter().any(|k| *k == K_EGRID || *k == K_SRCH || view::is_bars(*k) || *k == K_BAR) {
                         // on a bar's empty part: nothing
                     } else {
+                        if crate::testmode::on() {
+                            crate::timing::note(&format!("ovpress model at {:.0},{:.0}", d.0, d.1));
+                        }
                         let handle = view::handle_at(&s.cap.model, s.wins[w].mi, d.0, d.1);
                         let out = s.cap.model.press(p, handle, t);
                         after = act(s, out);
@@ -1389,6 +1432,9 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
                     if let Some(k) = s.pressed.take() {
                         let (_, click, _) = hit(&s.wins[w], d);
                         if click == Some(k) {
+                            if crate::testmode::on() {
+                                crate::timing::note(&format!("ovclicked key={k:x}"));
+                            }
                             let out = click_key(s, k, t);
                             after = act(s, out);
                         }

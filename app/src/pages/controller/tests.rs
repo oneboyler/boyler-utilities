@@ -1201,11 +1201,11 @@ fn check_stick_drift_with_a_made_up_drift() {
     // a stick resting a little off the centre, wobbling (largest 3.1 %)
     let wobble = [(0.012, -0.004), (0.02, 0.01), (-0.018, 0.025), (0.0, 0.031), (0.01, 0.0), (0.024, -0.012)];
     for (i, (x, y)) in wobble.iter().enumerate() {
-        t.o().lv.ls = (*x, *y);
+        t.o().lv.borrow_mut().ls = (*x, *y);
         assert!(t.p.tick(at + 400.0 + 700.0 * i as f64), "frames while it runs");
     }
     assert!(matches!(t.o().drift, Some(Drift::Run { .. })), "still running before 5 s");
-    t.o().lv.ls = (0.0, 0.0);
+    t.o().lv.borrow_mut().ls = (0.0, 0.0);
     t.p.tick(at + DRIFT_MS + 1.0);
     let Some(Drift::Done { max, dz, .. }) = t.o().drift else { panic!("done") };
     assert!((max - 0.031).abs() < 1e-6, "{max}");
@@ -1241,6 +1241,40 @@ fn the_fake_controller_drifts_a_little_while_checked() {
     // the window closed: the check is gone
     t.click(sub(K_PANEL, "x"));
     assert!(t.o().drift.is_none());
+}
+
+/// Order 055 (the owner + boss, Oct 9: only motion runs at the monitor's rate, data at its own pace): the drift check's bar is
+/// repainted 30 times a second at most and the page is built again only when the second shown changes.
+#[test]
+fn the_drift_bar_repaints_only_and_the_page_is_built_once_a_second() {
+    let mut t = T::new();
+    t.click_part(Pid::Stick(Side::Left));
+    t.click(Open::k("ls.drift"));
+    let Some(Drift::Run { at, .. }) = t.o().drift else { panic!("runs") };
+    assert!(t.p.tick(at + 100.0), "the bar moves");
+    assert!(t.p.live_only(), "only the live bar is painted again");
+    assert!(!t.p.tick(at + 110.0), "no frame between its steps");
+    assert!(t.p.wake_at(at + 110.0).is_some_and(|w| w > at + 110.0), "the next step is waited for");
+    assert!(t.p.tick(at + 1100.0), "a new second");
+    assert!(!t.p.live_only(), "the text changes: the page is built");
+    assert!((t.o().drift_share.get() - 0.22).abs() < 0.01, "{}", t.o().drift_share.get());
+}
+
+/// Order 055: the fake controller's demo (and a real pad's reports) reach the live boxes 30 times a second at most, as a
+/// repaint of the live boxes only - never a build, never a frame between two readings.
+#[test]
+fn the_live_readings_come_at_30_hz_and_build_nothing() {
+    let mut t = T::live();
+    // (a first step takes whatever the page found at its opening)
+    let warm = t.now + 500.0;
+    t.p.tick(warm);
+    let t0 = warm + 500.0;
+    assert!(t.p.tick(t0), "a reading");
+    assert!(t.p.live_only(), "only the live boxes read it");
+    assert!(!t.p.tick(t0 + 5.0), "too soon: no frame");
+    assert!(t.p.wake_at(t0 + 5.0).is_some_and(|w| w > t0 + 5.0 && w <= t0 + LV_MS + 1.0), "{:?}", t.p.wake_at(t0 + 5.0));
+    assert!(t.p.tick(t0 + LV_MS), "the next reading");
+    assert!(t.p.live_only());
 }
 
 /// Without the controller plugged in there is nothing to measure: the button is dimmed and does nothing.
@@ -1298,7 +1332,7 @@ fn pad_order42_look() {
     shot(&mut t, "2b_drift_idle", 170.0);
     t.click(Open::k("ls.drift"));
     let Some(Drift::Run { at, .. }) = t.o().drift else { return };
-    t.o().lv.ls = (0.02, 0.023);
+    t.o().lv.borrow_mut().ls = (0.02, 0.023);
     t.p.tick(at + 2100.0);
     t.now = at + 2100.0 - 2000.0;
     shot(&mut t, "3_drift_running", 170.0);
@@ -1348,7 +1382,8 @@ fn proof_045_controller_panels() {
 
 // ------------------------------------------------------------------------------------------------ Order 047 (test 3)
 
-/// the "Launch Steam" freeze (a big black box until Steam opened): the "Launch Steam" click and the moment Steam runs (its files read again - Steam writes them
+/// the owner's test 3 ("i clicked launch steam ... the entire bottom right of the screen gets a big black box, and then steam
+/// opens and it unfreezes"): the "Launch Steam" click and the moment Steam runs (its files read again - Steam writes them
 /// while it starts) hand the menu's thread back within a frame, even with a slow Steam library; the files are still read.
 #[test]
 fn launch_steam_and_steam_starting_never_hold_the_menu() {
@@ -1430,7 +1465,7 @@ fn opening_the_tab_never_holds_the_menu() {
     assert_eq!(t.o().game().map(|g| g.name.clone()).as_deref(), Some("Rocket League"));
 }
 
-/// Order 047 (~1.7 cores with the menu just open): with nothing moving the tab asks for no frames - `tick` says
+/// Order 047 (the boss: ~1.7 cores with the menu just open): with nothing moving the tab asks for no frames - `tick` says
 /// nothing changed and `wake_at` names no time, or one still to come (a toast's end), never one already past.
 #[test]
 fn nothing_moving_asks_for_no_frames() {

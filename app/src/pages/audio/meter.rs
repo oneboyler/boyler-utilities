@@ -7,9 +7,11 @@ use std::sync::Arc;
 
 use skia_safe as sk;
 
+use crate::anim::EASE;
 use crate::gfx::{sh, Gfx, Rgba, Shadow};
 use crate::icons::Icons;
 use crate::png::Pixels;
+use crate::ui::el::El;
 use crate::ui::{LVT, VZ1, VZ2, WHITE};
 
 /// One smoothed level with its held peak (the drawing's per-frame constants made frame-rate independent).
@@ -51,6 +53,60 @@ impl Level {
     pub fn moving(&self) -> bool {
         self.l > 0.0 || self.pk > 0.0
     }
+}
+
+/// Order 055: an app row's held-peak dot fades in and out (`.lvl` dot, .3 s `ease`, 0 <-> .9). It used to be a transition of
+/// the built page (every flip during music built the page and ran frames at the screen's rate); now it is stepped with the
+/// levels (`at` is read by the live pass), so a peak showing or hiding repaints only the meter.
+#[derive(Default, Clone, Copy, Debug)]
+pub struct PeakFade {
+    from: f32,
+    to: f32,
+    t0: f64,
+    seen: bool,
+}
+
+impl PeakFade {
+    /// The dot's opacity at `now`.
+    pub fn at(&self, now: f64) -> f32 {
+        self.from + (self.to - self.from) * EASE.ease((now - self.t0) / 300.0) as f32
+    }
+    /// The dot should show (`on`) or not: a new target starts from where the fade is now; the first call jumps (a row that
+    /// is new, or a picture, shows it at once - as the transition did on its first build).
+    pub fn set(&mut self, on: bool, now: f64) {
+        let to = if on { 0.9 } else { 0.0 };
+        if !self.seen {
+            *self = PeakFade { from: to, to, t0: now, seen: true };
+        } else if to != self.to {
+            *self = PeakFade { from: self.at(now), to, t0: now, seen: true };
+        }
+    }
+    /// Still fading at `now`?
+    pub fn busy(&self, now: f64) -> bool {
+        self.from != self.to && now - self.t0 < 300.0
+    }
+}
+
+/// The slim level bar under an app's slider (`slider::level_bar_with`, painted number for number) whose dot opacity is read
+/// at paint time too: `now()` = (level, peak, dot opacity).
+pub fn level_bar_live(now: impl Fn() -> (f32, f32, f32) + 'static, c1: Rgba, c2: Rgba) -> El {
+    El::paint(move |g, (x, y, w, _)| {
+        let (level, peak, pk_op) = now();
+        g.fill_rr(x, y, w, 3.0, 1.5, LVT());
+        let lvl = level.clamp(0.0, 1.0);
+        if lvl > 0.0 {
+            let br = g.hgrad(x, 0.0, x + w, 0.0, &[(0.0, c1), (1.0, c2)]);
+            let o = 0.45 + 0.55 * (lvl * 2.4).min(1.0);
+            g.push_layer(1.0, Some((x, y, w * lvl, 3.0, 1.5)));
+            g.fill_rr_shader(x, y, w, 3.0, 1.5, &br, o);
+            g.pop_layer();
+        }
+        if pk_op > 0.001 {
+            g.fill_circle(x + w * peak.clamp(0.0, 1.0) - 1.5, y + 1.5, 1.5, c2.mul_a(pk_op));
+        }
+    })
+    .size(0.0, 3.0)
+    .live()
 }
 
 /// The device row's canvas (`.dvs .vis`, w x 30): a faint pill, a quiet accent fill up to the knob, the live level

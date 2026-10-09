@@ -31,7 +31,7 @@ use crate::ui::pieces::{self, dropdown, group, link, reset, slider, toast, toggl
 use crate::ui::{cmix, ACC, ACC_S, CTL, CTL_H, F125, FG, FG2, FG3, HAIR, HOV, ICO, RED, SEL, TRK, WHITE, WIN_H, WIN_W};
 use crate::undo::{DefaultItem, Kind, Resettable, Val};
 
-use meter::{Face, FakeSound, Level};
+use meter::{Face, FakeSound, Level, PeakFade};
 use svc::{Cmd, Note, Svc};
 
 const K_OUT_VOL: Key = key("aud.outvol");
@@ -79,12 +79,18 @@ thread_local! {
     static LAST_SNAP: std::cell::RefCell<Option<std::rc::Rc<PageSnapshot>>> = const { std::cell::RefCell::new(None) };
 }
 
-/// Order 047: the meters' levels for the live pass (devices; apps by group).
+/// Order 055: the meters are DATA, not motion - they step at their own rate, never at the screen's: at most every 33 ms
+/// (~30 Hz) while any meter shows a level, and the worker is looked at again every 100 ms while all is silent (a sound
+/// starting then waits at most that long). Between two steps nothing is asked for: no frame, no work.
+const STEP_MS: f64 = 33.0;
+const SILENT_MS: f64 = 100.0;
+
+/// Order 047: the meters' levels for the live pass (devices; apps by group: level + peak, and the peak dot's opacity).
 #[derive(Default)]
 struct LiveLv {
     vo: Level,
     vi: Level,
-    apps: HashMap<String, Level>,
+    apps: HashMap<String, (Level, f32)>,
 }
 
 /// One mixer row.
@@ -100,6 +106,8 @@ struct App {
     muted: bool,
     lv: Level,
     last_sound: f64,
+    /// the held peak's dot (Order 055: stepped with the levels, painted by the live pass)
+    pk: PeakFade,
 }
 
 /// A % being typed.
@@ -142,11 +150,20 @@ struct St {
     vo: Level,
     vi: Level,
     /// Order 047: the levels as the meters paint them (the live pass reads these when it paints: a moving meter repaints
-    /// without the page being built again) and which app rows showed a held peak at the last build
+    /// without the page being built again)
     live: std::rc::Rc<std::cell::RefCell<LiveLv>>,
-    peaks: Vec<bool>,
     /// the last tick moved only the meters (the live pass repaints them; no build)
     live_only: bool,
+    /// Order 055: when the worker is looked at next (a step of the meters while there is sound, else the silent rate)
+    next_poll: f64,
+    /// the worker's write count at the last look: the same = nothing new to copy
+    seen_gen: Option<u64>,
+    /// the last look found a value held back (a command's answer awaited, a slider dragged, a % typed): look again
+    resync: bool,
+    /// the worker's first full read has been seen (until then the page looks at it every step: it is waited for)
+    answered: bool,
+    /// when the page opened (the wait for the first read is not kept up for ever if the worker never answers)
+    born: f64,
     /// Order 047: the last snapshot copied and its write count
     snap_cache: Option<(u64, std::rc::Rc<PageSnapshot>)>,
     /// Order 047: the last snapshot of this run, shown until the worker's first read is in
@@ -179,7 +196,8 @@ struct St {
     /// Windows' text selection colour and caret blink time (the frame keeps them for test A's page only)
     sel: Rgba,
     caret_ms: f64,
-    /// Order 047: which app rows showed as quiet (no sound for 1.5 s) at the last tick: a change repaints
+    /// Order 047: which app rows showed as quiet (no sound for 1.5 s) at the last step: a change repaints (a .25 s fade of
+    /// the row - motion - so it is a build, and 1.5 s of silence is its own hysteresis)
     quiet: Vec<bool>,
 }
 
@@ -279,6 +297,35 @@ pub fn reset_caches() {
 /// (test A's frame asks the page to measure device names once at open; the shared layout measures its own text now)
 pub fn remember_widths(_g: &crate::gfx::Gfx, _names: &[String]) {}
 
+/// Is the worker's Output / Input device (id, volume) what the page shows? (No copy made to ask.)
+fn same_dev(w: &Option<(String, bu_audio::VolumeMute)>, p: &Option<(String, f32)>) -> bool {
+    match (w, p) {
+        (Some((id, v)), Some((pid, pv))) => id == pid && v.volume == *pv,
+        (None, None) => true,
+        _ => false,
+    }
+}
+
+/// One mixer row follows the worker's row: the icon that arrived (the real layer reads icons on a helper thread), and the
+/// volume / mute unless the user holds them (`free` false). True = something on the page changed.
+fn follow_row(r: &mut App, a: &bu_audio::AppRow, free: bool, real: bool) -> bool {
+    let mut changed = false;
+    if let (Face::Glyph { .. }, Some(i)) = (&r.face, &a.look.icon) {
+        if real {
+            r.face = Face::Icon(meter::pixels(i));
+            r.c = Rgba::hex(a.look.colour);
+            r.c2 = Rgba::hex(a.look.colour2);
+            changed = true;
+        }
+    }
+    if free && (r.vol != a.volume || r.muted != a.muted) {
+        r.vol = a.volume;
+        r.muted = a.muted;
+        changed = true;
+    }
+    changed
+}
+
 impl St {
     /// Mute settings opens: the fake reads in place as before; a real mic (Order 047) opens on the last known state and
     /// is read off the menu's thread.
@@ -305,6 +352,7 @@ impl St {
         };
         self.snap_cache = Some((g, s.clone()));
         let s = if s.ready {
+            self.answered = true;
             self.seed = None;
             if !matches!(self.svc, Svc::Fake(..)) {
                 LAST_SNAP.with(|l| *l.borrow_mut() = Some(s.clone()));
@@ -335,65 +383,65 @@ impl St {
             changed = true;
         }
         let holding = now < self.hold_until;
-        let dragging = |k: Key| self.drag.map(|d| d.0 == k).unwrap_or(false);
-        let editing = |k: Key| self.edit.as_ref().map(|e| e.key == k).unwrap_or(false);
-        let out = s.output.as_ref().map(|(id, v)| (id.clone(), v.volume));
-        if !holding && !dragging(K_OUT_VOL) && !editing(K_OUT_PCT) && out != self.out {
-            self.out = out;
+        let (drag, edit) = (self.drag, self.edit.as_ref().map(|e| e.key));
+        // (a slider being dragged / a % being typed keeps its own value; the keys are made only while one is)
+        let dragging = |k: Key| drag.map(|d| d.0 == k).unwrap_or(false);
+        let editing = |k: Key| edit == Some(k);
+        let user = drag.is_some() || edit.is_some();
+        // a value held back now is looked at again at the next step (the worker may not write anything new meanwhile)
+        self.resync = holding || user;
+        if !holding && !dragging(K_OUT_VOL) && !editing(K_OUT_PCT) && !same_dev(&s.output, &self.out) {
+            self.out = s.output.as_ref().map(|(id, v)| (id.clone(), v.volume));
             changed = true;
         }
-        let inp = s.input.as_ref().map(|(id, v)| (id.clone(), v.volume));
-        if !holding && !dragging(K_IN_VOL) && !editing(K_IN_PCT) && inp != self.inp {
-            self.inp = inp;
+        if !holding && !dragging(K_IN_VOL) && !editing(K_IN_PCT) && !same_dev(&s.input, &self.inp) {
+            self.inp = s.input.as_ref().map(|(id, v)| (id.clone(), v.volume));
             changed = true;
         }
+        let real = !(self.frozen || matches!(self.svc, Svc::Fake(..)));
         // keep rows (and their smoothing) by app, in the worker's order
-        let mut rows = Vec::with_capacity(s.apps.len());
-        for a in &s.apps {
-            let pos = self.apps.iter().position(|r| r.group == a.group);
-            let mut r = match pos {
-                Some(i) => self.apps.remove(i),
-                None => {
-                    changed = true;
-                    let sample = svc::sample_look(&a.look.name);
-                    let (face, c, c2, mode) = match (&sample, &a.look.icon) {
-                        (Some(l), _) if self.frozen || matches!(self.svc, Svc::Fake(..)) => (
-                            Face::Glyph { glyph: l.glyph, a: Rgba::hex(l.a), b: Rgba::hex(l.b) },
-                            Rgba::hex(l.c),
-                            Rgba::hex(l.c2),
-                            l.mode,
-                        ),
-                        (_, Some(i)) => (Face::Icon(meter::pixels(i)), Rgba::hex(a.look.colour), Rgba::hex(a.look.colour2), ""),
-                        _ => {
-                            // no icon (yet): the drawing's grey tile with the app's first letter-free glyph
-                            let g = if a.system { "abell" } else { "apps" };
-                            (Face::Glyph { glyph: g, a: Rgba::hex(0xa2abbd), b: Rgba::hex(0x6c7487) }, Rgba::hex(a.look.colour), Rgba::hex(a.look.colour2), "")
-                        }
-                    };
-                    App { group: a.group.clone(), name: a.look.name.clone(), face, c, c2, mode, vol: a.volume, muted: a.muted, lv: Level::default(), last_sound: -1e9 }
-                }
-            };
-            if let (Face::Glyph { .. }, Some(i)) = (&r.face, &a.look.icon) {
-                // the icon arrived (the real layer reads icons on a helper thread)
-                if !(self.frozen || matches!(self.svc, Svc::Fake(..))) {
-                    r.face = Face::Icon(meter::pixels(i));
-                    r.c = Rgba::hex(a.look.colour);
-                    r.c2 = Rgba::hex(a.look.colour2);
-                    changed = true;
-                }
+        if s.apps.len() == self.apps.len() && s.apps.iter().zip(&self.apps).all(|(a, r)| a.group == r.group) {
+            // (the same apps in the same order - nearly every look: the rows follow in place, nothing is moved or made)
+            for (i, (a, r)) in s.apps.iter().zip(self.apps.iter_mut()).enumerate() {
+                let free = !holding && (!user || (!dragging(k_vol(i)) && !editing(k_pct(i))));
+                changed |= follow_row(r, a, free, real);
             }
-            let i = rows.len();
-            if !holding && !dragging(k_vol(i)) && !editing(k_pct(i)) && (r.vol != a.volume || r.muted != a.muted) {
-                r.vol = a.volume;
-                r.muted = a.muted;
+        } else {
+            let mut rows = Vec::with_capacity(s.apps.len());
+            for a in &s.apps {
+                let pos = self.apps.iter().position(|r| r.group == a.group);
+                let mut r = match pos {
+                    Some(i) => self.apps.remove(i),
+                    None => {
+                        changed = true;
+                        let sample = svc::sample_look(&a.look.name);
+                        let (face, c, c2, mode) = match (&sample, &a.look.icon) {
+                            (Some(l), _) if self.frozen || matches!(self.svc, Svc::Fake(..)) => (
+                                Face::Glyph { glyph: l.glyph, a: Rgba::hex(l.a), b: Rgba::hex(l.b) },
+                                Rgba::hex(l.c),
+                                Rgba::hex(l.c2),
+                                l.mode,
+                            ),
+                            (_, Some(i)) => (Face::Icon(meter::pixels(i)), Rgba::hex(a.look.colour), Rgba::hex(a.look.colour2), ""),
+                            _ => {
+                                // no icon (yet): the drawing's grey tile with the app's first letter-free glyph
+                                let g = if a.system { "abell" } else { "apps" };
+                                (Face::Glyph { glyph: g, a: Rgba::hex(0xa2abbd), b: Rgba::hex(0x6c7487) }, Rgba::hex(a.look.colour), Rgba::hex(a.look.colour2), "")
+                            }
+                        };
+                        App { group: a.group.clone(), name: a.look.name.clone(), face, c, c2, mode, vol: a.volume, muted: a.muted, lv: Level::default(), last_sound: -1e9, pk: PeakFade::default() }
+                    }
+                };
+                let i = rows.len();
+                let free = !holding && !dragging(k_vol(i)) && !editing(k_pct(i));
+                changed |= follow_row(&mut r, a, free, real);
+                rows.push(r);
+            }
+            if rows.len() != self.apps.len() {
                 changed = true;
             }
-            rows.push(r);
+            self.apps = rows;
         }
-        if rows.len() != self.apps.len() {
-            changed = true;
-        }
-        self.apps = rows;
         // levels
         let dt = (now - self.last).clamp(0.0, 50.0);
         self.last = now;
@@ -446,25 +494,57 @@ impl St {
         changed
     }
 
-    /// Order 047: the levels into `live`, where the meters' paint reads them (each tick, and each build).
-    fn sync_live(&mut self) {
+    /// Order 047: the levels into `live`, where the meters' paint reads them (each step, and each build). Order 055: the
+    /// app peak dots' fade is stepped here (it was a transition of the built page), and `live` is written in place - nothing
+    /// is made or cloned unless an app came or went.
+    fn sync_live(&mut self, now: f64) {
+        for a in self.apps.iter_mut() {
+            a.pk.set(a.lv.pk - a.lv.l > 0.02, now);
+        }
         let mut lv = self.live.borrow_mut();
         lv.vo = self.vo;
         lv.vi = self.vi;
-        lv.apps.clear();
+        let mut missing = lv.apps.len() != self.apps.len();
         for a in &self.apps {
-            lv.apps.insert(a.group.clone(), a.lv);
+            match lv.apps.get_mut(&a.group) {
+                Some(e) => *e = (a.lv, a.pk.at(now)),
+                None => missing = true,
+            }
+        }
+        if missing {
+            lv.apps.clear();
+            for a in &self.apps {
+                lv.apps.insert(a.group.clone(), (a.lv, a.pk.at(now)));
+            }
         }
     }
 
-    /// Order 047: is any meter (devices, apps) still showing a level or a peak tick? (Then frames keep coming.)
-    fn meters_moving(&self) -> bool {
-        self.vo.moving() || self.vi.moving() || self.apps.iter().any(|r| r.lv.moving())
+    /// Order 047: is any meter (devices, apps) still showing a level, a peak tick or a fading peak dot? (Then the meters
+    /// keep stepping - Order 055: every `STEP_MS`.)
+    fn meters_moving(&self, now: f64) -> bool {
+        self.vo.moving() || self.vi.moving() || self.apps.iter().any(|r| r.lv.moving() || r.pk.busy(now))
+    }
+
+    /// Order 055: which app rows are quiet now (no sound for 1.5 s) - kept in place, nothing made per call. True = a row
+    /// changed (its .25 s fade is a build).
+    fn quiet_flip(&mut self, now: f64) -> bool {
+        let mut flip = self.quiet.len() != self.apps.len();
+        self.quiet.resize(self.apps.len(), false);
+        for (q, a) in self.quiet.iter_mut().zip(&self.apps) {
+            let n = now - a.last_sound > 1500.0;
+            if *q != n {
+                *q = n;
+                flip = true;
+            }
+        }
+        flip && !self.frozen
     }
 
     fn run(&mut self, c: Cmd, now: f64) {
         self.svc.run(c);
         self.hold_until = now + 600.0;
+        // (the worker's answer is looked for at the next step, not at the silent rate)
+        self.next_poll = self.next_poll.min(now + STEP_MS);
     }
 
     fn value_of(&self, k: Key) -> f32 {
@@ -661,8 +741,10 @@ impl Audio {
     fn build_page(&mut self, cx: &mut Cx) -> Vec<El> {
         let header = pieces::header("Audio", None);
         let Some(st) = self.st.as_mut() else { return vec![header] };
-        st.sync_live();
-        st.peaks = st.apps.iter().map(|a| a.lv.pk - a.lv.l > 0.02).collect();
+        st.sync_live(cx.now);
+        // (what this build shows as quiet - a later change of it is a build again: `quiet_flip`)
+        st.quiet.clear();
+        st.quiet.extend(st.apps.iter().map(|a| cx.now - a.last_sound > 1500.0));
         // ---- Devices
         let out_row = dev_row(cx, st, Flow::Output);
         let in_row = dev_row(cx, st, Flow::Input);
@@ -851,12 +933,11 @@ fn app_row(cx: &mut Cx, st: &mut St, i: usize) -> El {
     let look = slider::Look { track_h: 4.0, fill: cmix(a.c, FG2(), mu), track: TRK(), thumb: cmix(WHITE, THUMB_MU, mu) };
     let rng = slider::slider(cx, kv, a.vol, 0.0, 22.0, look).w_pct(100.0);
     // `.lvl{position:absolute;left:0;right:0;top:25px;height:3px}` (gone while muted)
-    let pk_op = if a.lv.pk - a.lv.l > 0.02 { 0.9 } else { 0.0 };
-    let pk_op = cx.tr(rk, 3, pk_op, 300.0, EASE);
-    // (Order 047: level + peak read when the live pass paints it - `St::live`, written by `tick`)
+    // (Order 047: level + peak read when the live pass paints it - `St::live`, written by `tick`. Order 055: the peak dot's
+    // fade too - it is stepped with the levels, so a peak showing / hiding builds nothing)
     let (src, group) = (st.live.clone(), a.group.clone());
-    let now_lv = move || src.borrow().apps.get(&group).map(|l| (l.l, l.pk)).unwrap_or((0.0, 0.0));
-    let lvl = slider::level_bar_with(0.0, now_lv, pk_op, a.c, a.c2).w_pct(100.0).abs(0.0, 25.0, f32::NAN, f32::NAN).opacity(1.0 - mu).no_hit();
+    let now_lv = move || src.borrow().apps.get(&group).map(|(l, p)| (l.l, l.pk, *p)).unwrap_or((0.0, 0.0, 0.0));
+    let lvl = meter::level_bar_live(now_lv, a.c, a.c2).w_pct(100.0).abs(0.0, 25.0, f32::NAN, f32::NAN).opacity(1.0 - mu).no_hit();
     let mxc = El::block().flex1().h(22.0).margin(0.0, 0.0, 0.0, 4.0).opacity(1.0 - 0.58 * mu).child(rng).child(lvl);
     // `.mxr .sv{margin:0 12px}`
     let pct = pct(cx, st, kp, st.apps[i].vol, cmix(FG2(), FG3(), mu)).margin(0.0, 12.0, 0.0, 12.0);
@@ -994,7 +1075,11 @@ impl Page for Audio {
             vo: Level::default(),
             vi: Level::default(),
             live: Default::default(),
-            peaks: Vec::new(),
+            next_poll: now,
+            seen_gen: None,
+            resync: false,
+            answered: false,
+            born: now,
             live_only: false,
             snap_cache: None,
             seed: None,
@@ -1061,7 +1146,7 @@ impl Page for Audio {
     }
     /// The first full read of the devices is in (no Output / Input row shows empty, then snaps).
     fn ready(&self) -> bool {
-        self.st.as_ref().is_some_and(|s| s.out.is_some() || s.svc.snapshot().ready)
+        self.st.as_ref().is_some_and(|s| s.out.is_some() || s.answered || s.svc.snapshot().ready)
     }
     /// Another page sent the menu here: "mute" opens Mute settings (Voice to text's "Mic mute" link, Settings' shortcuts).
     fn jump(&mut self, target: &str) {
@@ -1105,7 +1190,11 @@ impl Page for Audio {
     }
     fn tick(&mut self, now: f64) -> bool {
         let Some(st) = self.st() else { return false };
-        let mut changed = st.poll(now);
+        // Order 036: the worker's change-log entries (nothing is made when there are none)
+        for (item, label, old, new) in st.svc.take_notes() {
+            svc::log(&item, &label, &old, &new);
+        }
+        let mut changed = false;
         if let Some(m) = &mut st.mute {
             // (Order 047: reads only after a change, off the menu's thread for a real mic; true = the state shown changed)
             changed |= m.refresh();
@@ -1128,27 +1217,39 @@ impl Page for Audio {
             mute::sync_icon(st.muted, false, false, was != st.muted);
             changed |= was != st.muted;
         }
-        // Order 047: frames only while a meter moves (or something changed); in silence the menu sleeps and `wake_at`
-        // looks for sound again at the worker's own rate (it reads levels every 16 ms)
-        let quiet: Vec<bool> = st.apps.iter().map(|a| now - a.last_sound > 1500.0).collect();
-        let went_quiet = !st.frozen && quiet != st.quiet;
-        st.quiet = quiet;
-        // the meters paint from `live` in the live pass; a held peak's dot showing / hiding is a transition of the built
-        // page (a rebuild)
-        st.sync_live();
-        let peaks: Vec<bool> = st.apps.iter().map(|a| a.lv.pk - a.lv.l > 0.02).collect();
-        let peak_flip = peaks != st.peaks;
-        st.peaks = peaks;
-        let moving = !st.frozen && st.meters_moving();
-        st.live_only = !(changed || went_quiet || peak_flip);
-        changed || went_quiet || peak_flip || moving
+        // Order 055: the meters and the worker's data are DATA - they are looked at when `next_poll` comes (a step every
+        // 33 ms while there is sound, every 100 ms in silence), never per frame: the frames of a 360 Hz screen (a hover, a
+        // scroll) pass here at once. `wake_at` asks for the step, so nothing else is needed to keep them going.
+        if now < st.next_poll - 1.0 {
+            st.live_only = false;
+            return changed;
+        }
+        // (the worker writes its levels every 16 ms; a write count that did not move, no meter still decaying and no value
+        // held back = nothing to copy or compare)
+        let g = st.svc.gen();
+        if st.seen_gen != Some(g) || st.resync || st.fake_sound.is_some() || st.meters_moving(now) {
+            changed |= st.poll(now);
+            st.seen_gen = Some(g);
+        }
+        // frames only while a meter moves (or something changed); in silence the menu sleeps and `wake_at` looks for sound
+        // again at the silent rate
+        let went_quiet = st.quiet_flip(now);
+        // the meters paint from `live` in the live pass - the peak dots too (their fade is stepped there), so a peak showing
+        // or hiding is not a build; a row going quiet (a .25 s fade of the row) is
+        st.sync_live(now);
+        let moving = !st.frozen && st.meters_moving(now);
+        st.next_poll = now + if moving || (!st.answered && now - st.born < 5000.0) { STEP_MS } else { SILENT_MS };
+        st.live_only = !(changed || went_quiet);
+        changed || went_quiet || moving
     }
     fn live_only(&self) -> bool {
         self.st.as_ref().is_some_and(|s| s.live_only)
     }
+    /// Order 055: the next step of the meters / the next look for sound - the page asks for it, the menu sleeps until then
+    /// (no frames, no CPU). Frozen test pictures never.
     fn wake_at(&self, now: f64) -> Option<f64> {
         let st = self.st.as_ref()?;
-        (!st.frozen).then_some(now + 16.0)
+        (!st.frozen).then_some(st.next_poll.max(now + 4.0))
     }
     fn event(&mut self, ev: &Ev, cx: &mut Cx) {
         let now = cx.now;

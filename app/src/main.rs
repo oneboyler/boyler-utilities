@@ -168,7 +168,15 @@ const TIMER_BG: usize = 9;
 const BG_GAP_MS: u32 = 40;
 
 fn push(e: Ev) {
-    EVENTS.with(|q| q.borrow_mut().push_back((e, ui::cx::Mods::read())));
+    EVENTS.with(|q| {
+        let mut q = q.borrow_mut();
+        // Order 055: a move right after a move not handled yet replaces it - only where the pointer is NOW matters (a
+        // 1000-8000 Hz mouse sends many per frame; each one was a hit test, a hover check and the top row's magnification)
+        if let (Ev::Move(..), Some((Ev::Move(..), _))) = (&e, q.back()) {
+            q.pop_back();
+        }
+        q.push_back((e, ui::cx::Mods::read()));
+    });
     // sent messages (WM_COPYDATA, tray callbacks) are handled inside GetMessage without it returning:
     // post a small wake-up so the loop sees the event right away
     if !WAKE_POSTED.with(|w| *w.borrow()) {
@@ -266,8 +274,12 @@ extern "system" fn wndproc(h: HWND, m: u32, w: WPARAM, l: LPARAM) -> LRESULT {
             WM_MOUSEMOVE if is_menu => {
                 let (x, y) = dip(l);
                 push(Ev::Move(x, y));
-                let mut t = TRACKMOUSEEVENT { cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32, dwFlags: TME_LEAVE, hwndTrack: h, dwHoverTime: 0 };
-                let _ = TrackMouseEvent(&mut t);
+                // (an off-screen test copy is never under the real pointer: Windows would answer every posted move with a
+                // leave at once - Order 055's cost measurement posts moves into it)
+                if !OFFSCREEN.with(|o| *o.borrow()) {
+                    let mut t = TRACKMOUSEEVENT { cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32, dwFlags: TME_LEAVE, hwndTrack: h, dwHoverTime: 0 };
+                    let _ = TrackMouseEvent(&mut t);
+                }
                 return LRESULT(0);
             }
             WM_MOUSELEAVE if is_menu => {
@@ -691,7 +703,7 @@ impl App {
             let _ = KillTimer(Some(self.msg), TIMER_WARM);
         }
         let gfx_dropped = menu::KEPT_GFX.with(|k| k.borrow_mut().take()).is_some() | gpu::cool_down();
-        // Order 047 item 11: no K32EmptyWorkingSet any more (the next open and its tab switches faulted
+        // Order 047 item 11: no K32EmptyWorkingSet any more (the boss's order: the next open and its tab switches faulted
         // the pages back in); the kept device (or its worker) goes
         if (present::drop_d3d() || gfx_dropped) && self.menu.is_none() {
             timing::note("cool_down");
@@ -853,7 +865,9 @@ impl App {
             "gpustate" => {
                 let st = self.menu.as_ref().map(|m| m.gpu_state()).unwrap_or_else(|| format!("menu closed device_alive={}", gpu::alive()));
                 let (hit, compiled) = shadercache::STATS.with(|s| s.get());
-                timing::note(&format!("gpustate {} {} shaders_cached {} shaders_compiled {}", arg, st, hit, compiled));
+                // (Order 052 item 0: + what the worker got / compiled / still has)
+                let (d, w) = (shadercache::DEFERRED.load(std::sync::atomic::Ordering::Relaxed), shadercache::WORKER_COMPILED.load(std::sync::atomic::Ordering::Relaxed));
+                timing::note(&format!("gpustate {} {} shaders_cached {} shaders_compiled {} deferred {} worker_compiled {} pending {}", arg, st, hit, compiled, d, w, shadercache::pending()));
             }
             // test-only (Order 051): the capture overlay over a made-up picture - ovtest:<x>,<y>,<w>,<h> (one made-up monitor),
             // ovdrag:<x0>,<y0>,<x1>,<y1>,<ms>[,<hz>] (a box dragged with posted mouse messages), ovstate, ovlose, ovclose
@@ -875,6 +889,8 @@ impl App {
                 let (hit, compiled) = shadercache::STATS.with(|s| s.get());
                 timing::note(&format!("ovstate {} window={:?} device_alive={} shaders_cached {} shaders_compiled {}", arg, st, gpu::alive(), hit, compiled));
             }
+            // test-only (Order 054): ovclick:<n> | x | copy | save = a click posted on a button of the overlay (see test_click)
+            "ovclick" => pages::screenshots::overlay::window::test_click(arg),
             "ovlose" => pages::screenshots::overlay::window::test_lose_gpu(),
             "ovclose" => pages::screenshots::overlay::window::test_close(),
             "gpulose" => {
@@ -1011,6 +1027,24 @@ impl App {
                 // snapmask:<out.png> — the window's edge mask (alpha = Skia's coverage of the rounded shape)
                 if let Some(m) = &self.menu {
                     let _ = png::save_png(&m.mask_pixels(), arg);
+                }
+            }
+            // test-only (Order 052 item 0, tools/gpucache/make.ps1): the open and the close motion drawn at every 1 ms step - the
+            // content's blur changes size every frame and Skia makes one shader per blur size, so the pack gets them all
+            "blursweep" => {
+                if let Some(m) = &mut self.menu {
+                    let t0 = timing::now();
+                    m.ui.open(t0);
+                    for k in 0..=900 {
+                        let _ = m.frame(t0 + k as f64);
+                    }
+                    let t1 = t0 + 1000.0;
+                    m.ui.close(t1);
+                    for k in 0..=200 {
+                        let _ = m.frame(t1 + k as f64);
+                    }
+                    m.ui.open(timing::now());
+                    timing::note("blursweep done");
                 }
             }
             "switchshots" => {
@@ -1369,9 +1403,15 @@ fn run(opts: Opts) -> Result<()> {
                     DispatchMessageW(&msgbuf);
                 }
                 app.drain();
+                // Order 055: the refresh after a frame that showed nothing (no present, so the swap chain stays silent)
+                if menu::take_vblank() {
+                    if let Some(m) = &mut app.menu {
+                        m.slot = true;
+                    }
+                }
                 if let Some(m) = &mut app.menu {
                     let now = timing::now();
-                    let need = m.ui.switching(now) || m.ui.close_t.is_some() || m.ui.dirty || m.ui.animating(now);
+                    let need =m.ui.switching(now) || m.ui.close_t.is_some() || m.ui.dirty || m.ui.animating(now);
                     // timed out: the compositor took no frame for 100 ms (window hidden) - draw anyway so nothing freezes
                     if want && need && (m.slot || timed_out) {
                         m.slot = false;
@@ -1400,7 +1440,7 @@ fn run(opts: Opts) -> Result<()> {
                 let _ = MsgWaitForMultipleObjectsEx(None, ms, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
                 let now = timing::now();
                 // the menu's own step came due (its time was asked BEFORE the sleep: a page answers "now + 16 ms", so asking
-                // again now would always be in the future and the page would never be polled)
+                // again now would always be in the future and the page would never be polled - Opus review HIGH 1)
                 if let Some(m) = app.menu.as_mut().filter(|_| menu_due.is_some_and(|t| t <= now + 0.5)) {
                     m.ui.wake(now);
                 }
@@ -1458,7 +1498,7 @@ fn run(opts: Opts) -> Result<()> {
         }
         app.destroy_menu();
         app.tray.remove();
-        // Order 047: the pages' last work runs on their own threads now (Audio's close, a take-over): wait for
+        // Order 047 (Opus review): the pages' last work runs on their own threads now (Audio's close, a take-over): wait for
         // it (2 s at most), then their change-log notes go in before the store closes
         offui::wait_idle(2000);
         pages::audio::drain_pending_rules();
@@ -1488,6 +1528,31 @@ fn main() {
     // and run hidden; nothing opens
     if let Some(code) = bu_addons::helper::run_if_requested(&args) {
         std::process::exit(code);
+    }
+    // started with the admin prompt to set up Search's own Everything (Order 049): voidtools' file checked, our manual
+    // service, v1.0.0's Everything tidied up when asked; nothing opens
+    if let Some(code) = bu_search::real::ours::run_if_requested(&args) {
+        std::process::exit(code as i32);
+    }
+    // Order 049: keep the day Boyler Utilities was FIRST installed (Setup rewrites its own date each time) - the rule that
+    // tells v1.0.0's Everything from a user's own (A_049_02)
+    bu_search::real::ours::remember_first_day();
+    // Setup's "Everything for Search" task: set up our own Everything (one admin prompt; v1.0.0's is tidied up). No window.
+    // the uninstaller: our Everything (copy + service) goes with the app (one admin prompt when it is there). No window.
+    if args.iter().any(|a| a == bu_search::real::ours::REMOVE_ARG) {
+        std::process::exit(match bu_search::real::ours::uninstall() {
+            Ok(()) => 0,
+            Err(bu_search::SearchError::InstallCancelled) => 1602,
+            Err(_) => 1,
+        });
+    }
+    if args.iter().any(|a| a == bu_search::real::ours::SETUP_ARG) {
+        let tidy = bu_search::real::ours::v100_present();
+        std::process::exit(match bu_search::real::ours::install(tidy) {
+            Ok(()) => 0,
+            Err(bu_search::SearchError::InstallCancelled) => 1602,
+            Err(_) => 1,
+        });
     }
     // started with the admin prompt for ONE admin action (Order 039): only the fixed ops of admin/, checked; nothing opens
     if let Some(code) = admin::helper::run_if_requested(&args) {

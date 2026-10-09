@@ -388,10 +388,10 @@ fn not_installed_offers_the_install() {
     let s = svc(&os);
     assert_eq!(s.start_engine(), Err(SearchError::EverythingNotInstalled));
     os.state().install_result = Err(SearchError::InstallCancelled);
-    assert_eq!(s.install_engine(), Err(SearchError::InstallCancelled));
+    assert_eq!(s.install_engine(false), Err(SearchError::InstallCancelled));
     assert_eq!(s.engine(), EverythingStatus::NotInstalled, "cancelled = nothing changed");
     os.state().install_result = Ok(());
-    s.install_engine().unwrap();
+    s.install_engine(false).unwrap();
     s.start_engine().unwrap();
     assert_eq!(os.state().actions, vec!["install everything", "install everything", "start everything"]);
     assert_eq!(s.engine(), EverythingStatus::Running { version: 1 });

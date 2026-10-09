@@ -1,4 +1,5 @@
-//! Order 047 (the "Launch Steam" freeze: a big black box on screen until Steam opened): work that can wait on Windows - starting a program or opening a link through the
+//! Order 047 (the owner's test 3: "i clicked launch steam ... the entire bottom right of the screen gets a big black box, and
+//! then steam opens and it unfreezes"): work that can wait on Windows - starting a program or opening a link through the
 //! shell, an admin prompt, a COM / registry / WMI read, a device read - never runs on the menu's thread. The menu's
 //! thread paints; while it waits on anything the window stops painting and Windows shows it black.
 //!
@@ -49,7 +50,7 @@ pub fn spawn(label: &'static str, f: impl FnOnce() + Send + 'static) {
 }
 
 /// The app is quitting: wait (at most `max_ms`) for the calls still running - their change-log notes must be in before
-/// the store closes (Audio's close and the take-over note from their threads).
+/// the store closes (Opus review: Audio's close and the take-over note from their threads).
 pub fn wait_idle(max_ms: u64) {
     let t0 = std::time::Instant::now();
     while RUNNING.load(Ordering::Acquire) > 0 && t0.elapsed().as_millis() < max_ms as u128 {

@@ -393,6 +393,9 @@ struct PageLayer {
     stale: bool,
     /// the page has sticky boxes, placed for this scroll offset
     sticky_at: Option<f32>,
+    /// Order 055: the page's `Cx::window` boxes: (key, its top in page coordinates (NaN = not found), the part built: top,
+    /// bottom in its own coordinates; infinite = built whole) - built again when the view leaves that part
+    windows: Vec<(Key, f32, f32, f32)>,
 }
 
 pub struct Ui {
@@ -729,6 +732,12 @@ impl Ui {
         let sy = self.page_scroll(now);
         // sticky boxes follow the scroll: the page is built again when it moved
         if self.layers.get(&tab).and_then(|l| l.sticky_at).is_some_and(|at| (at - sy).abs() > 0.01) {
+            self.mark_stale(tab);
+            self.dirty = true;
+        }
+        // Order 055: a windowed list (`Cx::window`) is built again when the view leaves the part that was built, or once its
+        // place is known after a build that did not know it (that one built it whole)
+        if self.layers.get(&tab).is_some_and(|l| !l.stale && l.windows.iter().any(|&(_, top, lo, hi)| !top.is_nan() && (lo.is_infinite() || sy - top < lo || sy + PAGE_H - top > hi))) {
             self.mark_stale(tab);
             self.dirty = true;
         }
@@ -2257,6 +2266,11 @@ impl Ui {
             self.st.wake = None;
         }
         let page = self.pages[tab].id();
+        // Order 055: the view this tab is built for and where its windowed lists were (`Cx::window`)
+        let sy = self.scroll[tab].value(now) as f32;
+        self.st.view = (sy, sy + PAGE_H);
+        self.st.win_top = self.layers.get(&tab).map(|l| l.windows.iter().filter(|w| !w.1.is_nan()).map(|w| (w.0, w.1)).collect()).unwrap_or_default();
+        self.st.win_new.clear();
         let mut cx = Cx::new(now, self.rm, g, &mut self.st).for_page(page);
         if tab == self.tab {
             cx.st.watch.clear();
@@ -2299,7 +2313,8 @@ impl Ui {
             };
             damage::Damage::add(&mut self.page_damage, d);
         }
-        self.layers.insert(tab, PageLayer { laid, built_at: now, stale: false, sticky_at });
+        let windows = std::mem::take(&mut self.st.win_new).into_iter().map(|(k, lo, hi)| (k, laid.rect_of(k).map_or(f32::NAN, |r| r.1), lo, hi)).collect();
+        self.layers.insert(tab, PageLayer { laid, built_at: now, stale: false, sticky_at, windows });
         // the content got shorter in this build: the scroll goes back inside it now (and one more frame paints it there),
         // not only at the next input (REVIEW_014_item1_333f84f remark 2)
         if current {
@@ -2414,6 +2429,21 @@ impl Ui {
     /// Forget the top row's kept icon pictures (the frame's self-check paints everything from scratch).
     pub fn clear_dock_cache(&mut self) {
         self.dock_icons.clear();
+    }
+    /// Order 055: where the shown page's live pass painted last (window DIPs; None = it painted nothing or is unknown).
+    pub fn live_ink(&self, now: f64) -> Option<(f32, f32, f32, f32)> {
+        let pl = self.layers.get(&self.tab)?;
+        let (x, y, w, h) = pl.laid.live_ink.get()?;
+        let dy = self.page_dy.unwrap_or(PAGE_TOP - self.page_scroll(now));
+        Some((x, y + dy, w, h))
+    }
+    /// Order 055: the open / close motion runs (the whole window changes every frame).
+    pub fn opening_or_closing(&self, now: f64) -> bool {
+        self.close_t.is_some() || now - self.open_t < self.open_len()
+    }
+    /// Order 055: the caption buttons' hover / press motion runs.
+    pub fn caps_busy(&self, now: f64) -> bool {
+        self.cap_h.iter().chain(self.cap_p.iter()).any(|t| t.busy(now))
     }
     /// Does the shown page paint anything in the live pass (meters, a legacy page)?
     pub fn page_has_live(&self) -> bool {
@@ -3426,7 +3456,7 @@ mod tests {
         assert!(ui.animating(t + 48.0), "and keeps wanting them");
     }
 
-    /// Order 047 (~1.7 cores with the menu open): at rest - the open motion over, nothing hovered or
+    /// Order 047 (the owner's test 3, ~1.7 cores with the menu open): at rest - the open motion over, nothing hovered or
     /// moving, a page that does not tick - the menu asks for NO frames and has nothing to wake for.
     #[test]
     fn at_rest_the_menu_draws_nothing() {
@@ -3441,6 +3471,53 @@ mod tests {
         // (`dirty` is not asserted: other tests' threads may wake the app-wide services flag meanwhile)
         assert!(!ui.animating(t + 16.0), "no frames at rest");
         assert_eq!(ui.wake_at(t + 16.0), None, "nothing to wake for");
+    }
+
+    /// Order 055 TOP RULE (TECH_RULES.md): nothing changing = the page is NOT built again and no frame is asked for - the
+    /// pointer moving inside the same box or over empty page, time passing, no new data.
+    #[test]
+    fn nothing_changing_builds_nothing() {
+        let g = Gfx::new(1.0);
+        let ready = std::rc::Rc::new(std::cell::Cell::new(true));
+        let mut ui = Ui::with_pages(probes(&ready, false), true, true, 0.0);
+        let mut now = 10_000.0;
+        ui.update(now);
+        ui.ensure_layer(&g, 0, now);
+        // the pointer comes onto the probe's box once (that is a change: its hover), then everything settles
+        ui.mouse_move(60.0, PAGE_TOP + 2.0 + 30.0, now);
+        for _ in 0..100 {
+            now += 16.0;
+            ui.prepare_page(&g, now);
+            ui.dirty = false;
+        }
+        let built = ui.layers[&0].built_at;
+        for i in 0..300 {
+            now += 3.0;
+            // inside the same box, then over empty page below it
+            let (x, y) = if i < 150 { (60.0 + (i % 7) as f32, PAGE_TOP + 2.0 + 25.0 + (i % 5) as f32) } else { (300.0 + (i % 11) as f32, PAGE_TOP + 300.0 + (i % 13) as f32) };
+            if i == 150 {
+                // leaving the box is a change: built once, then nothing again
+                ui.mouse_move(x, y, now);
+                ui.prepare_page(&g, now);
+                ui.dirty = false;
+                for _ in 0..100 {
+                    now += 16.0;
+                    ui.prepare_page(&g, now);
+                    ui.dirty = false;
+                }
+                continue;
+            }
+            ui.mouse_move(x, y, now);
+            assert!(!ui.dirty, "a move that changes nothing under the pointer asks for no frame (move {i})");
+            assert!(!ui.static_busy(now), "nothing moves (move {i})");
+            if i < 150 {
+                ui.prepare_page(&g, now);
+                assert_eq!(ui.layers[&0].built_at, built, "the page was built again although nothing changed (move {i})");
+            }
+        }
+        let built = ui.layers[&0].built_at;
+        ui.prepare_page(&g, now + 500.0);
+        assert_eq!(ui.layers[&0].built_at, built, "time passing alone builds nothing");
     }
 
     /// Order 047: a toast at rest needs no frames - only its fade-out, at 1.8 s, wakes the menu (it rebuilds there).

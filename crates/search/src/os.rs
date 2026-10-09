@@ -91,8 +91,20 @@ pub trait SearchOs: Send + Sync {
     fn everything_start(&self) -> Result<()>;
     /// Quit OUR instance (the menu closed / the app quits); a copy the user runs is left alone. No-op when none is ours.
     fn everything_stop(&self);
-    /// Download the official installer, check its SHA-256, run it silently (Windows asks for admin once). Blocks.
-    fn everything_install(&self) -> Result<()>;
+    /// Order 049: set up OUR Everything (voidtools' official file, checked; our own manual service) - Windows asks for
+    /// admin once; `tidy` also removes the Everything v1.0.0 installed for all of Windows. Blocks.
+    fn everything_install(&self, tidy: bool) -> Result<()>;
+    /// "Update search": our running Everything makes its file list again. Blocks briefly.
+    fn everything_update(&self) -> Result<()>;
+    /// The drives Search can cover (NTFS fixed drives, letters A-Z) and the Windows drive.
+    fn drives(&self) -> (Vec<char>, char);
+    /// The drives our Everything covers from its next start (the page restarts it after a change).
+    fn set_drives(&self, letters: &[char]);
+    /// Is the Everything v1.0.0 installed for all of Windows still there (A_049_02's rule)?
+    fn old_everything(&self) -> bool;
+    /// The Everything that answers is OURS (true also when none answers yet: the tab starts ours); false = a copy the
+    /// user runs, which is used as it is.
+    fn everything_mine(&self) -> bool;
 
     fn windows_search_status(&self) -> WsStatus;
     fn windows_search_scope(&self) -> IndexScope;

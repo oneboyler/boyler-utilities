@@ -84,8 +84,33 @@ impl SearchService {
 
     /// The page's "Install Everything": the official installer, checked, run silently (one admin prompt). Blocks for the
     /// download + install: call it off the UI thread. Afterwards `start_engine` starts it.
-    pub fn install_engine(&self) -> Result<()> {
-        self.os.everything_install()
+    pub fn install_engine(&self, tidy: bool) -> Result<()> {
+        self.os.everything_install(tidy)
+    }
+
+    /// "Update search" (Order 049): our running Everything makes its file list again (the page shows it building).
+    pub fn update_engine(&self) -> Result<()> {
+        self.os.everything_update()
+    }
+
+    /// The drives Search can cover and the Windows drive (the default, Order 049 item 6).
+    pub fn drives(&self) -> (Vec<char>, char) {
+        self.os.drives()
+    }
+
+    /// The drives our Everything covers from its next start.
+    pub fn set_drives(&self, letters: &[char]) {
+        self.os.set_drives(letters)
+    }
+
+    /// The Everything v1.0.0 installed for all of Windows is still there (the tab offers to tidy it up).
+    pub fn old_everything(&self) -> bool {
+        self.os.old_everything()
+    }
+
+    /// The answering Everything is ours (the drive chips and "Update search" apply only then).
+    pub fn engine_mine(&self) -> bool {
+        self.os.everything_mine()
     }
 
     fn apps(&self) -> Result<Arc<Vec<AppEntry>>> {

@@ -10,6 +10,9 @@
 //! and a reset (↺) while its value differs from Steam's (the game's Steam layout; Steam's default for the controller's own
 //! file). Item 11: the stick's "Check stick drift".
 
+use std::cell::RefCell;
+use std::rc::Rc;
+
 use bu_controller::layout::Press;
 use bu_controller::prefs::NOISE_STEPS;
 use bu_controller::settings::{radius_to_pct, CURVES, DZ_SHAPES, DZ_SOURCES, FLICK_SNAPS, GYRO_AXES, GYRO_BUTTONS, HAPTICS, HAPTICS_GROUP};
@@ -18,13 +21,13 @@ use taffy::style::AlignItems;
 
 use super::look::{self, ActShow};
 use super::pic::Pid;
-use super::{fmt, from_raw, gyro_mode_v, show, stick_dz, sv, touch_mode_v, Back, Conv, Ctl, Drift, Fmt, Open, AW, DRIFT_MS, LW, PANEL_IN, W};
-use crate::gfx::Font;
+use super::{fmt, from_raw, gyro_mode_v, show, stick_dz, sv, touch_mode_v, Back, Conv, Ctl, Drift, Fmt, Lv, Open, AW, DRIFT_MS, LW, PANEL_IN, W};
+use crate::gfx::{Font, Rgba};
 use crate::ui::cx::Cx;
 use crate::ui::el::{idx, lh, sub, El, Key};
 use crate::ui::pieces::segx::{self, Label};
-use crate::ui::pieces::{button, dropdown, group, link, progress, toggle};
-use crate::ui::{FG2, FG3};
+use crate::ui::pieces::{button, dropdown, group, link, toggle};
+use crate::ui::{ACC, FG2, FG3, TRK};
 
 /// What the row builders need besides the page: the label column, the row's width, whose settings they are.
 #[derive(Clone, Copy)]
@@ -208,11 +211,25 @@ impl Open {
             Some(Drift::Run { at, .. }) => {
                 let left = (DRIFT_MS - (cx.now - at)).max(0.0);
                 let share = (1.0 - left / DRIFT_MS) as f32;
-                // the bar and the count move every frame while it runs (the live pass)
-                vec![
-                    progress::bar(cx, sub(go, "bar"), Some(share)).flex1().live(),
-                    El::text(format!("Hands off \u{b7} {} s", (left / 1000.0).ceil() as i64), f12.tnum(), FG2(), lh(12.0, 1.35)).none().live(),
-                ]
+                // Order 055: the text changes once a second (the page is built then); the bar is a live box that reads its
+                // share (`drift_share`, given 30 times a second by `drift_tick`) when it is painted - no build per step
+                self.drift_share.set(share);
+                let sh = self.drift_share.clone();
+                let bar = El::block()
+                    .h(6.0)
+                    .radius(3.0)
+                    .bg(TRK())
+                    .clip()
+                    .child(
+                        El::paint(move |g, (x, y, w, h)| {
+                            let p = sh.get().clamp(0.0, 1.0);
+                            g.fill_rr_shader(x, y, w * p, h, 3.0, &g.hgrad(x, 0.0, x + w * p, 0.0, &[(0.0, ACC()), (1.0, Rgba::hex(0x64c8ff))]), 1.0);
+                        })
+                        .abs(0.0, 0.0, 0.0, 0.0),
+                    )
+                    .flex1()
+                    .live();
+                vec![bar, El::text(format!("Hands off \u{b7} {} s", (left / 1000.0).ceil() as i64), f12.tnum(), FG2(), lh(12.0, 1.35)).none().live()]
             }
             Some(Drift::Done { max, dz, .. }) => {
                 let again = sub(go, "again");
@@ -346,11 +363,10 @@ impl Open {
         let sens = s(StickSetting::Sensitivity).map(|r| r as f64).unwrap_or(100.0);
         let anti = s(StickSetting::AntiDeadZone).map(radius_to_pct).unwrap_or(0.0);
         let shp = s(StickSetting::DeadZoneShape).unwrap_or(1);
-        let lp = if side == Side::Left { self.lv.ls } else { self.lv.rs };
         let live = !self.frozen && (self.fake || self.live.is_some());
         let wk = Self::k(&format!("{n}.well"));
         self.reg(wk, Ctl::Well { inner: ik, outer: ok, at: (inner, outer) });
-        let wells = wells(cx, wk, Wells { inner, outer, curve, shape, sens, anti, shp, lp }, live);
+        let wells = wells(cx, wk, Wells { inner, outer, curve, shape, sens, anti, shp }, self.lv.clone(), side, live);
         let dz = self.r_slider_in(cx, PANEL, &format!("{n}.dz"), "Dead zone", (0.0, 60.0, 1.0), 8.0, Conv::Radius, Fmt::Pct, W::Stick(side, StickSetting::DeadZone), s(StickSetting::DeadZone), false, (0.0, outer - 5.0));
         let full = self.r_slider_in(cx, PANEL, &format!("{n}.full"), "Full at", (40.0, 100.0, 1.0), 100.0, Conv::Radius, Fmt::Pct, W::Stick(side, StickSetting::FullAt), s(StickSetting::FullAt), false, (inner + 5.0, 100.0));
         let shape_of = |r: Option<i64>| DZ_SHAPES.iter().position(|(v, _)| *v == r.unwrap_or(1));
@@ -421,14 +437,13 @@ impl Open {
         let s = |x: TriggerSetting| sv(&t.settings, x);
         let at_k = Self::k(&format!("{n}.at"));
         let at = self.drag.filter(|d| d.0 == at_k).map(|d| d.1).unwrap_or_else(|| s(TriggerSetting::ClicksAt).map(radius_to_pct).unwrap_or(100.0));
-        let pull = if side == Side::Left { self.lv.l2 } else { self.lv.r2 };
         // Analog = 0, Click only = 1 (`W::TrigAnalog`)
         let analog_of = |r: Option<i64>| r.map(|r| r as usize);
         let mode = self.r_seg(cx, PANEL, &format!("{n}.mode"), "Mode", &["Analog", "Click only"], &[Some(0), Some(1)], Some(i64::from(!t.analog)), &analog_of, W::TrigAnalog(side), false);
         let at_row = self.r_slider(cx, PANEL, &format!("{n}.at"), "Clicks at", (5.0, 100.0, 1.0), 100.0, Conv::Radius, Fmt::FullPull, W::Trig(side, TriggerSetting::ClicksAt), s(TriggerSetting::ClicksAt), false);
         let live = !self.frozen && (self.fake || self.live.is_some());
         // Order 045: `h('div',{class:'pdtr','data-tip':'Where the pull counts as a click'})`
-        let bar = look::pdtr((at / 100.0) as f32, pull, live).key(Self::k(&format!("{n}.bar"))).tip("Where the pull counts as a click");
+        let bar = look::pdtr((at / 100.0) as f32, self.lv.clone(), side, live).key(Self::k(&format!("{n}.bar"))).tip("Where the pull counts as a click");
         let click = self.r_act(cx, &format!("{n}.click"), "Click does", &t.click, AW::Trig(side, false), steam.as_ref().map(|x| &x.click));
         let soft = self.r_act(cx, &format!("{n}.soft"), "Soft pull does", &t.soft_pull, AW::Trig(side, true), None);
         let pull_sec = look::psec_first("Pull", vec![mode, at_row, bar, click, soft]);
@@ -563,6 +578,7 @@ pub(super) fn prefs_rows(o: &mut Open, cx: &mut Cx) -> Vec<El> {
 }
 
 /// The two wells of a stick (`stickWells`): the dead zone circle (live dot = the stick) and the response curve.
+#[derive(Clone, Copy)]
 pub(super) struct Wells {
     pub inner: f64,
     pub outer: f64,
@@ -571,7 +587,6 @@ pub(super) struct Wells {
     pub sens: f64,
     pub anti: f64,
     pub shp: i64,
-    pub lp: (f32, f32),
 }
 
 /// `curveF(s)`: the output % for a push % (Steam's curve ids: Linear 0, Aggressive 1, Relaxed 2, Wide 3, Extra wide 4, Custom 5
@@ -597,24 +612,24 @@ fn curve_f(w: &Wells) -> impl Fn(f64) -> f64 + '_ {
 /// `.pwls{display:grid;grid-template-columns:1fr 1fr;gap:10px}` `.cpn .pwls{max-width:340px;margin:2px 0 8px}`
 /// `.pwl{aspect-ratio:136/118;border-radius:9px;background:var(--well);box-shadow:inset 0 0 0 .5px var(--hair);overflow:hidden}`
 /// `.pwcap{display:flex;flex-wrap:wrap;justify-content:space-between;column-gap:6px;margin-top:4px;font-size:10.5px;color:var(--fg3)}`
-pub(super) fn wells(cx: &mut Cx, key: Key, w: Wells, live: bool) -> El {
-    use crate::gfx::{sh, Font, Rgba};
+/// Order 055: the live stick (the dot, the readout under the wells, the dot on the curve) is read from `src` (the page's
+/// shared readings) when the wells are painted - a new reading repaints them, it builds nothing.
+pub(super) fn wells(cx: &mut Cx, key: Key, w: Wells, src: Rc<RefCell<Lv>>, side: Side, live: bool) -> El {
+    use crate::gfx::{sh, Align, Font, Rgba};
     use crate::ui::el::lh;
     use crate::ui::{ACC, DASH, FG2, FG3, HAIR, WELL};
     let col_w = (PANEL_IN - 10.0) / 2.0;
     let h = col_w * 118.0 / 136.0;
     let s = col_w / 136.0;
-    let mag = (w.lp.0 as f64).hypot(w.lp.1 as f64);
-    let inside = mag * 100.0 <= w.inner;
     let f = curve_f(&w);
-    let out_pct = f((mag * 100.0).min(100.0)).round();
     let pts: Vec<(f32, f32)> = (0..=100).map(|i| (i as f32, f(i as f64) as f32)).collect();
-    let (inner, outer, shp, lp) = (w.inner as f32, w.outer as f32, w.shp, w.lp);
-    let lx = (mag * 100.0).min(100.0) as f32;
-    let ly = f(lx as f64) as f32;
+    let (inner, outer, shp) = (w.inner as f32, w.outer as f32, w.shp);
+    let (src_dz, src_cv, src_cap) = (src.clone(), src.clone(), src);
     let well = |e: El| e.size(col_w, h).radius(9.0).bg(WELL()).inset(&[sh(0.0, 0.0, 0.0, 0.5, HAIR())]).clip();
     // the dead zone circle (W 136, H 118, centre 68 / 59, R 48)
     let mut dz = El::paint(move |g, (x, y, _, _)| {
+        let lp = src_dz.borrow().stick(side);
+        let inside = (lp.0 as f64).hypot(lp.1 as f64) * 100.0 <= w.inner;
         let t0 = g.transform();
         g.set_transform(&(windows_numerics::Matrix3x2 { M11: s, M12: 0.0, M21: 0.0, M22: s, M31: x, M32: y } * t0));
         let (cx0, cy0, rr) = (68.0f32, 59.0f32, 48.0f32);
@@ -679,10 +694,24 @@ pub(super) fn wells(cx: &mut Cx, key: Key, w: Wells, live: bool) -> El {
         .child(live_tag);
     let cap = |l: El, r: El| El::row().wrap().justify(taffy::style::JustifyContent::SPACE_BETWEEN).gap2(0.0, 6.0).margin(4.0, 0.0, 0.0, 0.0).child(l).child(r);
     let f105 = Font::new(10.5, 400);
-    let dz_cap = cap(
-        El::row().child(El::text("Your stick: ", f105, FG3(), lh(10.5, 1.35))).child(El::text(format!("{} %", (mag.min(1.0) * 100.0).round()), Font::new(10.5, 600).tnum(), FG2(), lh(10.5, 1.35))),
-        El::text(if inside { "in the dead zone".to_string() } else { format!("out \u{2192} {out_pct} %") }, f105, FG3(), lh(10.5, 1.35)),
-    );
+    // (Order 055: the readout is one live box - "Your stick: N %" at the left, "in the dead zone" / "out → N %" at the right
+    // (space-between), drawn with the same fonts as the two texts were; it can never wrap: both fit one 212 px column)
+    let cap_lh = lh(10.5, 1.35);
+    let mut cap_live = El::paint(move |g, (x, y, bw, _)| {
+        let lp = src_cap.borrow().stick(side);
+        let mag = (lp.0 as f64).hypot(lp.1 as f64);
+        let pre = "Your stick: ";
+        g.text(pre, f105, x, y, cap_lh, FG3(), Align::Left, 0.0);
+        g.text(&format!("{} %", (mag.min(1.0) * 100.0).round()), Font::new(10.5, 600).tnum(), x + g.text_width(pre, f105), y, cap_lh, FG2(), Align::Left, 0.0);
+        let right = if mag * 100.0 <= w.inner { "in the dead zone".to_string() } else { format!("out \u{2192} {} %", curve_f(&w)((mag * 100.0).min(100.0)).round()) };
+        g.text(&right, f105, x + bw, y, cap_lh, FG3(), Align::Right, 0.0);
+    })
+    .no_hit()
+    .size(col_w, cap_lh);
+    if live {
+        cap_live = cap_live.live();
+    }
+    let dz_cap = El::row().margin(4.0, 0.0, 0.0, 0.0).child(cap_live);
     // the response curve (GL 20, GR 6, GT 7, GB 15)
     // the curve's hover readout (`cvW` mousemove: hx = the pointer's push %; `.pwl.hov .hv{opacity:1}` `.pwrd` "x → y %"); the
     // well's left edge in page coordinates = the panel's content box + the first column + the grid gap
@@ -694,6 +723,9 @@ pub(super) fn wells(cx: &mut Cx, key: Key, w: Wells, live: bool) -> El {
     });
     let hy = hx.map(|v| f(v as f64) as f32);
     let mut cv = El::paint(move |g, (x, y, _, _)| {
+        let lp = src_cv.borrow().stick(side);
+        let lx = (((lp.0 as f64).hypot(lp.1 as f64)) * 100.0).min(100.0) as f32;
+        let ly = curve_f(&w)(lx as f64) as f32;
         let t0 = g.transform();
         g.set_transform(&(windows_numerics::Matrix3x2 { M11: s, M12: 0.0, M21: 0.0, M22: s, M31: x, M32: y } * t0));
         let (gl, gr, gt, gb, ww, hh) = (20.0f32, 6.0f32, 7.0f32, 15.0f32, 136.0f32, 118.0f32);

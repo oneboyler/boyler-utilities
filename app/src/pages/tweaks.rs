@@ -1179,9 +1179,10 @@ impl Page for Tweaks {
         }
         // Quick fixes: only a real change of a row draws (a run's progress moved, a run ended, the restore point line came)
         if let Some(q) = &mut self.qf {
-            let before = q.picture();
+            // (Order 055: a version number, not the rows' texts built twice per tick)
+            let before = q.version();
             let mut toasts = q.poll();
-            changed |= !toasts.is_empty() || q.picture() != before;
+            changed |= !toasts.is_empty() || q.version() != before;
             if let Some(t) = toasts.pop() {
                 self.toast = Some((t, now));
             }

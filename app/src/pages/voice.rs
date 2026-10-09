@@ -92,6 +92,8 @@ pub struct Voice {
     just_closed: bool,
     /// the mic's smoothed voice level (the drawing's V.lv) and when it was pressed on (its little bounce)
     lv: f32,
+    /// Order 055: when the level last stepped (steps are 33 ms apart at most); None = it rests
+    lv_at: Option<f64>,
     mic_at: Option<f64>,
     copied_at: Option<f64>,
     /// the last thing said (shown by the frame's toast: `fresh` = not handed to it yet)
@@ -127,6 +129,18 @@ pub struct Voice {
 struct WinRead {
     langs: Vec<Language>,
     blocked: Option<VoiceError>,
+}
+
+/// Order 055: the level (and what animates with a listening page: the red dot, the caret) steps at 30 Hz at most.
+const STEP_MS: f64 = 33.0;
+
+/// Order 055: what the words box shows of a dictation (state + words), to tell a text change from a level message.
+fn dict_sig(d: &Dictation) -> (State, u64) {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    d.firm().hash(&mut h);
+    d.guess().hash(&mut h);
+    (d.state(), h.finish())
 }
 
 /// The key of the last read in the app's store (`env.keep`).
@@ -278,7 +292,11 @@ impl Page for Voice {
             read_in = true;
         }
         let Some(d) = self.dict.as_mut() else { return read_in };
-        let mut changed = d.poll() || read_in;
+        // Order 055: only a change of the state or the words repaints at once - the engine's level messages (every 50 ms)
+        // are data: the level is taken at the step below
+        let before = dict_sig(d);
+        d.poll();
+        let mut changed = read_in || dict_sig(d) != before;
         if let Some(e) = d.take_error() {
             let t = match e {
                 e if e.blocks() => {
@@ -293,15 +311,39 @@ impl Page for Voice {
             self.fresh = true;
             changed = true;
         }
-        // vFrame: lv += (t - lv) * (t > lv ? .45 : .14), t = env * (.9 + .1 sin(now / 41)) while listening
-        let on = d.state() == State::Listening;
+        // vFrame: lv += (t - lv) * (t > lv ? .45 : .14), t = env * (.9 + .1 sin(now / 41)) while listening.
+        // Order 055: a step every 33 ms at most (30 Hz, whatever the screen's rate); the drawing's per-frame factors are
+        // those of a 60 Hz frame, so a step of `dt` ms uses 1 - (1 - k)^(dt / 16.7): the same look at any rate
+        let st = d.state();
+        let on = st == State::Listening;
+        if !(on || st == State::Finishing || self.lv > 0.0) {
+            self.lv_at = None;
+            return changed;
+        }
+        if self.lv_at.is_some_and(|a| now - a < STEP_MS - 1.0) {
+            return changed;
+        }
+        let dt = self.lv_at.map_or(STEP_MS, |a| (now - a).clamp(1.0, 100.0));
+        self.lv_at = Some(now);
         let t = if on { d.level() * (0.9 + 0.1 * (now / 41.0).sin() as f32) } else { 0.0 };
-        let k = if t > self.lv { 0.45 } else { 0.14 };
+        let k0 = if t > self.lv { 0.45f32 } else { 0.14 };
+        let k = 1.0 - (1.0 - k0).powf((dt / (1000.0 / 60.0)) as f32);
         self.lv += (t - self.lv) * k;
         if !on && self.lv < 0.004 {
             self.lv = 0.0;
         }
-        changed || on || self.lv > 0.0 || d.state() == State::Finishing
+        true
+    }
+
+    /// Order 055: while the dictation listens (or the level is still falling) the next level step is 33 ms after the last -
+    /// its own wake-up, with or without input; at rest nothing.
+    fn wake_at(&self, now: f64) -> Option<f64> {
+        let st = self.dict.as_ref()?.state();
+        if matches!(st, State::Listening | State::Finishing) || self.lv > 0.0 {
+            Some(self.lv_at.map_or(now + 1.0, |a| a + STEP_MS).max(now + 1.0))
+        } else {
+            None
+        }
     }
 
     fn build(&mut self, cx: &mut Cx) -> Vec<El> {
@@ -312,9 +354,7 @@ impl Page for Voice {
             None => (String::new(), String::new(), 0),
         };
         let has_text = words > 0;
-        if matches!(st, State::Listening | State::Finishing) || self.lv > 0.0 {
-            cx.st.busy = true;
-        }
+        // (Order 055: no `busy` while it listens - the level, the red dot and the caret step at 30 Hz from `tick` / `wake_at`)
         // Order 047: the fixing caret only blinks (530 ms on / off): built again at each flip, no frames between
         if self.caret.is_some() {
             cx.wake_every(530.0, self.caret_at);
@@ -1126,6 +1166,24 @@ mod tests {
         v2.slow_read_ms = 300;
         crate::offui::assert_quick("Voice open again", || v2.open(&env, 3.0));
         assert!(v2.ready() && v2.describe().contains("lang=en-US langs=en-US"), "the last read at once: {}", v2.describe());
+    }
+
+
+    /// Order 055: while it listens, the page wakes itself for the next level step (33 ms after the last) - no input, no
+    /// per-frame rebuild - and a step closer than that does nothing.
+    #[test]
+    fn listening_steps_the_level_at_30_hz_on_its_own_wake_up() {
+        let (mut v, g) = page();
+        ev(&mut v, &g, Ev::Click(K_MIC), 1.0);
+        assert_eq!(v.state(), State::Listening);
+        v.tick(100.0);
+        let w = v.wake_at(100.0).expect("listening asks for its next step");
+        assert!(w > 100.0 && w <= 133.0, "wake {w}");
+        assert_eq!(v.lv_at, Some(100.0));
+        v.tick(110.0);
+        assert_eq!(v.lv_at, Some(100.0), "no second step 10 ms later");
+        v.tick(140.0);
+        assert_eq!(v.lv_at, Some(140.0));
     }
 
     /// Order 047: at rest the page asks for no frames; a stopped dictation's fixing caret wakes the menu only at its

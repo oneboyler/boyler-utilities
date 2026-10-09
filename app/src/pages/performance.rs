@@ -37,6 +37,7 @@ const K_LIVE: Key = key("pc.live");
 const K_SEARCH: Key = key("pc.search");
 const K_SORT: Key = key("pc.sort");
 const K_ROW: Key = key("pc.row");
+const K_LIST: Key = key("pc.list");
 const K_END: Key = key("pc.end");
 const K_ASK: Key = key("pc.ask");
 const K_MENU: Key = key("pc.menu");
@@ -133,6 +134,9 @@ enum Pop {
     Menu(String, f32, f32, bool),
 }
 
+/// How long an ended row is remembered (its fold-away is 220 ms; the rest is for a worker snapshot that still lists it).
+const ENDING_MS: f64 = 1500.0;
+
 #[derive(Default)]
 pub struct Performance {
     /// the app's store: the last snapshot is kept there when the tab closes (shown at once next time, "Your PC" not read again)
@@ -163,6 +167,9 @@ pub struct Performance {
     pressed: (f32, f32, f32, f32),
     /// rows being ended (key, since): they fold away (height 36 -> 0, 220 ms)
     ending: Vec<(String, f64)>,
+    /// Order 055: a new snapshot came since `ending` was last pruned (the prune looks up every ended row among the rows: done
+    /// once per snapshot, not every tick)
+    snap_new: bool,
     /// what Copy all / the menu did in a test copy (nothing is opened or copied there)
     pub log: Vec<String>,
 }
@@ -184,6 +191,7 @@ impl Performance {
     /// A new snapshot: Live order on = the shown order follows the sort; off = ended rows drop out, new ones go at the end
     /// (in sort order), nothing else moves.
     fn on_snap(&mut self) {
+        self.snap_new = true;
         if self.live {
             return self.resort();
         }
@@ -567,9 +575,33 @@ impl Performance {
                 .child(El::icon("cd", 8.0, 1.4, col).h(5.0).opacity(op).rotate(180.0 * up));
             head = head.child(b);
         }
-        let mut list = El::block();
-        let mut first = true;
+        // Order 055: only the rows in view (+ one view above and below) are built - ~40 of ~250 - the others are one empty box
+        // of their height each side (a hover fade built every row again each frame: the whole list at 360 Hz)
+        let (lo, hi) = cx.window(K_LIST, crate::ui::PAGE_H).unwrap_or((f32::NEG_INFINITY, f32::INFINITY));
+        let mut list = El::block().key(K_LIST);
+        let (mut y, mut gap) = (0.0f32, 0.0f32);
         for (n, r) in rows.iter().enumerate() {
+            // ending: the row folds away (height 36 -> 0, opacity 1 -> 0, 220 ms ease-out)
+            let fold = self.ending.iter().find(|(key, _)| *key == r.key).map(|(_, at)| {
+                let k2 = ((cx.now - at) / 220.0).clamp(0.0, 1.0);
+                // (real motion, only while it folds - also out of view: the rows under it move; Order 047: never clears what
+                // another part asked for)
+                if k2 < 1.0 {
+                    cx.st.busy = true;
+                }
+                EASE_OUT.ease(k2) as f32
+            });
+            let rh = 36.0 * (1.0 - fold.unwrap_or(0.0));
+            let (top, bottom) = (y, y + rh);
+            y = bottom;
+            if bottom < lo || top > hi {
+                gap += rh;
+                continue;
+            }
+            if gap > 0.0 {
+                list = list.child(El::block().h(gap).no_hit());
+                gap = 0.0;
+            }
             let k = idx(K_ROW, n);
             let hover = cx.hovered(k) || matches!(&self.pop, Some(Pop::Menu(key, ..)) if *key == r.key);
             let prot = r.windows_own || r.protected;
@@ -615,10 +647,9 @@ impl Performance {
                 .child(cell(processes::format_pct(r.cpu_pct), bc))
                 .child(cell(processes::format_ram(r.ram_bytes), br))
                 .child(cell(processes::format_pct(r.gpu_pct), bg));
-            if !first {
+            if n > 0 {
                 row = row.child(El::block().abs(10.0, 0.0, 0.0, f32::NAN).h(1.0).bg(HAIR()).no_hit());
             }
-            first = false;
             if !prot {
                 // `#sw .pend{height:22px;padding:0 11px;border-radius:6px;(drawing: position:absolute;right:8px - now the row's 5th
                 // grid column, its right edge 8 px in, so no number is under it)
@@ -647,17 +678,13 @@ impl Performance {
                 end = if op > 0.01 { end.on_click(ek).cursor(Cursor::Hand).title(if ask { "End task · asks first" } else { "End task" }) } else { end.no_hit() };
                 row = row.child(end);
             }
-            // ending: the row folds away (height 36 -> 0, opacity 1 -> 0, 220 ms ease-out)
-            if let Some((_, at)) = self.ending.iter().find(|(key, _)| *key == r.key) {
-                let k2 = ((cx.now - at) / 220.0).clamp(0.0, 1.0);
-                let v = EASE_OUT.ease(k2) as f32;
-                // (real motion, only while it folds; Order 047: never clears what another part asked for)
-                if k2 < 1.0 {
-                    cx.st.busy = true;
-                }
-                row = row.h(36.0 * (1.0 - v)).opacity(1.0 - v).clip();
+            if let Some(v) = fold {
+                row = row.h(rh).opacity(1.0 - v).clip();
             }
             list = list.child(row);
+        }
+        if gap > 0.0 {
+            list = list.child(El::block().h(gap).no_hit());
         }
         if rows.is_empty() && !self.query.trim().is_empty() {
             // `.pnone{padding:22px 0;text-align:center;font-size:12.5px;color:var(--fg2)}`
@@ -760,7 +787,15 @@ impl Page for Performance {
             self.copy_done(ok, now);
             changed = true;
         }
-        self.ending.retain(|(k, at)| now - at < 1500.0 && self.snap.rows.iter().any(|r| r.key == *k));
+        // Order 055: only when a new snapshot came (its rows may no longer hold the ended row) or the 1.5 s of one ran out
+        // (`wake_at`) - not every tick
+        if !self.ending.is_empty() && (self.snap_new || self.ending.iter().any(|(_, at)| now - at >= ENDING_MS)) {
+            let n = self.ending.len();
+            self.ending.retain(|(k, at)| now - at < ENDING_MS && self.snap.rows.iter().any(|r| r.key == *k));
+            // (an ended row that is still listed when its time runs out shows again: one build)
+            changed |= self.ending.len() != n;
+        }
+        self.snap_new = false;
         // Order 047: a toast at rest needs no frames (the toast piece wakes the menu when it fades); it goes at its end
         if self.toast.as_ref().is_some_and(|(_, t)| now - t >= toast::SHOW_MS + 300.0) {
             self.toast = None;
@@ -768,9 +803,14 @@ impl Page for Performance {
         }
         changed
     }
-    /// Order 047: the toast's end (it is dropped then); nothing else here is timed.
+    /// Order 047: the toast's end (it is dropped then); Order 055: and the 1.5 s an ended row is remembered for.
     fn wake_at(&self, now: f64) -> Option<f64> {
-        self.toast.as_ref().map(|(_, t)| (t + toast::SHOW_MS + 300.0).max(now + 1.0))
+        let toast = self.toast.as_ref().map(|(_, t)| (t + toast::SHOW_MS + 300.0).max(now + 1.0));
+        let ending = self.ending.iter().map(|(_, at)| (at + ENDING_MS).max(now + 1.0)).reduce(f64::min);
+        match (toast, ending) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
     }
     fn build(&mut self, cx: &mut Cx) -> Vec<El> {
         vec![pieces::header(self.name(), Some(badge::live_note("Live only while this page is open"))), self.tiles(), self.your_pc(cx), self.processes(cx)]

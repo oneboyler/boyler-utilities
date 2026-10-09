@@ -30,9 +30,16 @@ fn text_box(l: &Laid, s: &str) -> Option<(f32, f32, f32, f32)> {
     l.nodes.iter().find(|n| matches!(&n.el.content, Content::Text(t) if t.s == s)).map(|n| (n.rect.0, n.rect.1 + 56.0, n.rect.2, n.rect.3))
 }
 
+/// The page's own clock in a test: the moment it next looks at the worker (Order 055: the worker is looked at once per
+/// step - 33 ms with sound, 100 ms in silence - so a test that ticked at one fixed time would look once).
+fn step(a: &mut Audio) -> bool {
+    let now = a.st.as_ref().map_or(1000.0, |s| s.next_poll);
+    a.tick(now)
+}
+
 fn wait(a: &mut Audio, ms: u64) {
     std::thread::sleep(std::time::Duration::from_millis(ms));
-    a.tick(1000.0);
+    step(a);
 }
 
 fn click(a: &mut Audio, k: Key, g: &Gfx, st: &mut State) {
@@ -186,7 +193,7 @@ fn rec(item: &str) -> Option<crate::undo::Record> {
 /// The worker's entries are written on the page's next tick.
 fn wait_rec(a: &mut Audio, item: &str, now_raw: &str) -> crate::undo::Record {
     for _ in 0..300 {
-        a.tick(1000.0);
+        step(a);
         if let Some(r) = rec(item).filter(|r| r.now.raw == now_raw) {
             return r;
         }
@@ -775,4 +782,46 @@ fn a_default_output_pick_never_holds_the_menu() {
         wait(&mut a, 20);
     }
     assert_eq!(fake_default(&a, Flow::Output), "spk", "the worker switched it");
+}
+
+/// Order 055: the meters are DATA - a frozen picture (nothing moves) asks for no frame, and a tick that comes before the
+/// next look at the worker does nothing at all.
+#[test]
+fn a_tick_with_nothing_new_asks_for_no_frame_and_no_wake() {
+    let mut a = page();
+    let t0 = a.st.as_ref().unwrap().next_poll;
+    assert!(!a.tick(t0), "the first look finds nothing new in a frozen picture");
+    let np = a.st.as_ref().unwrap().next_poll;
+    assert!(np >= t0 + SILENT_MS, "no meter moves: the next look is at the silent rate ({np} after {t0})");
+    // (the frames of a hover / a scroll pass here many times between two looks)
+    assert!(!a.tick(t0 + 1.0) && !a.tick(np - 5.0));
+    assert_eq!(a.st.as_ref().unwrap().next_poll, np, "no look was made");
+    assert_eq!(a.wake_at(t0), None, "a frozen picture never wakes the menu");
+    assert!(!step(&mut a));
+}
+
+/// Order 055: with sound a meter steps every 33 ms - the ticks between two steps are no frame, and `wake_at` names the next
+/// step; a step that only moves the meters is a live-pass repaint (no build).
+#[test]
+fn meters_step_every_33_ms_and_the_ticks_between_ask_for_no_frame() {
+    mute::reset_for_test();
+    svc::set_rules(svc::Rules::default());
+    let g = Gfx::new(1.0);
+    let mut st = State::default();
+    let mut a = Audio::new();
+    a.open(&Env { test: true, real_read: false, frozen: false, rm: false, ..Env::default() }, 0.0);
+    lay(&mut a, &g, &mut st, 0.0);
+    // the fake's music starts: the rows leave "quiet" (their fade is a build), the meters rise
+    assert!(a.tick(40.0), "a moving meter wants a frame");
+    assert_eq!(a.wake_at(41.0), Some(40.0 + STEP_MS));
+    let last = a.st.as_ref().unwrap().last;
+    // inside the step: no frame, no new level, the same wake
+    assert!(!a.tick(50.0) && !a.tick(70.0));
+    assert_eq!(a.st.as_ref().unwrap().last, last, "the levels did not step");
+    assert_eq!(a.wake_at(50.0), Some(40.0 + STEP_MS));
+    // the next step: only the meters moved
+    assert!(a.tick(40.0 + STEP_MS));
+    assert!(a.live_only(), "the live pass repaints the meters; nothing is built");
+    assert_eq!(a.st.as_ref().unwrap().last, 40.0 + STEP_MS);
+    assert_eq!(a.wake_at(80.0), Some(40.0 + 2.0 * STEP_MS));
 }

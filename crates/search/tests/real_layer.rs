@@ -75,7 +75,7 @@ fn without_everything_the_service_says_so_and_keeps_the_apps() {
     }
     // the read-only layer never starts, stops or installs anything
     assert!(matches!(os.everything_start(), Err(SearchError::Refused(_))));
-    assert!(matches!(os.everything_install(), Err(SearchError::Refused(_))));
+    assert!(matches!(os.everything_install(false), Err(SearchError::Refused(_))));
     let svc = SearchService::new(os);
     let r = svc.search(&Query::new("notepad", Filter::All), &Cancel::new()).unwrap();
     assert_eq!(r.files_from, FilesFrom::Nothing);
@@ -133,8 +133,6 @@ fn our_index_is_kept_only_when_marked_whole() {
     // ... and if it does not (stopped while building, or ended mid-save), the next start builds
     assert!(host::prepare_index(&dir));
     assert!(!db.exists());
-    // the settings point a named instance at the Everything service's pipe
-    assert!(host::INI.contains("service_pipe_name=\\\\.\\PIPE\\Everything Service\r\n"), "{}", host::INI);
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
@@ -142,15 +140,54 @@ fn our_index_is_kept_only_when_marked_whole() {
 /// and leaves out the big folders, in Everything.ini's list form.
 #[test]
 fn our_everything_settings_are_lean() {
-    use bu_search::real::host;
-    let ini = host::ini(r"D:\Win\");
+    use bu_search::real::{host, ours};
+    let drives = [ours::Drive { letter: 'C', guid: r"\\?\Volume{c}".into() }, ours::Drive { letter: 'E', guid: r"\\?\Volume{e}".into() }];
+    let ini = host::ini(r"D:\Win\", ours::PIPE, &drives);
     for line in ["index_size=1", "index_date_modified=1", "fast_size_sort=0", "fast_date_modified_sort=0", "fast_path_sort=0", "fast_extension_sort=0", "index_recent_changes=0", "run_on_system_startup=0"] {
         assert!(ini.contains(&format!("{line}\r\n")), "{line} in {ini}");
     }
     let want = concat!(r#"exclude_folders="D:\\Win\\WinSxS","*:\\$Recycle.Bin","*\\node_modules","*\\target\\debug","*\\target\\release""#, "\r\n");
     assert!(ini.ends_with(want), "{ini}");
-    // the install passes our transform (it leaves out Everything's all-users start at sign-in)
-    let p = host::msi_params(std::path::Path::new(r"C:\t\e.msi"), std::path::Path::new(r"C:\t\n.mst"));
-    assert_eq!(p, r#"/i "C:\t\e.msi" TRANSFORMS="C:\t\n.mst" /qn /norestart"#);
-    assert!(host::NO_STARTUP_MST.len() > 1000 && host::NO_STARTUP_MST.starts_with(&[0xD0, 0xCF, 0x11, 0xE0]), "an MSI transform (OLE file)");
+    // Order 049: OUR service's pipe; only the picked drives (no drive is taken by itself)
+    assert!(ini.contains("service_pipe_name=\\\\.\\PIPE\\BoylerUtilities Search\r\n"), "{ini}");
+    for line in ["auto_include_fixed_volumes=0", r#"ntfs_volume_guids="\\\\?\\Volume{c}","\\\\?\\Volume{e}""#, r#"ntfs_volume_paths="C:","E:""#, "ntfs_volume_includes=1,1"] {
+        assert!(ini.contains(&format!("{line}\r\n")), "{line} in {ini}");
+    }
+}
+
+/// Order 049 (A_049_02, option 1): the Everything MSI is v1.0.0's only when installed on/after v1.0.0's day AND on the
+/// day Boyler Utilities was first installed.
+#[test]
+fn v100_everything_rule() {
+    use bu_search::real::ours::v100_rule;
+    assert!(v100_rule(Some("20261008"), Some("20261008")));
+    assert!(v100_rule(Some("20261012"), Some("20261012")));
+    assert!(!v100_rule(Some("20261008"), Some("20261009")), "another day: the user's own");
+    assert!(!v100_rule(Some("20260101"), Some("20260101")), "before v1.0.0");
+    assert!(!v100_rule(None, Some("20261008")), "not installed");
+    assert!(!v100_rule(Some("20261008"), None));
+    assert!(!v100_rule(Some("2026108"), Some("2026108")), "not a date");
+}
+
+/// The service gets OUR copy, its own pipe; signed-in users may start / stop it (and nothing more).
+#[test]
+fn our_service_command_and_access() {
+    use bu_search::real::ours;
+    assert_eq!(ours::service_command(std::path::Path::new(r"C:\Program Files\Boyler Utilities\Everything\Everything.exe")), r#""C:\Program Files\Boyler Utilities\Everything\Everything.exe" -svc -svc-pipe-name "\\.\PIPE\BoylerUtilities Search""#);
+    assert!(ours::SDDL.contains("(A;;CCLCSWRPWPLOCRRC;;;IU)"));
+    assert_eq!(ours::run_if_requested(&["x".into(), ours::HELPER_ARG.into(), "install".into()]), Some(ours::code::BAD_ARGS));
+    assert_eq!(ours::run_if_requested(&["x".into(), ours::HELPER_ARG.into(), "erase".into(), "C:\\".into(), "keep".into()]), Some(ours::code::BAD_ARGS));
+    assert_eq!(ours::run_if_requested(&["x".into()]), None);
+}
+
+/// Order 049 proof (by hand, a PC with voidtools' own Everything service running: `cargo test -p bu-search --test
+/// real_layer pipe_owner -- --ignored --nocapture`): the pipe-owner check names the service's own process. Read only - it
+/// connects to the pipe for a moment and lets go.
+#[test]
+#[ignore]
+fn pipe_owner_is_the_services_process() {
+    let pid = bu_search::real::ours::pipe_server_pid(r"\\.\PIPE\Everything Service");
+    println!("the Everything Service pipe is served by process {pid:?}");
+    assert!(pid.is_some());
+    assert_eq!(bu_search::real::ours::pipe_server_pid(r"\\.\PIPE\BoylerUtilities no such pipe"), None);
 }

@@ -92,6 +92,15 @@ pub(crate) struct NetBg {
     toasts: Vec<String>,
     /// the Network tab is shown: only then do the threads wake the menu (a closed tab / menu costs no repaints)
     open: bool,
+    /// Order 055: counts every change of what the page copies (speed, pings, pills, the speed test's thread) - `sync` compares
+    /// it first and clones only when it moved. Whoever changes those fields calls [`NetBg::touch`].
+    generation: u64,
+}
+
+impl NetBg {
+    fn touch(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+    }
 }
 
 type Bg = Arc<Mutex<NetBg>>;
@@ -205,6 +214,8 @@ pub struct Network {
     wf_auto: bool,
     /// the kept speed test + game pings (`NetBg`); the fields below are the page's copy of it, taken each tick
     bg: Bg,
+    /// the `NetBg` generation the copy below was taken at (None = not taken yet)
+    seen_gen: Option<u64>,
     speed: Speed,
     speed_running: bool,
     games: Vec<Game>,
@@ -538,14 +549,24 @@ impl Network {
     fn sync(&mut self) -> bool {
         let (finished, toasts) = {
             let Ok(mut b) = self.bg.lock() else { return false };
-            self.speed = b.speed.clone();
-            self.speed_running = b.speed_test.is_some();
-            self.game = b.game.min(self.games.len().saturating_sub(1));
-            self.gs_running = b.gs.is_some();
-            self.gs_rounds = b.gs_rounds;
-            self.pinged_at = b.pinged_at;
-            self.pills = b.pills.clone();
-            let f = if b.speed_test.as_ref().is_some_and(|t| t.is_finished()) { b.speed_test.take() } else { None };
+            // Order 055: the copy is taken (speed, pills cloned) only when the kept state changed since the last one
+            if self.seen_gen != Some(b.generation) {
+                self.seen_gen = Some(b.generation);
+                self.speed = b.speed.clone();
+                self.speed_running = b.speed_test.is_some();
+                self.game = b.game.min(self.games.len().saturating_sub(1));
+                self.gs_running = b.gs.is_some();
+                self.gs_rounds = b.gs_rounds;
+                self.pinged_at = b.pinged_at;
+                self.pills = b.pills.clone();
+            }
+            // (a finished thread does not touch the state: looked at every tick, it costs nothing)
+            let f = if b.speed_test.as_ref().is_some_and(|t| t.is_finished()) {
+                b.touch();
+                b.speed_test.take()
+            } else {
+                None
+            };
             (f, std::mem::take(&mut b.toasts))
         };
         let any = finished.is_some() || !toasts.is_empty();
@@ -556,6 +577,7 @@ impl Network {
             // joined outside the lock: the thread is done, this returns at once
             let r = t.join();
             if let Ok(mut b) = self.bg.lock() {
+                b.touch();
                 b.speed.run = false;
                 match r {
                     Ok(_) | Err(NetError::Cancelled) => {}
@@ -574,6 +596,7 @@ impl Network {
     /// The test copy's preset states (`BU_TEST_STATE`) go into the kept state too (the page shows what is kept).
     fn push_test_states(&mut self) {
         if let Ok(mut b) = self.bg.lock() {
+            b.touch();
             b.speed = self.speed.clone();
             b.pills = self.pills.clone();
             b.gs_rounds = self.gs_rounds;
@@ -616,6 +639,7 @@ impl Network {
             if b.speed_test.is_some() {
                 return;
             }
+            b.touch();
             b.speed = Speed { run: true, foot: Some("Testing".into()), ..Speed::default() };
             b.toasts.clear();
         }
@@ -625,6 +649,7 @@ impl Network {
             let mut wake = false;
             if let Ok(mut b) = bg.lock() {
                 wake = b.open;
+                b.touch();
                 let done = if let SpeedEvent::Done(r) = &e { Some(view::speed_toast(r)) } else { None };
                 speed_event(&mut b.speed, e);
                 if let Some(t) = done {
@@ -642,6 +667,7 @@ impl Network {
             }
         });
         if let Ok(mut b) = self.bg.lock() {
+            b.touch();
             b.speed_test = Some(test);
         }
         self.sync();
@@ -660,6 +686,7 @@ impl Network {
         if b.gs.is_some() {
             return;
         }
+        b.touch();
         b.gs_run += 1;
         b.gs_rounds = 0;
         b.pills.clear();
@@ -675,6 +702,7 @@ impl Network {
                 // one repaint a round (not one per region), and only while the tab is shown
                 wake = b.open && matches!(e, GameServerEvent::RoundDone);
                 if b.gs_run == run {
+                    b.touch();
                     match e {
                         GameServerEvent::RoundStarted => {}
                         GameServerEvent::Result(r) => {
@@ -699,6 +727,7 @@ impl Network {
 
     fn gs_stop(&mut self) {
         let g = self.bg.lock().ok().and_then(|mut b| {
+            b.touch();
             b.gs_run += 1;
             b.gs.take()
         });
@@ -723,6 +752,7 @@ impl Drop for PingGuard {
         let Some(bg) = self.bg.take() else { return };
         let g = bg.lock().ok().and_then(|mut b| {
             b.open = false;
+            b.touch();
             b.gs_run += 1;
             b.gs.take()
         });
@@ -773,6 +803,7 @@ impl Page for Network {
         if let Ok(mut b) = self.bg.lock() {
             b.toasts.clear();
             b.open = true;
+            b.touch();
         }
         if self.guard.bg.is_none() {
             self.guard.bg = Some(self.bg.clone());
@@ -971,6 +1002,7 @@ impl Network {
             if i != self.game {
                 self.gs_stop();
                 if let Ok(mut b) = self.bg.lock() {
+                    b.touch();
                     b.game = i;
                     b.pills.clear();
                     b.gs_rounds = 0;

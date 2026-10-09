@@ -16,7 +16,9 @@ mod panel;
 mod pic;
 mod work;
 
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
+use std::rc::Rc;
 
 use bu_controller::binding::{key_label, key_token, KEYS};
 use bu_controller::layout::{ActionSet, Layout, Press};
@@ -178,6 +180,9 @@ enum Drift {
 
 /// How long the stick is watched.
 const DRIFT_MS: f64 = 5000.0;
+/// Order 055 (the owner + boss, Oct 9: only MOTION runs at the monitor's rate, DATA at its own slow rate): the live view's
+/// readings reach the picture / the stick's wells / the drift bar at most this often (30 Hz), whatever the pad's report rate.
+const LV_MS: f64 = 33.0;
 /// The margin over the measured drift (whole %).
 const DRIFT_MARGIN: f64 = 2.0;
 
@@ -207,6 +212,50 @@ struct Lv {
     l2: f32,
     r2: f32,
     dn: Vec<Pid>,
+}
+
+impl Lv {
+    /// The stick of a side (-1..1).
+    fn stick(&self, side: Side) -> (f32, f32) {
+        if side == Side::Left {
+            self.ls
+        } else {
+            self.rs
+        }
+    }
+
+    /// How one part of the picture looks live: (pressed, trigger pull, stick cap offset in picture px). `frozen` = the
+    /// drawing without motion: the caps stay centred.
+    fn look_of(&self, id: Pid, frozen: bool) -> (bool, f32, (f32, f32)) {
+        let side_cap = match id {
+            Pid::Stick(Side::Left) => self.ls,
+            Pid::Stick(Side::Right) => self.rs,
+            _ => (0.0, 0.0),
+        };
+        let pull = match id {
+            Pid::Trig(Side::Left) => self.l2,
+            Pid::Trig(Side::Right) => self.r2,
+            _ => 0.0,
+        };
+        let dn = match id {
+            Pid::Trig(_) => pull > 0.08,
+            Pid::Stick(Side::Left) => self.dn.contains(&Pid::B(ButtonId::L3)),
+            Pid::Stick(Side::Right) => self.dn.contains(&Pid::B(ButtonId::R3)),
+            id => self.dn.contains(&id),
+        };
+        // the drawing without motion never moves the caps (`live()` runs only in its loop): frozen pictures keep them centred
+        let cap_off = if frozen { (0.0, 0.0) } else { (side_cap.0 * 7.0, side_cap.1 * 7.0) };
+        (dn, pull, cap_off)
+    }
+}
+
+/// What a frame step changed (`Open::live_tick`, `Open::drift_tick`): nothing, only what the live boxes read when they are
+/// painted (no build), or what the page's boxes are made of (a build).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Step {
+    Still,
+    Paint,
+    Build,
 }
 
 /// Everything the open page holds (dropped on close).
@@ -269,7 +318,15 @@ struct Open {
     /// the hover label hides after a click until the pointer moves to another part (`show(null)` on click)
     lab_off: Option<Pid>,
     live: Option<LiveView>,
-    lv: Lv,
+    /// Order 055: the live readings, shared with the live boxes (they read them when they are painted: a new reading
+    /// repaints them and builds nothing)
+    lv: Rc<RefCell<Lv>>,
+    /// when `lv` was last given a reading (at most one per `LV_MS`)
+    lv_at: f64,
+    /// a newer reading waits for its time (`wake_at`)
+    lv_wait: bool,
+    /// the last tick moved only what the live boxes read (`Page::live_only`)
+    live_only: bool,
     t0: f64,
     fake: bool,
     frozen: bool,
@@ -290,6 +347,11 @@ struct Open {
     /// "Launch Steam" was clicked (its button waits for Steam)
     launch_at: Option<f64>,
     drift: Option<Drift>,
+    /// the drift bar's share 0..1, read by the bar when it is painted
+    drift_share: Rc<Cell<f32>>,
+    /// the whole second "Hands off · N s" shows (a change builds the page), and when the bar was last given a share
+    drift_secs: i64,
+    drift_at: f64,
 }
 
 #[derive(Default)]
@@ -489,7 +551,10 @@ impl Open {
             pressed_part: None,
             lab_off: None,
             live: None,
-            lv: Lv::default(),
+            lv: Rc::new(RefCell::new(Lv::default())),
+            lv_at: f64::NEG_INFINITY,
+            lv_wait: false,
+            live_only: false,
             t0: now,
             fake: env.fake(),
             frozen: env.frozen,
@@ -503,6 +568,9 @@ impl Open {
             steam_up: true,
             launch_at: None,
             drift: None,
+            drift_share: Rc::new(Cell::new(0.0)),
+            drift_secs: 0,
+            drift_at: f64::NEG_INFINITY,
         };
         // the last opening's state at once; the worker's answer fills in
         if let Some(s) = env.keep.get::<Snap>(SNAP) {
@@ -517,7 +585,7 @@ impl Open {
         o.send(Job::Open { real_read: env.real_read, slow: data::test_slow() });
         if o.frozen {
             // the drawing without motion (RM): LV.ls = [.32, -.12]
-            o.lv.ls = (0.32, -0.12);
+            o.lv.borrow_mut().ls = (0.32, -0.12);
         }
         o
     }
@@ -1096,7 +1164,11 @@ impl Open {
             }
             _ => false,
         };
-        answers || steam || live || drift || launching
+        // Order 055: a new reading / the drift bar's step only repaint the live boxes (they read `lv` and the share when
+        // painted); anything else the step found builds the page again
+        let build = answers || steam || launching || live == Step::Build || drift == Step::Build;
+        self.live_only = !build;
+        build || live == Step::Paint || drift == Step::Paint
     }
 
     /// Steam started or ended (the watch's thread woke the menu; the fake's switch in tests): the glass comes / goes.
@@ -1166,29 +1238,70 @@ impl Open {
     }
 
     /// The drift check: the picked stick's largest distance from the centre while it runs; after `DRIFT_MS` the result.
-    fn drift_tick(&mut self, now: f64) -> bool {
-        let Some(Drift::Run { side, at, max }) = self.drift else { return false };
-        let p = if side == Side::Left { self.lv.ls } else { self.lv.rs };
+    /// (Order 055: the largest distance is also taken from every report in `live_tick`; here from the shown reading. The page
+    /// is built again only when the whole second shown changes or the check ends; the bar is repainted at `LV_MS` steps.)
+    fn drift_tick(&mut self, now: f64) -> Step {
+        let Some(Drift::Run { side, at, max }) = self.drift else { return Step::Still };
+        let p = self.lv.borrow().stick(side);
         let max = max.max(p.0.hypot(p.1));
-        self.drift = Some(if now - at >= DRIFT_MS {
+        if now - at >= DRIFT_MS {
             let full = self.view.as_ref().and_then(|v| v.sticks.iter().find(|s| s.side == side)).map(|s| stick_dz(s).1).unwrap_or(100.0);
-            Drift::Done { side, max, dz: drift_dz(max, full) }
-        } else {
-            Drift::Run { side, at, max }
-        });
-        true
+            self.drift = Some(Drift::Done { side, max, dz: drift_dz(max, full) });
+            return Step::Build;
+        }
+        self.drift = Some(Drift::Run { side, at, max });
+        self.drift_share.set(((now - at) / DRIFT_MS).clamp(0.0, 1.0) as f32);
+        let secs = ((DRIFT_MS - (now - at)).max(0.0) / 1000.0).ceil() as i64;
+        if secs != self.drift_secs {
+            self.drift_secs = secs;
+            self.drift_at = now;
+            return Step::Build;
+        }
+        if now - self.drift_at >= LV_MS - 0.5 {
+            self.drift_at = now;
+            return Step::Paint;
+        }
+        Step::Still
+    }
+
+    /// Order 055: the drift check's next step (the bar's repaint, the second shown, the end).
+    fn drift_wake(&self) -> Option<f64> {
+        matches!(self.drift, Some(Drift::Run { .. })).then(|| self.drift_at.max(0.0) + LV_MS)
+    }
+
+    /// Order 055: a reading may be given to the live boxes at `lv_at + LV_MS`: the time of a waiting real reading, or of the
+    /// fake controller's next demo step.
+    fn lv_wake(&self) -> Option<f64> {
+        let demo = self.fake && self.kind == PadKind::DualSenseEdge && !self.frozen;
+        (self.lv_wait || demo).then(|| self.lv_at.max(0.0) + LV_MS)
+    }
+
+    /// The drift check's largest distance, taken from a report (each one, not only the shown ones).
+    fn drift_fold(&mut self, lv: &Lv) {
+        if let Some(Drift::Run { side, at, max }) = self.drift {
+            let p = lv.stick(side);
+            self.drift = Some(Drift::Run { side, at, max: max.max(p.0.hypot(p.1)) });
+        }
     }
 
     /// The drawing's live loop (a made-up 6 s of hands) for the fake controller; the real controller's state otherwise.
-    fn live_tick(&mut self, now: f64) -> bool {
+    ///
+    /// Order 055: the readings are DATA - given to the live boxes at most every `LV_MS` (the newest one waits for its time,
+    /// `lv_wake`), never built into the page: `Step::Paint` repaints the live boxes only.
+    fn live_tick(&mut self, now: f64) -> Step {
         if self.frozen {
-            return false;
+            return Step::Still;
         }
         if self.fake {
             if self.kind != PadKind::DualSenseEdge {
-                self.lv = Lv::default();
-                return false;
+                *self.lv.borrow_mut() = Lv::default();
+                return Step::Still;
             }
+            // the demo moves at its own 30 Hz
+            if now - self.lv_at < LV_MS - 0.5 {
+                return Step::Still;
+            }
+            self.lv_at = now;
             let a = (now - self.t0) / 1000.0;
             let s = a % 6.0;
             let m = 0.55 + 0.42 * (a * 0.9).sin();
@@ -1218,23 +1331,33 @@ impl Open {
             let l2 = if s > 4.1 && s < 4.7 { ((s - 4.1) / 0.6 * std::f64::consts::PI).sin() * 0.6 } else { 0.0 };
             let presses = [(Pid::B(ButtonId::Cross), 2.55, 2.8), (Pid::B(ButtonId::Square), 3.35, 3.55), (Pid::B(ButtonId::R1), 4.95, 5.2), (Pid::B(ButtonId::DpadUp), 5.55, 5.75), (Pid::B(ButtonId::L3), 1.2, 1.4)];
             let dn = presses.iter().filter(|p| s >= p.1 && s < p.2).map(|p| p.0).collect();
-            self.lv = Lv { ls, rs, l2: l2 as f32, r2: r2 as f32, dn };
-            return true;
+            *self.lv.borrow_mut() = Lv { ls, rs, l2: l2 as f32, r2: r2 as f32, dn };
+            return Step::Paint;
         }
-        let Some(v) = &self.live else { return false };
+        let Some(v) = &self.live else { return Step::Still };
         if v.is_gone() {
             self.live = None;
-            self.lv = Lv::default();
-            return true;
+            *self.lv.borrow_mut() = Lv::default();
+            self.lv_wait = false;
+            // the "Live" tags and the live boxes go: the page is built again
+            return Step::Build;
         }
-        // a changed report woke the menu (env.waker): repaint the live parts once; nothing changed = no frame
-        match v.latest().map(|st| lv_of(&st)) {
-            Some(lv) if lv != self.lv => {
-                self.lv = lv;
-                true
-            }
-            _ => false,
+        // a changed report woke the menu (env.waker): nothing changed = no frame; a changed one is given to the live boxes
+        // when `LV_MS` have passed since the last (else it waits: `lv_wake`)
+        let Some(lv) = v.latest().map(|st| lv_of(&st)) else { return Step::Still };
+        self.drift_fold(&lv);
+        if lv == *self.lv.borrow() {
+            self.lv_wait = false;
+            return Step::Still;
         }
+        if now - self.lv_at < LV_MS - 0.5 {
+            self.lv_wait = true;
+            return Step::Still;
+        }
+        *self.lv.borrow_mut() = lv;
+        self.lv_at = now;
+        self.lv_wait = false;
+        Step::Paint
     }
 }
 
@@ -1292,10 +1415,15 @@ impl Page for Controller {
         // "Starting Steam…" ends; the page's toast goes (the worker's answers wake the menu themselves)
         let launch = o.launch_at.map(|a| a + LAUNCH_WAIT_MS);
         let toast = o.toast.as_ref().map(|(_, at)| at + toast::SHOW_MS + 400.0);
-        match (launch, toast) {
+        // Order 055: the live readings / the drift bar are data with their own pace (30 Hz), not frames
+        let min = |a: Option<f64>, b: Option<f64>| match (a, b) {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
-        }
+        };
+        min(min(launch, toast), min(o.lv_wake(), o.drift_wake()))
+    }
+    fn live_only(&self) -> bool {
+        self.o.as_ref().is_some_and(|o| o.live_only)
     }
     fn build(&mut self, cx: &mut Cx) -> Vec<El> {
         if self.o.is_none() {
@@ -1655,25 +1783,7 @@ impl Open {
             if on {
                 hovered = Some(p.id);
             }
-            let side_cap = match p.id {
-                Pid::Stick(Side::Left) => self.lv.ls,
-                Pid::Stick(Side::Right) => self.lv.rs,
-                _ => (0.0, 0.0),
-            };
-            let pull = match p.id {
-                Pid::Trig(Side::Left) => self.lv.l2,
-                Pid::Trig(Side::Right) => self.lv.r2,
-                _ => 0.0,
-            };
-            let dn = match p.id {
-                Pid::Trig(_) => pull > 0.08,
-                Pid::Stick(Side::Left) => self.lv.dn.contains(&Pid::B(ButtonId::L3)),
-                Pid::Stick(Side::Right) => self.lv.dn.contains(&Pid::B(ButtonId::R3)),
-                id => self.lv.dn.contains(&id),
-            };
-            // the drawing without motion never moves the caps (`live()` runs only in its loop): frozen pictures keep them centred
-            let cap_off = if self.frozen { (0.0, 0.0) } else { (side_cap.0 * 7.0, side_cap.1 * 7.0) };
-            looks.push(pic::Look { hv, sel: self.sel == Some(p.id), dn, pull, cap_off });
+            looks.push(pic::Look { hv, sel: self.sel == Some(p.id), ..pic::Look::default() });
         }
         let lc = if self.kind.has_light_bar() {
             self.pref().and_then(|p| p.led()).map(|(r, g, b)| if (r, g, b) == (0, 0, 0) { FG3() } else { Rgba::rgb(r, g, b) })
@@ -1682,7 +1792,25 @@ impl Open {
         };
         let pc = self.pic.clone();
         let live = !self.frozen && (self.fake || self.live.is_some());
-        let mut paint = El::paint(move |g, (x, y, w, _)| pic::paint(g, &pc, (x, y, w), &|i| looks[i], lc)).abs(0.0, 0.0, f32::NAN, f32::NAN).size(w, h).no_hit();
+        // Order 055: pressed / pull / cap offset are read from the shared readings when the picture is painted (a new reading
+        // repaints the live box, it builds nothing)
+        let (ids, lvs, frozen) = (parts.iter().map(|p| p.id).collect::<Vec<Pid>>(), self.lv.clone(), self.frozen);
+        let mut paint = El::paint(move |g, (x, y, w, _)| {
+            let lv = lvs.borrow();
+            pic::paint(
+                g,
+                &pc,
+                (x, y, w),
+                &|i| {
+                    let (dn, pull, cap_off) = lv.look_of(ids[i], frozen);
+                    pic::Look { dn, pull, cap_off, ..looks[i] }
+                },
+                lc,
+            )
+        })
+        .abs(0.0, 0.0, f32::NAN, f32::NAN)
+        .size(w, h)
+        .no_hit();
         if live {
             paint = paint.live();
         }
@@ -2063,7 +2191,12 @@ impl Open {
             Ctl::Back(Back::Layout(c)) => self.write(c, now),
             Ctl::Back(Back::Pref(v)) => self.write_pref(&v, "Steam\u{2019}s default", now),
             Ctl::Undo => self.undo(false, now),
-            Ctl::DriftGo(side) => self.drift = Some(Drift::Run { side, at: now, max: 0.0 }),
+            Ctl::DriftGo(side) => {
+                self.drift = Some(Drift::Run { side, at: now, max: 0.0 });
+                self.drift_secs = (DRIFT_MS / 1000.0).ceil() as i64;
+                self.drift_share.set(0.0);
+                self.drift_at = now;
+            }
             Ctl::DriftUse(side, dz) => {
                 self.drift = None;
                 self.acting = self.rows.get(&Self::k(&format!("{}.dz", stick_id(side)))).cloned();

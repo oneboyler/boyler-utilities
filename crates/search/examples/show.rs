@@ -39,6 +39,13 @@ fn everything_report(instance: Option<&str>, text: &str) {
         Some(i) => vec![everything::class_of(Some(i))],
         None => vec![everything::class_of(None), everything::class_of(Some(bu_search::real::host::INSTANCE))],
     };
+    {
+        use bu_search::real::ours;
+        println!("Search's own Everything (Order 049): copy {:?}, service {} (state {:?})", ours::exe().map(|p| p.display().to_string()), ours::SERVICE, ours::service_state());
+        let d: Vec<String> = ours::ntfs_drives().iter().map(|d| format!("{}: {}", d.letter, d.guid)).collect();
+        println!("  NTFS fixed drives: {d:?} - the Windows drive: {}", ours::windows_drive());
+        println!("  v1.0.0's Everything MSI installed on {:?}, Boyler Utilities first installed on {:?} -> tidy-up offered: {}", ours::v100_msi_day(), ours::app_first_day(), ours::v100_present());
+    }
     println!("Everything.exe on this PC: {:?}", bu_search::real::host::exe().map(|p| p.display().to_string()));
     let Some((class, h)) = classes.iter().find_map(|c| everything::find(c).map(|h| (c.clone(), h))) else {
         println!("no Everything IPC window in this session (looked for {classes:?})");

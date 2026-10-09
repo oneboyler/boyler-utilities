@@ -1,10 +1,10 @@
 ; Boyler Utilities - the installer (Order 032). Inno Setup 6.7. Build with tools/installer/build.sh (it passes the defines).
 ; - per user, never admin: %LOCALAPPDATA%\Programs\Boyler Utilities, Start menu shortcut, "Installed apps" entry under HKCU;
 ; - tasks (both ticked): Start with Windows (the app's own Run value, see app/src/pages/settings/autostart.rs) and
-;   Everything for Search (the official MSI, same address + SHA-256 as crates/search/src/real/host.rs; the ONLY step that
-;   may ask for admin: msiexec through Windows' admin prompt);
+;   Everything for Search (Order 049: Search's OWN copy of voidtools' Everything + our manual service, set up by the app's
+;   --install-everything step - the ONLY step that may ask for admin; nothing of it shows outside the app);
 ; - install / uninstall close the running app first (`--quit`); uninstall asks to keep the settings (default keep), never
-;   removes Everything. Uninstall /KEEPSETTINGS=no deletes them without asking (silent proof runs).
+;   removes a user's own Everything (Search's own copy + service go). Uninstall /KEEPSETTINGS=no deletes them without asking (silent proof runs).
 ; - uninstall first offers "Undo my Windows changes too?" (default Yes) when the app's change log isn't empty (Order 036:
 ;   the app's --undo-windows, no window); /UNDOWINDOWS=no|yes answers without asking.
 
@@ -51,8 +51,6 @@ Name: "everything"; Description: "Install Everything for Search (free, voidtools
 
 [Files]
 Source: "{#AppExeSrc}"; DestDir: "{app}"; DestName: "{#AppExe}"; Flags: ignoreversion
-; Order 049: the transform that leaves out the Everything MSI's all-users start at sign-in (crates/search/src/real/host.rs NO_STARTUP_MST)
-Source: "{#SrcRoot}\crates\search\assets\everything-no-startup.mst"; Flags: dontcopy
 
 [Icons]
 Name: "{autoprograms}\{#AppName}"; Filename: "{app}\{#AppExe}"
@@ -78,22 +76,13 @@ const
   MUTEX = 'Local\BoylerUtilities';
   RUN_KEY = 'Software\Microsoft\Windows\CurrentVersion\Run';
   UNINST_KEY = 'Software\Microsoft\Windows\CurrentVersion\Uninstall\{#AppGuid}_is1';
-  MSI_URL = 'https://{#MsiHost}{#MsiPath}';
-  MSI_SHA256 = '{#MsiSha256}';
-  MSI_NAME = 'Everything.x64.msi';
-  MST_NAME = 'everything-no-startup.mst';
 
-var
-  DownloadPage: TDownloadWizardPage;
-  MsiReady, MsiTried: Boolean;
+{ ---------------------------------------------------------------- Everything (crates/search/src/real/ours.rs) }
 
-{ ---------------------------------------------------------------- Everything (crates/search/src/real/host.rs exe()) }
-
+{ Order 049: Search's OWN Everything (our copy in Program Files + our manual service), never one the user installed. }
 function EverythingFound: Boolean;
 begin
-  Result := FileExists(ExpandConstant('{commonpf64}\Everything\Everything.exe'))
-    or FileExists(ExpandConstant('{commonpf32}\Everything\Everything.exe'))
-    or FileExists(ExpandConstant('{localappdata}\Programs\Everything\Everything.exe'));
+  Result := FileExists(ExpandConstant('{commonpf64}\Boyler Utilities\Everything\Everything.exe'));
 end;
 
 function WantEverything: Boolean;
@@ -101,62 +90,30 @@ begin
   Result := WizardIsTaskSelected('everything') and not EverythingFound;
 end;
 
-{ Download + SHA-256 check (Inno refuses a file whose hash differs). False = not downloaded; the user was told. }
-function FetchEverything: Boolean;
-begin
-  Result := MsiReady;
-  { one try per setup: a failed download (already told) is not repeated at the install step }
-  if Result or MsiTried then
-    Exit;
-  MsiTried := True;
-  try
-    if WizardSilent then
-      DownloadTemporaryFile(MSI_URL, MSI_NAME, MSI_SHA256, nil)
-    else begin
-      DownloadPage.Clear;
-      DownloadPage.Add(MSI_URL, MSI_NAME, MSI_SHA256);
-      DownloadPage.Show;
-      try
-        DownloadPage.Download;
-      finally
-        DownloadPage.Hide;
-      end;
-    end;
-    MsiReady := True;
-    Result := True;
-  except
-    Log('Everything download failed: ' + GetExceptionMessage);
-    SuppressibleMsgBox('Everything could not be downloaded (' + GetExceptionMessage + ').' + #13#10#13#10 +
-      'Boyler Utilities is installed without it - the Search tab can install it later.', mbInformation, MB_OK, IDOK);
-  end;
-end;
-
 #ifdef ProofNoMsi
-{ proof builds only (tools/installer/prove.ps1): the MSI was downloaded and its SHA-256 checked - never run it }
+{ proof builds only (tools/installer/prove.ps1): nothing is set up }
 procedure InstallEverything;
 begin
-  Log('PROOF: Everything MSI downloaded, SHA-256 ' + GetSHA256OfFile(ExpandConstant('{tmp}\') + MSI_NAME) + ' - msiexec not run (proof build)');
+  Log('PROOF: Everything set-up not run (proof build)');
 end;
 #else
-{ Windows' own msiexec by full path, through the admin prompt (the MSI installs for all users). }
+{ The app itself does it (no window): downloads voidtools' portable Everything, checks it, and its own admin helper (the
+  ONE admin prompt) puts it in Program Files with our manual service - and tidies up the Everything v1.0.0 installed. }
 procedure InstallEverything;
 var
   Code: Integer;
 begin
-  { Order 049: with our transform - the MSI's all-users "start Everything at sign-in" is left out }
-  ExtractTemporaryFile(MST_NAME);
-  if not ShellExec('runas', ExpandConstant('{sys}\msiexec.exe'),
-    '/i "' + ExpandConstant('{tmp}\') + MSI_NAME + '" TRANSFORMS="' + ExpandConstant('{tmp}\') + MST_NAME + '" /qn /norestart',
-    '', SW_HIDE, ewWaitUntilTerminated, Code) then begin
-    Log('Everything: msiexec did not start (' + SysErrorMessage(Code) + ')');
-    SuppressibleMsgBox('Everything was not installed (' + SysErrorMessage(Code) + ').' + #13#10#13#10 +
-      'The Search tab can install it later.', mbInformation, MB_OK, IDOK);
-  end else if (Code <> 0) and (Code <> 3010) then begin
-    Log('Everything: msiexec exit code ' + IntToStr(Code));
-    SuppressibleMsgBox('Everything was not installed (Windows Installer error ' + IntToStr(Code) + ').' + #13#10#13#10 +
-      'The Search tab can install it later.', mbInformation, MB_OK, IDOK);
-  end else
-    Log('Everything installed (exit code ' + IntToStr(Code) + ')');
+  if not Exec(ExpandConstant('{app}\{#AppExe}'), '--install-everything', '', SW_HIDE, ewWaitUntilTerminated, Code) then
+    Log('Everything: the set-up did not start (' + SysErrorMessage(Code) + ')')
+  else if Code = 0 then
+    Log('Everything set up')
+  else if Code = 1602 then
+    Log('Everything: the admin prompt was answered No')
+  else begin
+    Log('Everything: the set-up stopped (code ' + IntToStr(Code) + ')');
+    SuppressibleMsgBox('Everything for Search could not be set up (code ' + IntToStr(Code) + ').' + #13#10#13#10 +
+      'The Search tab can set it up later.', mbInformation, MB_OK, IDOK);
+  end;
 end;
 #endif
 
@@ -207,9 +164,14 @@ var
 
 function InitializeSetup: Boolean;
 var
-  Loc: String;
+  Loc, Day: String;
 begin
   AutostartWasOff := RegQueryStringValue(HKCU, UNINST_KEY, 'InstallLocation', Loc) and not AutostartIn(Loc);
+  { Order 049: keep the day of the FIRST install before this install rewrites the entry's date (it tells v1.0.0's
+    Everything from a user's own - crates/search/src/real/ours.rs v100_rule) }
+  if not RegValueExists(HKCU, 'Software\BoylerUtilities', 'FirstInstallDate') then
+    if RegQueryStringValue(HKCU, UNINST_KEY, 'InstallDate', Day) then
+      RegWriteStringValue(HKCU, 'Software\BoylerUtilities', 'FirstInstallDate', Day);
   Result := True;
 end;
 
@@ -239,17 +201,9 @@ end;
 
 { ---------------------------------------------------------------- setup events }
 
-procedure InitializeWizard;
-begin
-  DownloadPage := CreateDownloadPage(SetupMessage(msgWizardPreparing), 'Downloading Everything (voidtools)...', nil);
-  DownloadPage.ShowBaseNameInsteadOfUrl := True;
-end;
-
 function NextButtonClick(CurPageID: Integer): Boolean;
 begin
   Result := True;
-  if (CurPageID = wpReady) and WantEverything then
-    FetchEverything;
 end;
 
 function PrepareToInstall(var NeedsRestart: Boolean): String;
@@ -271,8 +225,7 @@ begin
   if not WizardIsTaskSelected('autostart') or not WantAutostart then
     RemoveAutostart;
   if WantEverything then
-    if FetchEverything then
-      InstallEverything;
+    InstallEverything;
 end;
 
 { ---------------------------------------------------------------- uninstall }
@@ -389,6 +342,12 @@ begin
         { first, while the exe and the settings (its change log) are still there }
         UndoWindowsChanges;
         RemoveAutostart;
+        { Order 049: Search's own Everything (copy + service) goes with the app - one admin prompt, only when it is there }
+        if EverythingFound then
+          if not Exec(ExpandConstant('{app}\{#AppExe}'), '--uninstall-everything', '', SW_HIDE, ewWaitUntilTerminated, I) then
+            Log('Everything: removing it did not start')
+          else
+            Log('Everything removed (code ' + IntToStr(I) + ')');
         Dirs := SettingsDirs;
         for I := 0 to GetArrayLength(Dirs) - 1 do
           Log('Settings folder: ' + Dirs[I]);

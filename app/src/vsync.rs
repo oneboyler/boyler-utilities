@@ -24,8 +24,10 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 pub enum Client {
     Timers = 0,
     Mic = 1,
+    /// Order 055: the menu after a frame that had nothing to show (no present = no swap-chain wake-up to pace it)
+    Menu = 2,
 }
-const N: usize = 2;
+const N: usize = 3;
 const WM_FRAME: u32 = WM_APP + 0x49;
 
 thread_local! {
@@ -56,6 +58,15 @@ fn ask(c: Client, due: f64, f: fn()) {
     }
     SLOTS.with(|s| s.borrow_mut()[c as usize] = Some((f, due)));
     publish();
+}
+
+/// Order 055: the next refresh for the open menu - in test copies too (an off-screen copy presents like the real one, and
+/// its cost is what the measurements read).
+pub fn next_menu(f: fn()) {
+    if cfg!(test) {
+        return;
+    }
+    ask(Client::Menu, crate::timing::now(), f);
 }
 
 /// `at` now: the next refresh.

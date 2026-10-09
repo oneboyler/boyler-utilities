@@ -1,4 +1,4 @@
-//! Drawing on the graphics card (Order 051).
+//! Drawing on the graphics card (Order 051, the owner Oct 9: "isnt gpu way better performative for aboslutely everyone").
 //! Skia's GPU backend (Ganesh) on Direct3D 12: one device + command queue on the adapter that drives the window's monitor,
 //! one Skia context on the UI thread, and composition swap chains made on that queue, so Skia draws straight into their back
 //! buffers. Why Direct3D 12 and not our old Direct3D 11 device: Skia's only Direct3D backend is Direct3D 12 (its prebuilt
@@ -28,8 +28,16 @@ use windows::Win32::Graphics::Dxgi::*;
 use windows::Win32::Graphics::Gdi::HMONITOR;
 use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_REMOTESESSION};
 
+thread_local! {
+    /// Order 052 (measuring): the last GPU present's (flush ms, Present ms)
+    pub static PRESENT_SPLIT: Cell<(f64, f64)> = const { Cell::new((0.0, 0.0)) };
+}
+
 /// After a lost device: the CPU path for this long, then the GPU again.
 pub const RETRY_MS: f64 = 3000.0;
+
+/// Order 055: Skia's GPU resource cache (default 256 MB).
+const RESOURCE_CACHE_BYTES: usize = 32 * 1024 * 1024;
 
 pub struct Gpu {
     pub device: ID3D12Device,
@@ -67,7 +75,9 @@ fn log_path(s: String) {
 /// Why the GPU is not used right now (None = it may be).
 fn cpu_reason() -> Option<String> {
     let remote = unsafe { GetSystemMetrics(SM_REMOTESESSION) } != 0;
-    reason(crate::testmode::env("BU_GPU").as_deref(), remote, LOST_AT.with(|l| l.get()), crate::timing::now())
+    let r = reason(crate::testmode::env("BU_GPU").as_deref(), remote, LOST_AT.with(|l| l.get()), crate::timing::now());
+    // Order 052 item 0: shaders still being compiled by the worker (shadercache.rs) - the CPU path until it is done
+    r.or_else(|| (!crate::shadercache::warm()).then(|| format!("shaders compiling ({} left)", crate::shadercache::pending())))
 }
 
 /// The path rule: a test switch, a remote desktop session, a lost device less than RETRY_MS ago = the CPU path.
@@ -131,6 +141,14 @@ pub fn trim_current() {
     }
 }
 
+/// Order 052 item 0: keep this device for the next `get` (the menu draws on the CPU path while shaders compile - starting
+/// a new device then took ~100 ms on the menu's thread, measured); dropped by `cool_down` (the menu's close).
+pub fn keep(g: Rc<Gpu>) {
+    if !g.lost() {
+        KEPT.with(|k| *k.borrow_mut() = Some(g));
+    }
+}
+
 /// Drop the warm device (the menu was not opened).
 pub fn cool_down() -> bool {
     KEPT.with(|k| k.borrow_mut().take()).is_some()
@@ -190,7 +208,10 @@ impl Gpu {
             let device = device.ok_or_else(|| Error::from(E_FAIL))?;
             let queue: ID3D12CommandQueue = device.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() })?;
             let bc = skg::d3d::BackendContext { adapter, device: device.clone(), queue: queue.clone(), memory_allocator: None, protected_context: skg::Protected::No };
-            let ctx = skg::direct_contexts::make_d3d(&bc, None).ok_or_else(|| Error::new(E_FAIL, "Skia's Direct3D context did not start"))?;
+            let mut ctx = skg::direct_contexts::make_d3d(&bc, None).ok_or_else(|| Error::new(E_FAIL, "Skia's Direct3D context did not start"))?;
+            // Order 055 (the owner Oct 9: 390 MB with the menu open): Skia keeps up to 256 MB of GPU textures / buffers for
+            // reuse by default; the menu needs its few window-sized layers - beyond this they are let go
+            ctx.set_resource_cache_limit(RESOURCE_CACHE_BYTES);
             crate::timing::note(&format!("open_step gpu_device {:.1} ms", crate::timing::now() - t));
             Ok(Gpu { device, queue, factory, name, ctx: RefCell::new(ctx) })
         }
@@ -313,12 +334,35 @@ impl GpuChain {
         self.surfs[i.min(self.surfs.len() - 1)].clone()
     }
 
-    /// Flush the back buffer's drawing and present it (vsync-paced: the compositor's next frame).
-    pub fn present(&mut self) -> Result<()> {
+    /// Flush the back buffer's drawing and present it (vsync-paced: the compositor's next frame). `dirty` = the only part
+    /// that differs from the frame shown now (window device px; None = all of it): the compositor redraws only that
+    /// (Order 055).
+    pub fn present(&mut self, dirty: Option<sk::IRect>) -> Result<()> {
         let i = unsafe { self.swap3.GetCurrentBackBufferIndex() } as usize;
         let i = i.min(self.surfs.len() - 1);
+        let t0 = crate::timing::now();
         self.gpu.flush_present(&mut self.surfs[i]);
-        unsafe { self.swap.Present(1, DXGI_PRESENT(0)).ok() }
+        let t1 = crate::timing::now();
+        // Order 052 item 0: a shader this frame needed was not ready (handed to the worker, shadercache.rs) - its draws are
+        // missing, so the frame is not shown: the caller draws it again on the CPU path at once (as after a lost device)
+        if crate::shadercache::take_missed() > 0 {
+            PRESENT_SPLIT.with(|p| p.set((t1 - t0, 0.0)));
+            return Err(Error::new(crate::shadercache::NOT_READY, "shaders compiling"));
+        }
+        let r = dirty.and_then(|r| sk::IRect::intersect(&r, &sk::IRect::from_wh(self.w as i32, self.h as i32)));
+        let r = unsafe {
+            match r {
+                Some(r) => {
+                    let mut rc = RECT { left: r.left, top: r.top, right: r.right, bottom: r.bottom };
+                    let p = DXGI_PRESENT_PARAMETERS { DirtyRectsCount: 1, pDirtyRects: &mut rc, pScrollRect: std::ptr::null_mut(), pScrollOffset: std::ptr::null_mut() };
+                    self.swap.Present1(1, DXGI_PRESENT(0), &p).ok()
+                }
+                None => self.swap.Present(1, DXGI_PRESENT(0)).ok(),
+            }
+        };
+        // Order 052 (measuring): Skia's flush (its draws recorded + any pipeline made on first use) vs the Present call
+        PRESENT_SPLIT.with(|p| p.set((t1 - t0, crate::timing::now() - t1)));
+        r
     }
 }
 
@@ -336,9 +380,10 @@ impl Drop for GpuChain {
 }
 
 /// Did a present / draw call fail because the device went away?
+/// (Order 052: or a frame was missing shaders - `GpuChain::present` - handled the same way: the CPU path for now)
 pub fn is_lost_error(e: &Error) -> bool {
     let c = e.code();
-    c == DXGI_ERROR_DEVICE_REMOVED || c == DXGI_ERROR_DEVICE_RESET || c == DXGI_ERROR_DEVICE_HUNG
+    c == DXGI_ERROR_DEVICE_REMOVED || c == DXGI_ERROR_DEVICE_RESET || c == DXGI_ERROR_DEVICE_HUNG || c == crate::shadercache::NOT_READY
 }
 
 #[cfg(test)]

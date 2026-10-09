@@ -45,6 +45,25 @@ pub fn drag(hwnd: HWND, a: (i32, i32), b: (i32, i32), ms: u32, hz: u32) {
     });
 }
 
+/// Order 054: a click on `p` (window px): the pointer slides onto it from 30 px to the left, 1 px per message at 1000 Hz (one
+/// coordinate changing, as a hand's last moves do), rests 20 ms, then the button goes down and up 30 ms later - posted from
+/// a helper thread like `drag`.
+pub fn click(hwnd: HWND, p: (i32, i32)) {
+    let h = hwnd.0 as isize;
+    std::thread::spawn(move || unsafe {
+        let hwnd = HWND(h as *mut _);
+        let ms = std::time::Duration::from_millis;
+        for x in (p.0 - 30).max(0)..=p.0 {
+            let _ = PostMessageW(Some(hwnd), WM_MOUSEMOVE, WPARAM(0), lp(x, p.1));
+            std::thread::sleep(ms(1));
+        }
+        std::thread::sleep(ms(20));
+        let _ = PostMessageW(Some(hwnd), WM_LBUTTONDOWN, WPARAM(1), lp(p.0, p.1));
+        std::thread::sleep(ms(30));
+        let _ = PostMessageW(Some(hwnd), WM_LBUTTONUP, WPARAM(0), lp(p.0, p.1));
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

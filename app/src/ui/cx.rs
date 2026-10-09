@@ -75,6 +75,12 @@ pub struct State {
     /// caret's next blink, a toast's end, a clock's next minute): the menu sleeps until then and builds again at it.
     /// `None` = nothing due. Cleared at each build of the shown page (`Cx::wake_at` sets it).
     pub wake: Option<f64>,
+    /// Order 055: the page's view while it is built (page coordinates: top, bottom - the scroll and the scroll + PAGE_H)
+    pub view: (f32, f32),
+    /// Order 055: where each `Cx::window` box was in the page's last layout (key, its top in page coordinates)
+    pub win_top: Vec<(Key, f32)>,
+    /// Order 055: the `Cx::window` boxes this build asked for (key, the part built: top, bottom in the box's own coordinates)
+    pub win_new: Vec<(Key, f32, f32)>,
 }
 
 impl State {
@@ -195,6 +201,19 @@ impl<'a> Cx<'a> {
         } else {
             None
         }
+    }
+    /// Order 055: a long list builds only what is in view: the part of box `k` (y from its own top) that is in the page's view
+    /// with `margin` more above and below, as of the last layout - its rows outside it become one empty box of their height.
+    /// None = not laid out yet: build it all (the frame builds once more as soon as it knows where the box is). The frame
+    /// builds the page again when the scroll leaves the part that was built.
+    pub fn window(&mut self, k: Key, margin: f32) -> Option<(f32, f32)> {
+        let top = self.st.win_top.iter().find(|w| w.0 == k).map(|w| w.1);
+        let (lo, hi) = match top {
+            Some(t) => (self.st.view.0 - t - margin, self.st.view.1 - t + margin),
+            None => (f32::NEG_INFINITY, f32::INFINITY),
+        };
+        self.st.win_new.push((k, lo, hi));
+        top.map(|_| (lo, hi))
     }
     /// How long the element has been hovered (ms), 0 if not.
     pub fn hover_age(&self, k: Key) -> f64 {

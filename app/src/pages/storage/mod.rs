@@ -8,7 +8,9 @@ mod view;
 #[cfg(test)]
 mod tests;
 
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -209,6 +211,17 @@ pub struct Storage {
     health_reading: bool,
     toast: Option<(String, f64)>,
     now: f64,
+    /// Order 055: the frame's time for the sweep / the shimmers (live boxes read it when they are painted; `tick` sets it
+    /// every frame) - they move at the monitor's rate without the page being built again
+    clock: Rc<Cell<f64>>,
+    /// the last build drew a walk's sweep (its progress line, bytes and seconds, is data: built again 4 times a second) /
+    /// a Clean up shimmer
+    sweep_on: Cell<bool>,
+    shim_on: Cell<bool>,
+    /// when the sweep's progress line was last built again
+    text_at: f64,
+    /// the last `tick`'s true moved only the live boxes
+    live_only: bool,
     /// test copies only (`BU_TEST_STATE scroll=<px>`): the page moved up (see network's)
     shift: f32,
     /// reduced motion (Windows' "show animations" off, from the last build): no staging, no slides
@@ -689,10 +702,31 @@ impl Page for Storage {
         *self = Storage { inbox: Arc::new(Mutex::new(Vec::new())), guard: std::mem::take(&mut self.guard), ..Storage::default() };
     }
 
+    /// Order 055: the sweep and the shimmers are live boxes (motion: true every frame while one shows, the live pass only);
+    /// the page is built again for data only - a message, a staged size arriving, the end of the sizes / the countdown, and
+    /// the walk's progress line 4 times a second.
     fn tick(&mut self, now: f64) -> bool {
+        let prev = self.now;
         self.now = now;
+        self.clock.set(now);
         let a = self.drain();
-        self.settle() || a
+        let mut data = self.settle() || a;
+        // a staged size shows up at its time (its shimmer is replaced by the number)
+        if self.staged.is_some() && CleanKind::ALL.iter().enumerate().any(|(i, _)| {
+            let at = self.size_t0 + SIZE_FIRST_MS + i as f64 * SIZE_STEP_MS;
+            prev < at && at <= now
+        }) {
+            data = true;
+        }
+        if self.sweep_on.get() && now - self.text_at >= 250.0 {
+            self.text_at = now;
+            data = true;
+        }
+        self.live_only = !data;
+        data || self.sweep_on.get() || self.shim_on.get()
+    }
+    fn live_only(&self) -> bool {
+        self.live_only
     }
 
     /// Order 047: the staged parts end at known moments - the measured sizes become the plan at `size_t0 + 1000 ms`, the

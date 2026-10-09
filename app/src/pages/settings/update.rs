@@ -156,9 +156,19 @@ impl Driver {
         let is_fake = self.fake.is_some();
         std::thread::spawn(move || {
             let tx2 = tx.clone();
+            // Order 055: every sample goes into the channel (the page keeps the latest), but the menu is woken at most every
+            // 33 ms - the download reports once per chunk (hundreds a second on a fast line) and each wake is a frame; a
+            // new phase and the last percent wake at once, the end (`Done`) always does
+            let mut last_wake: Option<std::time::Instant> = None;
+            let mut last_phase = None;
             let r = up.update(&rel, &mut |p: &Progress| {
                 let _ = tx2.send(Msg::Progress(p.clone()));
-                crate::services::Waker.wake();
+                let phase = std::mem::discriminant(&p.phase);
+                if wake_due(last_wake.map(|t| t.elapsed()), last_phase != Some(phase) || p.percent == Some(100)) {
+                    last_wake = Some(std::time::Instant::now());
+                    last_phase = Some(phase);
+                    crate::services::Waker.wake();
+                }
             });
             let ok = r.is_ok();
             if ok {
@@ -207,6 +217,12 @@ impl Driver {
     }
 }
 
+/// Order 055: does a progress sample wake the menu now? `since` = the time since the last wake (None = never), `urgent` = a
+/// new phase / the last percent. At most one wake per 33 ms otherwise.
+pub(super) fn wake_due(since: Option<Duration>, urgent: bool) -> bool {
+    urgent || since.is_none_or(|s| s >= Duration::from_millis(33))
+}
+
 /// A short reason for the About line ("Could not check · …").
 pub fn reason(e: &UpdateError) -> String {
     match e {
@@ -218,5 +234,19 @@ pub fn reason(e: &UpdateError) -> String {
         UpdateError::InstallDirNotWritable(_) => "the app's folder can't be written".into(),
         UpdateError::Cancelled => "cancelled".into(),
         other => other.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Order 055: progress wakes the menu at most every 33 ms, but a new phase / the last percent at once.
+    #[test]
+    fn progress_wakes_are_throttled_to_33_ms() {
+        assert!(wake_due(None, false), "the first sample wakes");
+        assert!(!wake_due(Some(Duration::from_millis(5)), false));
+        assert!(wake_due(Some(Duration::from_millis(33)), false));
+        assert!(wake_due(Some(Duration::from_millis(1)), true), "a new phase does not wait");
     }
 }

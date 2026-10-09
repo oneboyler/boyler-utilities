@@ -1,4 +1,5 @@
-//! The Controller tab's worker (Order 047, the "Launch Steam" freeze: a big black box on screen until Steam opened). When Steam started,
+//! The Controller tab's worker (Order 047, the owner's test 3: "i clicked launch steam, and a lot of times i notice this, the
+//! entire bottom right of the screen gets a big black box, and then steam opens and it unfreezes"). When Steam started,
 //! the tab read every game's files again ON THE MENU'S THREAD (the game list 4-5 times: every appmanifest of every library
 //! + localconfig.vdf, MBs) while Steam was writing them; every setting click wrote, backed up and read it all again there
 //! too; the tab's opening listed the controllers (one report per PlayStation pad for its battery, up to 400 ms each).

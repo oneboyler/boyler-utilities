@@ -127,6 +127,15 @@ pub struct Scene {
     pub busy: bool,
 }
 
+/// Order 054: a decoration the pointer goes through, children included (`El::no_hit` is the box alone: the hit test still
+/// looks inside it). The crosshair / ring / emoji drawn under the pointer took every press on the toolbar, so no button
+/// could be clicked; the hint and the tips the same where they lie over something.
+fn ghost(mut e: El) -> El {
+    e.hit = false;
+    e.children = e.children.into_iter().map(ghost).collect();
+    e
+}
+
 /// A small SVG (path / circle / rect elements, `viewBox="0 0 n n"`) stroked in a `size` box, like Blink paints an inline
 /// `<svg>`: pixel-snapped origin, `stroke: currentColor`, round caps / joins unless `butt`.
 fn svg(src: &'static str, size: f32, stroke: f32, col: Rgba, butt: bool) -> El {
@@ -603,7 +612,7 @@ pub fn scene(m: &Model, cx: &mut Cx, mi: usize, now: f64) -> Scene {
         if op > 0.0 {
             glass.push(Glass { key: key("cap.hint"), blur: 20.0, sat: Some(1.5) });
             // left:50% then translateX(-50%): the box is snapped at left 50 % and the transform moves it by a fraction (like Blink)
-            front = front.child(hint.abs(w / 2.0, 18.0, f32::NAN, f32::NAN).opacity(op).translate(-hw / 2.0, ty));
+            front = front.child(ghost(hint).abs(w / 2.0, 18.0, f32::NAN, f32::NAN).opacity(op).translate(-hw / 2.0, ty));
         }
         // .cxb{right:18px;top:18px;34x34;border-radius:50%;color:rgba(255,255,255,.88);background:rgba(22,24,30,.62);
         //   backdrop-filter:blur(20px) saturate(1.5);box-shadow:inset 0 0 0 .5px rgba(255,255,255,.16),0 8px 24px rgba(0,0,0,.28)}
@@ -722,7 +731,7 @@ pub fn scene(m: &Model, cx: &mut Cx, mi: usize, now: f64) -> Scene {
             }
             _ => {}
         }
-        front = front.child(xh.z(4));
+        front = front.child(ghost(xh).z(4));
     }
 
     // ---- the hover tips (`[data-n]::after`, after .35 s): the tools + Undo (10 px under the toolbar, above it when the toolbar is
@@ -770,7 +779,7 @@ pub fn scene(m: &Model, cx: &mut Cx, mi: usize, now: f64) -> Scene {
         let (tw, th) = measure(cx.g, &tipb);
         // left:50% + translate(-50%, 3px -> 0): snapped at the button's centre, then moved by the fraction
         let y = if below { ry + rh + gap } else { ry - gap - th };
-        front = front.child(tipb.abs(rx + rw / 2.0, y, f32::NAN, f32::NAN).opacity(op).translate(-tw / 2.0, 3.0 * (1.0 - op)).z(5));
+        front = front.child(ghost(tipb).abs(rx + rw / 2.0, y, f32::NAN, f32::NAN).opacity(op).translate(-tw / 2.0, 3.0 * (1.0 - op)).z(5));
     }
 
     Scene { w, h, scale: s, back, front, glass, busy }
@@ -1099,6 +1108,25 @@ fn front_translate(l: &Laid, n: &crate::ui::lay::Node) -> (f32, f32) {
     (x, y)
 }
 
+/// Order 054 (tests + test copies: `ovclick`): every clickable box of a laid-out front - its key and centre (DIPs) - that is
+/// shown and not covered by another part (a scrolled-away emoji, the picker over the bar).
+pub fn buttons(l: &Laid) -> Vec<(Key, (f32, f32))> {
+    let mut v = Vec::new();
+    for n in &l.nodes {
+        let Some(k) = n.el.key.filter(|_| n.el.click) else { continue };
+        let (rx, ry, rw, rh) = n.rect;
+        if rw <= 0.0 || rh <= 0.0 || front_opacity(l, n) <= 0.0 {
+            continue;
+        }
+        let (tx, ty) = front_translate(l, n);
+        let c = (rx + tx + rw / 2.0, ry + ty + rh / 2.0);
+        if l.hit(c.0, c.1).and_then(|(j, _)| l.clickable(j)) == Some(k) {
+            v.push((k, c));
+        }
+    }
+    v
+}
+
 /// Which corner handle is at a DIP point of this monitor (within its 8 px dot + 2 px).
 pub fn handle_at(m: &Model, mi: usize, x: f32, y: f32) -> Option<Corner> {
     let sel = m.sel?;
@@ -1122,4 +1150,91 @@ pub fn is_bars(k: Key) -> bool {
 #[allow(dead_code)]
 fn unused(_: Shadow, _: Rgba) {
     let _ = (EASE_IN, sub(K_CAP, ""));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ui::cx::State;
+    use bu_screenshot::fake::mon;
+    use bu_screenshot::geom;
+
+    const T: f64 = 10_000.0;
+
+    /// The front of monitor `mi` as the window lays it out (transitions settled).
+    fn front_of(g: &Gfx, m: &Model, mi: usize) -> Laid {
+        let mut st = State::default();
+        for _ in 0..2 {
+            let mut cx = Cx::new(T, false, g, &mut st);
+            let _ = scene(m, &mut cx, mi, T);
+        }
+        let mut cx = Cx::new(T, false, g, &mut st);
+        let sc = scene(m, &mut cx, mi, T);
+        Laid::new(g, sc.front, sc.w, Some(sc.h))
+    }
+
+    fn states(dpi: u32) -> Vec<(String, Model)> {
+        let mons = || {
+            let mut v = vec![mon(0, 0, 1920, 1080, true, false), mon(1920, 0, 3440, 1440, false, false)];
+            for m in &mut v {
+                m.dpi = dpi;
+            }
+            geom::number_monitors(&mut v);
+            v
+        };
+        // the drawing's states (100 %, 1920 x 1080 and 3440 x 1440)
+        let mut out: Vec<(String, Model)> = Vec::new();
+        if dpi == 96 {
+            out.extend(super::super::proof::states().into_iter().map(|(n, m)| (n.to_string(), m)));
+            out.extend(super::super::proof::states_3440().into_iter().map(|(n, m)| (format!("{n}@3440"), m)));
+        }
+        // Order 041: a click picks the whole monitor - the toolbar then lies inside the box, under the tool's own pointer
+        for tool in [None, Some(Tool::Arrow), Some(Tool::Box), Some(Tool::Pen), Some(Tool::Hl), Some(Tool::Text), Some(Tool::Emoji)] {
+            for mi in [0usize, 1] {
+                let r = mons()[mi].rect;
+                let p = (r.x as f32 + 400.0, r.y as f32 + 300.0);
+                let mut m = Model::new(mons(), p, 0.0, None);
+                m.press(p, None, 10.0);
+                m.release(10.0);
+                if let Some(t) = tool {
+                    m.pick_tool(t, 20.0);
+                }
+                out.push((format!("whole{mi}-{tool:?}@{dpi}"), m));
+            }
+        }
+        out
+    }
+
+    /// Order 054 (the owner: "i cant click on any of the buttons inside of screenshot"): with the pointer ON a button - and the
+    /// crosshair / cross / ring / emoji drawn there, as the window draws it when the last move didn't count as "over the
+    /// toolbar" - the press finds that button, on every button of every state, at 100 % and 150 %, on both monitors.
+    #[test]
+    fn every_button_takes_the_click_under_its_own_pointer() {
+        let mut checked = 0;
+        let mut seen = std::collections::HashSet::new();
+        for dpi in [96, 144] {
+            for (name, mut m) in states(dpi) {
+                for mi in 0..m.monitors.len() {
+                    let mo = m.monitors[mi].clone();
+                    let g = Gfx::new(mo.dpi as f32 / 96.0);
+                    let s = g.scale;
+                    m.moved((-100_000.0, -100_000.0), false);
+                    let away = front_of(&g, &m, mi);
+                    for (k, c) in buttons(&away) {
+                        // the pointer on the button, not known as "over the toolbar": its own pointer is drawn under it
+                        m.moved((mo.rect.x as f32 + c.0 * s, mo.rect.y as f32 + c.1 * s), false);
+                        let l = front_of(&g, &m, mi);
+                        let got = l.hit(c.0, c.1).and_then(|(j, _)| l.clickable(j));
+                        assert_eq!(got, Some(k), "{name} monitor {mi}: a press on button {k:#x} at {c:?} (pointer {:?}) went elsewhere", m.pointer());
+                        checked += 1;
+                        seen.insert(k);
+                    }
+                }
+            }
+        }
+        for k in [K_X, K_SZ, K_LIVE, K_SNAP, K_UNDO, K_COPY, K_SAVE, K_MORE, K_BACK, idx(K_TOOL, 0), idx(K_TOOL, 5), idx(K_MON, 0), idx(K_ETAB, 1)] {
+            assert!(seen.contains(&k), "button {k:#x} never checked");
+        }
+        assert!(checked > 300, "only {checked} presses checked");
+    }
 }

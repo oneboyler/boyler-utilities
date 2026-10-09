@@ -3,10 +3,10 @@
 #   tools/installer/build.sh                 cargo build --release -p bu-app, then the setup
 #   tools/installer/build.sh --exe <path>    package an exe that is already built (no cargo)
 #   tools/installer/build.sh --out <dir>     write the setup there instead of <repo>/dist
-#   tools/installer/build.sh --define N=V    extra ISCC define (proof builds only: ProofNoMsi=1, MsiSha256=<wrong>)
+#   tools/installer/build.sh --define N=V    extra ISCC define (proof builds only: ProofNoMsi=1)
 # Inno Setup: %LOCALAPPDATA%\Programs\Inno Setup 6 (installed per user: innosetup-6.7.3.exe /CURRENTUSER /VERYSILENT).
-# The Everything MSI's address + SHA-256 are read from crates/search/src/real/host.rs, the version from app/Cargo.toml,
-# so the setup and the Search tab can never disagree.
+# The version is read from app/Cargo.toml. Everything for Search is set up by the app itself (--install-everything, Order 049:
+# the same code as the Search tab's button), so the setup and the Search tab can never disagree.
 set -euo pipefail
 
 root="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -37,11 +37,8 @@ fi
 [ -f "$exe" ] || { echo "no exe: $exe" >&2; exit 1; }
 exe="$(cd "$(dirname "$exe")" && pwd)/$(basename "$exe")"   # ISCC resolves a relative path against the .iss folder
 
-host_rs="$root/crates/search/src/real/host.rs"
-const() { sed -n "s/^pub const $1: &str = \"\(.*\)\";$/\1/p" "$host_rs"; }
-msi_host="$(const MSI_HOST)"; msi_path="$(const MSI_PATH)"; msi_sha="$(const MSI_SHA256)"
 version="$(sed -n 's/^version = "\(.*\)"$/\1/p' "$root/app/Cargo.toml" | head -1)"
-for v in msi_host msi_path msi_sha version; do
+for v in version; do
   [ -n "${!v}" ] || { echo "could not read $v" >&2; exit 1; }
 done
 
@@ -53,9 +50,6 @@ MSYS2_ARG_CONV_EXCL="*" "$iscc" /Q \
   "/DSrcRoot=$(w "$root")" \
   "/DAppExeSrc=$(w "$exe")" \
   "/DOutDir=$(w "$out")" \
-  "/DMsiHost=$msi_host" \
-  "/DMsiPath=$msi_path" \
-  "/DMsiSha256=$msi_sha" \
   ${extra[@]+"${extra[@]}"} \
   "$(w "$root/tools/installer/BoylerUtilities.iss")"
 setup="$out/Boyler Utilities Setup.exe"

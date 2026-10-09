@@ -28,6 +28,8 @@ impl Clock for Clk {
 
 /// `TBCOL` - each new timer takes the next colour.
 pub const TBCOL: [u32; 5] = [0x0a84ff, 0x2fd6c4, 0xffb340, 0xff6b8a, 0xbf5af2];
+/// Order 055: the Timers page repaints a running countdown's line / ring in steps of a quarter pixel of the 260 px line.
+pub const RING_STEPS: f64 = 1040.0;
 /// `.thn` maxlength
 pub const NAME_MAX: usize = 22;
 
@@ -413,8 +415,19 @@ impl Model {
         zones::PLACES.iter().filter(|p| !self.places.iter().any(|x| x.city == p.city)).map(|p| (p.city, format!("{} \u{b7} {}", p.city, p.land))).collect()
     }
 
+    /// Order 055: the UTC minute the world clock shows now (a change of it = the clock's text changed; no strings built).
+    pub fn utc_minute(&self) -> u64 {
+        self.zones.utc_now().as_secs() / 60
+    }
+    /// Order 055: how long until the world clock's next minute starts (the page wakes then, not every 250 ms).
+    pub fn to_next_minute(&self) -> Duration {
+        let now = self.zones.utc_now();
+        let into = Duration::from_secs(now.as_secs() % 60) + Duration::from_nanos(u64::from(now.subsec_nanos()));
+        Duration::from_secs(60) - into
+    }
+
     pub fn world(&self) -> zones::WorldView {
-        let minute = self.zones.utc_now().as_secs() / 60;
+        let minute = self.utc_minute();
         let cities: Vec<String> = self.places.iter().map(|p| p.city.clone()).collect();
         if let Some((m, c, w)) = self.world_cache.borrow().as_ref() {
             if *m == minute && *c == cities {
@@ -466,6 +479,40 @@ impl Model {
     pub fn next_end(&self) -> Option<Duration> {
         let now = self.clock.now();
         self.timers.iter().filter_map(|t| t.cd.deadline()).map(|d| d.saturating_sub(now)).min()
+    }
+
+    /// Order 055: how long until what the Timers page shows of the RUNNING timers looks different: (the digits - the next
+    /// whole second of a countdown / of a stopwatch's seconds, exact; the countdown's line / ring - its next step of a
+    /// quarter pixel (`RING_STEPS` over the 260 px line), exact, the caller keeps it off a faster rate than it can show).
+    /// A stopwatch's hundredths are not in here (the page steps them at its own 30 Hz). None = no such timer runs.
+    pub fn page_next_change(&self) -> (Option<Duration>, Option<Duration>) {
+        let sec = Duration::from_secs(1);
+        let (mut digits, mut ring): (Option<Duration>, Option<Duration>) = (None, None);
+        let take = |slot: &mut Option<Duration>, d: Duration| *slot = Some(slot.map_or(d, |n| n.min(d)));
+        for t in self.timers.iter().filter(|t| t.running()) {
+            match t.kind {
+                Kind::Sw => take(&mut digits, sec - Duration::from_nanos(u64::from(t.sw.elapsed().subsec_nanos()))),
+                Kind::Cd => {
+                    let left = t.cd.left();
+                    if left.is_zero() {
+                        // running at zero: the next `check` finishes it
+                        take(&mut digits, Duration::ZERO);
+                        continue;
+                    }
+                    // the digits are the left time rounded up: they change when it passes a whole second
+                    let n = left.subsec_nanos();
+                    take(&mut digits, if n == 0 { sec } else { Duration::from_nanos(u64::from(n)) });
+                    let set = t.cd.set_time().as_secs_f64();
+                    if set > 0.0 {
+                        let at = left.as_secs_f64() / set * RING_STEPS;
+                        // the step the ring sits in: it moves when the share drops below that step's lower edge
+                        let edge = if at.fract() == 0.0 { at - 1.0 } else { at.floor() };
+                        take(&mut ring, Duration::from_secs_f64(((at - edge) / RING_STEPS * set).max(0.0)));
+                    }
+                }
+            }
+        }
+        (digits, ring)
     }
 
     /// Order 049: how long until a pill of `pills(preview)` looks different - a running timer's time text (whole seconds), a

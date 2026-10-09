@@ -66,10 +66,46 @@ pub struct Timers {
     new_row: Option<(u32, f64)>,
     /// laps count when the newest lap row slid in
     lap_at: Option<(usize, f64)>,
-    /// the world clock's minute last shown (it repaints once a minute)
-    shown_minute: String,
-    /// Order 047: what the running timers showed at the last tick (digits, ring) - a change repaints
+    /// the world clock's UTC minute last shown (it repaints once a minute; None = not built yet)
+    shown_minute: Option<u64>,
+    /// Order 047: what the running timers showed at the last build / true tick (the digits of each) - a change repaints.
+    /// None = no timer runs (or the world clock is shown)
     shown_sig: Option<u64>,
+    /// Order 055: the same for the DATA that may only repaint at 30 Hz - the selected stopwatch's hundredths, the
+    /// countdowns' line / ring steps - and when that last repainted (ms)
+    shown_fine: u64,
+    last_fire: f64,
+}
+
+/// Order 055: a stopwatch's hundredths and a countdown's ring are data: shown at most every 33 ms (30 Hz), whatever the
+/// monitor's rate.
+const FINE_MS: f64 = 33.0;
+
+/// Order 055: what the page shows of the running timers, as two signatures: (every running timer's digits - these repaint at
+/// once; the selected stopwatch's hundredths + every running countdown's ring step - these at most every `FINE_MS`).
+/// (None, 0) when nothing runs or the world clock is shown: no strings are built then.
+fn page_sig(m: &model::Model) -> (Option<u64>, u64) {
+    use std::hash::{Hash, Hasher};
+    if m.mode == Mode::Clk || !m.any_running() {
+        return (None, 0);
+    }
+    let mut coarse = std::collections::hash_map::DefaultHasher::new();
+    let mut fine = std::collections::hash_map::DefaultHasher::new();
+    for t in m.timers.iter().filter(|t| t.running()) {
+        t.id.hash(&mut coarse);
+        t.short_text().hash(&mut coarse);
+        match t.kind {
+            Kind::Sw if t.id == m.sel => t.big_text().hash(&mut fine),
+            Kind::Sw => {}
+            Kind::Cd => ((t.share_left() * model::RING_STEPS as f32) as i32).hash(&mut fine),
+        }
+    }
+    (Some(coarse.finish()), fine.finish())
+}
+
+/// Order 055: is a running stopwatch's hundredths on the page (the big time of the selected stopwatch)?
+fn hundredths_shown(m: &model::Model) -> bool {
+    m.mode != Mode::Clk && m.selected().is_some_and(|t| t.kind == Kind::Sw && t.running())
 }
 
 /// A colour with the hover mix of `.tmrw`'s transition.
@@ -556,7 +592,7 @@ impl Page for Timers {
         self.pv_at = None;
         self.new_row = None;
         self.lap_at = None;
-        self.shown_minute = String::new();
+        self.shown_minute = None;
         overlay::set_preview(false);
     }
     fn build(&mut self, cx: &mut Cx) -> Vec<El> {
@@ -568,7 +604,12 @@ impl Page for Timers {
         let header = pieces::header(self.name(), Some(seg::seg(cx, K_SEG, &LABELS, on, true)));
         let hero = self.hero(cx);
         let list = self.list(cx);
-        self.shown_minute = self.with(|m| m.world().home_time);
+        // Order 055: what this build shows is what `tick` compares against (no extra rebuild right after a hover's build)
+        let (minute, (coarse, fine)) = self.with(|m| (m.utc_minute(), page_sig(m)));
+        self.shown_minute = Some(minute);
+        self.shown_sig = coarse;
+        self.shown_fine = fine;
+        self.last_fire = cx.now;
         // a toast (a countdown ended, a refusal): the frame's own (frosted, above everything, not blocking the page)
         if let Some((t, _)) = self.toast.take() {
             cx.toast(&t);
@@ -576,35 +617,31 @@ impl Page for Timers {
         vec![header, hero, list]
     }
     fn tick(&mut self, now: f64) -> bool {
-        let (ended, running, mode) = self.with(|m| {
+        // (a countdown that reached zero finishes here; with nothing running this is a few comparisons)
+        let (ended, (coarse, fine), minute, clock) = self.with(|m| {
             m.check();
-            (std::mem::take(&mut m.ended), m.any_running(), m.mode)
+            (std::mem::take(&mut m.ended), page_sig(m), m.utc_minute(), m.mode == Mode::Clk)
         });
-        // Order 047: a running timer repaints only when what it shows changed (a digit; its ring / line by a quarter
-        // pixel) - not every frame of a 360 Hz screen; `wake_at` looks again every 5 ms
-        let sig = if running {
-            use std::hash::{Hash, Hasher};
-            let mut h = std::collections::hash_map::DefaultHasher::new();
-            self.with(|m| {
-                for t in m.timers.iter().filter(|t| t.running()) {
-                    t.big_text().hash(&mut h);
-                    t.short_text().hash(&mut h);
-                    ((t.share_left() * 4000.0) as i32).hash(&mut h);
-                }
-            });
-            Some(h.finish())
-        } else {
-            None
-        };
-        let mut dirty = sig != self.shown_sig;
-        self.shown_sig = sig;
+        // Order 047 / 055: a running timer repaints when a digit changed (at once), and its hundredths / ring step at most
+        // every 33 ms - never every frame of a 360 Hz screen. `wake_at` asks again exactly when that can next happen, so
+        // the digits keep moving with a still mouse and an unfocused menu. (`page_sig` builds nothing when no timer runs.)
+        let mut dirty = coarse != self.shown_sig;
+        if !dirty && fine != self.shown_fine && now - self.last_fire >= FINE_MS - 1.0 {
+            dirty = true;
+        }
+        if dirty {
+            self.shown_sig = coarse;
+            self.shown_fine = fine;
+            self.last_fire = now;
+        }
         if let Some((id, text)) = ended.into_iter().last() {
             self.show_toast(text, now);
             self.end_at = Some((id, now));
             dirty = true;
             overlay::sync();
         }
-        if mode == Mode::Clk && self.with(|m| m.world().home_time) != self.shown_minute {
+        // the world clock repaints once a minute (the minute number, no strings)
+        if clock && self.shown_minute != Some(minute) {
             dirty = true;
         }
         dirty
@@ -614,16 +651,33 @@ impl Page for Timers {
         false
     }
     fn wake_at(&self, now: f64) -> Option<f64> {
-        // a running timer's digits / ring: looked at every 5 ms (a stopwatch's hundredths change every 10); the world
-        // clock's minute every 250 ms
-        let (running, clock) = self.with(|m| (m.any_running(), m.mode == Mode::Clk));
-        if running {
-            Some(now + 5.0)
-        } else if clock {
-            Some(now + 250.0)
-        } else {
-            None
+        // Order 055: exactly when the page will look different - the next whole second of a running timer, a stopwatch's
+        // hundredths 33 ms after the last repaint (30 Hz), a countdown's ring step (never faster than 33 ms), the world
+        // clock's next minute. Nothing running and no clock = None (no frames, no wake-ups). 1 ms past the edge so the
+        // tick never lands just before it.
+        let (running, clock, hundredths, (digits, ring), minute, end) =
+            self.with(|m| (m.any_running(), m.mode == Mode::Clk, hundredths_shown(m), m.page_next_change(), m.to_next_minute(), m.next_end()));
+        let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0 + 1.0;
+        let mut at: Option<f64> = None;
+        let mut take = |t: f64| at = Some(at.map_or(t, |a| a.min(t)));
+        if clock {
+            take(now + ms(minute));
+            // a countdown that ends meanwhile (its toast)
+            if let Some(e) = end {
+                take(now + ms(e));
+            }
+        } else if running {
+            if let Some(d) = digits {
+                take(now + ms(d));
+            }
+            if let Some(r) = ring {
+                take(now + ms(r).max(FINE_MS));
+            }
+            if hundredths {
+                take((self.last_fire + FINE_MS).max(now + 1.0));
+            }
         }
+        at
     }
     fn event(&mut self, ev: &Ev, cx: &mut Cx) {
         let now = cx.now;

@@ -1005,9 +1005,13 @@ pub fn set_spot(sp: micicon::Spot) {
     save(None);
 }
 
-/// While the Audio page shows: another app muting the mic updates the icon (event-driven, bu-micmute's watch).
+/// While the Audio page shows: another app muting the mic updates the icon (event-driven, bu-micmute's watch). Order 055:
+/// the change wakes the menu (it used to be found by the page's 16 ms polling).
 pub fn watch(m: &MicMute) {
-    let _ = m.start_watching(Arc::new(|_| CHANGED.store(true, Ordering::Relaxed)));
+    let _ = m.start_watching(Arc::new(|_| {
+        CHANGED.store(true, Ordering::Relaxed);
+        crate::services::Waker.wake();
+    }));
 }
 /// Another app changed the mic since the last look (the page reads the state again).
 pub fn take_changed() -> bool {

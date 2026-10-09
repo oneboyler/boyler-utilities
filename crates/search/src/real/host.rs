@@ -1,58 +1,62 @@
-//! Everything the program: where it is, our own hidden instance (started with the Search tab, quit with the menu), and the
-//! one-click install (the owner, Oct 8: "Install Everything" downloads the official MSI from voidtools.com, checks it, runs it
-//! silently; Windows asks for admin once).
+//! Everything the program: our own copy (`ours`: set up by one admin prompt), our hidden instance (started with the Search
+//! tab, quit when the tab closes), and its settings.
 //!
 //! Our instance is a NAMED one (`-instance BoylerUtilities`) with its own settings file (no tray icon, no window, no update
 //! check, not run at sign-in) and its own index file in `%LOCALAPPDATA%\BoylerUtilities\Everything`, so a copy of Everything
 //! the user runs themselves is never touched (and is used instead when it runs). The switches (`-instance`, `-startup`,
-//! `-config`, `-db`, `-exit`) and the settings were run on Everything 1.4.1.1032 in Order 043 (a scratch instance):
-//! a first build of five drives took 75 - 80 s, loading the saved index 9.3 s, saving it on quit 7.7 - 9.6 s.
+//! `-config`, `-db`, `-exit`, `-reindex`) and the settings were run on Everything 1.4.1.1032 (Orders 043, 049, scratch
+//! instances): a first build of five drives took 75 - 80 s, loading the saved index 9.3 s, saving it on quit 7.7 - 9.6 s.
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
+use super::ours::{self, Drive};
 use crate::error::{Result, SearchError};
 
 /// Our instance's name (its IPC window is `EVERYTHING_TASKBAR_NOTIFICATION_(BoylerUtilities)`).
 pub const INSTANCE: &str = "BoylerUtilities";
 
-/// The installer the owner approved (the boss, Oct 8): its address and SHA-256.
-pub const MSI_HOST: &str = "www.voidtools.com";
-pub const MSI_PATH: &str = "/Everything-1.4.1.1032.x64.msi";
-pub const MSI_SHA256: &str = "4e7a80885aab8566b750c56a2a2b3e7c3c1f4920bcc53777e07f5eeb9e1f7485";
-
-/// Order 049: that MSI writes an all-users "start Everything at sign-in" Run value and has no property to turn it off (its
-/// tables: no START_ON_STARTUP; the value is component StartOnStartup with no condition). This transform
-/// (tools/installer/everything_mst.ps1) gives that component the condition 1=0, so msiexec skips it (dry-run costing:
-/// requested 3 = installed without it, -1 = skipped with it). The Everything service stays: our instance reads every drive
-/// through it.
-pub const NO_STARTUP_MST: &[u8] = include_bytes!("../../assets/everything-no-startup.mst");
-
-/// Our instance's settings (Everything.ini): everything that would show or stay is off. `service_pipe_name`: a NAMED
-/// instance looks for a service pipe of its own name, finds none ("Open pipe failed 2" in Everything's debug log) and then
-/// reads only the drives a normal user may open - on a test PC only one of its five drives, so the others were missing from every
-/// search (measured, Order 043). It is pointed at the one pipe the Everything service makes.
+/// Our instance's settings (Everything.ini): everything that would show or stay is off; only the drives `ini` lists
+/// (no drive is taken by itself).
 ///
 /// Order 049 (RAM): only the indexes our query needs. It sorts by name (always kept) and asks for size + date modified
 /// (`everything::query`), so those two stay indexed but without their own sorted copies (`fast_*_sort=0`); no list of recent
-/// changes; and the big folders nobody searches for are left out (`EXCLUDE`).
-pub const INI: &str = "[Everything]\r\nrun_in_background=1\r\nshow_tray_icon=0\r\nrun_on_system_startup=0\r\ncheck_for_updates_on_startup=0\r\nshow_in_taskbar=0\r\nrun_as_admin=0\r\nservice_pipe_name=\\\\.\\PIPE\\Everything Service\r\nindex_size=1\r\nindex_date_modified=1\r\nfast_size_sort=0\r\nfast_date_modified_sort=0\r\nfast_path_sort=0\r\nfast_extension_sort=0\r\nindex_recent_changes=0\r\nexclude_list_enabled=1\r\n";
+/// changes; and the big folders nobody searches for are left out (`EXCLUDE`). Measured on a PC with 10.1 M files on 5
+/// drives: 830 MB -> 552 MB; the Windows drive alone (the default, item 6): 186 MB.
+pub const INI: &str = "[Everything]\r\nrun_in_background=1\r\nshow_tray_icon=0\r\nrun_on_system_startup=0\r\ncheck_for_updates_on_startup=0\r\nshow_in_taskbar=0\r\nrun_as_admin=0\r\nindex_size=1\r\nindex_date_modified=1\r\nfast_size_sort=0\r\nfast_date_modified_sort=0\r\nfast_path_sort=0\r\nfast_extension_sort=0\r\nindex_recent_changes=0\r\nexclude_list_enabled=1\r\nauto_include_fixed_volumes=0\r\nauto_include_fixed_refs_volumes=0\r\nauto_include_removable_volumes=0\r\n";
 
-/// The folders our index leaves out (Everything's wildcards, `*` = any text): Windows' component store, every drive's
-/// recycle bin, and build output (node_modules, Rust's target\debug + target\release). `{windir}` = the Windows folder.
+/// The folders our index leaves out (Everything's wildcards, `*` = any text, any depth - checked Oct 9): Windows'
+/// component store, every drive's recycle bin, and build output (node_modules, Rust's target\debug + target\release).
+/// `{windir}` = the Windows folder.
 pub const EXCLUDE: [&str; 5] = [r"{windir}\WinSxS", r"*:\$Recycle.Bin", r"*\node_modules", r"*\target\debug", r"*\target\release"];
 
-/// Our instance's whole settings file: `INI` + the left-out folders (Everything.ini's list form: each in quotes, `\`
-/// doubled, comma between).
-pub fn ini(windir: &str) -> String {
-    let list: Vec<String> = EXCLUDE.iter().map(|f| format!("\"{}\"", f.replace("{windir}", windir.trim_end_matches('\\')).replace('\\', "\\\\"))).collect();
-    format!("{INI}exclude_folders={}\r\n", list.join(","))
+/// Everything.ini's list form: each in quotes, `\` doubled, comma between.
+fn ini_list<'a>(items: impl Iterator<Item = &'a str>) -> String {
+    items.map(|s| format!("\"{}\"", s.replace('\\', "\\\\"))).collect::<Vec<_>>().join(",")
+}
+
+/// Our instance's whole settings file: `INI` + the service pipe it reads the drives through (OUR service's) + the drives
+/// it covers (only these, Order 049 item 6: the volume GUID is what makes Everything take a drive - a letter alone indexed
+/// nothing, tried Oct 9) + the left-out folders.
+pub fn ini(windir: &str, pipe: &str, drives: &[Drive]) -> String {
+    let w = windir.trim_end_matches('\\');
+    let ex: Vec<String> = EXCLUDE.iter().map(|f| f.replace("{windir}", w)).collect();
+    let letters: Vec<String> = drives.iter().map(|d| format!("{}:", d.letter)).collect();
+    let ones = vec!["1"; drives.len()].join(",");
+    let zeros = vec!["0"; drives.len()].join(",");
+    format!(
+        "{INI}service_pipe_name={pipe}\r\nntfs_volume_guids={}\r\nntfs_volume_paths={}\r\nntfs_volume_roots={}\r\nntfs_volume_includes={ones}\r\nntfs_volume_load_recent_changes={zeros}\r\nexclude_folders={}\r\n",
+        ini_list(drives.iter().map(|d| d.guid.as_str())),
+        ini_list(letters.iter().map(|s| s.as_str())),
+        ini_list(drives.iter().map(|_| "")),
+        ini_list(ex.iter().map(|s| s.as_str())),
+    )
 }
 
 /// What `index.ok` holds when OUR index was made with today's settings and saved whole (Everything quit by itself after
 /// its index was loaded). Another text (older settings) throws the index away.
-pub const INDEX_MARK: &str = "BoylerUtilities index: service pipe, lean (049)";
+pub const INDEX_MARK: &str = "BoylerUtilities index: our service, lean, picked drives (049)";
 
 /// The mark file next to our index.
 pub fn mark_file(dir: &Path) -> PathBuf {
@@ -81,18 +85,9 @@ pub fn mark_index(dir: &Path) {
 /// How long a quitting instance may take to save a loaded index (measured on a test PC: 7.7 - 9.6 s for a large index).
 pub const SAVE_WAIT: Duration = Duration::from_secs(30);
 
-/// Where Everything.exe is (the installer's folders), if it is on this PC.
+/// Our Everything.exe (Order 049: only our own copy, never the user's).
 pub fn exe() -> Option<PathBuf> {
-    let mut c = Vec::new();
-    for v in ["ProgramFiles", "ProgramW6432", "ProgramFiles(x86)"] {
-        if let Ok(p) = std::env::var(v) {
-            c.push(Path::new(&p).join("Everything").join("Everything.exe"));
-        }
-    }
-    if let Ok(p) = std::env::var("LOCALAPPDATA") {
-        c.push(Path::new(&p).join("Programs").join("Everything").join("Everything.exe"));
-    }
-    c.into_iter().find(|p| p.is_file())
+    ours::exe()
 }
 
 /// Our instance's folder (settings + index).
@@ -105,15 +100,25 @@ pub fn db_file(dir: &Path) -> PathBuf {
     dir.join("Everything.db")
 }
 
-/// Start our instance hidden, at below-normal priority (Order 049: its index build never competes with a game or the
-/// desktop). Writes its settings file first (each time: the user never edits ours).
-pub fn start_ours(exe: &Path, dir: &Path) -> Result<Child> {
+/// Start our service, then our instance hidden at below-normal priority (its index build never competes with a game or
+/// the desktop), covering `drives`. Writes its settings file first (each time: the user never edits ours).
+pub fn start_ours(exe: &Path, dir: &Path, drives: &[Drive]) -> Result<Child> {
+    ours::service_start(Duration::from_secs(10))?;
+    // the service never stays running without our instance (review): any failure below stops it again
+    let r = start_client(exe, dir, drives);
+    if r.is_err() {
+        ours::service_stop();
+    }
+    r
+}
+
+fn start_client(exe: &Path, dir: &Path, drives: &[Drive]) -> Result<Child> {
     use std::os::windows::process::CommandExt;
     const BELOW_NORMAL_PRIORITY_CLASS: u32 = 0x0000_4000;
     std::fs::create_dir_all(dir).map_err(|e| SearchError::Everything(format!("its folder: {e}")))?;
     let ini = dir.join("Everything.ini");
     let windir = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
-    std::fs::write(&ini, self::ini(&windir)).map_err(|e| SearchError::Everything(format!("its settings: {e}")))?;
+    std::fs::write(&ini, self::ini(&windir, ours::PIPE, drives)).map_err(|e| SearchError::Everything(format!("its settings: {e}")))?;
     let db = db_file(dir);
     Command::new(exe)
         .creation_flags(BELOW_NORMAL_PRIORITY_CLASS)
@@ -192,15 +197,35 @@ pub fn stop_ours(exe: Option<&Path>, ours: Ours, wait: Duration) -> bool {
         }
     }
     let until = Instant::now() + wait;
+    let mut clean = false;
     while Instant::now() < until {
         if let Ok(Some(_)) = child.try_wait() {
-            return true;
+            clean = true;
+            break;
         }
         std::thread::sleep(Duration::from_millis(50));
     }
-    let _ = child.kill();
-    let _ = child.wait();
-    false
+    if !clean {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    // Order 049: nothing of Everything stays running - our service stops with it
+    ours::service_stop();
+    clean
+}
+
+/// "Update search" (Order 049 item 8): our running instance makes its file list again (`-reindex`).
+pub fn reindex_ours(exe: &Path) -> Result<()> {
+    let mut c = Command::new(exe).arg("-instance").arg(INSTANCE).arg("-reindex").spawn().map_err(|e| SearchError::Everything(format!("could not ask it: {e}")))?;
+    let until = Instant::now() + Duration::from_secs(5);
+    while !matches!(c.try_wait(), Ok(Some(_))) && Instant::now() < until {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    if !matches!(c.try_wait(), Ok(Some(_))) {
+        let _ = c.kill();
+        let _ = c.wait();
+    }
+    Ok(())
 }
 
 // ------------------------------------------------------------------------------------------------- install
@@ -274,21 +299,19 @@ pub fn download(host: &str, path: &str) -> Result<Vec<u8>> {
     }
 }
 
-/// Run the MSI silently, elevated (Windows' admin prompt), with the transform that leaves out its start-at-sign-in. Ok =
-/// installed (exit 0, or 3010 "restart needed later").
-pub fn run_msi(msi: &Path, mst: &Path) -> Result<()> {
+/// Start `file params` with Windows' admin prompt (hidden) and wait for it: its exit code. A "No" on the prompt =
+/// `InstallCancelled`.
+pub fn run_elevated(file: &Path, params: &str) -> Result<u32> {
     use windows::core::PCWSTR;
     use windows::Win32::Foundation::{CloseHandle, ERROR_CANCELLED, WAIT_OBJECT_0};
     use windows::Win32::System::Threading::{GetExitCodeProcess, WaitForSingleObject, INFINITE};
     use windows::Win32::UI::Shell::{ShellExecuteExW, SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW};
     use windows::Win32::UI::WindowsAndMessaging::SW_HIDE;
     let verb = super::wide("runas");
-    // Windows' own msiexec by its full path (never one found by name in the current or the app's folder)
-    let root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
-    let file = super::wide(&format!(r"{root}\System32\msiexec.exe"));
+    let file = super::wide(&file.display().to_string());
     // ShellExecuteEx wants COM on its thread
     let _com = super::Com::sta();
-    let params = super::wide(&msi_params(msi, mst));
+    let params = super::wide(params);
     let mut sei = SHELLEXECUTEINFOW {
         cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
         fMask: SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC,
@@ -303,91 +326,24 @@ pub fn run_msi(msi: &Path, mst: &Path) -> Result<()> {
             if e.code() == ERROR_CANCELLED.to_hresult() {
                 return Err(SearchError::InstallCancelled);
             }
-            return Err(SearchError::Install(format!("the installer did not start: {}", e.message())));
+            return Err(SearchError::Install(format!("the set-up did not start: {}", e.message())));
         }
         if sei.hProcess.is_invalid() {
-            return Err(SearchError::Install("the installer did not start".into()));
+            return Err(SearchError::Install("the set-up did not start".into()));
         }
         let w = WaitForSingleObject(sei.hProcess, INFINITE);
         let mut code = 1u32;
         let _ = GetExitCodeProcess(sei.hProcess, &mut code);
         let _ = CloseHandle(sei.hProcess);
         if w != WAIT_OBJECT_0 {
-            return Err(SearchError::Install("the installer did not finish".into()));
+            return Err(SearchError::Install("the set-up did not finish".into()));
         }
-        match code {
-            0 | 3010 => Ok(()),
-            1602 => Err(SearchError::InstallCancelled),
-            c => Err(SearchError::Install(format!("the installer stopped (code {c})"))),
-        }
+        Ok(code)
     }
 }
 
-/// msiexec's command line: install silently, with the transform, no restart.
-pub fn msi_params(msi: &Path, mst: &Path) -> String {
-    format!("/i \"{}\" TRANSFORMS=\"{}\" /qn /norestart", msi.display(), mst.display())
-}
-
-/// The whole install: download, check the SHA-256 (a mismatch never runs), run, delete the file.
-pub fn install() -> Result<()> {
-    let data = download(MSI_HOST, MSI_PATH)?;
-    if sha256_hex(&data)? != MSI_SHA256 {
-        return Err(SearchError::Install("the download did not match voidtools' file - nothing was installed".into()));
-    }
-    let dir = std::env::temp_dir().join("BoylerUtilities");
-    std::fs::create_dir_all(&dir).map_err(|e| SearchError::Install(format!("could not save it: {e}")))?;
-    let msi = dir.join("Everything-1.4.1.1032.x64.msi");
-    std::fs::write(&msi, &data).map_err(|e| SearchError::Install(format!("could not save it: {e}")))?;
-    // held open with read-only sharing while the installer runs, and checked again through that handle: nothing can swap
-    // the file between the check and the elevated install
-    let lock = {
-        use std::io::Read;
-        use std::os::windows::fs::OpenOptionsExt;
-        const FILE_SHARE_READ: u32 = 1;
-        let mut f = std::fs::OpenOptions::new().read(true).share_mode(FILE_SHARE_READ).open(&msi).map_err(|e| SearchError::Install(format!("could not check it: {e}")))?;
-        let mut again = Vec::new();
-        f.read_to_end(&mut again).map_err(|e| SearchError::Install(format!("could not check it: {e}")))?;
-        if sha256_hex(&again)? != MSI_SHA256 {
-            drop(f);
-            let _ = std::fs::remove_file(&msi);
-            return Err(SearchError::Install("the saved file did not match voidtools' file - nothing was installed".into()));
-        }
-        f
-    };
-    // the transform (ours, from inside the app): saved, held and checked the same way
-    let mst = dir.join("everything-no-startup.mst");
-    if let Err(e) = std::fs::write(&mst, NO_STARTUP_MST) {
-        drop(lock);
-        let _ = std::fs::remove_file(&mst);
-        let _ = std::fs::remove_file(&msi);
-        return Err(SearchError::Install(format!("could not save it: {e}")));
-    }
-    let mst_lock = {
-        use std::io::Read;
-        use std::os::windows::fs::OpenOptionsExt;
-        const FILE_SHARE_READ: u32 = 1;
-        let held = std::fs::OpenOptions::new().read(true).share_mode(FILE_SHARE_READ).open(&mst).and_then(|mut f| {
-            let mut again = Vec::new();
-            f.read_to_end(&mut again).map(|_| (f, again))
-        });
-        match held {
-            Ok((f, again)) if again == NO_STARTUP_MST => f,
-            _ => {
-                drop(lock);
-                let _ = std::fs::remove_file(&mst);
-                let _ = std::fs::remove_file(&msi);
-                return Err(SearchError::Install("could not check its settings file - nothing was installed".into()));
-            }
-        }
-    };
-    let r = run_msi(&msi, &mst);
-    drop(lock);
-    drop(mst_lock);
-    let _ = std::fs::remove_file(&msi);
-    let _ = std::fs::remove_file(&mst);
-    r?;
-    if exe().is_none() {
-        return Err(SearchError::Install("the installer finished but Everything is not where it should be".into()));
-    }
-    Ok(())
+/// The whole install (Order 049: our own copy + our service, `ours::install`); `tidy` also removes the Everything v1.0.0
+/// put on the PC (A_049_02's rule).
+pub fn install(tidy: bool) -> Result<()> {
+    ours::install(tidy)
 }

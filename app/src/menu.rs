@@ -20,6 +20,7 @@ use crate::gpu::{self, Gpu, GpuChain};
 use crate::present::{Chain, Swap};
 use std::rc::Rc;
 use crate::timing;
+use crate::vsync;
 use crate::ui::{self, Frame, Ui, PAGE_H, PAGE_TOP, RADIUS, WIN_H, WIN_W};
 
 
@@ -28,6 +29,34 @@ const SH_L: f32 = 124.0;
 const SH_T: f32 = 94.0;
 const SH_R: f32 = 124.0;
 const SH_B: f32 = 154.0;
+
+/// Order 055: what a frame changes on the screen (window device px).
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Dirty {
+    /// nothing: no compositing, no present
+    Nothing,
+    Rect(sk::IRect),
+    Full,
+}
+
+/// The page's view (where the page's layers show), window device px.
+fn page_view(s: f32) -> sk::IRect {
+    sk::IRect::from_ltrb(0, (PAGE_TOP * s).floor() as i32, (WIN_W * s).ceil() as i32, ((PAGE_TOP + PAGE_H) * s).ceil() as i32)
+}
+
+thread_local! {
+    /// Order 055: the refresh after a frame that showed nothing came (the menu may draw its next frame)
+    static VBLANK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn on_vblank() {
+    VBLANK.with(|v| v.set(true));
+}
+
+/// Did the refresh asked for after a frame without a present come (main loop: the menu's slot)?
+pub fn take_vblank() -> bool {
+    VBLANK.with(|v| v.replace(false))
+}
 
 pub struct Menu {
     pub hwnd: HWND,
@@ -156,6 +185,8 @@ impl Menu {
                 crate::comp::GlassMode::Host | crate::comp::GlassMode::BlurBehind => gpu::get(Some(mon)),
                 _ => None,
             };
+            // Order 052 item 0: opened on the CPU path while shaders compile - the GPU again once they are done
+            let warming = gpu.is_none() && matches!(mode, crate::comp::GlassMode::Host | crate::comp::GlassMode::BlurBehind) && !crate::shadercache::warm();
             let (gpu, chain, mask) = make_swaps(gpu, &g, w, h)?;
             // the layers on the same device; a GPU that can't give them (out of memory, a crash just now) = the CPU path
             let (gpu, chain, mask, ly, lc) = match (Layers::new(gpu.clone(), w, h), surf_on(gpu.as_ref(), w, h)) {
@@ -241,7 +272,7 @@ impl Menu {
                 shadow,
                 g,
                 gpu,
-                retry_at: None,
+                retry_at: warming.then_some(now),
                 mon,
                 chain,
                 mask,
@@ -518,7 +549,8 @@ impl Menu {
         let p2 = timing::now();
         // Order 051: back on the GPU after a lost device (RETRY_MS later), or onto the CPU path when it is lost now
         if self.gpu.is_none() && self.retry_at.is_some_and(|t| now >= t) {
-            self.retry_at = None;
+            // (Order 052 item 0: shaders still compiling - asked again a moment later; the worker wakes the menu when done)
+            self.retry_at = (!crate::shadercache::warm()).then_some(now + 250.0);
             if let Some(g) = gpu::get(Some(self.mon)) {
                 if let Err(e) = self.rebuild(Some(g)) {
                     timing::note(&format!("gpu retry failed {:08x}", e.code().0));
@@ -531,23 +563,61 @@ impl Menu {
             self.glass.set_opacity(op);
             self.glass.set_offset_y(frac);
         }
-        self.draw(now)?;
+        let d = self.draw(now)?;
+        if d == Dirty::Nothing {
+            // Order 055: nothing on the screen changed - no present; the next refresh paces the next look instead of the
+            // swap chain (a present that is not made never wakes it)
+            vsync::next_menu(on_vblank);
+            self.ui.dirty = false;
+            return Ok(());
+        }
         let p3 = timing::now();
-        if let Err(e) = self.present() {
+        if let Err(e) = self.present(d) {
             if self.gpu.is_some() && (gpu::is_lost_error(&e) || self.gpu.as_ref().is_some_and(|g| g.lost())) {
-                // the frame is drawn again on the CPU at once: no blank window
-                self.on_lost()?;
+                // the frame is drawn again on the CPU at once: no blank window (Order 052 item 0: also a frame that was
+                // missing shaders - the GPU again once the worker has compiled them)
+                if e.code() == crate::shadercache::NOT_READY && !self.gpu.as_ref().is_some_and(|g| g.lost()) {
+                    timing::note(&format!("gpu shaders missing: cpu path until compiled ({} left)", crate::shadercache::pending()));
+                    self.retry_at = Some(timing::now() + 250.0);
+                    let keep = self.gpu.clone();
+                    self.rebuild(None)?;
+                    if let Some(g) = keep {
+                        gpu::keep(g);
+                    }
+                } else {
+                    self.on_lost()?;
+                }
                 self.glass.set_opacity(op);
                 self.glass.set_offset_y(frac);
-                self.draw(now)?;
-                self.present()?;
+                let d = self.draw(now)?;
+                self.present(d)?;
             } else {
                 return Err(e);
             }
         }
+        // (a refresh asked after an empty frame is not needed any more: the swap chain paces again)
+        take_vblank();
         let p4 = timing::now();
         if p4 - p0 > 8.0 {
-            timing::note(&format!("slow_frame update {:.1} window {:.1} draw {:.1} present {:.1}", p1 - p0, p2 - p1, p3 - p2, p4 - p3));
+            let (fl, pr) = gpu::PRESENT_SPLIT.with(|p| p.get());
+            timing::note(&format!("slow_frame update {:.1} window {:.1} draw {:.1} present {:.1} (flush {:.1} Present {:.1})", p1 - p0, p2 - p1, p3 - p2, p4 - p3, fl, pr));
+        }
+        // Order 047 / 052 (measuring): a clicked tab's page is on the screen - from the click to this frame's present, and
+        // this frame's own cost (update / draw / present)
+        if let Some((t0, ready)) = self.ui.switch_shown.take() {
+            timing::note(&format!(
+                "switch_shown {} {:.2} ms frame {:.2} ms (update {:.2} draw {:.2} present {:.2} = flush {:.2} + Present {:.2}) ready={} path={}",
+                self.ui.tab_id(),
+                p4 - t0,
+                p4 - p0,
+                p1 - p0,
+                p3 - p2,
+                p4 - p3,
+                gpu::PRESENT_SPLIT.with(|p| p.get().0),
+                gpu::PRESENT_SPLIT.with(|p| p.get().1),
+                ready,
+                if self.gpu.is_some() { "gpu" } else { "cpu" }
+            ));
         }
         self.frames += 1;
         self.last_frame = timing::now();
@@ -629,19 +699,22 @@ impl Menu {
         }
     }
 
-    fn draw(&mut self, now: f64) -> Result<()> {
+    /// Paint the frame; returns what changed on the screen (Order 055: only that is composited and presented).
+    fn draw(&mut self, now: f64) -> Result<Dirty> {
         self.last_now = now;
+        // (Order 052 item 0: shaders missing from here to the present are this frame's - shadercache::take_missed)
+        let _ = crate::shadercache::take_missed();
         // Order 051: on the GPU the frame is painted straight into the swap chain's back buffer
         if let Swap::Gpu(c) = &self.chain {
             self.lc = c.back();
         }
         let Menu { g, icons, ly, lc, ui, .. } = self;
-        lc.canvas().clear(sk::Color::TRANSPARENT);
-        Self::compose(g, icons, ui, ly, lc, 0.0, 0.0, false, now);
+        // (the frame clears only the area it composites - compose)
+        let d = Self::compose(g, icons, ui, ly, lc, 0.0, 0.0, false, now);
         if self.mode == crate::comp::GlassMode::Own {
             self.draw_own_glass();
         }
-        Ok(())
+        Ok(d)
     }
 
     /// BU_GLASS=own: the drawing's backdrop recipe on the captured desktop (made again only when the desktop under
@@ -714,7 +787,7 @@ impl Menu {
     /// depends on it. Like Chromium, a layer is rastered again only when its content changed: the page, `::after` and
     /// top-row layers when anything but the meters moves, the meters every frame, the rim once.
     #[allow(clippy::too_many_arguments)]
-    fn compose(g: &Gfx, icons: &Icons, ui: &mut Ui, ly: &mut Layers, t: &mut sk::Surface, ox: f32, oy: f32, shadows: bool, now: f64) {
+    fn compose(g: &Gfx, icons: &Icons, ui: &mut Ui, ly: &mut Layers, t: &mut sk::Surface, ox: f32, oy: f32, shadows: bool, now: f64) -> Dirty {
         let f = Frame { g, icons, now };
         let s = g.scale;
         // test only (Order 013 edge proof): the window's own layer + the sheen, no content (BU_TEST=bare)
@@ -734,6 +807,9 @@ impl Menu {
         // the snapped page offset is this frame's (set below for the band); a switch's pages are painted without it (the
         // new tab must not take the old tab's scroll)
         ui.page_dy = None;
+        // Order 055: what this frame changes, in window device px - only that is composited (and presented)
+        let (rim_was, after_was, prev_ct) = (ly.rim_valid, ly.after_valid, ly.band_ct);
+        let mut page_dirty: Option<sk::IRect> = None;
         let fresh = !ly.valid || shadows || ui.dirty || ui.static_busy(now);
         // a page switch: both pages painted once (at rest), then only moved and faded each frame, like the drawing's
         // composited page layers
@@ -765,6 +841,19 @@ impl Menu {
             let ct = ((PAGE_TOP - ui.page_scroll(now)) * s).round() as i32;
             ui.page_dy = Some(ct as f32 / s);
             ly.band_ct = ct;
+            // the page's part: the boxes that changed (their painted place, outer shadows included - ui::damage), or the
+            // whole view when the band starts again or the page scrolled
+            let pv = page_view(s);
+            let restart = invalid || ct != prev_ct || ly.band.as_ref().is_none_or(|b| !b.ok || b.tab != ui.tab);
+            page_dirty = match (&damage, restart) {
+                (_, true) | (Some(ui::damage::Damage::Full), _) => Some(pv),
+                (Some(ui::damage::Damage::Rects(rs)), false) => rs
+                    .iter()
+                    .map(|&(x, y, w, h)| sk::IRect::from_ltrb((x * s).floor() as i32 - 2, (y * s).floor() as i32 + ct - 2, ((x + w) * s).ceil() as i32 + 2, ((y + h) * s).ceil() as i32 + ct + 2))
+                    .filter_map(|r| sk::IRect::intersect(&r, &pv))
+                    .reduce(|a, b| sk::IRect::join(&a, &b)),
+                (None, false) => None,
+            };
             band_frame(g, &f, ui, ly, ct, damage, invalid);
         } else {
             ui.page_dy = None;
@@ -812,6 +901,91 @@ impl Menu {
             ly.rim_valid = true;
         }
         let t2 = crate::timing::now();
+        // the top row's layers (they never overlap each other, so one picture of them blends the same). Painted again only
+        // when something in it changed (Order 041: 1-2.5 ms a frame)
+        let dsig = ui.dock_sig(now);
+        let mut dock_drawn = 0;
+        if invalid || shadows || dsig.is_none() || dsig != ly.dock_sig {
+            ly.dock_sig = dsig;
+            dock_drawn = 1;
+            ly.dock.canvas().clear(sk::Color::TRANSPARENT);
+            g.begin(ly.dock.canvas());
+            ui.draw_dock(&f);
+            g.end();
+        }
+        // the shared tooltip first: a shown popup / tooltip makes the frame whole (Order 055)
+        ui.update_tips(g, now);
+        // the top row's hover names and chevrons, and the page's glass scrollbar: into their own layer, frosting the frame
+        // so far (the page, its meters, the ::after layer - not the top row: Chromium's backdrop root is the window's content)
+        let sb = !bare && ui.scrollbar_shown(now);
+        let ovl = !bare && ui.dock_overlays_shown(now);
+        // where they are (window device px): the top band (chevrons, names) and the scrollbar's column
+        // (the name label's shadow reaches ~110 DIPs down)
+        let band_r = sk::IRect::from_ltrb(0, 0, ly.over.width(), (120.0 * s).ceil() as i32);
+        // (the scrollbar at x 588 frosts 8 px blur = up to 3 sigma = 24 px to its left)
+        let col_r = sk::IRect::from_ltrb((556.0 * s).floor() as i32, band_r.bottom, ly.over.width(), ly.over.height());
+        // Order 055 (the owner Oct 9: 6.4 % CPU, 6.9 % GPU while moving the mouse over the open menu): only what changed is
+        // composited and presented. A frame is whole while anything moves the whole window (opening / closing, a tab
+        // switch, the content's blur), while a popup or tooltip shows (it frosts everything under it), when a cached layer
+        // was painted again, and right after such a frame (its leftovers go).
+        let full_now = invalid || shadows || bare || motion.is_some() || blur > 0.01 || !band_on || !rim_was || !after_was || ui.popup_open() || ui.opening_or_closing(now) || ui.caps_busy(now);
+        let full = full_now || ly.prev_full;
+        let join = |a: Option<sk::IRect>, b: Option<sk::IRect>| match (a, b) {
+            (Some(a), Some(b)) => Some(sk::IRect::join(&a, &b)),
+            (a, b) => a.or(b),
+        };
+        let mut dirty = page_dirty;
+        // the meters: where the live pass painted now and where it painted last (a meter that went away)
+        let live_now = if live_on { ui.live_ink(now).map(|(x, y, w, h)| sk::IRect::from_ltrb((x * s).floor() as i32 - 4, (y * s).floor() as i32 - 4, ((x + w) * s).ceil() as i32 + 4, ((y + h) * s).ceil() as i32 + 4)) } else { None };
+        if live_on {
+            dirty = join(dirty, join(live_now, ly.prev_live).and_then(|r| sk::IRect::intersect(&r, &page_view(s))));
+        }
+        if dock_drawn == 1 {
+            dirty = join(dirty, Some(sk::IRect::from_ltrb(0, 0, ly.dock.width(), (64.0 * s).ceil() as i32)));
+        }
+        // the overlays are painted again when their own state changed or the pixels they frost did (the same state over
+        // the same pixels = the same picture: a hover name over the Audio meters' page was painted every frame, ~1.5 ms)
+        let osig = {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            (ui.overlay_sig(now), sb, ovl).hash(&mut h);
+            h.finish()
+        };
+        let under = |r: &sk::IRect| dirty.is_some_and(|d| sk::IRect::intersects(&d, r));
+        let over_redraw = (sb || ovl) && (full || ly.over_key != Some(osig) || under(&band_r) || under(&col_r));
+        if over_redraw || (ly.over_shown && !(sb || ovl)) {
+            dirty = join(dirty, Some(sk::IRect::join(&band_r, &col_r)));
+        }
+        let this = if full {
+            Dirty::Full
+        } else {
+            dirty.map(Dirty::Rect).unwrap_or(Dirty::Nothing)
+        };
+        if this == Dirty::Nothing {
+            // nothing on the screen changes: no compositing, no present (Order 055)
+            ly.valid = true;
+            return this;
+        }
+        ly.prev_live = live_now;
+        ly.over_shown = sb || ovl;
+        // the area composited: this frame's change; on the GPU the back buffer holds the frame before the last one, so the
+        // last presented frame's change is brought in too (flip-sequential swap chain of 2 buffers)
+        let area = match (this, ly.prev_change) {
+            (Dirty::Rect(r), Dirty::Rect(p)) if ly.gpu.is_some() => Some(sk::IRect::join(&r, &p)),
+            (Dirty::Rect(_), Dirty::Full) if ly.gpu.is_some() => None,
+            (Dirty::Rect(r), _) => Some(r),
+            _ => None,
+        };
+        ly.prev_full = full_now;
+        ly.prev_change = this;
+        {
+            let c = t.canvas();
+            c.save();
+            if let Some(a) = area {
+                c.clip_irect(a.with_offset(((ox * s).round() as i32, (oy * s).round() as i32)), sk::ClipOp::Intersect);
+            }
+            c.clear(sk::Color::TRANSPARENT);
+        }
         let page = ly.page.image_snapshot();
         let live = ly.live.image_snapshot();
         let after = ly.after.image_snapshot();
@@ -919,66 +1093,22 @@ impl Menu {
         }
         g.end();
         let t3 = crate::timing::now();
-        // the top row's layers (they never overlap each other, so one picture of them blends the same). Painted again only
-        // when something in it changed (Order 041: 1-2.5 ms a frame)
-        let dsig = ui.dock_sig(now);
-        let mut dock_drawn = 0;
-        if invalid || shadows || dsig.is_none() || dsig != ly.dock_sig {
-            ly.dock_sig = dsig;
-            dock_drawn = 1;
-            ly.dock.canvas().clear(sk::Color::TRANSPARENT);
-            g.begin(ly.dock.canvas());
-            ui.draw_dock(&f);
-            g.end();
-        }
         let dock = ly.dock.image_snapshot();
         let tsb = crate::timing::now();
-        // the top row's hover names and chevrons, and the page's glass scrollbar: every frame they show, into their own
-        // layer, frosting the frame so far (the page, its meters, the ::after layer - not the top row: Chromium's
-        // backdrop root is the window's content)
-        let sb = !bare && ui.scrollbar_shown(now);
-        let ovl = !bare && ui.dock_overlays_shown(now);
-        // where they are (window device px): the top band (chevrons, names) and the scrollbar's column
-        // (the name label's shadow reaches ~110 DIPs down)
-        let band_r = sk::IRect::from_ltrb(0, 0, ly.over.width(), (120.0 * s).ceil() as i32);
-        // (the scrollbar at x 588 frosts 8 px blur = up to 3 sigma = 24 px to its left)
-        let col_r = sk::IRect::from_ltrb((556.0 * s).floor() as i32, band_r.bottom, ly.over.width(), ly.over.height());
-        if sb || ovl {
+        if over_redraw {
             let base = t.image_snapshot_with_bounds(sk::IRect::from_xywh(dx as i32, dy as i32, ly.over.width(), ly.over.height())).unwrap_or_else(|| page.clone());
             OV_PROF.with(|o| o.set((crate::timing::now() - tsb, 0.0, 0.0)));
-            // the same state over the same pixels: the same picture - kept (a hover name over the Audio meters' page was
-            // painted again every frame: its 30 px frost alone ~1.5 ms)
-            let key = {
-                use std::hash::{Hash, Hasher};
-                let mut h = std::collections::hash_map::DefaultHasher::new();
-                (ui.overlay_sig(now), sb, ovl).hash(&mut h);
-                if let Some(pm) = base.peek_pixels() {
-                    let rb = pm.row_bytes();
-                    if let Some(px) = pm.bytes() {
-                        for r in [band_r, col_r] {
-                            for y in r.top..r.bottom.min(pm.height()) {
-                                let o = y as usize * rb;
-                                px[o + r.left as usize * 4..o + (r.right.min(pm.width()) as usize) * 4].hash(&mut h);
-                            }
-                        }
-                    }
-                }
-                h.finish()
-            };
             let th = crate::timing::now();
-            // (on the GPU there are no CPU pixels to compare: painted every frame they show - cheap there)
-            if invalid || shadows || ly.gpu.is_some() || ly.over_key != Some(key) {
-                ly.over_key = Some(key);
-                ly.over.canvas().clear(sk::Color::TRANSPARENT);
-                g.begin(ly.over.canvas());
-                if ovl {
-                    ui.draw_dock_overlays(&f, &base);
-                }
-                if sb {
-                    ui.draw_page_scrollbar(&f, &base);
-                }
-                g.end();
+            ly.over_key = Some(osig);
+            ly.over.canvas().clear(sk::Color::TRANSPARENT);
+            g.begin(ly.over.canvas());
+            if ovl {
+                ui.draw_dock_overlays(&f, &base);
             }
+            if sb {
+                ui.draw_page_scrollbar(&f, &base);
+            }
+            g.end();
             OV_PROF.with(|o| {
                 let v = o.get();
                 o.set((v.0, th - tsb - v.0, crate::timing::now() - th));
@@ -1009,8 +1139,7 @@ impl Menu {
             c.restore();
         }
         let t4 = crate::timing::now();
-        // the popup, above everything (+ the shared tooltip)
-        ui.update_tips(g, now);
+        // the popup, above everything (+ the shared tooltip, updated above)
         if ui.popup_open() {
             // the WHOLE target as it is (device pixels): `backdrop` draws its base at device 0,0, so a crop at (dx, dy) put
             // the wrong part behind the popup in the comparison picture (the window at dx, dy != 0) - Lane R 09:01
@@ -1044,12 +1173,15 @@ impl Menu {
         }
         let _ = t5;
         ly.valid = true;
+        // (the clip of the changed area, set before the frame was cleared)
+        t.canvas().restore();
+        this
     }
 
-    /// Hand the finished frame to the swap chain.
-    fn present(&mut self) -> Result<()> {
+    /// Hand the finished frame to the swap chain (`d` = what changed: the compositor redraws only that - Order 055).
+    fn present(&mut self, d: Dirty) -> Result<()> {
         let chain = match &mut self.chain {
-            Swap::Gpu(c) => return c.present(),
+            Swap::Gpu(c) => return c.present(if let Dirty::Rect(r) = d { Some(r) } else { None }),
             Swap::Cpu(c) => c,
         };
         let src = match &mut self.out {
@@ -1257,6 +1389,8 @@ impl Menu {
 impl Drop for Menu {
     fn drop(&mut self) {
         unsafe {
+            // (Order 052: a device kept while shaders compiled goes with the menu)
+            gpu::cool_down();
             ui::reset_caches();
             self.glass.close();
             self.chain.release();
@@ -1440,6 +1574,12 @@ struct Layers {
     band_ct: i32,
     /// what the top row's picture was painted from (`Ui::dock_sig`): the same = it is not painted again
     dock_sig: Option<u64>,
+    /// Order 055: the last presented frame had to be whole / what it changed (the GPU back buffer is two frames old), where its
+    /// live pass painted, and whether the overlays showed
+    prev_full: bool,
+    prev_change: Dirty,
+    prev_live: Option<sk::IRect>,
+    over_shown: bool,
 }
 
 impl Layers {
@@ -1462,6 +1602,10 @@ impl Layers {
             band: None,
             band_ct: 0,
             dock_sig: None,
+            prev_full: true,
+            prev_change: Dirty::Full,
+            prev_live: None,
+            over_shown: false,
             gpu,
         })
     }
@@ -1682,7 +1826,7 @@ fn make_swaps(gpu: Option<Rc<Gpu>>, g: &Gfx, w: i32, h: i32) -> Result<(Option<R
             let mut mask = GpuChain::new(&gp, w as u32, h as u32)?;
             let mut ms = mask.back();
             paint_mask(g, &mut ms);
-            mask.present()?;
+            mask.present(None)?;
             Ok((Swap::Gpu(chain), Swap::Gpu(mask)))
         })();
         match made {

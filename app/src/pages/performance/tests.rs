@@ -363,3 +363,71 @@ fn at_rest_the_page_asks_for_no_frames() {
     assert!(p.toast.is_none() && p.wake_at(end).is_none());
     assert!(!p.tick(end + 1.0));
 }
+
+/// Order 055: the ended rows are looked up among the snapshot's rows once per snapshot (or at their 1.5 s), not every tick.
+#[test]
+fn ended_rows_are_pruned_per_snapshot_not_per_tick() {
+    let mut p = page();
+    assert!(!p.tick(10.0));
+    let key = p.snap.rows[0].key.clone();
+    p.ending.push((key.clone(), 100.0));
+    // a row that is gone from the rows stays until a snapshot (or its time) says so
+    p.snap.rows.retain(|r| r.key != key);
+    assert!(!p.tick(200.0) && p.ending.len() == 1, "no new snapshot: nothing looked up");
+    assert_eq!(p.wake_at(200.0), Some(100.0 + ENDING_MS), "the menu wakes at its expiry");
+    p.on_snap();
+    p.tick(300.0);
+    assert!(p.ending.is_empty(), "a new snapshot without the row drops it");
+    // still listed when its time runs out: it shows again (one build)
+    let key = p.snap.rows[0].key.clone();
+    p.ending.push((key, 1000.0));
+    assert!(p.tick(1000.0 + ENDING_MS) && p.ending.is_empty());
+}
+
+/// Order 055: a long list builds only the rows in view (+ one view above and below); the others keep their height as one
+/// empty box each side, so every built row sits where it sat when all were built and the page is as tall.
+#[test]
+fn only_the_rows_in_view_are_built() {
+    fn rows_built(e: &El, keys: &[Key]) -> usize {
+        usize::from(e.key.is_some_and(|k| keys.contains(&k))) + e.children.iter().map(|c| rows_built(c, keys)).sum::<usize>()
+    }
+    let mut p = page();
+    let base = p.snap.rows.clone();
+    p.snap.rows = (0..250)
+        .map(|i| {
+            let mut r = base[i % base.len()].clone();
+            r.key = format!("row{i}");
+            r.name = format!("p{i:03}");
+            r
+        })
+        .collect();
+    p.on_snap();
+    let keys: Vec<Key> = (0..250).map(|n| idx(K_ROW, n)).collect();
+    let g = Gfx::new(1.0);
+    let mut st = State::default();
+    let lay = |p: &mut Performance, st: &mut State| {
+        let mut cx = Cx::new(1000.0, false, &g, st);
+        let kids = p.build(&mut cx);
+        let n = kids.iter().map(|e| rows_built(e, &keys)).sum::<usize>();
+        (n, crate::ui::lay::Laid::new(&g, El::block().w(600.0).children(kids), 600.0, None))
+    };
+    // not laid out yet: all of it
+    let (n, whole) = lay(&mut p, &mut st);
+    assert_eq!(n, 250);
+    let top = whole.rect_of(K_LIST).expect("the list's box").1;
+    assert_eq!(st.win_new.len(), 1);
+    // scrolled into the middle of the list
+    let sy = top + 100.0 * 36.0;
+    st.view = (sy, sy + crate::ui::PAGE_H);
+    st.win_top = vec![(K_LIST, top)];
+    st.win_new.clear();
+    let (n, part) = lay(&mut p, &mut st);
+    assert!(n < 45, "{n} rows built for a ~13-row view");
+    assert_eq!(part.height, whole.height, "the page is as tall");
+    for r in [87, 100, 113, 120] {
+        assert_eq!(part.rect_of(idx(K_ROW, r)), whole.rect_of(idx(K_ROW, r)), "row {r} sits where it sat");
+    }
+    assert!(part.rect_of(idx(K_ROW, 0)).is_none() && part.rect_of(idx(K_ROW, 249)).is_none());
+    let (_, lo, hi) = st.win_new[0];
+    assert!(lo <= 100.0 * 36.0 - crate::ui::PAGE_H && hi >= 100.0 * 36.0 + 2.0 * crate::ui::PAGE_H, "built: {lo}..{hi}");
+}

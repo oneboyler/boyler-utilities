@@ -171,5 +171,6 @@ fn the_reply_layout_is_read_field_by_field() {
 fn the_installer_check_is_sha256() {
     // the empty input's well-known SHA-256: proves the CNG call and the hex form (nothing is downloaded)
     assert_eq!(bu_search::real::host::sha256_hex(b"").unwrap(), "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
-    assert_eq!(bu_search::real::host::MSI_SHA256.len(), 64);
+    assert_eq!(bu_search::real::ours::ZIP_SHA256.len(), 64);
+    assert_eq!(bu_search::real::ours::EXE_SHA256.len(), 64);
 }

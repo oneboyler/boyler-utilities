@@ -6,6 +6,7 @@
 mod apps;
 pub mod everything;
 pub mod host;
+pub mod ours;
 mod shell;
 pub mod wsearch;
 
@@ -29,6 +30,10 @@ pub struct RealOs {
     ours: Mutex<Option<host::Ours>>,
     /// Ours was started without an index file: while it loads, it is building its file list for the first time.
     ours_building: AtomicBool,
+    /// Order 049: the drives our instance covers (letters; empty = the Windows drive)
+    drives: Mutex<Vec<char>>,
+    /// the drives ours was started on
+    started: Mutex<Vec<char>>,
     /// May this layer start / stop / install Everything (the app: yes; `read_only`: never).
     host: bool,
 }
@@ -36,7 +41,7 @@ pub struct RealOs {
 impl RealOs {
     /// The app's layer: reads and actions.
     pub fn new() -> RealOs {
-        RealOs { read_only: false, user_class: Some(everything::class_of(None)), our_class: everything::class_of(Some(host::INSTANCE)), ours: Mutex::new(None), ours_building: AtomicBool::new(false), host: true }
+        RealOs { read_only: false, user_class: Some(everything::class_of(None)), our_class: everything::class_of(Some(host::INSTANCE)), ours: Mutex::new(None), ours_building: AtomicBool::new(false), drives: Mutex::new(Vec::new()), started: Mutex::new(Vec::new()), host: true }
     }
     /// Reads only; every open / reveal / open-with / clipboard call is refused before Windows is asked, and Everything is
     /// never started, stopped or installed.
@@ -82,6 +87,19 @@ impl RealOs {
                 host::mark_index(&d);
             }
         }
+    }
+
+    /// The drives our instance covers now: the picked ones that are still NTFS fixed drives (none picked / none left =
+    /// the Windows drive).
+    fn covered(&self) -> Vec<ours::Drive> {
+        let want = self.drives.lock().unwrap().clone();
+        let all = ours::ntfs_drives();
+        let win = ours::windows_drive();
+        let mut v: Vec<ours::Drive> = all.iter().filter(|d| want.contains(&d.letter)).cloned().collect();
+        if v.is_empty() {
+            v = all.into_iter().filter(|d| d.letter == win).collect();
+        }
+        v
     }
 
     /// The same + whether it is ours.
@@ -159,7 +177,7 @@ impl SearchOs for RealOs {
                 Some(_) => EverythingStatus::Loading { building: mine && self.ours_building.load(Ordering::SeqCst) },
                 None => EverythingStatus::NotRunning,
             },
-            None if self.host && host::exe().is_none() => EverythingStatus::NotInstalled,
+            None if self.host && !ours::installed() => EverythingStatus::NotInstalled,
             None => EverythingStatus::NotRunning,
         }
     }
@@ -174,8 +192,18 @@ impl SearchOs for RealOs {
     fn everything_start(&self) -> Result<()> {
         // start and stop are serialised by the `ours` lock (a stop in progress finishes first, then this looks again)
         let mut ours = self.ours.lock().unwrap();
-        if self.ev_window().is_some() {
-            return Ok(());
+        // Order 049 (review): ours runs on other drives than the picked ones (a quick drive change raced an earlier
+        // start): it quits and starts again on the picked ones
+        let want: Vec<char> = self.covered().iter().map(|d| d.letter).collect();
+        if ours.is_some() && *self.started.lock().unwrap() != want {
+            if let Some(c) = ours.take() {
+                self.quit_ours(c);
+            }
+        }
+        if let Some((_, mine)) = self.ev_window_whose() {
+            if !mine || ours.is_some() {
+                return Ok(());
+            }
         }
         if !self.host {
             return Err(SearchError::Refused("start Everything".into()));
@@ -191,7 +219,9 @@ impl SearchOs for RealOs {
         let dir = host::data_dir().ok_or_else(|| SearchError::Everything("no LOCALAPPDATA".into()))?;
         // no whole index of today's settings: it makes its file list (the page says "building"; later starts load the saved one)
         self.ours_building.store(host::prepare_index(&dir), Ordering::SeqCst);
-        *ours = Some(host::Ours::new(host::start_ours(&exe, &dir)?));
+        let drives = self.covered();
+        *ours = Some(host::Ours::new(host::start_ours(&exe, &dir, &drives)?));
+        *self.started.lock().unwrap() = want;
         Ok(())
     }
 
@@ -203,11 +233,42 @@ impl SearchOs for RealOs {
         }
     }
 
-    fn everything_install(&self) -> Result<()> {
+    fn everything_install(&self, tidy: bool) -> Result<()> {
         if !self.host {
             return Err(SearchError::Refused("install Everything".into()));
         }
-        host::install()
+        host::install(tidy)
+    }
+
+    fn everything_update(&self) -> Result<()> {
+        if !self.host {
+            return Err(SearchError::Refused("update Everything".into()));
+        }
+        // only OUR instance is asked (a copy the user runs keeps its own index)
+        let ours = self.ours.lock().unwrap();
+        match (ours.as_ref(), host::exe()) {
+            (Some(_), Some(exe)) if everything::find(&self.our_class).is_some() => {
+                self.ours_building.store(true, Ordering::SeqCst);
+                host::reindex_ours(&exe)
+            }
+            _ => Ok(()),
+        }
+    }
+
+    fn drives(&self) -> (Vec<char>, char) {
+        (ours::ntfs_drives().into_iter().map(|d| d.letter).collect(), ours::windows_drive())
+    }
+
+    fn set_drives(&self, letters: &[char]) {
+        *self.drives.lock().unwrap() = letters.to_vec();
+    }
+
+    fn old_everything(&self) -> bool {
+        self.host && ours::v100_present()
+    }
+
+    fn everything_mine(&self) -> bool {
+        self.ev_window_whose().map(|w| w.1).unwrap_or(true)
     }
 
     fn windows_search_status(&self) -> WsStatus {

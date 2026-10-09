@@ -2,6 +2,10 @@
 //! `.ach`, `.pg2`, `.pdcp`, `.cpx`, `.lsw`, `.pwl`, `.pdtr`, `.pnote`, `.pdlive`, `.pdset`), built from `El` with the
 //! drawing's CSS quoted on each.
 
+use std::cell::RefCell;
+use std::rc::Rc;
+
+use bu_controller::Side;
 use taffy::style::{AlignItems, JustifyContent};
 
 use crate::anim::EASE;
@@ -298,9 +302,17 @@ pub fn pdlive(on: bool) -> El {
 /// The trigger's "where it clicks" bar: `.pdtr{height:10px;margin:4px 0 6px;border-radius:5px;background:var(--well);
 /// box-shadow:inset 0 0 0 .5px var(--hair);overflow:hidden}` `i{background:linear-gradient(90deg,rgba(10,132,255,.06),var(--acc-s))}`
 /// (width = clicks at) `b{width:2px;margin-left:-1px;background:var(--acc)}` (at it) `em{top:3px;bottom:3px;border-radius:3px;
-/// background:#30d158;opacity:.75}` (the live pull).
-pub fn pdtr(at: f32, pull: f32, live: bool) -> El {
+/// background:#30d158;opacity:.75}` (the live pull: Order 055, read from the shared readings when the bar is painted).
+pub fn pdtr(at: f32, src: Rc<RefCell<super::Lv>>, side: Side, live: bool) -> El {
     let e = El::paint(move |g, (x, y, w, h)| {
+        let pull = {
+            let lv = src.borrow();
+            if side == Side::Left {
+                lv.l2
+            } else {
+                lv.r2
+            }
+        };
         g.fill_rr(x, y, w, h, 5.0, WELL());
         g.push_clip(x, y, w, h);
         let fw = w * at;

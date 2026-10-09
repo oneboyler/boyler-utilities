@@ -539,3 +539,29 @@ fn kept_pixels_are_the_same_picture() {
         assert!(got.data == want.data, "byte for byte");
     }
 }
+
+/// Order 055: a running stopwatch asks for its own next look (its hundredths at 30 Hz at most), with no input at all; a page
+/// with nothing running asks for nothing. A still screen does not rebuild between two looks.
+#[test]
+fn a_running_stopwatch_wakes_itself_at_30_hz_and_a_resting_page_sleeps() {
+    let mut t = T::new(false);
+    assert_eq!(t.page.wake_at(0.0), None);
+    t.click(K_GO);
+    t.build();
+    t.advance(10);
+    let w = t.page.wake_at(t.now).expect("a running stopwatch wakes itself");
+    assert!(w > t.now && w <= t.now + 33.0, "wake {w} now {}", t.now);
+    // the hundredths changed but the last repaint is only 10 ms old: no frame yet
+    assert!(!t.page.tick(t.now));
+    t.advance(25);
+    assert!(t.page.tick(t.now), "33 ms later the hundredths repaint");
+    // a whole second changes the digits at once
+    t.build();
+    t.advance(1_000);
+    assert!(t.page.tick(t.now));
+    // stopped: one last repaint, then it sleeps
+    t.click(K_GO);
+    assert!(t.page.tick(t.now));
+    assert_eq!(t.page.wake_at(t.now), None);
+    assert!(!t.page.tick(t.now));
+}

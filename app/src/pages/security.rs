@@ -6,6 +6,8 @@
 //! the service lives in `env.keep` for the app's whole life, so a scan goes on with the tab left or the window closed and
 //! the page shows it (running, or its answer) the moment it opens again; the last read of Defender shows at once too.
 
+use std::cell::Cell;
+use std::rc::Rc;
 use std::sync::{mpsc, Arc};
 
 use bu_security as sec;
@@ -162,6 +164,15 @@ pub struct Security {
     tx: Option<mpsc::Sender<Msg>>,
     rx: Option<mpsc::Receiver<Msg>>,
     now: f64,
+    /// Order 055: the frame's time for the sweep bar and the ring (live boxes read it when they are painted; `tick` sets it
+    /// every frame) - they move at the monitor's rate without the page being built again
+    clock: Rc<Cell<f64>>,
+    /// the whole seconds of the card's "running 0:05" line as last built (a new second is the one rebuild a scan needs)
+    secs_shown: Cell<u64>,
+    /// the last `tick`'s true moved only the live boxes (the sweep, the ring)
+    live_only: bool,
+    /// when `tick` last asked whether a scan from an earlier open has ended
+    polled: f64,
     /// Order 036: a page never opened (Settings › Reset, the uninstaller) resets through a service made on first use: the
     /// sample fake in a test copy, Defender otherwise
     rs_svc: std::cell::OnceCell<Arc<sec::SecurityService>>,
@@ -220,32 +231,51 @@ impl Security {
         }
     }
 
+    /// Used by `open` and `build`: the messages, the OS clock's stamp and the end of a scan.
     fn pump(&mut self) -> bool {
+        let mut any = self.drain();
+        if let Some(svc) = self.svc() {
+            self.now_stamp = Some(svc.now());
+            any |= self.scan_ended();
+        }
+        any
+    }
+
+    /// The messages that came (a fake answers inline and a handled message may ask again - read after an action: until quiet).
+    fn drain(&mut self) -> bool {
         let mut any = false;
-        // a fake answers inline and a handled message may ask again (read after an action): until quiet
         for _ in 0..8 {
             if !self.pump_once() {
                 break;
             }
             any = true;
         }
-        if let Some(svc) = self.svc() {
-            self.now_stamp = Some(svc.now());
-            // a scan started by an earlier open answers that page's channel (gone): its answer is read from env.keep
-            if self.scanning.is_some() && !svc.is_scanning() {
-                if let Some(r) = claim(&self.env.keep, None) {
-                    self.scan_done(r);
-                    any = true;
-                    // its read of Defender (inline on the fake) is waiting in the channel
-                    for _ in 0..8 {
-                        if !self.pump_once() {
-                            break;
-                        }
-                    }
-                }
+        any
+    }
+
+    /// A scan started by an earlier open answers that page's channel (gone): its answer is read from env.keep.
+    fn scan_ended(&mut self) -> bool {
+        let Some(svc) = self.svc() else { return false };
+        if self.scanning.is_none() || svc.is_scanning() {
+            return false;
+        }
+        let Some(r) = claim(&self.env.keep, None) else { return false };
+        self.scan_done(r);
+        // its read of Defender (inline on the fake) is waiting in the channel
+        for _ in 0..8 {
+            if !self.pump_once() {
+                break;
             }
         }
-        any
+        true
+    }
+
+    /// The whole seconds the card's "running 0:05" line shows (Quick and Full scans only).
+    fn scan_secs(&self, now: f64) -> Option<u64> {
+        match &self.scanning {
+            Some((sec::ScanKind::Quick, since)) | Some((sec::ScanKind::Full, since)) => Some(((now - since) / 1000.0).max(0.0) as u64),
+            _ => None,
+        }
     }
 
     fn pump_once(&mut self) -> bool {
@@ -661,19 +691,23 @@ impl Security {
         // bu-security reports only the elapsed time (Defender prints no progress): the bar glides, the line says how long
         let em = format!("running {}:{:02}", secs / 60, secs % 60);
         if open {
-            cx.st.busy = true;
+            self.secs_shown.set(secs);
         }
-        let t = (((self.now % 1100.0) / 1100.0) as f32).clamp(0.0, 1.0);
-        let g = Bezier::new(0.45, 0.0, 0.55, 1.0).ease(t as f64) as f32;
+        // Order 055: no `st.busy` (that built the whole page every frame for the whole scan): the glide is a live box that
+        // reads the frame's time when it is painted
+        let clock = self.clock.clone();
         // `.sbar{position:relative;height:4px;margin:7px 0 6px;border-radius:2px;background:var(--trk);overflow:hidden}`
         // `.sbar i{background:linear-gradient(90deg,var(--vz1),var(--vz2))}` (an indeterminate glide, like `.updbar.ind`)
         let bar = El::block().h(4.0).margin(7.0, 0.0, 6.0, 0.0).radius(2.0).bg(TRK()).clip().child(
             El::paint(move |gx: &Gfx, (x, y, w, h)| {
+                let t = (((clock.get() % 1100.0) / 1100.0) as f32).clamp(0.0, 1.0);
+                let g = Bezier::new(0.45, 0.0, 0.55, 1.0).ease(t as f64) as f32;
                 let pw = w * 0.38;
                 let px = x + pw * (-1.0 + 3.5 * g);
                 gx.fill_rr_shader(px, y, pw, h, 2.0, &gx.hgrad(px, 0.0, px + pw, 0.0, &[(0.0, VZ1()), (1.0, VZ2())]), 1.0);
             })
-            .abs(0.0, 0.0, 0.0, 0.0),
+            .abs(0.0, 0.0, 0.0, 0.0)
+            .live(),
         );
         // `.sprg{padding:2px 14px 12px}` `.sprh{display:flex;align-items:baseline;gap:8px;font-size:12px}` `.sprh b{font-weight:600}`
         // `.sprh em{font-style:normal;color:var(--fg2);font-variant-numeric:tabular-nums}` `.sprh .lnk{margin-left:auto}`
@@ -730,12 +764,13 @@ impl Security {
                     )
             }
             Dz::Busy { path, since } => {
-                cx.st.busy = true;
                 let (dir, name) = split(path);
                 // `.sdzr .ring{width:44px;height:44px}` `circle{stroke-width:3}` `.rb{stroke:var(--trk)}` `.rf{stroke:var(--acc)}`: no
                 // progress from Defender for one file - the arc turns (the drawing fills it with a made-up %)
-                let deg = (((self.now - since) % 1100.0) / 1100.0 * 360.0) as f32;
+                // Order 055: a live box, the turn is read from the frame's time when it is painted (no `st.busy`)
+                let (clock, since) = (self.clock.clone(), *since);
                 let ring = El::paint(move |g: &Gfx, (x, y, w, _)| {
+                    let deg = (((clock.get() - since) % 1100.0) / 1100.0 * 360.0) as f32;
                     let r = skia_safe::Rect::new(x + 3.0 + 1.5, y + 3.0 + 1.5, x + w - 4.5, y + w - 4.5);
                     g.stroke_oval(r, 3.0, TRK(), 1.0);
                     let mut b = skia_safe::PathBuilder::new();
@@ -743,7 +778,8 @@ impl Security {
                     g.stroke_geom(&b.detach(), 3.0, ACC());
                 })
                 .size(44.0, 44.0)
-                .none();
+                .none()
+                .live();
                 sdzr(ring, &name, &dir, "Scanning\u{2026}", FG2(), 500, vec![])
             }
             Dz::Ok { path, text } => {
@@ -1133,12 +1169,28 @@ impl Page for Security {
         // Defender's first answer (or the kept one) is in: no "Reading…" flash on a real PC
         self.page.is_some() || self.read_err.is_some()
     }
+    /// Order 055: a scan's sweep / the ring are live boxes (motion, the monitor's rate: true every frame while they show);
+    /// the page is built again only for data - a message, the end of a scan, a new second in "running 0:05".
     fn tick(&mut self, now: f64) -> bool {
         self.now = now;
-        self.pump()
+        self.clock.set(now);
+        let mut data = self.drain();
+        // a scan of an earlier open has no message: its end is asked for 4 times a second (not the OS clock, not every frame)
+        if self.scanning.is_some() && (data || now - self.polled >= 250.0) {
+            self.polled = now;
+            data |= self.scan_ended();
+        }
+        let second = self.scan_secs(now).is_some_and(|s| s != self.secs_shown.get());
+        let moving = self.scanning.is_some() || matches!(self.dz, Some(Dz::Busy { .. }));
+        self.live_only = !(data || second);
+        data || second || moving
+    }
+    fn live_only(&self) -> bool {
+        self.live_only
     }
     fn build(&mut self, cx: &mut Cx) -> Vec<El> {
         self.now = cx.now;
+        self.clock.set(cx.now);
         self.pump();
         let th = self.threats();
         let qr = self.quarantine();
@@ -1539,6 +1591,31 @@ mod tests {
         p.click(K_CANCEL);
         settle(&mut p);
         assert_eq!(p.toast.as_ref().unwrap().0, "Scan stopped");
+    }
+
+    /// Order 055: a running scan keeps frames coming (the sweep is motion) but builds the page only for data / a new second.
+    #[test]
+    fn a_scan_moves_live_boxes_without_rebuilding_the_page() {
+        let mut p = page();
+        p.click(idx(K_SCAN, 0));
+        started(&p);
+        let since = p.scanning.as_ref().unwrap().1;
+        assert!(p.tick(since + 10.0), "the sweep moves");
+        p.secs_shown.set(0);
+        assert!(p.tick(since + 20.0) && p.live_only(), "same second, no message: live pass only");
+        assert!(p.tick(since + 1500.0) && !p.live_only(), "a new second in \"running 0:01\": the page is built");
+        fake(&p).release_scan();
+        let mut t = since + 2000.0;
+        for _ in 0..400 {
+            t += 300.0;
+            p.tick(t);
+            if p.scanning.is_none() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(p.scanning.is_none(), "the end of the scan is data");
+        assert!(!p.tick(t + 10.0), "at rest: no frames");
     }
 
     /// the owner's F2: a scan goes on with the window closed; the next open shows it running, then its answer (once).

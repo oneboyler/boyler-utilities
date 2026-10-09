@@ -137,6 +137,25 @@ fn a_stopped_walks_late_answer_does_not_end_the_new_walk() {
     second.cancel();
 }
 
+/// Order 055: a running walk's sweep is a live box - no `st.busy`, frames come from `tick`, and the page is built again only
+/// for data (the progress line 4 times a second), never per frame.
+#[test]
+fn a_running_walk_moves_a_live_sweep_without_rebuilding_each_frame() {
+    let mut s = opened();
+    let mut st = State::default();
+    // (a walk that never answers: no message arrives while the test ticks)
+    s.scans.insert('C', Scan::Running { ctl: Arc::new(ScanControl::new()), started: 100.0 });
+    let _ = build(&mut s, &mut st, 100.0);
+    assert!(!st.busy, "the sweep does not ask for a page build per frame");
+    assert!(s.sweep_on.get());
+    s.text_at = 100.0;
+    // (the open's own reads may still be in the inbox: drained first)
+    s.tick(105.0);
+    assert!(s.tick(110.0) && s.live_only(), "motion, live pass only");
+    assert!(s.tick(400.0) && !s.live_only(), "the progress line is data: built again after 250 ms");
+    assert!(s.tick(410.0) && s.live_only());
+}
+
 #[test]
 fn another_drive_is_measured_separately() {
     let mut s = opened();

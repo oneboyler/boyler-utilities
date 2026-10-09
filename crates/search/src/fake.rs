@@ -32,6 +32,12 @@ pub struct FakeState {
     pub everything_error: Option<SearchError>,
     pub ws_error: Option<SearchError>,
     pub action_error: Option<SearchError>,
+    /// Order 049: the NTFS drives + the Windows drive, the drives our Everything covers, and v1.0.0's Everything still there
+    pub drives: (Vec<char>, char),
+    pub covered: Vec<char>,
+    pub old_everything: bool,
+    /// the running Everything is a copy the user runs (not ours)
+    pub user_copy: bool,
 }
 
 pub struct FakeOs(Mutex<FakeState>);
@@ -57,6 +63,10 @@ impl FakeOs {
             everything_error: None,
             ws_error: None,
             action_error: None,
+            drives: (vec!['C', 'D'], 'C'),
+            covered: vec!['C'],
+            old_everything: false,
+            user_copy: false,
         }))
     }
     pub fn state(&self) -> MutexGuard<'_, FakeState> {
@@ -142,14 +152,43 @@ impl SearchOs for FakeOs {
             s.everything = EverythingStatus::NotRunning;
         }
     }
-    fn everything_install(&self) -> Result<()> {
+    fn everything_install(&self, tidy: bool) -> Result<()> {
         let mut s = self.state();
-        s.actions.push("install everything".into());
+        s.actions.push(if tidy { "install everything + tidy v1.0.0's".into() } else { "install everything".into() });
         let r = s.install_result.clone();
-        if r.is_ok() && s.everything == EverythingStatus::NotInstalled {
-            s.everything = EverythingStatus::NotRunning;
+        if r.is_ok() {
+            if s.everything == EverythingStatus::NotInstalled {
+                s.everything = EverythingStatus::NotRunning;
+            }
+            if tidy {
+                s.old_everything = false;
+            }
         }
         r
+    }
+    fn everything_update(&self) -> Result<()> {
+        let mut s = self.state();
+        s.actions.push("update everything".into());
+        if s.everything_ours && matches!(s.everything, EverythingStatus::Running { .. }) {
+            s.everything = EverythingStatus::Loading { building: true };
+        }
+        Ok(())
+    }
+    fn drives(&self) -> (Vec<char>, char) {
+        self.state().drives.clone()
+    }
+    fn set_drives(&self, letters: &[char]) {
+        let mut s = self.state();
+        if s.covered != letters {
+            s.actions.push(format!("drives {}", letters.iter().collect::<String>()));
+            s.covered = letters.to_vec();
+        }
+    }
+    fn old_everything(&self) -> bool {
+        self.state().old_everything
+    }
+    fn everything_mine(&self) -> bool {
+        !self.state().user_copy
     }
     fn windows_search_status(&self) -> WsStatus {
         self.state().ws

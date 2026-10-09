@@ -38,6 +38,12 @@ const K_MORE: Key = key("srch.more");
 const K_MENU: Key = key("srch.menu");
 const K_INSTALL: Key = key("srch.install");
 const K_TOAST: Key = key("srch.toast");
+/// Order 049: the drive chips, "Update search", "Tidy up" (v1.0.0's Everything)
+const K_DRIVE: Key = key("srch.drive");
+const K_UPDATE: Key = key("srch.update");
+const K_TIDY: Key = key("srch.tidy");
+/// The page's saved drives (letters, e.g. "CD"; none = the Windows drive)
+const DRIVES_SETTING: &str = "drives";
 
 const VK_BACK: u16 = 0x08;
 const VK_ENTER: u16 = 0x0D;
@@ -202,6 +208,14 @@ pub fn sample_os(engine: bool) -> Arc<srch::FakeOs> {
     os
 }
 
+/// What `prepare_after` does first on its worker.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum First {
+    Nothing,
+    Restart,
+    Update,
+}
+
 enum Msg {
     /// a query's answer + the "<n> items" of its folder rows (read with the results, never per frame)
     Results(u64, srch::Result<srch::SearchResults>, std::collections::HashMap<String, u64>),
@@ -209,6 +223,10 @@ enum Msg {
     Engine(srch::EverythingStatus),
     /// the install ended
     Installed(srch::Result<()>),
+    /// Order 049: this PC's drives Search can cover + the Windows drive, and whether v1.0.0's Everything is still there
+    Drives(Vec<char>, char, bool),
+    /// the Everything that answers is ours (false = a copy the user runs)
+    Mine(bool),
     /// a started Everything did not answer within `ENGINE_WAIT` (the waiter stopped)
     NoAnswer,
 }
@@ -240,6 +258,13 @@ pub struct Search {
     /// the started Everything never answered (`Msg::NoAnswer`)
     no_answer: bool,
     install_err: Option<String>,
+    /// Order 049: the drives (all NTFS fixed drives, the Windows drive), the picked ones (saved), v1.0.0's Everything there
+    all_drives: Vec<char>,
+    win_drive: Option<char>,
+    drives: Vec<char>,
+    old_ev: bool,
+    /// the answering Everything is a copy the user runs (no drive chips then)
+    theirs: bool,
     /// the engine waiter stops (the page closed)
     stop: Arc<AtomicBool>,
     folder_counts: std::collections::HashMap<String, u64>,
@@ -285,14 +310,45 @@ impl Search {
     /// follow it until its index is loaded (each change is sent; the waiter ends when ready, when the page closes, or when
     /// it has not answered for `ENGINE_WAIT` - a loading index is followed to its end). Off the UI thread on a real PC.
     fn prepare(&mut self) {
+        self.prepare_after(First::Nothing);
+    }
+
+    /// `prepare`, after a first step on the same worker (Order 049): quit ours first (the drives changed - it starts again
+    /// on the new ones), or ask ours to make its file list again ("Update search").
+    fn prepare_after(&mut self, first: First) {
         let Some(svc) = self.svc.clone() else { return };
         let tx = self.tx.clone().expect("open");
+        // each preparation has its own stop: an earlier waiter (still following a load) stops here, so it can never start
+        // ours again on the old drives (review, Order 049)
+        self.stop.store(true, Ordering::SeqCst);
+        self.stop = Arc::new(AtomicBool::new(false));
         let stop = self.stop.clone();
         let wake = self.env.waker();
         let fake = self.env.fake();
         self.wait_since = self.now;
         self.no_answer = false;
+        // the saved drives (the settings store: no Windows call); the drive list itself is read on the worker
+        let saved = self.saved_drives();
         let job = move || {
+            match first {
+                First::Nothing => {}
+                First::Restart => svc.release(),
+                First::Update => {
+                    let _ = svc.update_engine();
+                }
+            }
+            // the drives (Windows' drive list + each drive's file system: a sleeping disk may take a moment - never on the
+            // UI thread); none saved = the Windows drive (Order 049 item 6)
+            let (all, win) = svc.drives();
+            let mut pick: Vec<char> = saved.into_iter().filter(|c| all.contains(c)).collect();
+            if pick.is_empty() {
+                pick = vec![win];
+            }
+            svc.set_drives(&pick);
+            if tx.send(Msg::Drives(all, win, svc.old_everything())).is_err() {
+                return;
+            }
+            wake.wake();
             // NotInstalled comes back as the status below; other start errors leave it NotRunning
             let _ = svc.start_engine();
             let t0 = std::time::Instant::now();
@@ -306,6 +362,10 @@ impl Search {
                 }
                 if last != Some(st) {
                     last = Some(st);
+                    // Order 049: the drive chips / Update search only for OUR Everything (a copy the user runs is left as it is)
+                    if matches!(st, srch::EverythingStatus::Running { .. } | srch::EverythingStatus::Loading { .. }) && tx.send(Msg::Mine(svc.engine_mine())).is_err() {
+                        return;
+                    }
                     if tx.send(Msg::Engine(st)).is_err() {
                         return;
                     }
@@ -344,10 +404,43 @@ impl Search {
         self.installing = true;
         self.install_err = None;
         let tx = self.tx.clone().expect("open");
+        // Order 049: the same admin prompt also tidies up v1.0.0's Everything when it is still there (A_049_02)
+        let tidy = self.old_ev;
         self.spawn(move || {
-            let _ = tx.send(Msg::Installed(svc.install_engine()));
+            let _ = tx.send(Msg::Installed(svc.install_engine(tidy)));
         });
         self.pump();
+    }
+
+    /// The saved drives (letters), empty = none saved.
+    fn saved_drives(&self) -> Vec<char> {
+        if self.env.fake() {
+            return self.drives.clone();
+        }
+        crate::services::with(|s| s.store.get_str(crate::settings::Scope::Page("srch"), DRIVES_SETTING).map(|v| v.chars().filter(|c| c.is_ascii_uppercase()).collect()))
+            .flatten()
+            .unwrap_or_default()
+    }
+
+    /// A drive chip: on / off (at least one stays on), saved, and ours starts again on the new drives.
+    fn toggle_drive(&mut self, d: char) {
+        let mut pick = self.drives.clone();
+        if pick.contains(&d) {
+            if pick.len() == 1 {
+                return;
+            }
+            pick.retain(|c| *c != d);
+        } else {
+            pick.push(d);
+            pick.sort();
+        }
+        self.drives = pick;
+        if !self.env.fake() {
+            let v: String = self.drives.iter().collect();
+            crate::services::with(|s| s.store.set_str(crate::settings::Scope::Page("srch"), DRIVES_SETTING, &v));
+        }
+        self.engine = Some(srch::EverythingStatus::NotRunning);
+        self.prepare_after(First::Restart);
     }
 
     /// Search as you type: the fake answers at once; the real one on a worker thread (the previous query is cancelled).
@@ -396,6 +489,17 @@ impl Search {
         for m in msgs {
             match m {
                 Msg::NoAnswer => self.no_answer = true,
+                Msg::Mine(m) => self.theirs = !m,
+                Msg::Drives(all, win, old) => {
+                    let mut pick: Vec<char> = self.saved_drives().into_iter().filter(|c| all.contains(c)).collect();
+                    if pick.is_empty() {
+                        pick = vec![win];
+                    }
+                    self.drives = pick;
+                    self.all_drives = all;
+                    self.win_drive = Some(win);
+                    self.old_ev = old;
+                }
                 Msg::Engine(st) => {
                     let was = self.ready();
                     self.engine = Some(st);
@@ -586,7 +690,44 @@ impl Search {
         };
         kids.push(Self::chip(cx, K_TYPE, &label, self.ext.is_some(), true));
         // `.fchs{display:flex;flex-wrap:wrap;gap:6px;margin:10px 0 0}`
-        El::row().wrap().gap(6.0).margin(10.0, 0.0, 0.0, 0.0).children(kids)
+        let types = El::row().wrap().gap(6.0).margin(10.0, 0.0, 0.0, 0.0).children(kids);
+        match self.drive_chips(cx) {
+            Some(d) => El::col().child(types).child(d),
+            None => types,
+        }
+    }
+
+    /// Order 049 item 6 (the owner: "like little bubbles just like file types ... default it to the main drive only"): one chip
+    /// per drive Search can cover, the picked ones on (at least one), and "Update search" at the end (item 8: our
+    /// Everything makes its file list again - only while this tab is open). Shown once our Everything is set up.
+    fn drive_chips(&self, cx: &mut Cx) -> Option<El> {
+        if self.theirs || self.all_drives.is_empty() || matches!(self.engine, None | Some(srch::EverythingStatus::NotInstalled)) {
+            return None;
+        }
+        let mut kids = Vec::new();
+        for (i, d) in self.all_drives.iter().enumerate() {
+            kids.push(Self::chip(cx, idx(K_DRIVE, i), &format!("{d}:"), self.drives.contains(d), false).title(if Some(*d) == self.win_drive { "The Windows drive" } else { "Search this drive too" }));
+        }
+        let busy = matches!(self.engine, Some(srch::EverythingStatus::Loading { .. }) | Some(srch::EverythingStatus::NotRunning));
+        let upd = if busy { El::text("Update search", Font::new(11.0, 400), FG3(), lh(11.0, 1.35)) } else { link::link(cx, K_UPDATE, "Update search", 11.0) };
+        kids.push(upd.ml_auto().title("Make the file list again (only while this tab is open)"));
+        Some(El::row().center().wrap().gap(6.0).margin(8.0, 0.0, 0.0, 0.0).children(kids))
+    }
+
+    /// Order 049 item 9: v1.0.0 installed Everything for all of Windows - one short line, then (on the button) the one
+    /// admin prompt that tidies it up. Shown while our own Everything is set up (else "Install Everything" does both).
+    fn tidy_note(&self, cx: &mut Cx) -> Option<El> {
+        if !self.old_ev || self.installing || matches!(self.engine, None | Some(srch::EverythingStatus::NotInstalled)) {
+            return None;
+        }
+        Some(
+            El::col()
+                .items(AlignItems::CENTER)
+                .pad(22.0, 0.0, 0.0, 0.0)
+                .child(El::text("Boyler Utilities installed Everything for all of Windows last time \u{2014} it now runs only inside the app.", Font::new(11.0, 400), FG3(), lh(11.0, 1.5)).align(Align::Center).wrapping())
+                .child(El::block().margin(8.0, 0.0, 0.0, 0.0).child(cbtn(cx, K_TIDY, "Tidy it up", Kind::Ghost, true, false, 0.0)))
+                .child(El::text("Windows asks once for permission", Font::new(11.0, 400), FG3(), lh(11.0, 1.5)).margin(4.0, 0.0, 0.0, 0.0)),
+        )
     }
 
     /// `.shint`: the line under the chips while the field is empty (`padding:48px 0 10px;text-align:center;font-size:12.5px;
@@ -931,6 +1072,9 @@ impl Page for Search {
                 Some(n) => v.push(n),
                 None => v.push(self.hint("Type to find apps, folders and files on this PC.", None, 48.0)),
             }
+            if let Some(t) = self.tidy_note(cx) {
+                v.push(t);
+            }
         } else {
             v.extend(self.results(cx));
         }
@@ -977,8 +1121,17 @@ impl Page for Search {
                     cx.focus(Some(K_FIELD));
                     return;
                 }
-                if *k == K_INSTALL {
+                if *k == K_INSTALL || *k == K_TIDY {
                     self.install();
+                    return;
+                }
+                if *k == K_UPDATE {
+                    self.engine = Some(srch::EverythingStatus::Loading { building: true });
+                    self.prepare_after(First::Update);
+                    return;
+                }
+                if let Some(d) = (0..self.all_drives.len()).find(|i| *k == idx(K_DRIVE, *i)).map(|i| self.all_drives[i]) {
+                    self.toggle_drive(d);
                     return;
                 }
                 if *k == K_TYPE {
@@ -1307,6 +1460,42 @@ mod tests {
         assert!(r.groups.iter().any(|g| g.kind == srch::ItemKind::Folder), "files and folders now");
     }
 
+    /// Order 049 (the owner, Oct 9): drive chips like the type chips, the Windows drive only by default, at least one on; a
+    /// change starts ours again on the new drives; "Update search" asks ours to make its file list again; v1.0.0's
+    /// Everything: one short line + "Tidy it up" (the one admin prompt).
+    #[test]
+    fn drive_chips_update_and_tidy_up() {
+        let mut p = page(true);
+        let s = shown(&mut p);
+        assert!(s.contains(&"C:".to_string()) && s.contains(&"D:".to_string()) && s.contains(&"Update search".to_string()), "{s:?}");
+        assert_eq!(p.drives, vec!['C'], "the Windows drive only");
+        assert_eq!(fake(&p).state().covered, vec!['C']);
+        // the only one on stays on
+        click(&mut p, idx(K_DRIVE, 0));
+        assert_eq!(p.drives, vec!['C']);
+        // D on: ours quits and starts again on C + D
+        click(&mut p, idx(K_DRIVE, 1));
+        assert_eq!(p.drives, vec!['C', 'D']);
+        assert_eq!(fake(&p).state().covered, vec!['C', 'D']);
+        assert!(fake(&p).state().actions.iter().any(|a| a == "drives CD"), "{:?}", fake(&p).state().actions);
+        assert!(p.ready());
+        // Update search
+        click(&mut p, K_UPDATE);
+        assert!(fake(&p).state().actions.iter().any(|a| a == "update everything"));
+        // no v1.0.0 Everything: no line
+        assert!(!shown(&mut p).iter().any(|t| t.contains("installed Everything for all of Windows")));
+        fake(&p).state().old_everything = true;
+        p.close();
+        let mut p = page(true);
+        let f = fake(&p);
+        f.state().old_everything = true;
+        p.prepare();
+        assert!(shown(&mut p).iter().any(|t| t.contains("installed Everything for all of Windows")));
+        click(&mut p, K_TIDY);
+        assert!(f.state().actions.iter().any(|a| a == "install everything + tidy v1.0.0's"), "{:?}", f.state().actions);
+        assert!(!p.old_ev || !shown(&mut p).iter().any(|t| t.contains("installed Everything for all of Windows")));
+    }
+
     /// the owner, Oct 8: our Everything runs only while the tab is used; a line saying what it does until its index is in.
     #[test]
     fn ours_starts_with_the_tab_builds_and_quits_with_it() {
@@ -1476,7 +1665,8 @@ mod tests {
         assert!(near(r(idx(K_CHIP, 0)), (26.0, 150.0, 33.7344, 24.0)), "chip 0 {:?}", r(idx(K_CHIP, 0)));
         assert!(near(r(idx(K_CHIP, 1)), (65.7344, 150.0, 45.8281, 24.0)), "chip 1 {:?}", r(idx(K_CHIP, 1)));
         assert!(near(r(idx(K_CHIP, 6)), (354.6563, 150.0, 77.8281, 24.0)), "chip 6 {:?}", r(idx(K_CHIP, 6)));
-        assert!((laid.height - (250.75 - 56.0 + 18.0)).abs() < 0.05, "page height {}", laid.height);
+        // Order 049: + the drive chips row (8 px gap + 24 px chips) under the type chips
+        assert!((laid.height - (250.75 - 56.0 + 18.0 + 32.0)).abs() < 0.05, "page height {}", laid.height);
     }
 
     /// The proof pictures of Order 043, made with NO window and no running app: the real frame (`Ui`, every page on its

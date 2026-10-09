@@ -603,3 +603,20 @@ fn a_dns_pick_never_holds_the_menu() {
     assert_ne!(n.dns.as_ref().unwrap().current, DnsCurrent::Automatic, "the new DNS shows");
     SLOW_CHANGE_MS.with(|c| c.set(None));
 }
+
+/// Order 055: `sync` takes the page's copy of the kept state only when its generation moved (no clone per tick).
+#[test]
+fn sync_copies_the_kept_state_only_when_it_changed() {
+    let mut n = opened();
+    n.tick(10.0);
+    n.speed.foot = Some("page's own mark".into());
+    n.tick(20.0);
+    assert_eq!(n.speed.foot.as_deref(), Some("page's own mark"), "same generation: not copied again");
+    {
+        let mut b = n.bg.lock().unwrap();
+        b.touch();
+        b.speed.foot = Some("kept".into());
+    }
+    n.tick(30.0);
+    assert_eq!(n.speed.foot.as_deref(), Some("kept"), "a new generation: copied");
+}

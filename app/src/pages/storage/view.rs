@@ -36,6 +36,10 @@ fn type_color(t: FileType) -> Rgba {
 }
 
 pub fn page(s: &mut Storage, cx: &mut Cx) -> Vec<El> {
+    // Order 055: this build says whether a sweep / a shimmer is on screen (`Storage::tick` keeps frames coming for them)
+    s.clock.set(cx.now);
+    s.sweep_on.set(false);
+    s.shim_on.set(false);
     let mut v = vec![pieces::header("Storage", None).margin(-s.shift, 2.0, 8.0, 2.0), tiles(s, cx)];
     v.extend(using(s, cx));
     v.extend(clean_up(s, cx));
@@ -98,7 +102,8 @@ fn using(s: &mut Storage, cx: &mut Cx) -> Vec<El> {
         Scan::Idle => vec![idle_state(s, cx)],
         Scan::Running { ctl, started } => {
             let p = ctl.progress();
-            vec![scan_state(cx, l, used, p.bytes, cx.now - started)]
+            s.sweep_on.set(true);
+            vec![scan_state(cx, &s.clock, l, used, p.bytes, cx.now - started)]
         }
         Scan::Done { result, .. } => {
             let r = result.clone();
@@ -154,16 +159,19 @@ fn idle_state(s: &Storage, cx: &mut Cx) -> El {
 /// While measuring: `.scw{gap:9px;padding:30px 0 28px}` "Measuring C:…" (`.sct` 12.5 / 600) + the calm sweep `.scan{width:180px;
 /// height:4px;border-radius:2px;background:var(--trk)} i{width:40%;background:var(--acc);animation:scan 1.1s cubic-bezier(.45,0,.55,1)
 /// infinite}`. Order 022 adds what the drawing leaves out: how far it is (`.scw small{font-size:11px;color:var(--fg3)}`) and Stop.
-fn scan_state(cx: &mut Cx, l: char, used: u64, seen: u64, ms: f64) -> El {
-    cx.st.busy = true;
-    let t = SCAN.ease((cx.now % 1100.0) / 1100.0) as f32;
+fn scan_state(cx: &mut Cx, clock: &std::rc::Rc<std::cell::Cell<f64>>, l: char, used: u64, seen: u64, ms: f64) -> El {
+    // Order 055: no `st.busy` (that built the whole page every frame for the whole walk): the sweep is a live box that reads
+    // the frame's time when it is painted
+    let clock = clock.clone();
     let sweep = El::paint(move |g, (x, y, w, h)| {
+        let t = SCAN.ease((clock.get() % 1100.0) / 1100.0) as f32;
         let pw = w * 0.4;
         g.push_clip_rr4(x, y, w, h, [2.0; 4]);
         g.fill_rr(x + pw * (-1.0 + 3.5 * t), y, pw, h, 2.0, ACC());
         g.pop_clip();
     })
-    .abs(0.0, 0.0, 0.0, 0.0);
+    .abs(0.0, 0.0, 0.0, 0.0)
+    .live();
     let secs = (ms / 1000.0).floor() as u64;
     let line = format!("{} of {} · {} s", gbf(seen.min(used.max(seen))), gbf(used), secs);
     El::col()
@@ -483,7 +491,8 @@ fn clean_up(s: &mut Storage, cx: &mut Cx) -> Vec<El> {
         } else if let Some(r) = arrived {
             El::text(gbf(r.bytes), Font::new(13.0, 600).tnum(), FG(), lh(13.0, 1.35))
         } else if s.measuring {
-            shim(cx)
+            s.shim_on.set(true);
+            shim(&s.clock)
         } else {
             El::text("—", Font::new(13.0, 600), FG3(), lh(13.0, 1.35))
         };
@@ -528,10 +537,11 @@ fn clean_up(s: &mut Storage, cx: &mut Cx) -> Vec<El> {
 
 /// `.shim{width:48px;height:10px;border-radius:5px;background:linear-gradient(90deg,var(--ctl) 0%,var(--ctl-h) 50%,var(--ctl) 100%);
 /// background-size:200% 100%;animation:shim 1.1s linear infinite}` (from background-position 100% to -100%)
-fn shim(cx: &mut Cx) -> El {
-    cx.st.busy = true;
-    let t = ((cx.now % 1100.0) / 1100.0) as f32;
+fn shim(clock: &std::rc::Rc<std::cell::Cell<f64>>) -> El {
+    // Order 055: a live box (no `st.busy`): it reads the frame's time when it is painted
+    let clock = clock.clone();
     El::paint(move |g, (x, y, w, h)| {
+        let t = ((clock.get() % 1100.0) / 1100.0) as f32;
         // a 2w-wide gradient image slid from position 100% (offset -w) to -100% (offset +w)
         let off = -w + 2.0 * w * t;
         let shd = g.hgrad(x + off - w, y, x + off + w, y, &[(0.0, CTL()), (0.5, CTL_H()), (1.0, CTL())]);
@@ -539,6 +549,7 @@ fn shim(cx: &mut Cx) -> El {
     })
     .size(48.0, 10.0)
     .none()
+    .live()
 }
 
 // ================================================================ Drive health
