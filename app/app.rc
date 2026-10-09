@@ -17,8 +17,8 @@ BEGIN
       VALUE "FileDescription", "Boyler Utilities"
       VALUE "ProductName", "Boyler Utilities"
       VALUE "OriginalFilename", "Boyler Utilities.exe"
-      VALUE "FileVersion", "1.0.1"
-      VALUE "ProductVersion", "1.0.1"
+      VALUE "FileVersion", "1.0.2"
+      VALUE "ProductVersion", "1.0.2"
     END
   END
   BLOCK "VarFileInfo"

@@ -1,5 +1,8 @@
 # Boyler Utilities — What's new
 
+## 1.0.2 (2026-10-09)
+- Changing the resolution live: the menu and its Keep / Revert bar now stay on the monitor you changed instead of jumping to your other screen.
+
 ## 1.0.1 (2026-10-09)
 - Never freezes your PC: the screenshot overlay can no longer lock the desktop, and slow Windows work (changing a
   setting, Launch Steam, reading devices) no longer holds up the menu.

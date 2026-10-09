@@ -10,6 +10,7 @@
 
 #![windows_subsystem = "windows"]
 
+mod anchor;
 mod anim;
 mod appicon;
 mod appinfo;
@@ -1159,7 +1160,9 @@ impl App {
             }
             Ev::StartBg => self.start_next_bg(),
             Ev::Display => {
-                let (work, _) = self.monitor();
+                // Order 056: the monitor whose mode the Display tab changed, read fresh now (the tray icon's rect is from
+                // before the change and can lie on the other monitor)
+                let work = anchor::changed_work().unwrap_or_else(|| self.monitor().0);
                 if let Some(m) = &mut self.menu {
                     m.re_anchor(work);
                 }

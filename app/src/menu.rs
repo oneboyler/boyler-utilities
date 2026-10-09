@@ -641,10 +641,7 @@ impl Menu {
         if self.offscreen {
             return;
         }
-        let m = (12.0 * self.scale).round() as i32;
-        // (a work area smaller than the menu: its top-left stays on the screen, like `place`)
-        self.x = (work.right - m - self.w).max(work.left + m);
-        self.y = (work.bottom - m - self.h).max(work.top + m);
+        (self.x, self.y) = crate::anchor::corner(work, self.w, self.h, self.scale);
         unsafe {
             let _ = SetWindowPos(self.hwnd, None, self.x, self.y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
         }

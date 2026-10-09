@@ -62,7 +62,7 @@ fn updates_and_links_use_the_public_repo() {
     assert_eq!(update::REPO, "oneboyler/boyler-utilities");
     assert_eq!(update::page_url(true), "https://github.com/oneboyler/boyler-utilities/releases");
     assert_eq!(update::page_url(false), "https://github.com/oneboyler/boyler-utilities");
-    assert_eq!(VERSION, "1.0.1");
+    assert_eq!(VERSION, "1.0.2");
 }
 
 #[test]

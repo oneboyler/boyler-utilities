@@ -695,6 +695,9 @@ impl Display {
             return;
         }
         let (Some(id), Some(f)) = (self.sel_id(), self.f) else { return };
+        if let Some(m) = self.mons.get(self.sel) {
+            crate::anchor::changed(&m.gdi_name); // Order 056: the menu re-anchors on this monitor
+        }
         if self.run(move |rt| {
             let res = rt.svc.lock().map(|mut s| s.apply_fields(&id, f.w, f.h, f.hz.hz(), f.sc, Instant::now()));
             let r = match res {
