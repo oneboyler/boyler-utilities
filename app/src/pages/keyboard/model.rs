@@ -2,7 +2,7 @@
 //! carry a preset action or a macro, and the macros. One key does ONE thing: switching it to another kind clears the old kind.
 
 use bu_keysound::binds::{Bind, Binds, Preset};
-use bu_keysound::macros::{self, Macro};
+use bu_keysound::macros::{self, Macro, Step};
 use bu_keysound::remap::{self, Code, Mapping, DISABLED};
 
 /// What a key does.
@@ -70,6 +70,11 @@ impl Model {
 
     /// The key gets remapped to `to` (0 = turned off). Err (nothing changed): the list wouldn't be valid.
     pub fn set_remap(&mut self, c: Code, to: Code) -> Result<(), String> {
+        // a key "becoming itself" is the key as Windows made it - nothing is stored (Order 059)
+        if c == to {
+            self.reset_key(c);
+            return Ok(());
+        }
         let mut next: Vec<Mapping> = self.pending.iter().filter(|m| m.from != c).copied().collect();
         next.push(Mapping { from: c, to });
         remap::check(&next)?;
@@ -147,6 +152,16 @@ impl Model {
         Ok(id)
     }
 
+    /// A new macro with the template's name and steps; Err at the limit.
+    pub fn new_macro_from(&mut self, name: &str, steps: Vec<Step>) -> Result<String, String> {
+        let id = self.new_macro()?;
+        if let Some(m) = self.macros.iter_mut().find(|m| m.id == id) {
+            m.name = name.to_string();
+            m.steps = steps;
+        }
+        Ok(id)
+    }
+
     /// Deletes a macro and frees every key that ran it.
     pub fn delete_macro(&mut self, id: &str) {
         self.macros.retain(|m| m.id != id);
@@ -192,7 +207,8 @@ mod tests {
     fn bad_changes_change_nothing() {
         let mut mo = m();
         let before = mo.clone();
-        assert!(mo.set_remap(0x3A, 0x3A).is_err(), "a key can't become itself");
+        assert!(mo.set_remap(0x1E, 0x1E).is_ok(), "a key \"becoming itself\" is just Normal (Order 059)");
+        assert_eq!(mo, before, "and changes nothing here: it was Normal already");
         assert!(mo.set_macro(0x57, "nope").is_err());
         assert!(mo.set_preset(0x57, Preset::OpenWeb("ftp://x".into())).is_err());
         assert_eq!(mo, before);

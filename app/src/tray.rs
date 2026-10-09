@@ -13,6 +13,8 @@ pub const WM_TRAY: u32 = WM_APP + 1;
 const ICON_ID: u32 = 1;
 pub const IDM_OPEN: usize = 100;
 pub const IDM_QUIT: usize = 101;
+/// Order 062: shown only while a noise plays (the Noise tab).
+pub const IDM_STOP_NOISE: usize = 102;
 
 pub struct Tray {
     hwnd: HWND,
@@ -164,11 +166,14 @@ impl Tray {
         }
     }
 
-    /// The tiny right-click menu. Returns the picked command id (0 = none).
-    pub fn context_menu(&self, x: i32, y: i32) -> usize {
+    /// The tiny right-click menu (Open, Stop noise while a noise plays, Quit). Returns the picked command id (0 = none).
+    pub fn context_menu(&self, x: i32, y: i32, noise: bool) -> usize {
         unsafe {
             let Ok(m) = CreatePopupMenu() else { return 0 };
             let _ = AppendMenuW(m, MF_STRING, IDM_OPEN, w!("Open"));
+            if noise {
+                let _ = AppendMenuW(m, MF_STRING, IDM_STOP_NOISE, w!("Stop noise"));
+            }
             let _ = AppendMenuW(m, MF_STRING, IDM_QUIT, w!("Quit"));
             let _ = SetMenuDefaultItem(m, IDM_OPEN as u32, 0);
             let _ = SetForegroundWindow(self.hwnd);

@@ -249,7 +249,27 @@ pub fn place(p: Place, mw: f32, mh: f32) -> (f32, f32, bool, bool) {
 ///   0 0 0 .5px rgba(0,0,0,.35),0 12px 32px rgba(0,0,0,.35)}` (+ the open transition from its origin corner).
 pub fn menu(cx: &mut Cx, key: Key, list: &[Row], p: Place, min_w: f32) -> El {
     let kids = rows(cx, key, list);
-    // its size (Chromium measures offsetWidth / offsetHeight after filling it): the widest row's max-content + 10
+    let (mw, mh, min_w) = menu_size(cx, list, p, min_w);
+    menu_box(cx, key, kids, p, mw, mh, min_w)
+}
+
+/// [`menu`] for a LONG list (Order 059: the Keyboard tab's ready-made actions): the box keeps its 300 px and the rows scroll
+/// inside it (wheel, slim glass thumb) instead of hanging out below. Row clicks are the same `Ev::Click(idx(key, i))`.
+pub fn menu_scroll(cx: &mut Cx, key: Key, list: &[Row], p: Place, min_w: f32) -> El {
+    let kids = rows(cx, key, list);
+    let (mw, mh, min_w) = menu_size(cx, list, p, min_w);
+    let body = cx
+        .scroll_box(crate::ui::el::sub(key, "scroll"), kids)
+        .items(AlignItems::STRETCH)
+        .min_h(0.0)
+        .max_h(290.0)
+        .slim_thumb(crate::ui::el::SlimThumb::GLASS);
+    menu_box(cx, key, vec![body], p, mw, mh, min_w)
+}
+
+/// The menu's measured size (Chromium measures offsetWidth / offsetHeight after filling it): the widest row's max-content + 10,
+/// its rows' heights + 10 up to 300 - and the minimum width.
+fn menu_size(cx: &mut Cx, list: &[Row], p: Place, min_w: f32) -> (f32, f32, f32) {
     let mut w: f32 = 0.0;
     for r in list {
         let rw = match r {
@@ -266,7 +286,7 @@ pub fn menu(cx: &mut Cx, key: Key, list: &[Row], p: Place, min_w: f32) -> El {
     };
     let mw = (w + 10.0).max(min_w);
     let mh: f32 = (list.iter().enumerate().map(|(i, r)| row_h(r, i == 0)).sum::<f32>() + 10.0).min(300.0);
-    menu_box(cx, key, kids, p, mw, mh, min_w)
+    (mw, mh, min_w)
 }
 
 /// The popup confirm `.mcf` (Startup's "This is part of Windows", Performance's "End … ?", Security's Offline scan / Allow /

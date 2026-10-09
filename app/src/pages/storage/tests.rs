@@ -173,15 +173,18 @@ fn clean_up_measures_first_then_cleans_only_the_ticked_rows() {
     let mut st = State::default();
     // before measuring, a row can't be ticked and the button measures
     click(&mut s, &mut st, idx(K_CN, 0));
-    assert_eq!(s.ticked.len(), 4, "every row ticked at rest; a click before measuring changes nothing");
+    assert_eq!(s.ticked.len(), 2, "Recycle bin + Temp files ticked at rest (shader + launcher caches are not); a click before measuring changes nothing");
     click(&mut s, &mut st, K_CLN);
     assert!(s.measuring);
     assert!(wait_for(&mut s, 5000, |s| s.plan.is_some()));
     let gbs: Vec<String> = CleanKind::ALL.iter().map(|k| gbf(s.plan.as_ref().unwrap().row(*k).unwrap().bytes)).collect();
     assert_eq!(gbs, ["6.4 GB", "3.3 GB", "2.8 GB", "1.9 GB"]);
-    // every row ticked: "Clean 14.4 GB"
+    assert_eq!(s.ticked.len(), 2, "measuring keeps the default ticks");
     let l = build(&mut s, &mut st, 0.0);
     assert!(l.rect_of(K_CLN).is_some());
+    // tick the shader and launcher caches by hand: "Clean 14.4 GB"
+    click(&mut s, &mut st, idx(K_CN, 2));
+    click(&mut s, &mut st, idx(K_CN, 3));
     assert_eq!(s.ticked.len(), 4);
     assert!(s.fake.as_ref().unwrap().changes().is_empty(), "measuring deletes nothing");
     // untick the recycle bin, then Clean
@@ -273,7 +276,9 @@ fn clean_up_sizes_arrive_one_by_one_and_cleaned_rows_count_down() {
     assert!(s.plan.is_none());
     s.tick(1000.0);
     assert!(s.plan.is_some() && !s.measuring, "measured at 1000 ms");
-    // Clean (all four ticked)
+    // Clean (all four ticked by hand)
+    click(&mut s, &mut st, idx(K_CN, 2));
+    click(&mut s, &mut st, idx(K_CN, 3));
     click(&mut s, &mut st, K_CLN);
     while s.countdown.is_none() && t0.elapsed().as_secs() < 10 {
         s.tick(1000.0);
@@ -513,4 +518,197 @@ fn nothing_moving_asks_for_no_frames() {
     assert_eq!(s.wake_at(900.0), Some(s.size_t0 + SIZES_DONE_MS), "the menu wakes when they become the plan");
     s.tick(s.size_t0 + SIZES_DONE_MS);
     assert!(s.plan.is_some() && s.wake_at(1000.0).is_none());
+}
+
+/// Order 069 (the owner: "i cleaned my bin, and recalculating it wasnt possible ... cause i didnt clean all 4"): after ANY clean -
+/// one row or all - the sizes are measured again by themselves, and "Measure again" is always there; what was left unticked
+/// never blocks it. The shader and launcher caches start unticked.
+#[test]
+fn after_any_clean_the_sizes_are_measured_again_and_measure_again_always_works() {
+    let mut s = opened();
+    let mut st = State::default();
+    click(&mut s, &mut st, K_CLN);
+    assert!(wait_for(&mut s, 5000, |s| s.plan.is_some()));
+    let mut ticked: Vec<_> = s.ticked.iter().copied().collect();
+    ticked.sort();
+    assert_eq!(ticked, [CleanKind::RecycleBin, CleanKind::TempFiles], "shader + launcher caches start unticked");
+    let size = |s: &Storage, k| gbf(s.plan.as_ref().unwrap().row(k).unwrap().bytes);
+    // clean the Recycle bin ONLY (untick Temp files; the other two were never ticked)
+    click(&mut s, &mut st, idx(K_CN, 1));
+    click(&mut s, &mut st, K_CLN);
+    assert!(wait_for(&mut s, 5000, |s| s.report.is_some()));
+    // ... and the cleaned row is measured again without a click
+    assert!(s.measuring || s.plan.as_ref().unwrap().row(CleanKind::RecycleBin).unwrap().bytes == 0);
+    assert!(wait_for(&mut s, 5000, |s| !s.measuring && s.plan.as_ref().unwrap().row(CleanKind::RecycleBin).unwrap().bytes == 0));
+    assert_eq!((size(&s, CleanKind::TempFiles), size(&s, CleanKind::ShaderCaches), size(&s, CleanKind::LauncherCaches)), ("3.3 GB".into(), "2.8 GB".into(), "1.9 GB".into()), "the unticked rows are still there");
+    assert!(s.done(CleanKind::RecycleBin) && !s.done(CleanKind::TempFiles));
+    assert!(s.ticked.contains(&CleanKind::RecycleBin), "ticks stay as they were");
+    // "Measure again" is there and works, though three rows were never cleaned
+    let l = build(&mut s, &mut st, 0.0);
+    assert!(l.rect_of(K_CAGAIN).is_some());
+    click(&mut s, &mut st, K_CAGAIN);
+    assert!(s.measuring);
+    assert!(wait_for(&mut s, 5000, |s| !s.measuring));
+    assert_eq!(size(&s, CleanKind::TempFiles), "3.3 GB");
+    // something lands in the bin meanwhile: Measure again finds it, the row is not "Cleaned" any more and can be ticked again
+    s.fake.as_ref().unwrap().with_recycle_bin(1 << 30, 5);
+    click(&mut s, &mut st, K_CAGAIN);
+    assert!(wait_for(&mut s, 5000, |s| !s.measuring));
+    assert_eq!(size(&s, CleanKind::RecycleBin), "1.0 GB");
+    assert!(!s.done(CleanKind::RecycleBin));
+    assert!(texts(&build(&mut s, &mut st, 0.0)).contains(&"1.0 GB".to_string()));
+    // all four cleaned: still measured again, still "Measure again"
+    click(&mut s, &mut st, idx(K_CN, 1));
+    click(&mut s, &mut st, idx(K_CN, 2));
+    click(&mut s, &mut st, idx(K_CN, 3));
+    click(&mut s, &mut st, K_CLN);
+    assert!(wait_for(&mut s, 5000, |s| s.cleaning));
+    assert!(wait_for(&mut s, 8000, |s| !s.cleaning && !s.measuring && s.report.as_ref().is_some_and(|r| r.rows.len() == 4)));
+    let t = texts(&build(&mut s, &mut st, 0.0));
+    assert!(t.iter().filter(|x| *x == "Cleaned").count() >= 3, "{t:?}");
+    click(&mut s, &mut st, K_CAGAIN);
+    assert!(s.measuring);
+    assert!(wait_for(&mut s, 5000, |s| !s.measuring));
+}
+
+fn context(s: &mut Storage, st: &mut State, k: Key) {
+    let g = Gfx::new(1.0);
+    let mut cx = Cx::new(0.0, false, &g, st);
+    s.event(&Ev::Context(k, 300.0, 300.0), &mut cx);
+}
+
+/// Order 069 (the owner OK): the Folders view gets a small Folders | Files switch; Files = the 20 biggest single files of the
+/// drive from the SAME walk; a right-click opens Show in folder / Delete; Delete asks first and moves the file to the
+/// Recycle Bin (never a straight delete); what Windows manages cannot be deleted from there.
+#[test]
+fn files_view_lists_the_biggest_files_and_deletes_to_the_bin_after_a_confirm() {
+    let e = Env { test: true, frozen: true, ..Env::default() };
+    let mut s = Storage::default();
+    s.open(&e, 0.0);
+    let mut st = State::default();
+    click(&mut s, &mut st, K_MEASURE);
+    assert!(wait_for(&mut s, 10_000, |s| matches!(s.scan_of('C'), Scan::Done { .. })));
+    click(&mut s, &mut st, idx(K_SEG, 1)); // Folders
+    let l = build(&mut s, &mut st, 0.0);
+    assert!(l.rect_of(idx(K_FSEG, 0)).is_some() && l.rect_of(idx(K_FSEG, 1)).is_some(), "the small Folders | Files switch");
+    assert!(l.rect_of(idx(K_BIG, 0)).is_none(), "Folders first");
+    click(&mut s, &mut st, idx(K_FSEG, 1));
+    assert_eq!(s.fmode, FMode::Files);
+    let files = s.big_files();
+    assert_eq!(files.len(), 20, "the 20 biggest");
+    assert!(files.windows(2).all(|w| w[0].bytes >= w[1].bytes));
+    let l = build(&mut s, &mut st, 0.0);
+    assert!(l.rect_of(idx(K_BIG, 0)).is_some() && l.rect_of(idx(K_BIG, 19)).is_some() && l.rect_of(idx(K_BIG, 20)).is_none());
+    let t = texts(&l);
+    assert!(t.contains(&files[0].name) && t.contains(&gbf(files[0].bytes)), "{t:?}");
+    assert!(s.fake.as_ref().unwrap().changes().is_empty(), "listing deletes nothing, measures nothing again");
+
+    // Windows' own file (the pagefile): the menu opens, Delete does nothing
+    let locked = files.iter().position(|f| f.name == "pagefile.sys").expect("the pagefile is among the biggest");
+    assert!(!files[locked].can_recycle());
+    context(&mut s, &mut st, idx(K_BIG, locked));
+    assert!(s.fmenu.is_some());
+    click(&mut s, &mut st, idx(K_FMENU, 2));
+    assert!(s.fdlg.is_none() && s.fake.as_ref().unwrap().changes().is_empty());
+    s.popup_dismiss();
+    assert!(s.fmenu.is_none());
+
+    // a right-click on a normal file: Show in folder opens Explorer (a test copy only says so)
+    let n = files.iter().position(|f| f.can_recycle()).unwrap();
+    let f = files[n].clone();
+    context(&mut s, &mut st, idx(K_BIG, n));
+    assert_eq!(s.fmenu.as_ref().map(|m| m.0.clone()), Some(f.clone()));
+    click(&mut s, &mut st, idx(K_FMENU, 1));
+    assert!(s.fmenu.is_none() && s.toast.as_ref().unwrap().0.starts_with("Opens Explorer with "));
+    // Delete asks first
+    context(&mut s, &mut st, idx(K_BIG, n));
+    click(&mut s, &mut st, idx(K_FMENU, 2));
+    assert!(s.fdlg.is_some() && s.fmenu.is_none());
+    assert!(s.fake.as_ref().unwrap().changes().is_empty(), "nothing moves before the confirm");
+    let g = Gfx::new(1.0);
+    let mut cx = Cx::new(0.0, false, &g, &mut st);
+    let pop = s.popup(&mut cx);
+    assert!(pop.is_some(), "the confirm is up");
+    // Cancel
+    click(&mut s, &mut st, sub(K_FDLG, "no"));
+    assert!(s.fdlg_closing.is_some());
+    s.fdlg = None;
+    s.fdlg_closing = None;
+    assert!(s.fake.as_ref().unwrap().changes().is_empty());
+    // Delete for real (the fake PC): to the bin, the row leaves the list
+    context(&mut s, &mut st, idx(K_BIG, n));
+    click(&mut s, &mut st, idx(K_FMENU, 2));
+    let bin_before = s.fake.as_ref().unwrap().recycle_bin().unwrap();
+    click(&mut s, &mut st, sub(K_FDLG, "go"));
+    assert!(wait_for(&mut s, 5000, |s| !s.big_files().contains(&f)));
+    let ch = s.fake.as_ref().unwrap().changes();
+    assert_eq!(ch.len(), 1, "{ch:?}");
+    assert!(ch[0].starts_with("recycle_file "), "to the Recycle Bin, not remove_file: {ch:?}");
+    let bin = s.fake.as_ref().unwrap().recycle_bin().unwrap();
+    assert_eq!((bin.items, bin.bytes), (bin_before.items + 1, bin_before.bytes + f.bytes));
+    assert!(s.toast.as_ref().unwrap().0.starts_with("Moved to the Recycle Bin · "), "{:?}", s.toast);
+    assert_eq!(s.big_files().len(), 19);
+    // the choice is kept when the tab is left and opened again
+    s.close();
+    let mut s = Storage::default();
+    s.open(&e, 5.0);
+    assert_eq!(s.fmode, FMode::Files);
+    assert_eq!(s.big_files().len(), 19);
+}
+
+/// Order 069 picture check (only with `BU_RENDER_DIR` set): the Files list, its right-click menu and delete confirm, and the
+/// Clean up foot with "Measure again" after a partial clean - painted off-screen with the app's own painter, dark and light.
+#[test]
+fn pictures_of_the_files_view_and_measure_again() {
+    let Ok(dir) = std::env::var("BU_RENDER_DIR") else { return };
+    unsafe {
+        let _ = windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_MULTITHREADED);
+    }
+    for light in [false, true] {
+        crate::ui::set_light(light);
+        let name = if light { "light" } else { "dark" };
+        let mut s = opened();
+        let mut st = State::default();
+        click(&mut s, &mut st, K_MEASURE);
+        assert!(wait_for(&mut s, 10_000, |s| matches!(s.scan_of('C'), Scan::Done { .. })));
+        click(&mut s, &mut st, idx(K_SEG, 1));
+        click(&mut s, &mut st, idx(K_FSEG, 1));
+        // Clean up measured, the Recycle bin cleaned, the other rows left: "Measure again" next to the summary
+        click(&mut s, &mut st, K_CLN);
+        assert!(wait_for(&mut s, 5000, |s| s.plan.is_some()));
+        click(&mut s, &mut st, idx(K_CN, 1));
+        click(&mut s, &mut st, K_CLN);
+        assert!(wait_for(&mut s, 8000, |s| s.report.is_some() && !s.measuring && !s.cleaning));
+        let g = Gfx::new(1.0);
+        let icons = crate::icons::Icons::new();
+        let shot = |s: &mut Storage, st: &mut State, popup: bool, file: &str| {
+            let mut cx = Cx::new(5000.0, false, &g, st);
+            let kids = s.build(&mut cx);
+            let laid = Laid::new(&g, El::block().w(600.0).pad(2.0, 26.0, 18.0, 26.0).children(kids), 600.0, None);
+            let (w, h) = (crate::ui::WIN_W as i32, (laid.height.ceil() as i32).max(crate::ui::WIN_H as i32));
+            let mut sf = crate::gfx::new_surface(w, h).unwrap();
+            g.begin(sf.canvas());
+            let bg = if light { crate::gfx::Rgba::rgb(236, 239, 245) } else { crate::gfx::Rgba::rgb(20, 24, 40) };
+            g.fill_rect(0.0, 0.0, w as f32, h as f32, bg);
+            laid.paint(&g, &icons, 0.0, 0.0, None);
+            if popup {
+                let mut cx = Cx::new(5000.0, false, &g, st);
+                if let Some(p) = s.popup(&mut cx) {
+                    let pl = Laid::new(&g, p, w as f32, None);
+                    pl.paint(&g, &icons, 0.0, 0.0, None);
+                }
+            }
+            g.end();
+            let px = crate::png::from_surface(&mut sf);
+            crate::png::save_png(&px, &format!("{dir}/storage_{file}_{name}.png")).expect("save");
+        };
+        shot(&mut s, &mut st, false, "files");
+        let n = s.big_files().iter().position(|f| f.can_recycle()).unwrap();
+        context(&mut s, &mut st, idx(K_BIG, n));
+        shot(&mut s, &mut st, true, "files_menu");
+        click(&mut s, &mut st, idx(K_FMENU, 2));
+        s.fdlg = s.fdlg.take().map(|(f, _)| (f, 0.0));
+        shot(&mut s, &mut st, true, "files_delete");
+    }
+    crate::ui::set_light(false);
 }

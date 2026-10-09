@@ -17,10 +17,10 @@
 //! LATE = when the start is reported, the process already shows a visible top-level window (`EnumWindows`; no handle to
 //! the app). Reported as `has_window: true`; the switcher then does NOT switch ("never mid-game").
 //!
-//! STOP = `bu_procwatch::wait_exit`: `OpenProcess(SYNCHRONIZE)` ONLY (what A_004_01 approved: no read, no write, no
-//! query), waited on by the Windows thread pool (no thread of ours per app). Already gone when its start is handled →
-//! Stopped at once. If even SYNCHRONIZE is refused: process snapshots decide (at every snapshot and when one of its
-//! windows is destroyed).
+//! STOP = `bu_procwatch::wait_exit_no_handle` (Order 063: NO handle to the game at all - not even SYNCHRONIZE; an anti-cheat
+//! protected game such as VALORANT is never opened): the exit is found by process snapshots - at every snapshot, when one of
+//! its windows is destroyed, and by a bounded re-check timer. Already gone when its start is handled → Stopped at once.
+//! (The Display tab's watcher still uses `wait_exit`: `OpenProcess(SYNCHRONIZE)` ONLY, A_004_01.)
 
 use crate::accel::switch::AppEvent;
 use crate::error::{Error, Result};
@@ -151,12 +151,12 @@ impl Inner {
         self.wait_exit(pid);
     }
 
-    /// Stopped comes from `bu_procwatch::wait_exit` (a SYNCHRONIZE handle only, A_004_01; snapshots if even that is
-    /// refused). The wait is kept until it fires or the watcher is dropped.
+    /// Stopped comes from `bu_procwatch::wait_exit_no_handle` (no handle to the process at all; process snapshots decide, A_063).
+    /// The wait is kept until it fires or the watcher is dropped.
     fn wait_exit(self: &Arc<Self>, pid: u32) {
         let id = self.next_wait.fetch_add(1, Ordering::Relaxed);
         let weak = Arc::downgrade(self);
-        let wait = bu_procwatch::wait_exit(
+        let wait = bu_procwatch::wait_exit_no_handle(
             pid,
             Box::new(move || {
                 if let Some(me) = weak.upgrade() {

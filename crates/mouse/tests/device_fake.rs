@@ -324,3 +324,58 @@ fn the_query_and_hold_frames() {
     assert!(!p::read_request_allowed(&p::hold_frame(true)));
     assert!(!p::read_request_allowed(&p::frame(p::CMD_DRIVER, 0, &[1])), "the announce is not a read request");
 }
+
+// ---- Order 061: every mouse is detected and named ----
+
+fn mouse_if(path: &str, vid: u16, pid: u16, product: Option<&str>) -> HidInfo {
+    HidInfo { product: product.map(str::to_string), ..hid(path, vid, pid, 0x01, 0x02, 8, 0) }
+}
+
+#[test]
+fn the_x2_v2_on_the_shared_compx_id_is_named_and_gets_the_pulsar_link() {
+    let list = vec![mouse_if(r"\?\hid#vid_3554&pid_f507&mi_00#a", 0x3554, 0xF507, Some("2.4G Wireless Receiver"))];
+    let y = find_mice(&list).remove(0);
+    assert_eq!(y.name, "Pulsar X2A Wireless / X2 V2 Mini", "the model beats the receiver's generic product string");
+    assert_eq!(y.ids(), "3554:F507");
+    assert_eq!(y.brand.as_ref().map(|b| b.name), Some("Pulsar"));
+    assert_eq!(y.protocol, None, "not a proven protocol: DPI and polling stay unsupported, the web driver link is shown");
+    assert_eq!(y.link(), Some(("open its web settings".into(), "https://bbb.pulsar.gg/")));
+}
+
+#[test]
+fn a_shared_id_with_an_unknown_pid_is_named_by_its_product_string_and_gets_no_wrong_brand() {
+    let list = vec![mouse_if(r"\?\hid#vid_3554&pid_0001#a", 0x3554, 0x0001, Some("Gaming Mouse 2.4G"))];
+    let y = find_mice(&list).remove(0);
+    assert_eq!(y.name, "Gaming Mouse 2.4G");
+    assert_eq!(y.brand, None);
+    assert_eq!(y.ids(), "3554:0001");
+    // no product string at all: never "nothing"
+    let y = find_mice(&[mouse_if(r"\?\hid#vid_3554&pid_0002#a", 0x3554, 0x0002, None)]).remove(0);
+    assert_eq!(y.name, "Mouse (3554:0002)");
+}
+
+#[test]
+fn the_product_string_can_name_the_brand_on_a_shared_id() {
+    let b = bu_mouse::device::brand_of(0x3554, 0x0003, Some("Pulsar Xlite V3 Dongle"), None);
+    assert_eq!(b.map(|b| b.name), Some("Pulsar"));
+    assert_eq!(bu_mouse::device::brand_of(0x3554, 0x0003, Some("Gaming Mouse"), Some("Shenzhen")), None);
+}
+
+#[test]
+fn a_libratbag_model_is_named_and_asus_gets_its_link() {
+    let list = vec![mouse_if(r"\?\hid#vid_0b05&pid_1845#a", 0x0B05, 0x1845, Some("ROG USB"))];
+    let y = find_mice(&list).remove(0);
+    assert_eq!(y.name, "ASUS ROG Gladius II");
+    assert_eq!(y.brand.as_ref().map(|b| b.name), Some("ASUS"));
+}
+
+#[test]
+fn a_mouse_without_a_usb_id_is_listed_only_when_no_mouse_has_one() {
+    let none = mouse_if(r"\?\acpi#pnp0f13#4&1", 0, 0, None);
+    let y = find_mice(std::slice::from_ref(&none)).remove(0);
+    assert_eq!(y.name, "Mouse");
+    let both = vec![none, mouse_if(r"\?\hid#vid_046d&pid_c547#a", 0x046D, 0xC547, Some("USB Receiver"))];
+    let all = find_mice(&both);
+    assert_eq!(all.len(), 1);
+    assert_eq!(all[0].name, "USB Receiver");
+}

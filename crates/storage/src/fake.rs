@@ -1,7 +1,7 @@
 //! A fake OS for tests: an in-memory file tree, drives, recycle bin, processes and disk health.
 //! Nothing here touches the real PC.
 
-use crate::{
+use crate::{DriveListing, ListEntry,
     DriveInfo, HealthRaw, KnownDirs, MediaKind, NvmeHealthLog, OsHealthStatus, PhysicalDisk, RawEntry, RecycleBinInfo, Result,
     SmartAttribute, StorageError, StorageOs,
 };
@@ -35,6 +35,22 @@ struct State {
     disks: Vec<PhysicalDisk>,
     health: HashMap<u32, HealthRaw>,
     changes: Vec<String>,
+    /// Order 069: the fast whole-drive listing (Everything): off, on, or failing
+    listing: FakeListingMode,
+    /// how many listings were opened
+    listings_opened: u32,
+}
+
+/// What the fake's `open_listing` answers.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum FakeListingMode {
+    /// no listing: the walk is used
+    #[default]
+    Off,
+    /// the fake tree, as a listing
+    On,
+    /// it is tried and fails: the walk is used
+    Failing,
 }
 
 /// The fake. Build it with the `with_*` / `add_*` methods, then pass `&fake` where a `StorageOs` is wanted.
@@ -126,6 +142,15 @@ impl FakeOs {
         self.st().drives = d;
         self
     }
+    /// Order 069: answer `open_listing` with this fake tree (or fail it).
+    pub fn with_listing(&self, mode: FakeListingMode) -> &Self {
+        self.st().listing = mode;
+        self
+    }
+    /// How many listings were opened.
+    pub fn listings_opened(&self) -> u32 {
+        self.st().listings_opened
+    }
     pub fn with_recycle_bin(&self, bytes: u64, items: u64) -> &Self {
         self.st().recycle = RecycleBinInfo { bytes, items };
         self
@@ -172,8 +197,52 @@ impl FakeOs {
     }
 }
 
+/// The fake tree as a listing: every folder and file of one drive (what Everything's index would give - links are not
+/// followed; the dirs' keys are lower case, names keep their case).
+struct FakeListing {
+    folders: Vec<ListEntry>,
+    files: Vec<ListEntry>,
+    at: [usize; 2],
+}
+
+impl DriveListing for FakeListing {
+    fn page(&mut self, folders: bool, max: usize) -> Result<Vec<ListEntry>> {
+        let (list, at) = if folders { (&self.folders, &mut self.at[0]) } else { (&self.files, &mut self.at[1]) };
+        let page: Vec<ListEntry> = list.iter().skip(*at).take(max).cloned().collect();
+        *at += page.len();
+        Ok(page)
+    }
+}
+
 impl StorageOs for FakeOs {
+    fn open_listing(&self, letter: char, _ctl: &crate::scan::ScanControl) -> Option<Result<Box<dyn DriveListing>>> {
+        let mut st = self.st();
+        match st.listing {
+            FakeListingMode::Off => return None,
+            FakeListingMode::Failing => {
+                st.listings_opened += 1;
+                return Some(Err(StorageError::Unsupported("the fast listing".into())));
+            }
+            FakeListingMode::On => {}
+        }
+        st.listings_opened += 1;
+        let prefix = format!("{}:\\", letter.to_ascii_lowercase());
+        let (mut folders, mut files) = (Vec::new(), Vec::new());
+        for (dir, list) in st.dirs.iter().filter(|(d, _)| d.starts_with(&prefix)) {
+            let shown = dir.trim_end_matches('\\').to_string();
+            for e in list.iter().filter(|e| !e.reparse) {
+                let entry = ListEntry { dir: shown.clone(), name: e.name.clone(), size: if e.is_dir { 0 } else { e.size }, cloud_only: e.cloud };
+                if e.is_dir {
+                    folders.push(entry);
+                } else {
+                    files.push(entry);
+                }
+            }
+        }
+        Some(Ok(Box::new(FakeListing { folders, files, at: [0, 0] })))
+    }
     fn drives(&self) -> Result<Vec<DriveInfo>> {
+
         Ok(self.st().drives.clone())
     }
     fn read_dir(&self, path: &Path) -> io::Result<Vec<RawEntry>> {
@@ -201,6 +270,24 @@ impl StorageOs for FakeOs {
         }
         list.remove(i);
         st.changes.push(format!("remove_file {}", key(path)));
+        Ok(())
+    }
+    fn recycle_file(&self, path: &Path) -> io::Result<()> {
+        let mut st = self.st();
+        let (parent, name) = split(path).ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;
+        let list = st.dirs.get_mut(&parent).ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?;
+        let i = list
+            .iter()
+            .position(|e| !e.is_dir && e.name.eq_ignore_ascii_case(&name))
+            .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?;
+        if list[i].in_use {
+            return Err(io::Error::from_raw_os_error(32)); // ERROR_SHARING_VIOLATION
+        }
+        let gone = list.remove(i);
+        // the file is in the bin now (it can be restored from there)
+        st.recycle.bytes += gone.size;
+        st.recycle.items += 1;
+        st.changes.push(format!("recycle_file {}", key(path)));
         Ok(())
     }
     fn remove_dir(&self, path: &Path) -> io::Result<()> {
@@ -357,7 +444,7 @@ impl FakeOs {
         f.add_file(format!("{local}\\D3DSCache\\cache.bin"), gb(1.1));
         f.add_file(format!("{local}\\NVIDIA\\DXCache\\cache.bin"), gb(1.7));
         f.add_file("C:\\Program Files (x86)\\Steam\\appcache\\appinfo.vdf", gb(1.2));
-        f.add_file(format!("{local}\\EpicGamesLauncher\\Saved\\webcache\\data_1"), gb(0.5));
+        f.add_file(format!("{local}\\EpicGamesLauncher\\Saved\\webcache_4430\\Cache\\data_1"), gb(0.5));
         f.add_file(format!("{local}\\Riot Games\\Riot Client\\HttpCache\\data_1"), gb(0.2));
         // D: and E: (the drawing's top folders)
         for (p, size) in [

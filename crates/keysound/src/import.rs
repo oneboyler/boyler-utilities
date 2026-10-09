@@ -67,6 +67,8 @@ pub fn from_parts(config: &str, fallback: &str, load: &dyn Fn(&str) -> Result<Ve
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| fallback.to_string());
     let defines = v.get("defines").and_then(|d| d.as_object()).ok_or("config.json has no \"defines\"")?;
+    // real packs leave keys empty ("" or null = no sound for that key): those are not defined
+    let defines: serde_json::Map<String, serde_json::Value> = defines.iter().filter(|(_, x)| !(x.is_null() || x.as_str() == Some(""))).map(|(k, x)| (k.clone(), x.clone())).collect();
     let multi = v.get("key_define_type").and_then(|t| t.as_str()) == Some("multi");
 
     // which defined entry gives which of the five sounds
@@ -286,11 +288,13 @@ fn decode_wav(b: &[u8]) -> Result<Audio, String> {
 pub fn referenced_files(config: &str) -> Result<Vec<String>, String> {
     let v: serde_json::Value = serde_json::from_str(config).map_err(|e| format!("config.json isn't valid JSON: {e}"))?;
     let mut out: Vec<String> = Vec::new();
-    if let Some(s) = v.get("sound").and_then(|s| s.as_str()) {
+    // a multi pack's stray "sound" entry (the Opera GX pack names a sound.ogg it does not ship) is not a file it needs
+    let multi = v.get("key_define_type").and_then(|t| t.as_str()) == Some("multi");
+    if let (false, Some(s)) = (multi, v.get("sound").and_then(|s| s.as_str())) {
         out.push(s.to_string());
     }
     if let Some(d) = v.get("defines").and_then(|d| d.as_object()) {
-        out.extend(d.values().filter_map(|x| x.as_str()).map(str::to_string));
+        out.extend(d.values().filter_map(|x| x.as_str()).filter(|s| !s.is_empty()).map(str::to_string));
     }
     out.sort();
     out.dedup();
@@ -322,10 +326,101 @@ pub fn folder_name(name: &str) -> String {
 
 /// Imports the pack in `src` into the app's pack folder `root`: reads and decodes it first (a bad pack changes nothing),
 /// then copies its `config.json` and the files it names into `root\<name>`. Returns the pack (its name = the folder's).
+/// `src` may hold the pack directly or in ONE folder inside it (a zip unpacked by Explorer is that).
 pub fn install(src: &Path, root: &Path) -> Result<Imported, String> {
-    let mut pack = read_pack(src)?;
+    let src = pack_dir(src)?;
+    let pack = read_pack(&src)?;
     let config = std::fs::read_to_string(src.join("config.json")).map_err(|e| format!("config.json: {e}"))?;
-    let files = referenced_files(&config)?;
+    let mut files: Vec<(String, Vec<u8>)> = Vec::new();
+    for f in referenced_files(&config)? {
+        let bytes = std::fs::read(src.join(&f)).map_err(|e| format!("{f}: {e}"))?;
+        files.push((f, bytes));
+    }
+    put(pack, &config, &files, root)
+}
+
+/// The folder that holds `config.json`: `src` itself, or the one folder inside it that does.
+fn pack_dir(src: &Path) -> Result<std::path::PathBuf, String> {
+    if src.join("config.json").is_file() {
+        return Ok(src.to_path_buf());
+    }
+    let inner: Vec<std::path::PathBuf> = std::fs::read_dir(src)
+        .map(|d| d.filter_map(|e| e.ok()).map(|e| e.path()).filter(|p| p.join("config.json").is_file()).collect())
+        .unwrap_or_default();
+    match inner.as_slice() {
+        [one] => Ok(one.clone()),
+        _ => Err("this folder is not a Mechvibes pack: no config.json inside".into()),
+    }
+}
+
+/// The biggest .zip taken (a Mechvibes pack is a few MB), and the most it may unpack to.
+const MAX_ZIP: u64 = 100 * 1024 * 1024;
+const MAX_UNPACKED: usize = 160 * 1024 * 1024;
+
+/// Imports a Mechvibes pack as the site hands it out: the `.zip` itself (its `config.json` at the top or inside one folder
+/// of it) - read in memory, nothing is unpacked to disk but the pack's own files - or a folder. Err: a plain sentence
+/// ("This isn't a Mechvibes pack: …").
+pub fn install_any(src: &Path, root: &Path) -> Result<Imported, String> {
+    if src.is_dir() {
+        return install(src, root);
+    }
+    let is_zip = src.extension().is_some_and(|e| e.eq_ignore_ascii_case("zip"));
+    let len = std::fs::metadata(src).map_err(|e| format!("can't read {}: {e}", src.display()))?.len();
+    if len > MAX_ZIP {
+        return Err(format!("that file is too big for a sound pack ({} MB)", len / 1024 / 1024));
+    }
+    let bytes = std::fs::read(src).map_err(|e| format!("can't read {}: {e}", src.display()))?;
+    if !is_zip && !bytes.starts_with(b"PK") {
+        return Err("This isn't a Mechvibes pack: pick the .zip you downloaded, or the pack's folder".into());
+    }
+    let fallback = src.file_stem().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "Imported".into());
+    install_zip(&bytes, &fallback, root)
+}
+
+/// [`install_any`] for a zip already in memory; `fallback` names a pack whose config has no name.
+pub fn install_zip(zip: &[u8], fallback: &str, root: &Path) -> Result<Imported, String> {
+    let entries = bu_addons::zip::read(zip, MAX_UNPACKED).map_err(|_| "This isn't a Mechvibes pack: that .zip can't be read (damaged, encrypted or not a zip)".to_string())?;
+    let norm = |n: &str| n.replace(std::path::MAIN_SEPARATOR, "/");
+    // the shallowest config.json (not macOS' __MACOSX copies)
+    let cfg = entries
+        .iter()
+        .filter(|e| !e.dir)
+        .filter(|e| {
+            let n = norm(&e.name);
+            !n.starts_with("__MACOSX/") && n.rsplit('/').next().is_some_and(|f| f.eq_ignore_ascii_case("config.json"))
+        })
+        .min_by_key(|e| norm(&e.name).matches('/').count())
+        .ok_or("This isn't a Mechvibes pack: there is no config.json in that .zip")?;
+    let cfg_name = norm(&cfg.name);
+    let base = &cfg_name[..cfg_name.len() - "config.json".len()];
+    if cfg.data.len() as u64 > MAX_CONFIG {
+        return Err("config.json is too big".into());
+    }
+    let config = String::from_utf8_lossy(&cfg.data).trim_start_matches('\u{feff}').to_string();
+    let fallback = if base.is_empty() { fallback.to_string() } else { base.trim_end_matches('/').rsplit('/').next().unwrap_or(fallback).to_string() };
+    // (a pack's config often names a file in other letter case than the zip holds it)
+    let find = |name: &str| {
+        let want = format!("{base}{name}");
+        entries.iter().find(|e| !e.dir && norm(&e.name) == want).or_else(|| entries.iter().find(|e| !e.dir && norm(&e.name).eq_ignore_ascii_case(&want)))
+    };
+    let pack = from_parts(&config, &fallback, &|name| match find(name) {
+        Some(e) if e.data.len() as u64 > MAX_FILE => Err(format!("{name} is too big ({} MB)", e.data.len() / 1024 / 1024)),
+        Some(e) => Ok(e.data.clone()),
+        None => Err(format!("the pack's sound file {name} is missing from the .zip")),
+    })
+    .map_err(|e| format!("This isn't a usable Mechvibes pack: {e}"))?;
+    let mut files: Vec<(String, Vec<u8>)> = Vec::new();
+    for f in referenced_files(&config)? {
+        // a file that is named but not shipped only matters when one of the five sounds needs it (from_parts said so above)
+        if let Some(e) = find(&f) {
+            files.push((f, e.data.clone()));
+        }
+    }
+    put(pack, &config, &files, root)
+}
+
+/// Writes a decoded pack into `root\<name>` (a free folder name; a failure removes what was written).
+fn put(mut pack: Imported, config: &str, files: &[(String, Vec<u8>)], root: &Path) -> Result<Imported, String> {
     std::fs::create_dir_all(root).map_err(|e| format!("the pack folder: {e}"))?;
     let base = folder_name(&pack.name);
     let mut name = base.clone();
@@ -336,14 +431,14 @@ pub fn install(src: &Path, root: &Path) -> Result<Imported, String> {
     }
     let dest = root.join(&name);
     std::fs::create_dir_all(&dest).map_err(|e| format!("the pack folder: {e}"))?;
-    let copy = || -> Result<(), String> {
+    let write = || -> Result<(), String> {
         std::fs::write(dest.join("config.json"), config.as_bytes()).map_err(|e| format!("config.json: {e}"))?;
-        for f in &files {
-            std::fs::copy(src.join(f), dest.join(f)).map_err(|e| format!("{f}: {e}"))?;
+        for (f, data) in files {
+            std::fs::write(dest.join(f), data).map_err(|e| format!("{f}: {e}"))?;
         }
         Ok(())
     };
-    if let Err(e) = copy() {
+    if let Err(e) = write() {
         let _ = std::fs::remove_dir_all(&dest);
         return Err(e);
     }
@@ -454,6 +549,21 @@ mod tests {
         assert_eq!(p.set.get(Kind::Down).len(), p.set.get(Kind::Space).len(), "only one key defined: it is every sound");
     }
 
+
+    #[test]
+    fn real_world_packs_with_empty_defines_and_a_stray_sound_entry_import() {
+        // from the mechvibes.com list (Order 061): "" / null defines, and a multi pack naming a "sound" file it doesn't ship
+        let cfg = r#"{"name":"Gappy","key_define_type":"multi","sound":"sound.ogg","defines":
+            {"1":"","2":null,"30":"a.wav","30-up":"a-up.wav","57":"space.wav","28":"enter.wav","14":"bs.wav"}}"#;
+        let p = from_parts(cfg, "f", &files).unwrap();
+        assert_eq!(p.name, "Gappy");
+        let names = referenced_files(cfg).unwrap();
+        assert!(!names.iter().any(|n| n.is_empty() || n == "sound.ogg"), "{names:?}");
+        // a single pack still needs its sound file
+        assert_eq!(referenced_files(r#"{"sound":"sound.wav","defines":{"30":[0,50]}}"#).unwrap(), vec!["sound.wav"]);
+        // a pack that defines nothing but empty names has no keys
+        assert!(from_parts(r#"{"key_define_type":"multi","defines":{"30":""}}"#, "f", &files).unwrap_err().contains("no keys"));
+    }
     #[test]
     fn bad_packs_are_refused_with_a_reason() {
         let e = |cfg: &str| from_parts(cfg, "f", &files).unwrap_err();
@@ -530,5 +640,47 @@ mod tests {
         assert_eq!(p.name, "Disk");
         assert!(read_pack(&dir.join("nothing-here")).unwrap_err().contains("config.json"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Order 059: the .zip as the Mechvibes site hands it out installs - config at the top, inside one folder, deflated or
+    /// stored - and a zip / file / folder that isn't a pack says so in one plain line.
+    #[test]
+    fn a_downloaded_zip_is_imported_as_it_is() {
+        let base = std::env::temp_dir().join(format!("bu-keysound-zip-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let root = base.join("root");
+        let cfg = br#"{"name":"Zipped Switch","sound":"sound.wav","defines":{"30":[0,60],"57":[100,90]}}"#;
+        let snd = wav(44_100, 500, 1);
+        // top level, deflated
+        let z = bu_addons::zip::build(&[("config.json", &cfg[..]), ("sound.wav", &snd[..]), ("readme.txt", &b"x"[..])], true);
+        let p = install_zip(&z, "pack", &root).unwrap();
+        assert_eq!(p.name, "Zipped Switch");
+        assert!(root.join("Zipped Switch").join("sound.wav").is_file());
+        assert!(!root.join("Zipped Switch").join("readme.txt").exists());
+        // inside one folder, stored, from a file on disk (the way the page calls it)
+        let z = bu_addons::zip::build(&[("My Pack/config.json", &cfg[..]), ("My Pack/sound.wav", &snd[..])], false);
+        let zf = base.join("download.zip");
+        std::fs::write(&zf, &z).unwrap();
+        assert_eq!(install_any(&zf, &root).unwrap().name, "Zipped Switch 2");
+        // a folder with the pack inside one folder (Explorer's "extract all")
+        let ex = base.join("extracted");
+        std::fs::create_dir_all(ex.join("inner")).unwrap();
+        std::fs::write(ex.join("inner").join("config.json"), cfg).unwrap();
+        std::fs::write(ex.join("inner").join("sound.wav"), &snd).unwrap();
+        assert_eq!(install_any(&ex, &root).unwrap().name, "Zipped Switch 3");
+        // not packs: each says why, nothing is installed
+        let err = |r: Result<Imported, String>| r.unwrap_err();
+        let nocfg = bu_addons::zip::build(&[("a.txt", &b"hi"[..])], true);
+        assert!(err(install_zip(&nocfg, "p", &root)).contains("no config.json"));
+        assert!(err(install_zip(b"this is not a zip at all", "p", &root)).contains("isn't a Mechvibes pack"));
+        let nosound = bu_addons::zip::build(&[("config.json", &cfg[..])], true);
+        assert!(err(install_zip(&nosound, "p", &root)).contains("missing"));
+        let txt = base.join("notes.txt");
+        std::fs::write(&txt, "hello").unwrap();
+        assert!(err(install_any(&txt, &root)).contains("isn't a Mechvibes pack"));
+        assert!(err(install_any(&base.join("empty-folder-that-is-not-there"), &root)).contains("can't read"));
+        assert_eq!(installed(&root).len(), 3);
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

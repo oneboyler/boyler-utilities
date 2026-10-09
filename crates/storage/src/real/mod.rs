@@ -3,6 +3,7 @@
 
 mod disk;
 mod fs;
+pub mod listing;
 pub mod wmi;
 
 pub use disk::{parse_nvme_health_log, parse_nvme_protocol_data, parse_smart, parse_temperature_descriptor};
@@ -23,7 +24,8 @@ use windows::Win32::System::Registry::{
 };
 use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 use windows::Win32::UI::Shell::{
-    SHEmptyRecycleBinW, SHQueryRecycleBinW, SHERB_NOCONFIRMATION, SHERB_NOPROGRESSUI, SHERB_NOSOUND, SHQUERYRBINFO,
+    SHEmptyRecycleBinW, SHFileOperationW, SHQueryRecycleBinW, FOF_ALLOWUNDO, FOF_NOCONFIRMATION, FOF_NOERRORUI, FOF_SILENT,
+    FOF_WANTNUKEWARNING, FO_DELETE, SHERB_NOCONFIRMATION, SHERB_NOPROGRESSUI, SHERB_NOSOUND, SHFILEOPSTRUCTW, SHQUERYRBINFO,
 };
 
 /// The real OS. Cheap to create.
@@ -109,6 +111,13 @@ pub(crate) fn elevated() -> bool {
 }
 
 impl StorageOs for RealOs {
+    /// Order 069: the drive's folders and files through our Everything (never in a read-only layer: it starts a program).
+    fn open_listing(&self, letter: char, ctl: &crate::scan::ScanControl) -> Option<Result<Box<dyn crate::DriveListing>>> {
+        if self.read_only {
+            return None;
+        }
+        listing::open(letter, ctl)
+    }
     fn drives(&self) -> Result<Vec<DriveInfo>> {
         disk::drives()
     }
@@ -122,6 +131,45 @@ impl StorageOs for RealOs {
     fn remove_dir(&self, path: &Path) -> io::Result<()> {
         self.refuse_io("a delete")?;
         fs::remove_dir(path)
+    }
+    fn recycle_file(&self, path: &Path) -> io::Result<()> {
+        use std::os::windows::ffi::OsStrExt;
+        self.refuse_io("a delete")?;
+        // one real file only (never a folder or a link), and a path the shell can take (no `\\?\`, under MAX_PATH)
+        let meta = std::fs::symlink_metadata(path)?;
+        if !meta.is_file() {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "not a plain file"));
+        }
+        // only a fixed drive has a Recycle Bin that keeps it: a stick, a network share or a card would delete it for good
+        {
+            use windows::Win32::Storage::FileSystem::GetDriveTypeW;
+            let root: Vec<u16> = path.components().next().map(|c| c.as_os_str().encode_wide().chain([b'\\' as u16, 0]).collect()).unwrap_or_default();
+            if root.len() < 3 || unsafe { GetDriveTypeW(PCWSTR(root.as_ptr())) } != 3 {
+                return Err(io::Error::new(io::ErrorKind::Unsupported, "only a file on a fixed drive goes to the Recycle Bin"));
+            }
+        }
+        // the shell wants a list of paths ended by two NULs
+        let mut from: Vec<u16> = path.as_os_str().encode_wide().collect();
+        if from.is_empty() || from.contains(&0) {
+            return Err(io::Error::from(io::ErrorKind::InvalidInput));
+        }
+        from.extend([0, 0]);
+        // ALLOWUNDO = the Recycle Bin; NOCONFIRMATION + WANTNUKEWARNING = no "are you sure" of the shell's, but it still warns
+        // when the file is too big for the bin and would be gone for good
+        let mut op = SHFILEOPSTRUCTW {
+            wFunc: FO_DELETE,
+            pFrom: PCWSTR(from.as_ptr()),
+            fFlags: (FOF_ALLOWUNDO.0 | FOF_NOCONFIRMATION.0 | FOF_WANTNUKEWARNING.0 | FOF_NOERRORUI.0 | FOF_SILENT.0) as u16,
+            ..Default::default()
+        };
+        let rc = unsafe { SHFileOperationW(&mut op) };
+        if rc != 0 {
+            return Err(io::Error::other(format!("SHFileOperationW failed (0x{rc:X})")));
+        }
+        if op.fAnyOperationsAborted.as_bool() || std::fs::symlink_metadata(path).is_ok() {
+            return Err(io::Error::other("the file was not moved to the Recycle Bin"));
+        }
+        Ok(())
     }
     fn recycle_bin(&self) -> Result<RecycleBinInfo> {
         let mut info = SHQUERYRBINFO { cbSize: std::mem::size_of::<SHQUERYRBINFO>() as u32, ..Default::default() };

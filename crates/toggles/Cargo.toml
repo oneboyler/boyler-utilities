@@ -37,3 +37,7 @@ features = [
 [[example]]
 name = "toggles-show"
 path = "examples/show.rs"
+
+[[example]]
+name = "toggles-verify"
+path = "examples/verify.rs"

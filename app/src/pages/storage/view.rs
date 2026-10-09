@@ -14,6 +14,8 @@ use crate::gfx::{sh, Font, Rgba};
 use crate::pages::network::temp::{self, Shape};
 use crate::ui::el::{key, lh, sub, Cursor, Key, RADIUS_PILL};
 use crate::ui::pieces::button::{self, Kind};
+use crate::ui::pieces::mitems::{self, It, Place, Row};
+use crate::ui::pieces::udlg;
 use crate::ui::pieces::tip::{self, Rq};
 use crate::ui::pieces::{self, bits, group, inote, link, mbtn, ptl, reset, seg};
 use crate::ui::{cmix, ACC, AMBER, CTL, CTL_H, FG, FG2, FG3, GREEN, GRP, HAIR, HOV, ICO, LVT, RED, SEL, TRK};
@@ -107,7 +109,14 @@ fn using(s: &mut Storage, cx: &mut Cx) -> Vec<El> {
         }
         Scan::Done { result, .. } => {
             let r = result.clone();
-            let mut kids = if s.view == View::Types { types_view(s, cx, &r) } else { folders_view(s, cx, &r) };
+            let mut kids = if s.view == View::Types {
+                types_view(s, cx, &r)
+            } else {
+                // Order 069: the Folders view's small Folders | Files switch on top, then one of the two lists
+                let mut v = vec![fmode_bar(s, cx)];
+                v.extend(if s.fmode == FMode::Files { files_view(s, cx) } else { folders_view(s, cx, &r) });
+                v
+            };
             // `anim(list,[{opacity:0,transform:'translateX('+dir*10+'px)'},{opacity:1,transform:'translateX(0px)'}],{duration:220,
             // easing:EASE_OUT})` on the list (the box's last child)
             if let Some((t0, dir)) = s.list_anim {
@@ -274,6 +283,90 @@ fn fdi(file: bool, locked: bool) -> El {
     El::block().size(16.0, 16.0).none().place_center().child(temp::svg(shapes, vb, vb, 16.0, 16.0))
 }
 
+/// The small switch on top of the Folders view: `Folders | Files` (the shared `seg`, left, with the list's own side padding).
+fn fmode_bar(s: &Storage, cx: &mut Cx) -> El {
+    let sg = seg::seg(cx, K_FSEG, &["Folders", "Files"], if s.fmode == FMode::Files { 1 } else { 0 }, true);
+    El::row().pad(8.0, 12.0, 8.0, 12.0).inset(&[sh(0.0, -1.0, 0.0, 0.0, HAIR())]).child(sg)
+}
+
+/// Files: the drive's biggest single files (Order 069), biggest first - icon, name with its folder small underneath, the size
+/// bar and size; hover shows Show in folder, a right-click opens the file's menu (Show in folder / Delete to the Recycle
+/// Bin). Out of the same walk as the folders: nothing is measured again.
+fn files_view(s: &Storage, cx: &mut Cx) -> Vec<El> {
+    let biggest = s.big_files();
+    let max = biggest.first().map(|b| b.bytes).unwrap_or(1).max(1);
+    let mut list = Vec::new();
+    if biggest.is_empty() {
+        list.push(El::text("No files found", Font::new(12.5, 400), FG3(), lh(12.5, 1.35)).pad(14.0, 12.0, 14.0, 12.0));
+    }
+    for (i, b) in biggest.iter().enumerate() {
+        let k = idx(K_BIG, i);
+        let hv = cx.hover_t(k, 120.0, EASE);
+        let locked = !b.can_recycle();
+        let dir = b.dir.display().to_string();
+        let ttl = El::col()
+            .flex1()
+            .min_w(0.0)
+            .child(El::text(b.name.clone(), Font::new(12.5, 400), FG(), lh(12.5, 1.35)).ellipsis().tip(&b.path().display().to_string()))
+            .child(El::text(dir, F11, FG3(), lh(11.0, 1.35)).ellipsis().margin(1.0, 0.0, 0.0, 0.0));
+        let w = ((b.bytes as f64 / max as f64) * 100.0).max(1.5) as f32;
+        let fdb = El::block().size(96.0, 4.0).none().radius(2.0).bg(LVT()).clip().child(El::block().abs(0.0, 0.0, f32::NAN, 0.0).w_pct(w).radius(2.0).bg(ACC()).opacity(0.85));
+        let fk = idx(K_BOP, i);
+        let fh = cx.hover_t(fk, 120.0, EASE);
+        let fop = El::block()
+            .size(24.0, 24.0)
+            .none()
+            .radius(6.0)
+            .bg(CTL_H().mul_a(fh))
+            .place_center()
+            .opacity(hv)
+            .on_click(fk)
+            .cursor(Cursor::Hand)
+            .title("Show in folder")
+            .child(El::icon("open", 13.0, 1.5, cmix(FG2(), FG(), fh)).no_hit());
+        let r = group::row(i == 0, vec![
+            fdi(true, locked),
+            ttl,
+            fdb,
+            El::text(gbf(b.bytes), Font::new(12.0, 400).tnum(), FG2(), lh(12.0, 1.35)).w(62.0).align(crate::gfx::Align::Right).none(),
+            fop,
+        ])
+        .min_h(44.0)
+        .pad(4.0, 12.0, 4.0, 12.0)
+        .gap(10.0)
+        .bg(HOV().mul_a(hv))
+        // a left click does nothing; the key makes the row take the right button (Ev::Context)
+        .on_click(k);
+        list.push(r);
+    }
+    vec![El::block().children(list)]
+}
+
+/// The Files row's right-click menu: the folder it is in on top, Show in folder, Delete (red; greyed for what Windows manages).
+pub(super) fn file_menu_el(s: &Storage, cx: &mut Cx) -> Option<El> {
+    let (f, x, y) = s.fmenu.clone()?;
+    let head = f.dir.display().to_string();
+    let title = f.path().display().to_string();
+    let list = vec![
+        Row::HeadTitled(&head, &title),
+        Row::Item(It::icon("fold", "Show in folder")),
+        Row::Item(It::icon("trash", "Delete").danger().disabled(!f.can_recycle())),
+    ];
+    Some(mitems::menu(cx, K_FMENU, &list, Place::At(x, y), 214.0))
+}
+
+/// The delete confirm (the shared `udlg`): what goes where, Cancel · Delete.
+pub(super) fn file_dialog_el(s: &Storage, cx: &mut Cx) -> Option<El> {
+    let (f, at) = s.fdlg.clone()?;
+    let title = format!("Delete {}?", f.name);
+    let line = format!("It goes to the Recycle Bin ({}), where you can restore it from. It is in {}.", gbf(f.bytes), f.dir.display());
+    let footer = vec![
+        button::cbtn_sized(cx, sub(K_FDLG, "no"), "Cancel", Kind::Ghost, button::DFT, false, 76.0),
+        button::cbtn_sized(cx, sub(K_FDLG, "go"), "Delete", Kind::Red, button::DFT, false, 76.0),
+    ];
+    Some(udlg::udlg(cx, K_FDLG, &title, &line, &[], 0, None, footer, at, s.fdlg_closing))
+}
+
 /// Folders: the path line `.fcr{display:flex;align-items:center;gap:2px;height:38px;padding:0 12px 0 6px;box-shadow:inset 0 -1px 0 var(--hair)}`
 /// (back `.fbk` 26 x 26, the parts `.fcb{height:24px;padding:0 6px;border-radius:5px;font-size:12.5px;color:var(--fg2)}` `.fcur{color:var(--fg);
 /// font-weight:600}`, `.fsep` chevrons, `.fsz` the size) and the rows `.fdr{min-height:36px;padding-top:4px;padding-bottom:4px;gap:10px}`.
@@ -389,8 +482,8 @@ fn clean_meta(k: CleanKind) -> (&'static str, &'static str) {
     match k {
         CleanKind::RecycleBin => ("trash", "Emptying it can’t be undone"),
         CleanKind::TempFiles => ("tmpf", "Files an open app is still using are skipped"),
-        CleanKind::ShaderCaches => ("cube", "Games rebuild them on their next start (the first load is a little slower)"),
-        CleanKind::LauncherCaches => ("pad", "Download and web caches · launchers rebuild them, you stay signed in"),
+        CleanKind::ShaderCaches => ("cube", "Games recompile shaders on their next start: expect a stutter on the first run"),
+        CleanKind::LauncherCaches => ("pad", "Only the launchers' web caches · logins and cookies are never touched, you stay logged in"),
     }
 }
 
@@ -450,7 +543,8 @@ fn clean_up(s: &mut Storage, cx: &mut Cx) -> Vec<El> {
         let row = s.plan.as_ref().and_then(|p| p.row(*k));
         // a row cleaned now counts down first (`GBf(from+(to-from)*k)`, 520 ms, rows 380 ms apart), then shows ✓
         let cd = s.countdown.as_ref().and_then(|c| c.progress(*k, cx.now, cx.rm).map(|p| (c, p)));
-        let cleaned = s.report.as_ref().and_then(|r| r.rows.iter().find(|c| c.kind == Some(*k))).or_else(|| {
+        // (Order 069: only while nothing is left in it - the measure after a clean shows what really is)
+        let cleaned = s.report.as_ref().filter(|_| s.done(*k)).and_then(|r| r.rows.iter().find(|c| c.kind == Some(*k))).or_else(|| {
             cd.filter(|(_, p)| *p >= 1.0).and_then(|(c, _)| c.report.rows.iter().find(|r| r.kind == Some(*k)))
         });
         // after Measure: this row's size has arrived (`300 + i*180` ms) while the others still shimmer
@@ -531,7 +625,17 @@ fn clean_up(s: &mut Storage, cx: &mut Cx) -> Vec<El> {
     };
     let disabled = s.measuring || s.cleaning || (measured && total == 0);
     let btn = button::cbtn(cx, K_CLN, &label, Kind::Primary, false, disabled, 118.0);
-    rows.push(group::row(false, vec![El::text(sum, Font::new(12.0, 400).tnum(), FG2(), lh(12.0, 1.35)).flex1(), btn]).min_h(50.0).justify(JustifyContent::SPACE_BETWEEN));
+    // Order 069: "Measure again" next to the summary, always there once measured (its line stays when it is hidden: while a
+    // measure or a clean runs)
+    let again = link::link(cx, K_CAGAIN, "Measure again", 11.0);
+    let again = if measured && !s.measuring && !s.cleaning { again } else { again.opacity(0.0) };
+    let left = El::row()
+        .items(AlignItems::BASELINE)
+        .gap(8.0)
+        .flex1()
+        .child(El::text(sum, Font::new(12.0, 400).tnum(), FG2(), lh(12.0, 1.35)))
+        .child(again);
+    rows.push(group::row(false, vec![left, btn]).min_h(50.0).justify(JustifyContent::SPACE_BETWEEN));
     vec![group::gh("Clean up").child(bits::ghs("all drives")), group::grp(rows)]
 }
 

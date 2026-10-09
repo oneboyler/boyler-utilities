@@ -17,12 +17,13 @@ use std::sync::{Arc, Mutex};
 use bu_storage::cleanup::{self, CleanKind, CleanPlan, CleanReport, PartState};
 use bu_storage::drives::{self, DriveTile};
 use bu_storage::health::{self, HealthRow};
+use bu_storage::bigfiles::BigFile;
 use bu_storage::scan::{self, FolderId, ScanControl, ScanResult};
 use bu_storage::{FakeOs, StorageError, StorageOs};
 
 use crate::pages::{Env, Page};
 use crate::ui::cx::{Cx, Ev};
-use crate::ui::el::{idx, key, El, Key};
+use crate::ui::el::{idx, key, sub, El, Key};
 
 const K_DRV: Key = key("sto.drv");
 const K_SEG: Key = key("sto.seg");
@@ -36,7 +37,16 @@ const K_FDR: Key = key("sto.fdr");
 const K_FOP: Key = key("sto.fop");
 const K_CN: Key = key("sto.cn");
 const K_CLN: Key = key("sto.cln");
+/// Clean up's "Measure again" link (Order 069)
+const K_CAGAIN: Key = key("sto.cagain");
 const K_TOAST: Key = key("sto.toast");
+/// The Folders view's small Folders | Files switch (Order 069)
+const K_FSEG: Key = key("sto.fseg");
+/// Files view: a row (right-click = its menu), its Show in folder button, the menu, the delete confirm
+const K_BIG: Key = key("sto.big");
+const K_BOP: Key = key("sto.bop");
+const K_FMENU: Key = key("sto.fmenu");
+const K_FDLG: Key = key("sto.fdlg");
 /// Drive health's "Read with admin" link (Order 039, A_039_01)
 const K_HADM: Key = key("sto.hadm");
 
@@ -80,6 +90,8 @@ enum Msg {
     /// "Read with admin" (Order 039): the health rows read again with the elevated copy's admin reads
     HealthAdmin(Result<Vec<HealthRow>, crate::admin::AdminError>),
     Toast(String),
+    /// a file moved to the Recycle Bin (or not): drive, the file, the answer
+    Recycled(char, BigFile, Result<(), StorageError>),
 }
 
 /// Windows' own Temp folder in a clean report: emptied by the app's elevated copy (Order 039, one admin prompt, as part of
@@ -129,6 +141,14 @@ enum View {
     Folders,
 }
 
+/// What the Folders view lists (Order 069): the folders, or the drive's biggest single files.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+enum FMode {
+    #[default]
+    Folders,
+    Files,
+}
+
 /// The drawing's timings (menu-v22 stoRender / clnMeasure / the Clean click).
 /// The list's slide-in when the view, the drive or the folder changes: `translateX(dir*10px) -> 0`, opacity 0 -> 1, 220 ms EASE_OUT.
 pub(super) const LIST_MS: f64 = 220.0;
@@ -173,6 +193,8 @@ struct Kept {
     scans: HashMap<char, Scan>,
     drv: char,
     view: View,
+    fmode: FMode,
+    recycled: Vec<(char, BigFile)>,
     plan: Option<CleanPlan>,
     measuring: bool,
     cleaning: bool,
@@ -197,6 +219,9 @@ pub struct Storage {
     drives: Vec<DriveTile>,
     drv: char,
     view: View,
+    fmode: FMode,
+    /// Files moved to the Recycle Bin from the Files list since the drive was measured (they stay out of the list)
+    recycled: Vec<(char, BigFile)>,
     scans: HashMap<char, Scan>,
     /// the folder looked at in the Folders view (a chain from the root)
     path: Vec<FolderId>,
@@ -235,6 +260,10 @@ pub struct Storage {
     measure_at: f64,
     /// a finished clean whose rows still count down
     countdown: Option<Countdown>,
+    /// Files view: the right-click menu (file, pointer x, y, since) and the delete confirm (file, since; closing since)
+    fmenu: Option<(BigFile, f32, f32)>,
+    fdlg: Option<(BigFile, f64)>,
+    fdlg_closing: Option<f64>,
     /// a folder of a pruned walk being scanned again: (drive, folder, its control, since)
     sub: Option<(char, FolderId, Arc<ScanControl>, f64)>,
     /// the menu is open (shared with the walks: one that ends after the menu closed keeps only its pruned tree)
@@ -245,14 +274,14 @@ pub struct Storage {
 
 impl Storage {
     /// A test copy's preset states (`BU_TEST_STATE`, read only in a FAKE test copy: `env.fake()`): `scroll=<px>`, `measured` (C: walked, File
-    /// types), `folders` (+ the Folders view), `scanning` (a walk 41 s in), `cleanmeasured` (Clean up measured), `cleaned`.
+    /// types), `folders` (+ the Folders view), `files` (+ the Files list), `filemenu` / `filedlg` (+ a Files row's right-click menu / its delete confirm), `scanning` (a walk 41 s in), `cleanmeasured` (Clean up measured), `cleaned`.
     fn apply_test_states(&mut self) {
         let states: Vec<String> =
             std::env::var("BU_TEST_STATE").map(|s| s.split(',').map(|t| t.trim().to_string()).collect()).unwrap_or_default();
         let Some(os) = self.os.clone() else { return };
         for t in states {
             match t.as_str() {
-                "measured" | "folders" => {
+                "measured" | "folders" | "files" | "filemenu" | "filedlg" => {
                     if let Ok(mut r) = scan::scan_drive(os.as_ref(), 'C', &ScanControl::new()) {
                         if self.env.frozen {
                             // the drawing's sample sizes (`types:{games:386,videos:268,apps:152,pics:48,docs:19}`); its folder tree
@@ -262,8 +291,19 @@ impl Storage {
                         }
                         self.scans.insert('C', Scan::Done { result: Arc::new(r), when: "21:37".into(), at: std::time::SystemTime::now() });
                     }
-                    if t == "folders" {
+                    if t != "measured" {
                         self.view = View::Folders;
+                    }
+                    if matches!(t.as_str(), "files" | "filemenu" | "filedlg") {
+                        self.fmode = FMode::Files;
+                    }
+                    // the first file that can be deleted (the drive's top ones are Windows' pagefile / hiberfil)
+                    if let Some(f) = self.big_files().into_iter().find(|b| b.can_recycle()) {
+                        if t == "filemenu" {
+                            self.fmenu = Some((f, 330.0, 330.0));
+                        } else if t == "filedlg" {
+                            self.fdlg = Some((f, self.now - 1000.0));
+                        }
                     }
                 }
                 // Order 039: the hard drive read without admin (no SMART) - Drive health shows "Read with admin"
@@ -280,10 +320,8 @@ impl Storage {
                 }
                 "cleanmeasured" | "cleaned" => {
                     if let Ok(p) = cleanup::measure(os.as_ref()) {
-                        let keep: HashSet<CleanKind> = p.default_ticked().into_iter().collect();
-                        self.ticked.retain(|k| keep.contains(k));
                         if t == "cleaned" {
-                            let ticked: Vec<CleanKind> = self.ticked.iter().copied().collect();
+                            let ticked: Vec<CleanKind> = p.default_ticked();
                             self.report = p.clean(os.as_ref(), &ticked).ok();
                         }
                         self.plan = Some(p);
@@ -354,6 +392,7 @@ impl Storage {
                 }
                 match r {
                     Ok(res) => {
+                        self.recycled.retain(|(d, _)| *d != l);
                         self.scans.insert(l, Scan::Done { result: Arc::from(res), when, at });
                         if l == self.drv {
                             self.path.clear();
@@ -395,9 +434,12 @@ impl Storage {
                 }
             }
             Msg::Measured(r) => match r {
+                // Measure again (after a clean, or by its link): the new sizes replace the old at once, the ticks stay as they are
+                Ok(p) if self.plan.is_some() => {
+                    self.plan = Some(p);
+                    self.measuring = false;
+                }
                 Ok(p) => {
-                    let keep: HashSet<CleanKind> = p.default_ticked().into_iter().collect();
-                    self.ticked.retain(|k| keep.contains(k));
                     // the sizes arrive one by one (the drawing: 300 + i*180 ms after the press); a slower real measure
                     // starts that run when its answer is here
                     self.size_t0 = self.measure_at.max(self.now - SIZE_FIRST_MS);
@@ -437,8 +479,27 @@ impl Storage {
                 }
             }
             Msg::Toast(t) => self.toast(t),
+            Msg::Recycled(l, file, r) => match r {
+                Ok(()) => {
+                    // it leaves the list (the folder sizes and the drive's free space stay as measured: the bin still holds it)
+                    self.recycled.push((l, file.clone()));
+                    self.toast(format!("Moved to the Recycle Bin · {}", gbf(file.bytes)));
+                    // the Recycle bin row of Clean up holds one more file now: its size is measured again (else Clean would
+                    // empty the bin with this file in it without the page having said so)
+                    if self.plan.is_some() {
+                        self.measure_clean();
+                    }
+                }
+                Err(StorageError::UnsafePath(_)) => self.toast("Windows manages that file"),
+                Err(StorageError::NotFound(_)) => {
+                    self.recycled.push((l, file));
+                    self.toast("That file is already gone");
+                }
+                Err(e) => self.toast(format!("Couldn’t delete {} · {e}", file.name)),
+            },
         }
     }
+
 
     /// "Read with admin": the drives' admin-only details, read once by the app's elevated copy (read-only; only on the click).
     fn health_with_admin(&mut self) {
@@ -476,8 +537,14 @@ impl Storage {
             if rep.rows.iter().any(|r| r.skipped.iter().any(|(_, st)| *st == PartState::NeedsAdmin)) {
                 t.push_str(" · Windows temp folder: needs admin, not changed");
             }
-            self.report = Some(rep);
+            // rows of an earlier clean that this one did not touch keep their "Cleaned"
+            let mut all = self.report.take().unwrap_or_default();
+            all.rows.retain(|old| !rep.rows.iter().any(|n| n.kind == old.kind));
+            all.rows.extend(rep.rows);
+            self.report = Some(all);
             self.toast(t);
+            // Order 069: after ANY clean (one row or all) the sizes are measured again by themselves - whatever was left unticked
+            self.measure_clean();
             // the tiles show the new free space
             self.run(self.env.fake(), |os, inbox| Self::post(inbox, Msg::Drives(drives::list(os))));
             changed = true;
@@ -545,13 +612,67 @@ impl Storage {
         self.scans.insert(l, Scan::Idle);
     }
 
+    /// Measure the clean-up rows: the first time (the sizes arrive one by one), and again whenever asked or after a clean
+    /// (Order 069: never blocked by what was ticked or cleaned - only by a measure or a clean already running).
+    /// The Files list of the shown drive (empty before it is measured).
+    fn big_files(&self) -> Vec<BigFile> {
+        match self.scan_of(self.drv) {
+            Scan::Done { result, .. } => result.biggest.iter().filter(|b| !self.recycled.iter().any(|(d, r)| *d == self.drv && r == *b)).cloned().collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Right-click on a Files row: its menu at the pointer.
+    fn file_menu(&mut self, i: usize, x: f32, y: f32) {
+        if self.fdlg.is_some() {
+            return;
+        }
+        if let Some(f) = self.big_files().get(i) {
+            self.fmenu = Some((f.clone(), x, y));
+        }
+    }
+
+    /// Delete in the menu: the confirm first (nothing moves before it).
+    fn file_delete_ask(&mut self, f: BigFile) {
+        if f.can_recycle() {
+            self.fmenu = None;
+            self.fdlg = Some((f, self.now));
+            self.fdlg_closing = None;
+        }
+    }
+
+    fn close_file_dialog(&mut self) {
+        if self.fdlg.is_some() && self.fdlg_closing.is_none() {
+            self.fdlg_closing = Some(self.now);
+        }
+    }
+
+    /// The confirm's Delete: the file goes to the Recycle Bin (it can be restored from there), on its own thread.
+    fn file_delete(&mut self) {
+        let Some((f, _)) = self.fdlg.take() else { return };
+        self.fdlg_closing = None;
+        // a --real-read test copy reads the real PC and changes nothing
+        if self.env.real_read {
+            self.toast("Test copy: nothing is deleted");
+            return;
+        }
+        let l = self.drv;
+        self.run(false, move |os, inbox| {
+            let r = bu_storage::bigfiles::recycle(os, &f.path());
+            Self::post(inbox, Msg::Recycled(l, f, r))
+        });
+    }
+
     fn measure_clean(&mut self) {
-        if self.measuring || self.plan.is_some() {
+
+        if self.measuring || self.cleaning {
             return;
         }
         self.measuring = true;
         self.measure_at = self.now;
-        self.report = None;
+        if self.plan.is_none() {
+            self.report = None;
+        }
         self.run(false, |os, inbox| Self::post(inbox, Msg::Measured(cleanup::measure(os))));
     }
 
@@ -631,8 +752,9 @@ impl Page for Storage {
             Arc::new(bu_storage::RealOs::new())
         };
         self.os = Some(os);
-        // every row starts ticked (the drawing's `CLN` rows are `on:true`); empty rows drop out once measured
-        self.ticked = CleanKind::ALL.iter().copied().collect();
+        // Recycle bin + Temp files start ticked; shader and launcher caches do not (Order 069: clearing them makes games
+        // recompile shaders). Empty rows show greyed whatever their tick.
+        self.ticked = CleanKind::ALL.iter().copied().filter(|k| k.ticked_by_default()).collect();
         // what the tab had when it closed (a walk that ran on, the results, the clean-up sizes): shown at once
         if self.guard.keep.is_none() {
             self.guard.keep = Some(env.keep.clone());
@@ -647,6 +769,8 @@ impl Page for Storage {
             self.scans = k.scans;
             self.drv = k.drv;
             self.view = k.view;
+            self.fmode = k.fmode;
+            self.recycled = k.recycled;
             self.plan = k.plan;
             self.measuring = k.measuring;
             self.cleaning = k.cleaning;
@@ -682,6 +806,8 @@ impl Page for Storage {
                     scans: std::mem::take(&mut self.scans),
                     drv: self.drv,
                     view: self.view,
+                    fmode: self.fmode,
+                    recycled: std::mem::take(&mut self.recycled),
                     plan: self.plan.take(),
                     measuring: self.measuring,
                     cleaning: self.cleaning,
@@ -750,18 +876,51 @@ impl Page for Storage {
 
     fn event(&mut self, ev: &Ev, cx: &mut Cx) {
         self.now = cx.now;
-        if let Ev::Click(k) = ev {
-            self.click(*k);
+        match ev {
+            Ev::Click(k) => self.click(*k),
+            // a right-click on a Files row (or on a part of it) opens its menu at the pointer
+            Ev::Context(k, x, y) if self.view == View::Folders && self.fmode == FMode::Files => {
+                let n = self.big_files().len();
+                if let Some(i) = (0..n).find(|i| *k == idx(K_BIG, *i) || *k == idx(K_BOP, *i)) {
+                    self.file_menu(i, *x, *y);
+                }
+            }
+            _ => {}
         }
     }
 
+
     fn popup(&mut self, cx: &mut Cx) -> Option<El> {
-        let (t, at) = self.toast.clone()?;
-        if cx.now - at > crate::ui::pieces::toast::SHOW_MS + 300.0 {
+        let mut kids = Vec::new();
+        if let Some(m) = view::file_menu_el(self, cx) {
+            kids.push(m.z(20));
+        }
+        if let Some(t) = self.fdlg_closing {
+            if cx.now - t > crate::ui::pieces::udlg::close_ms(cx.rm) {
+                self.fdlg = None;
+                self.fdlg_closing = None;
+            }
+        }
+        if let Some(d) = view::file_dialog_el(self, cx) {
+            kids.push(d);
+        }
+        if let Some((t, at)) = self.toast.clone() {
+            if cx.now - at <= crate::ui::pieces::toast::SHOW_MS + 300.0 {
+                kids.push(crate::ui::pieces::toast::toast(cx, K_TOAST, &t, at, false));
+            }
+        }
+        if kids.is_empty() {
             return None;
         }
-        Some(crate::ui::pieces::toast::toast(cx, K_TOAST, &t, at, false))
+        Some(El::block().abs(0.0, 0.0, f32::NAN, f32::NAN).size(crate::ui::WIN_W, crate::ui::WIN_H).no_hit().children(kids))
     }
+
+    fn popup_dismiss(&mut self) {
+        // a click beside the menu closes it (the confirm's own dim takes the clicks beside it: "out"); Esc closes the confirm
+        self.fmenu = None;
+        self.close_file_dialog();
+    }
+
 
     fn describe(&self) -> String {
         let s = match self.scan_of(self.drv) {
@@ -805,9 +964,50 @@ impl Storage {
             self.slide(0.0);
             return;
         }
+        // Order 069: the Folders | Files switch, the Files rows' Show in folder, the right-click menu, the delete confirm
+        if let Some(i) = (0..2).find(|i| k == idx(K_FSEG, *i)) {
+            let m = if i == 0 { FMode::Folders } else { FMode::Files };
+            if m != self.fmode {
+                self.fmode = m;
+                self.path.clear();
+                self.fmenu = None;
+                self.slide(0.0);
+            }
+            return;
+        }
+        if k == sub(K_FDLG, "no") || k == sub(K_FDLG, "out") {
+            self.close_file_dialog();
+            return;
+        }
+        if k == sub(K_FDLG, "go") {
+            if self.fdlg_closing.is_none() {
+                self.file_delete();
+            }
+            return;
+        }
+        if let Some((f, ..)) = self.fmenu.clone() {
+            if let Some(i) = (0..4).find(|i| k == idx(K_FMENU, *i)) {
+                self.fmenu = None;
+                match i {
+                    1 => self.open_in_explorer(f.path(), true),
+                    2 => self.file_delete_ask(f),
+                    _ => {}
+                }
+                return;
+            }
+        }
+        if self.fmode == FMode::Files {
+            let files = self.big_files();
+            if let Some((i, f)) = files.iter().enumerate().find(|(i, _)| k == idx(K_BOP, *i)) {
+                let _ = i;
+                self.open_in_explorer(f.path(), true);
+                return;
+            }
+        }
         if let Some(i) = (0..CleanKind::ALL.len()).find(|i| k == idx(K_CN, *i)) {
+
             let kind = CleanKind::ALL[i];
-            let ok = !self.cleaning && self.plan.as_ref().and_then(|p| p.row(kind)).is_some_and(|r| !r.is_empty()) && !self.done(kind);
+            let ok = !self.cleaning && !self.measuring && self.plan.as_ref().and_then(|p| p.row(kind)).is_some_and(|r| !r.is_empty());
             if ok && !self.ticked.remove(&kind) {
                 self.ticked.insert(kind);
             }
@@ -860,6 +1060,7 @@ impl Storage {
                 }
             }
             _ if k == K_HADM => self.health_with_admin(),
+            _ if k == K_CAGAIN => self.measure_clean(),
             _ if k == K_CLN => {
                 if self.plan.is_none() {
                     self.measure_clean();
@@ -871,9 +1072,11 @@ impl Storage {
         }
     }
 
-    /// The row was cleaned (its result shows instead of its size).
-    fn done(&self, kind: CleanKind) -> bool {
-        self.report.as_ref().is_some_and(|r| r.rows.iter().any(|c| c.kind == Some(kind)))
+    /// The row was cleaned and nothing is left in it (its "Cleaned" shows instead of its size); while the sizes are measured
+    /// again after a clean, a cleaned row waits for its new size.
+    pub(super) fn done(&self, kind: CleanKind) -> bool {
+        let cleaned = self.report.as_ref().is_some_and(|r| r.rows.iter().any(|c| c.kind == Some(kind)));
+        cleaned && (self.measuring || self.plan.as_ref().and_then(|p| p.row(kind)).is_none_or(|r| r.is_empty()))
     }
 }
 

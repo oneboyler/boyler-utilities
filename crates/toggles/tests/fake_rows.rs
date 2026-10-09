@@ -247,13 +247,6 @@ fn hags_not_set_follows_the_driver_default_and_unsupported_greys_it() {
 fn multi_value_rows_any_value_on_means_on() {
     let mut t = user();
     let cdm = rows::CDM;
-    t.os_mut().put(Hive::Hkcu, cdm, "RotatingLockScreenOverlayEnabled", RegValue::Dword(0));
-    // the other value is missing (= on) -> still partly on
-    assert!(sw(&t, "lock_screen_tips"));
-    t.set("lock_screen_tips", false).unwrap();
-    assert_eq!(t.os().get(Hive::Hkcu, cdm, "SubscribedContent-338387Enabled"), Some(RegValue::Dword(0)));
-    assert!(!sw(&t, "lock_screen_tips"));
-
     t.set("xbox_background_recording", false).unwrap();
     assert_eq!(t.os().get(Hive::Hkcu, r"System\GameConfigStore", "GameDVR_Enabled"), Some(RegValue::Dword(0)));
     assert_eq!(t.os().get(Hive::Hkcu, r"Software\Microsoft\Windows\CurrentVersion\GameDVR", "AppCaptureEnabled"), Some(RegValue::Dword(0)));
@@ -262,6 +255,40 @@ fn multi_value_rows_any_value_on_means_on() {
     for n in ["SubscribedContent-338393Enabled", "SubscribedContent-353694Enabled", "SubscribedContent-353696Enabled"] {
         assert_eq!(t.os().get(Hive::Hkcu, cdm, n), Some(RegValue::Dword(0)), "{n}");
     }
+}
+
+/// Order 068, real flip run: SubscribedContent-338387Enabled is Settings' Spotlight / Picture choice (1 turned his Picture lock screen
+/// into Windows spotlight) - the row must never write it, either way, and undo puts the overlay back exactly.
+#[test]
+fn lock_screen_tips_only_touches_the_overlay_never_the_spotlight_choice() {
+    let mut t = user();
+    let cdm = rows::CDM;
+    let (overlay, spotlight) = ("RotatingLockScreenOverlayEnabled", "SubscribedContent-338387Enabled");
+    // nothing stored = Windows' default (on)
+    assert!(sw(&t, "lock_screen_tips"));
+    for (pic, stored) in [("Picture", 0), ("Spotlight", 1)] {
+        t.os_mut().put(Hive::Hkcu, cdm, spotlight, RegValue::Dword(stored));
+        t.os_mut().put(Hive::Hkcu, cdm, overlay, RegValue::Dword(0));
+        assert!(!sw(&t, "lock_screen_tips"), "{pic}");
+        t.set("lock_screen_tips", true).unwrap();
+        assert_eq!(t.os().get(Hive::Hkcu, cdm, overlay), Some(RegValue::Dword(1)), "{pic}");
+        assert!(sw(&t, "lock_screen_tips"), "{pic}");
+        t.set("lock_screen_tips", false).unwrap();
+        assert_eq!(t.os().get(Hive::Hkcu, cdm, overlay), Some(RegValue::Dword(0)), "{pic}");
+        assert!(!sw(&t, "lock_screen_tips"), "{pic}");
+        t.undo("lock_screen_tips").unwrap();
+        assert_eq!(t.os().get(Hive::Hkcu, cdm, overlay), Some(RegValue::Dword(1)), "{pic}");
+        // the Spotlight / Picture choice is exactly as it was after every step
+        assert_eq!(t.os().get(Hive::Hkcu, cdm, spotlight), Some(RegValue::Dword(stored)), "{pic}");
+    }
+}
+
+/// Order 068, real flip run: Mono audio's value was written but Settings still showed it OFF - it is badged "after a restart".
+#[test]
+fn mono_audio_says_it_takes_a_restart() {
+    let r = rows::find("mono_audio").unwrap();
+    assert_eq!(r.badges, [bu_toggles::model::Badge::Restart]);
+    assert_eq!(r.applies, rows::Applies::Restart);
 }
 
 #[test]

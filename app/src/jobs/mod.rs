@@ -158,6 +158,12 @@ impl JobCtx {
         self.stop.load(Ordering::SeqCst)
     }
 
+    /// The stop flag itself (Order 066: a download's writer checks it between chunks, so a stop - or the app quitting - ends it
+    /// at once instead of after the whole file).
+    pub fn stop_flag(&self) -> Arc<AtomicBool> {
+        self.stop.clone()
+    }
+
     /// `ctx.check()?` between steps: returns Err(Stopped) once stop was pressed.
     pub fn check(&self) -> Result<(), JobError> {
         if self.stopped() {

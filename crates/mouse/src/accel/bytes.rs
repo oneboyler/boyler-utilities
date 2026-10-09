@@ -312,3 +312,26 @@ pub fn read_profiles(b: &[u8]) -> Vec<Profile> {
     }
     out
 }
+
+/// Do these two buffers (WRITE bytes we built, READ bytes from the driver) make the driver behave the same? Equal sizes,
+/// every byte equal except struct padding and — for an axis that is Off (noaccel) in both — the axis' curve arguments and
+/// its precomputed union: the driver never looks at them while the mode is Off, and Raw Accel's own GUI leaves stale bytes
+/// there (measured on the real driver, Oct 9: a live Off profile held an old curve's numbers in that union).
+pub fn same_effect(ours: &[u8], theirs: &[u8]) -> bool {
+    let Some((n, m)) = read_header(ours) else { return false };
+    if ours.len() != theirs.len() || read_header(theirs) != Some((n, m)) || ours.len() != write_size(n as usize, m as usize) {
+        return false;
+    }
+    let mut skip = padding_ranges(n as usize, m as usize);
+    for i in 0..n as usize {
+        let at = IO_BASE + i * MODIFIER_SETTINGS;
+        for (args, union) in [(at + 544, at + PROFILE + 24), (at + 544 + ACCEL_ARGS, at + PROFILE + 24 + ACCEL_UNION)] {
+            let off = AccelMode::Noaccel.as_i32();
+            if rd_i32(ours, args) == off && rd_i32(theirs, args) == off {
+                skip.push(args + 4..args + ACCEL_ARGS);
+                skip.push(union..union + ACCEL_UNION);
+            }
+        }
+    }
+    (0..ours.len()).all(|i| ours[i] == theirs[i] || skip.iter().any(|r| r.contains(&i)))
+}

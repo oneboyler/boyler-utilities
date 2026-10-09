@@ -149,7 +149,7 @@ fn opens_with_the_drawings_sample_and_changes_nothing() {
     assert_eq!(m.mouse_dpi(), Some(1600));
     let on = m.v.on_mouse.as_ref().unwrap();
     assert_eq!((on.polling_hz, on.lift_off, on.battery_percent), (Some(1000), Some(10), Some(78)));
-    assert_eq!(header_line(&m.panel, &m.per_app), "VALORANT: Valorant · off everywhere else");
+    assert_eq!(header_line(&m.panel, &m.per_app), "VALORANT: Valorant · otherwise Off");
     assert_eq!(m.panel.presets.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(), ["Valorant", "Default"]);
     assert!(m.panel.on && !m.panel.expanded);
     // opening only reads: nothing in the change log; every item's value is read (Raw Accel's fake driver too)
@@ -369,19 +369,19 @@ fn acceleration_card_switch_curve_presets_per_app() {
     click(&mut m, sub(idx(K_ROW, 0), "pre"));
     assert!(matches!(m.menu, Some(Menu::RowPreset(_))));
     click(&mut m, idx(K_MENU, 2));
-    assert_eq!(header_line(&m.panel, &m.per_app), "VALORANT: Fast · off everywhere else");
+    assert_eq!(header_line(&m.panel, &m.per_app), "VALORANT: Fast · otherwise Off");
     click(&mut m, sub(idx(K_CHIP, 2), "del"));
-    assert_eq!(header_line(&m.panel, &m.per_app), "VALORANT: Off · off everywhere else");
+    assert_eq!(header_line(&m.panel, &m.per_app), "VALORANT: Off · otherwise Off");
     assert_eq!(toast(&m), Some("Deleted Fast · VALORANT now Off"));
     // Add app -> the app picker opens at once; Rocket League
     click(&mut m, K_ADD);
     assert!(matches!(m.menu, Some(Menu::RowApp(_))));
     click(&mut m, idx(K_MENU, 4));
     assert_eq!((m.per_app.rows()[1].label.as_str(), m.per_app.rows()[1].exe.as_str()), ("Rocket League", "RocketLeague.exe"));
-    // Everywhere else -> Default; the row's × removes it
+    // "When none of these games are open" -> Default; the row's × removes it
     click(&mut m, K_ELSE);
     click(&mut m, idx(K_MENU, 3));
-    assert!(header_line(&m.panel, &m.per_app).ends_with("everywhere else: Default"));
+    assert!(header_line(&m.panel, &m.per_app).ends_with("otherwise Default"));
     click(&mut m, sub(idx(K_ROW, 1), "x"));
     assert_eq!(m.per_app.rows().len(), 1);
     // the worker has the card as the page left it (what it hands Raw Accel's driver)
@@ -455,10 +455,10 @@ fn a_press_inside_the_open_cursor_list_does_not_move_it() {
     with_cx(|cx| m.event(&Ev::Press(idx(K_ROLE, 1), 50.0, 310.0, bubble), cx));
     click(&mut m, idx(K_ROLE, 1));
     assert_eq!((m.menu, m.anchor), (Some(Menu::Cursor(1)), bubble));
-    with_cx(|cx| m.event(&Ev::Press(idx(K_MENU, 50), 120.0, 420.0, (46.0, 400.0, 260.0, 46.0)), cx));
+    with_cx(|cx| m.event(&Ev::Press(idx(K_MENU, 900), 120.0, 420.0, (46.0, 400.0, 260.0, 46.0)), cx));
     assert_eq!(m.anchor, bubble, "the list stays where it opened");
     // its "Choose your own file…" row closes it (the picker is Windows' own window)
-    click(&mut m, idx(K_MENU, 50));
+    click(&mut m, idx(K_MENU, 900));
     assert_eq!(m.menu, None);
 }
 
@@ -495,8 +495,10 @@ fn boxes_match_the_drawing_card_open() {
         ("row app", sub(row0, "app"), [82.0, 705.469, 172.0, 24.0]),
         ("row preset", sub(row0, "pre"), [282.0, 705.469, 128.0, 24.0]),
         ("row x", sub(row0, "x"), [540.0, 706.469, 22.0, 22.0]),
-        ("add app", K_ADD, [76.0, 744.469, 84.484, 26.0]),
-        ("everywhere else", K_ELSE, [282.0, 785.469, 128.0, 24.0]),
+        // Order 063: "Add a game" (the drawing had "Add app"), so the button is wider
+        ("add game", K_ADD, [76.0, 744.469, 104.625, 26.0]),
+        // Order 063: "When none of these games are open" + its list right after the label (the drawing: "Everywhere else" + an arrow)
+        ("when none are open", K_ELSE, [295.125, 785.469, 128.0, 24.0]),
         ("copy its curve", K_COPY, [229.672, 826.469, 68.297, 15.0]),
         ("open raw accel", K_OPEN, [307.969, 826.469, 78.578, 15.0]),
         ("pointer speed", K_SPEED, [334.0, 904.312, 168.0, 20.0]),
@@ -818,4 +820,265 @@ fn a_setting_change_never_holds_the_menu() {
     settle(&mut m);
     assert!(m.v.win.unwrap().buttons_swapped);
     assert_eq!(toast(&m), Some("Right button is now your main button"));
+}
+
+fn has_text(l: &crate::ui::lay::Laid, s: &str) -> bool {
+    l.nodes.iter().any(|n| matches!(&n.el.content, crate::ui::el::Content::Text(t) if t.s == s))
+}
+
+fn else_labels(m: &Mouse) -> Vec<(String, bool)> {
+    m.menu_items(Menu::Else)
+        .into_iter()
+        .filter_map(|i| match i {
+            MItem::Item { label, checked, .. } => Some((label, checked)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Order 063 (the owner: "turning mouse accel on should turn it on for everything; then it is optional to have a different
+/// preset per game, or off or on something else when none of the selected apps are open"): no game listed = one quiet
+/// "Add a game" line and nothing else about games; the first game brings "When none of these games are open" with the main
+/// preset (default) / another preset / Off.
+#[test]
+fn per_game_is_optional_and_the_when_none_row_comes_with_the_first_game() {
+    let mut m = opened();
+    m.panel.expanded = true;
+    assert!(render_page(&mut m, None).rect_of(K_ELSE).is_some(), "the sample lists VALORANT");
+    // no game: one quiet line
+    click(&mut m, sub(idx(K_ROW, 0), "x"));
+    let l = render_page(&mut m, None);
+    assert!(l.rect_of(K_ELSE).is_none() && l.rect_of(K_ADD).is_some());
+    assert!(!has_text(&l, "Per game") && !has_text(&l, "When none of these games are open"));
+    assert_eq!(header_line(&m.panel, &m.per_app), "Valorant everywhere", "the switch alone = the picked preset on everything");
+    // the first game: Rocket League
+    click(&mut m, K_ADD);
+    click(&mut m, idx(K_MENU, 4));
+    let l = render_page(&mut m, None);
+    assert!(has_text(&l, "Per game") && has_text(&l, "When none of these games are open") && l.rect_of(K_ELSE).is_some());
+    // (the drawing's sample card keeps "Off" for the other times; a new card starts on the main preset - last lines below)
+    assert_eq!(header_line(&m.panel, &m.per_app), "Rocket League: Valorant \u{b7} otherwise Off");
+    // the list: main preset, the presets, Off (ticked)
+    assert_eq!(else_labels(&m), vec![("Main preset".to_string(), false), ("Valorant".into(), false), ("Default".into(), false), ("Off".into(), true)]);
+    assert_eq!(bu_mouse::accel::switch::PerApp::new().everywhere_else(), Target::Main, "a new card: the main preset");
+    click(&mut m, K_ELSE);
+    click(&mut m, idx(K_MENU, 5));
+    assert_eq!(m.per_app.everywhere_else(), Target::Off);
+    assert!(header_line(&m.panel, &m.per_app).ends_with("otherwise Off"));
+    click(&mut m, K_ELSE);
+    click(&mut m, idx(K_MENU, 3));
+    assert!(matches!(m.per_app.everywhere_else(), Target::Preset(_)) && header_line(&m.panel, &m.per_app).ends_with("otherwise Default"));
+    click(&mut m, K_ELSE);
+    click(&mut m, idx(K_MENU, 0));
+    assert_eq!(m.per_app.everywhere_else(), Target::Main);
+    // the worker was told each time: the card it keeps is the page's
+    assert_eq!(m.v.per_app.everywhere_else(), Target::Main);
+}
+
+/// Order 063: a game that was already open when the app noticed it is not switched - the row says so; and another program
+/// writing the driver gets its amber line on the card.
+#[test]
+fn a_late_game_and_another_writer_are_said_on_the_card() {
+    let mut m = opened();
+    m.panel.expanded = true;
+    let row = m.per_app.rows()[0].id;
+    m.v.late = vec![row];
+    m.v.other_writer = Some("Your own Raw Accel app is open. It writes the driver too, and the last one to write wins. Close it to keep this card in charge.".into());
+    let l = render_page(&mut m, if let Ok(d) = std::env::var("BU_PIC_OUT") { Some(format!("{d}/mouse_063_late_and_writer.png")) } else { None }.as_deref());
+    assert!(has_text(&l, "Already open \u{b7} next launch"));
+    assert!(has_text(&l, &m.v.other_writer.clone().unwrap()));
+    m.v.late.clear();
+    m.v.other_writer = None;
+    let l = render_page(&mut m, None);
+    assert!(!has_text(&l, "Already open \u{b7} next launch"));
+}
+
+/// Order 061: a mouse the app can't set yet (the X2 V2 on the shared CompX id) is named with its VID:PID and the Pulsar link,
+/// and every other mouse Windows lists is a row of its own.
+fn fake_hid(vid: u16, pid: u16, product: &str) -> bu_mouse::os::HidInfo {
+    bu_mouse::os::HidInfo {
+        path: format!(r"\?\hid#vid_{vid:04x}&pid_{pid:04x}#x"),
+        vid,
+        pid,
+        version: 0,
+        usage_page: 0x01,
+        usage: 0x02,
+        input_len: 8,
+        output_len: 0,
+        feature_len: 0,
+        interface: None,
+        product: Some(product.into()),
+        manufacturer: None,
+    }
+}
+
+#[test]
+fn every_listed_mouse_is_named_with_its_ids_and_the_extra_ones_get_a_row() {
+    let mice = bu_mouse::device::find_mice(&[fake_hid(0x3554, 0xF507, "2.4G Wireless Receiver"), fake_hid(0x046D, 0xC547, "USB Receiver")]);
+    assert_eq!(mice.len(), 2);
+    let mut m = opened();
+    m.v.mice = Some(mice);
+    let l = render_page(&mut m, None);
+    let has = |s: &str| l.nodes.iter().any(|n| matches!(&n.el.content, crate::ui::el::Content::Text(t) if t.s.contains(s)));
+    assert!(has("Pulsar X2A Wireless / X2 V2 Mini"), "the model's name, not the receiver's");
+    assert!(has("3554:F507"), "its VID:PID");
+    assert!(has("USB Receiver") && has("Also connected"), "the other mouse has its own row");
+    assert!(has("open its web settings"), "the Pulsar link");
+}
+
+#[test]
+#[ignore]
+fn proof_061_mice() {
+    if std::env::var("BU_PIC_OUT").is_err() {
+        return;
+    }
+    let mut m = opened();
+    m.v.mice = Some(bu_mouse::device::find_mice(&[fake_hid(0x3554, 0xF507, "2.4G Wireless Receiver"), fake_hid(0x046D, 0xC547, "USB Receiver")]));
+    let g = Gfx::new(1.0);
+    let mut st = State::default();
+    let mut cx = Cx::new(0.0, false, &g, &mut st);
+    let kids = m.build(&mut cx);
+    let root = El::block().w(600.0).h(330.0).pad(2.0, 26.0, 18.0, 26.0).children(kids);
+    crate::ui::lay::proof_png(root, 600.0, 330.0, 2.0, "mouse_061_mice.png");
+}
+
+// ---- Order 066: the cursor pickers show REAL cursors, his own sets, and "Get more cursors" ----
+
+/// A test cursor file: a 16 px arrow-ish picture (opaque left half) as a 32-bit .cur.
+fn test_cur(path: &std::path::Path) {
+    let s = 16u32;
+    let mut dib = Vec::new();
+    for v in [40u32, s, s * 2, 1 | (32 << 16), 0, 0, 0, 0, 0, 0] {
+        dib.extend_from_slice(&v.to_le_bytes());
+    }
+    for _y in 0..s {
+        for x in 0..s {
+            dib.extend_from_slice(&[200, 120, 40, if x < 8 { 255 } else { 0 }]);
+        }
+    }
+    dib.extend_from_slice(&vec![0u8; (s * 4) as usize]);
+    let mut c = vec![0, 0, 2, 0, 1, 0, s as u8, s as u8, 0, 0, 1, 0, 1, 0];
+    c.extend_from_slice(&(dib.len() as u32).to_le_bytes());
+    c.extend_from_slice(&22u32.to_le_bytes());
+    c.extend_from_slice(&dib);
+    std::fs::write(path, c).unwrap();
+}
+
+#[test]
+fn the_picker_lists_his_current_cursors_his_files_and_a_real_picture_per_row() {
+    let dir = std::env::temp_dir().join(format!("bu-066-picker-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (a, b) = (dir.join("cross_r.cur"), dir.join("beam_m.cur"));
+    test_cur(&a);
+    test_cur(&b);
+    let mut m = opened();
+    // his current Normal cursor is a file he picked; he picked one more before
+    if let Some(c) = &mut m.v.cursors {
+        c.roles[0].set = SetId::Own;
+        c.roles[0].file = a.to_string_lossy().into_owned();
+    }
+    m.v.own_files = vec![a.to_string_lossy().into_owned(), b.to_string_lossy().into_owned()];
+    m.v.files = vec![(SetId::WindowsDefault, vec![Some(a.to_string_lossy().into_owned()); 7])];
+    let rows = m.picker_sets(0);
+    assert_eq!(rows[0].name, "Your current cursors", "what he has now is the first row");
+    assert_eq!(rows[0].note, "cross_r.cur");
+    assert!(rows[0].file.is_some());
+    let own: Vec<&PickRow> = rows.iter().filter(|r| matches!(r.id, SetId::OwnFile(_))).collect();
+    assert_eq!(own.len(), 2, "both files he picked are offered again");
+    assert!(own.iter().all(|r| r.file.is_some() && r.note == "A file you picked"));
+    let wd = rows.iter().find(|r| r.id == SetId::WindowsDefault).unwrap();
+    assert!(wd.file.is_some(), "every row carries its set's real file");
+    // the real picture is read from that file
+    assert!(pic::load(wd.file.as_deref().unwrap()).is_some());
+    assert!(pic::load(r"C:\no\such\file.cur").is_none(), "a missing file is just not drawn");
+    // picking one of his own files puts it on the bubble
+    m.menu = Some(Menu::Cursor(1));
+    let i = m.picker_sets(1).iter().position(|r| matches!(&r.id, SetId::OwnFile(p) if p.ends_with("beam_m.cur"))).unwrap();
+    click(&mut m, idx(K_MENU, i));
+    assert_eq!(m.menu, None);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn get_more_cursors_opens_its_window_from_the_link_and_from_every_picker() {
+    let mut m = opened();
+    click(&mut m, K_SGET);
+    assert!(m.store_open, "the header link opens it");
+    let mut el = None;
+    with_cx(|cx| el = Some(m.store_window(cx)));
+    assert!(el.unwrap().is_some());
+    click(&mut m, store::K_GDONE);
+    assert!(!m.store_open);
+    // the picker's own row
+    click(&mut m, idx(K_ROLE, 0));
+    assert_eq!(m.menu, Some(Menu::Cursor(0)));
+    click(&mut m, idx(K_MENU, 901));
+    assert!(m.store_open && m.menu.is_none());
+    click(&mut m, store::K_GDONE);
+    // a test copy never touches the network or starts a job
+    assert!(store::snapshot().getting.is_none());
+}
+
+#[test]
+fn the_window_lists_every_pack_with_who_made_it_and_its_licence() {
+    let mut m = opened();
+    click(&mut m, K_SGET);
+    let mut el = None;
+    with_cx(|cx| el = Some(m.store_window(cx).unwrap()));
+    let g = crate::gfx::Gfx::new(1.0);
+    let l = crate::ui::lay::Laid::new(&g, El::block().w(crate::ui::WIN_W).h(crate::ui::WIN_H).child(el.unwrap()), crate::ui::WIN_W, Some(crate::ui::WIN_H));
+    for i in 0..bu_mouse::store::LIST.len() {
+        assert!(l.rect_of(idx(store::K_GROW, i)).is_some(), "row {i} has its Get button");
+    }
+    let b = l.rect_of(sub(key("cur.get"), "rows")).unwrap();
+    assert!(b.1 >= 8.0 && b.1 + b.3 <= crate::ui::WIN_H - 8.0, "the list sits inside the window: {b:?}");
+}
+
+/// Order 066 proof pictures (`BU_PIC_OUT=<folder> BU_STORE_CACHE=<folder of the real-site test> cargo test -p bu-app proof_066 -- --ignored`):
+/// the pickers drawn from HIS real data (read only: his current cursors, his files, every scheme Windows has) and the
+/// "Get more cursors" window with the packs' real pictures from the cache the real-site test filled.
+#[test]
+#[ignore]
+fn proof_066_pictures() {
+    if std::env::var("BU_PIC_OUT").is_err() {
+        return;
+    }
+    let appdata = std::env::var("APPDATA").unwrap();
+    let real = bu_mouse::Mouse::new(bu_mouse::win::RealOs::read_only(), bu_mouse::AppDirs::new(PathBuf::from(appdata).join("Boyler Utilities").join("mouse")));
+    let mut m = opened();
+    m.v.cursors = real.cursors().ok();
+    m.v.packs = real.packs().unwrap_or_default();
+    m.v.glass = !real.glass_set().is_empty();
+    m.v.schemes = real.installed_schemes().unwrap_or_default();
+    m.v.files = real.set_preview_files();
+    m.v.own_files = real.own_files().into_iter().map(|p| p.to_string_lossy().into_owned()).collect();
+    m.v.suggest = Role::ALL.iter().map(|r| real.suggestion(*r).ok().flatten()).collect();
+    println!("his current: {:?}", m.v.cursors.as_ref().map(|c| c.roles.iter().map(|r| (r.role.name(), r.set.label(), r.file.clone())).collect::<Vec<_>>()));
+    println!("own files: {:?}", m.v.own_files);
+    println!("schemes: {:?}", m.v.schemes.iter().map(|s| s.0.as_str()).collect::<Vec<_>>());
+    // the Cursors group: the 7 bubbles with his real cursors
+    let mut grp = None;
+    with_cx(|cx| grp = Some(m.cursors(cx)));
+    crate::ui::lay::proof_png(El::block().w(crate::ui::WIN_W).h(130.0).pad(8.0, 26.0, 8.0, 26.0).child(grp.unwrap()), crate::ui::WIN_W, 130.0, 1.5, "066_bubbles.png");
+    for (i, name) in [(0usize, "066_picker_normal.png"), (2, "066_picker_text.png")] {
+        m.anchor = (60.0, 300.0, 40.0, 40.0);
+        let mut el = None;
+        with_cx(|cx| el = Some(m.cursor_menu(cx, i)));
+        crate::ui::lay::proof_png(El::block().w(crate::ui::WIN_W).h(crate::ui::WIN_H).child(el.unwrap()), crate::ui::WIN_W, crate::ui::WIN_H, 1.5, name);
+    }
+    // the window of downloadable packs with the real pictures
+    if let Ok(cache) = std::env::var("BU_STORE_CACHE") {
+        let cache = PathBuf::from(cache);
+        store::update(|g| {
+            for l in bu_mouse::store::LIST.iter() {
+                let pics = bu_mouse::store::load_preview(&bu_mouse::store::cache_dir(&cache, l.id));
+                let dec: Vec<(Role, std::sync::Arc<bu_mouse::curfile::CursorImage>)> = pics.iter().filter_map(|(r, b)| bu_mouse::curfile::decode(b, 64).map(|c| (*r, std::sync::Arc::new(c)))).collect();
+                g.pics.insert(l.id.to_string(), dec);
+            }
+        });
+        m.store_open = true;
+        let mut el = None;
+        with_cx(|cx| el = Some(m.store_window(cx).unwrap()));
+        crate::ui::lay::proof_png(El::block().w(crate::ui::WIN_W).h(crate::ui::WIN_H).child(el.unwrap()), crate::ui::WIN_W, crate::ui::WIN_H, 1.5, "066_get_more.png");
+    }
 }

@@ -67,9 +67,32 @@ pub fn brand(vid: u16) -> Option<Brand> {
         0x3057 => ("VAXEE", "https://vcc.vaxee.cn/index.php"),
         0x373B => ("ATK", "https://hub.atk.pro/"),
         0x33E4 => ("G-Wolves", "https://www.mouse.fit/"),
+        0x0B05 => ("ASUS", "https://rog.asus.com/armoury-crate/"),
         _ => return None,
     };
     Some(Brand { name, settings_url })
+}
+
+/// The brand of one mouse: by vendor id when the id belongs to one brand, else by the model (a Pulsar on the shared CompX id
+/// 3554), else by the brand's own name in the mouse's product / manufacturer string. Never a guess from a shared id.
+pub fn brand_of(vid: u16, pid: u16, product: Option<&str>, manufacturer: Option<&str>) -> Option<Brand> {
+    if let Some(b) = brand(vid) {
+        return Some(b);
+    }
+    let pulsar = brand(0x3710);
+    if crate::models::PULSAR.iter().any(|e| e.0 == vid && e.1 == pid) {
+        return pulsar;
+    }
+    let says_pulsar = |s: Option<&str>| s.map(|s| s.to_ascii_lowercase().contains("pulsar")).unwrap_or(false);
+    if says_pulsar(product) || says_pulsar(manufacturer) {
+        return pulsar;
+    }
+    None
+}
+
+/// "3710:5406" - the ids a user reports for a mouse the app does not know.
+pub fn ids_text(vid: u16, pid: u16) -> String {
+    format!("{vid:04X}:{pid:04X}")
 }
 
 /// Which protocol a supported mouse speaks.
@@ -107,6 +130,11 @@ pub struct YourMouse {
 }
 
 impl YourMouse {
+    /// "3710:5406" (VID:PID, hex) - shown in the tab's details; `0000:0000` = Windows gave no USB id (built-in / virtual).
+    pub fn ids(&self) -> String {
+        ids_text(self.vid, self.pid)
+    }
+
     /// The small line under the name.
     pub fn sub_line(&self) -> &'static str {
         match (self.protocol.is_some(), self.wireless) {
@@ -126,20 +154,26 @@ impl YourMouse {
 /// Every mouse in a device list (one entry per vid:pid that has a mouse collection, usage page 1 / usage 2), supported
 /// mice first and among them the cable before the dongle (a dongle whose mouse is on its cable answers nothing).
 pub fn find_mice(hid: &[HidInfo]) -> Vec<YourMouse> {
-    let mut ids: Vec<(u16, u16)> = hid.iter().filter(|h| h.usage_page == 0x01 && h.usage == 0x02 && h.vid != 0).map(|h| (h.vid, h.pid)).collect();
+    let mut ids: Vec<(u16, u16)> = hid.iter().filter(|h| h.usage_page == 0x01 && h.usage == 0x02).map(|h| (h.vid, h.pid)).collect();
     ids.sort();
     ids.dedup();
+    // a mouse with no USB id (touchpad, PS/2, remote session) is only listed when no mouse with an id is there (it would
+    // otherwise be a second row for the same hardware or a virtual device)
+    if ids.iter().any(|i| i.0 != 0) {
+        ids.retain(|i| i.0 != 0);
+    }
     let mut out: Vec<YourMouse> = ids
         .into_iter()
         .map(|(vid, pid)| {
             let sup = supported(vid, pid);
             let product = hid.iter().filter(|h| h.vid == vid && h.pid == pid).find_map(|h| h.product.clone());
+            let manufacturer = hid.iter().filter(|h| h.vid == vid && h.pid == pid).find_map(|h| h.manufacturer.clone());
             let config = sup.and_then(|_| config_interface(hid, vid, pid));
             YourMouse {
-                name: sup.map(|s| s.1.to_string()).or(product).unwrap_or_else(|| format!("Mouse ({vid:04X}:{pid:04X})")),
+                name: sup.map(|s| s.1.to_string()).or_else(|| crate::models::model(vid, pid).map(str::to_string)).or(product.clone()).unwrap_or_else(|| if vid == 0 { "Mouse".to_string() } else { format!("Mouse ({vid:04X}:{pid:04X})") }),
                 vid,
                 pid,
-                brand: brand(vid),
+                brand: brand_of(vid, pid, product.as_deref(), manufacturer.as_deref()),
                 protocol: config.and_then(|_| sup.map(|s| s.0)),
                 config_path: config.map(|c| c.path.clone()),
                 output_len: config.map(|c| c.output_len).unwrap_or(0),
@@ -148,7 +182,8 @@ pub fn find_mice(hid: &[HidInfo]) -> Vec<YourMouse> {
             }
         })
         .collect();
-    out.sort_by_key(|m| (m.protocol.is_none(), m.wireless == Some(true)));
+    // supported first, then mice the tables know by model, then the rest; no-id mice last
+    out.sort_by_key(|m| (m.protocol.is_none(), m.vid == 0, crate::models::model(m.vid, m.pid).is_none(), m.wireless == Some(true)));
     out
 }
 

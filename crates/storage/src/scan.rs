@@ -8,14 +8,18 @@
 //! Memory is kept small: one 40-byte record per folder, names in one shared string, and per folder only its biggest
 //! files by name (the rest is one "other files" sum). The whole result is dropped when the page closes.
 
+use crate::bigfiles::{BigFile, BIGGEST_FILES};
 use crate::classify::{classify_file, ClassRules, FileType, FolderClass};
 use crate::{Result, StorageError, StorageOs, VolumeState};
-use std::collections::VecDeque;
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, VecDeque};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
+
+mod listing;
 
 pub type FolderId = u32;
 
@@ -417,6 +421,10 @@ pub struct ScanStats {
 #[derive(Debug, Clone)]
 pub struct ScanResult {
     pub tree: FolderTree,
+    /// The biggest single files of the whole walk, biggest first (Order 069, the Files view): out of the same walk, a few KB,
+    /// kept when the tree is cut down. At most [`BIGGEST_FILES`], and never more than each folder keeps by name
+    /// (`ScanOptions::files_per_folder`, 24 by default).
+    pub biggest: Vec<BigFile>,
     pub types: TypeBreakdown,
     pub stats: ScanStats,
 }
@@ -444,7 +452,27 @@ pub fn scan_drive_with(os: &dyn StorageOs, letter: char, threads: Option<usize>,
     if let Some(t) = threads {
         opts.threads = t.max(1);
     }
-    let mut result = scan_folder(os, Path::new(&format!("{letter}:\\")), &rules, opts, ctl)?;
+    let top = PathBuf::from(format!("{letter}:\\"));
+    // Order 069: a fast listing of the whole drive (Everything's index) when there is one; the walk when there is none, or it failed
+    let listed = match os.open_listing(letter, ctl) {
+        Some(Ok(mut l)) => match listing::scan_listing(l.as_mut(), &top, &rules, opts, ctl) {
+            Ok(r) => Some(r),
+            Err(StorageError::Cancelled) => return Err(StorageError::Cancelled),
+            Err(_) => None,
+        },
+        Some(Err(StorageError::Cancelled)) => return Err(StorageError::Cancelled),
+        _ => None,
+    };
+    let mut result = match listed {
+        Some(r) => r,
+        None => {
+            // the listing's progress is not the walk's
+            ctl.files.store(0, Ordering::Relaxed);
+            ctl.folders.store(0, Ordering::Relaxed);
+            ctl.bytes.store(0, Ordering::Relaxed);
+            scan_folder(os, &top, &rules, opts, ctl)?
+        }
+    };
     result.types.used_bytes = Some(drive.total_bytes.saturating_sub(drive.free_bytes));
     result.types.free_bytes = Some(drive.free_bytes);
     Ok(result)
@@ -559,8 +587,11 @@ pub fn scan_folder(
         nodes[p].total += t;
     }
     let folders = nodes.len() as u64;
+    let tree = FolderTree { root_path: root.to_path_buf(), nodes, names: st.names, files: st.files };
+    let biggest = biggest_of(&tree);
     Ok(ScanResult {
-        tree: FolderTree { root_path: root.to_path_buf(), nodes, names: st.names, files: st.files },
+        tree,
+        biggest,
         types: TypeBreakdown { walked: st.walked, used_bytes: None, free_bytes: None },
         stats: ScanStats {
             files: st.files_seen,
@@ -571,6 +602,30 @@ pub fn scan_folder(
             threads,
         },
     })
+}
+
+/// The biggest files overall: every folder keeps its biggest by name, so a bounded min-heap over those finds them all.
+fn biggest_of(tree: &FolderTree) -> Vec<BigFile> {
+    let mut heap: BinaryHeap<Reverse<(u64, u32, u32)>> = BinaryHeap::with_capacity(BIGGEST_FILES + 1);
+    for (n, node) in tree.nodes.iter().enumerate() {
+        for f in node.files_off..node.files_off + node.n_files {
+            let bytes = tree.files[f as usize].bytes;
+            if heap.len() < BIGGEST_FILES {
+                heap.push(Reverse((bytes, n as u32, f)));
+            } else if heap.peek().is_some_and(|Reverse(min)| bytes > min.0) {
+                heap.pop();
+                heap.push(Reverse((bytes, n as u32, f)));
+            }
+        }
+    }
+    let mut top: Vec<(u64, u32, u32)> = heap.into_iter().map(|Reverse(t)| t).collect();
+    top.sort_by(|a, b| b.0.cmp(&a.0).then(a.2.cmp(&b.2)));
+    top.into_iter()
+        .filter_map(|(bytes, n, f)| {
+            let rec = tree.files[f as usize];
+            Some(BigFile { name: tree.name_of(rec.name_off, rec.name_len).to_string(), dir: tree.path(n).ok()?, bytes })
+        })
+        .collect()
 }
 
 fn worker(

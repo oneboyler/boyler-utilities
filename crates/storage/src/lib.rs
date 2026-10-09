@@ -9,6 +9,7 @@
 //!
 //! Every Windows call goes through the [`StorageOs`] trait: [`RealOs`] (Windows) and [`FakeOs`] (tests).
 
+pub mod bigfiles;
 pub mod classify;
 pub mod cleanup;
 pub mod drives;

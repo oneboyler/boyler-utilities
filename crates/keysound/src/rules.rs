@@ -57,12 +57,39 @@ pub struct Settings {
     pub volume: u8,
     /// Silent while a full-screen app / game is in front.
     pub off_in_game: bool,
+    /// "Ignore repeats within __ ms" (0-80; 0 = off): a key that comes down twice inside the window plays one sound.
+    pub repeat_ms: u8,
     pub rules: Vec<Rule>,
+    /// "Mouse clicks too" (Order 064, off by default): the mouse buttons make sounds as well. The side buttons play the chosen
+    /// pack's key sound, the others a click of our own made to suit that pack. Needs the key sounds to be on.
+    pub mouse_on: bool,
+    /// The mouse sounds' own volume (0-100, default [`DEFAULT_VOLUME`]).
+    pub mouse_volume: u8,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { pack: Pack::Builtin(PackId::Linear), volume: DEFAULT_VOLUME, off_in_game: true, rules: Vec::new() }
+        Settings {
+            pack: Pack::Builtin(PackId::Linear),
+            volume: DEFAULT_VOLUME,
+            off_in_game: false,
+            repeat_ms: 0,
+            rules: Vec::new(),
+            mouse_on: false,
+            mouse_volume: DEFAULT_VOLUME,
+        }
+    }
+}
+
+/// The pack in charge while `exe` is in front: a game in front is silent while "off while a game is in front" is on, whatever the
+/// per-app rules say; otherwise the app's own rule wins over the general pack. None = silent.
+fn pick<'a>(s: &'a Settings, exe: &str, game_in_front: bool) -> Option<&'a Pack> {
+    if game_in_front && s.off_in_game {
+        return None;
+    }
+    match s.rules.iter().find(|r| r.exe.eq_ignore_ascii_case(exe)) {
+        Some(r) => r.pack.as_ref(),
+        None => Some(&s.pack),
     }
 }
 
@@ -70,13 +97,19 @@ impl Default for Settings {
 /// A game in front is silent while "off while a game is in front" is on, whatever the per-app rules say; otherwise the app's
 /// own rule wins over the general pack; volume 0 is silent.
 pub fn choose<'a>(s: &'a Settings, exe: &str, game_in_front: bool) -> Option<&'a Pack> {
-    if s.volume == 0 || (game_in_front && s.off_in_game) {
+    if s.volume == 0 {
         return None;
     }
-    match s.rules.iter().find(|r| r.exe.eq_ignore_ascii_case(exe)) {
-        Some(r) => r.pack.as_ref(),
-        None => Some(&s.pack),
+    pick(s, exe, game_in_front)
+}
+
+/// The same for a mouse button (Order 064): the mouse sounds follow the same game switch and per-app rules as the keys (so
+/// they use the pack the keys would use there), but have their own switch and volume. None = silent.
+pub fn choose_mouse<'a>(s: &'a Settings, exe: &str, game_in_front: bool) -> Option<&'a Pack> {
+    if !s.mouse_on || s.mouse_volume == 0 {
+        return None;
     }
+    pick(s, exe, game_in_front)
 }
 
 #[cfg(test)]
@@ -88,21 +121,21 @@ mod tests {
     }
 
     #[test]
-    fn defaults_are_quiet_and_game_safe() {
+    fn defaults_are_quiet_and_play_in_games() {
         let s = Settings::default();
         assert_eq!(s.volume, 5);
-        assert!(s.off_in_game);
+        assert!(!s.off_in_game, "Order 059: sounds play in games unless the user turns it on");
+        assert_eq!(s.repeat_ms, 0, "the chatter filter is off");
         assert_eq!(choose(&s, "notepad.exe", false), Some(&Pack::Builtin(PackId::Linear)));
     }
 
     #[test]
     fn a_game_in_front_is_silent_while_the_switch_is_on() {
         let mut s = Settings::default();
-        assert_eq!(choose(&s, "valorant-win64-shipping.exe", true), None);
-        s.off_in_game = false;
-        assert!(choose(&s, "valorant-win64-shipping.exe", true).is_some());
-        // a per-app rule can't force sound over a game while the switch is on
+        assert!(choose(&s, "valorant-win64-shipping.exe", true).is_some(), "off by default: sounds play in games");
         s.off_in_game = true;
+        assert_eq!(choose(&s, "valorant-win64-shipping.exe", true), None);
+        // a per-app rule can't force sound over a game while the switch is on
         s.rules.push(rule("game.exe", Some(Pack::Builtin(PackId::Clicky))));
         assert_eq!(choose(&s, "game.exe", true), None);
     }
@@ -115,6 +148,30 @@ mod tests {
         assert_eq!(choose(&s, "Discord.EXE", false), None, "Off in Discord (names compare without case)");
         assert_eq!(choose(&s, "notepad.exe", false), Some(&Pack::Builtin(PackId::Typewriter)));
         assert_eq!(choose(&s, "chrome.exe", false), Some(&Pack::Builtin(PackId::Linear)));
+    }
+
+    #[test]
+    fn mouse_sounds_are_off_quiet_and_follow_the_games_switch_and_the_app_rules() {
+        let mut s = Settings::default();
+        assert!(!s.mouse_on, "off by default");
+        assert_eq!(s.mouse_volume, 5, "quiet by default");
+        assert_eq!(choose_mouse(&s, "a.exe", false), None, "the switch is off");
+        s.mouse_on = true;
+        assert_eq!(choose_mouse(&s, "a.exe", false), Some(&Pack::Builtin(PackId::Linear)));
+        // their own volume: the keys' volume 0 doesn't silence them, theirs does
+        s.volume = 0;
+        assert!(choose_mouse(&s, "a.exe", false).is_some());
+        s.mouse_volume = 0;
+        assert_eq!(choose_mouse(&s, "a.exe", false), None);
+        s.mouse_volume = 5;
+        // the same game switch and per-app rules as the keys
+        s.off_in_game = true;
+        assert_eq!(choose_mouse(&s, "game.exe", true), None, "a game in front: silent");
+        s.off_in_game = false;
+        s.rules.push(rule("discord.exe", None));
+        s.rules.push(rule("notepad.exe", Some(Pack::Builtin(PackId::Typewriter))));
+        assert_eq!(choose_mouse(&s, "discord.exe", false), None);
+        assert_eq!(choose_mouse(&s, "notepad.exe", false), Some(&Pack::Builtin(PackId::Typewriter)));
     }
 
     #[test]

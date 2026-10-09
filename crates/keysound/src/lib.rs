@@ -15,12 +15,19 @@
 //! * "Off while a game is in front": Windows' own "a full-screen app is in front" answer ([`front`]), read at the moment of a
 //!   press (cached while the same window stays in front) — no hook, no timer, no thread.
 //!
+//! **Mouse clicks too** (Order 064, off by default, own volume 5 %): the same engine, the same one stream, the same game switch,
+//! per-app rules and "ignore repeats" window. `bu-rawin` hands over a [`bu_rawin::MouseSoundEvent`] (Left / Right / Middle /
+//! Side + up or down; no position, no device). Side buttons (X1 / X2) play the chosen pack's own key sound; left, right and the
+//! wheel click play a click of our own synth ([`synth::ClickStyle`]: silent switch, optical, micro-switch, deep click, or a tick of
+//! a satisfying pack) that suits the pack. While the switch is off the mouse is not even registered with Windows.
+//!
 //! **Key remap** ([`remap`]): Windows' own Scancode Map (HKLM, one admin Yes, a restart), listed + "Reset all".
 //!
 //! The pure parts (synth, mixer, rules, the scancode map codec) are unit-tested; `engine` / `front` / `stream` /
 //! `remap::real` are the thin Windows shells.
 
 pub mod binds;
+pub mod gallery;
 pub mod import;
 pub mod kind;
 pub mod layout;
@@ -44,8 +51,8 @@ mod stream;
 pub mod watch;
 
 pub use kind::{kind_of, Kind, KINDS};
-pub use rules::{choose, gain, Pack, Rule, Settings, DEFAULT_VOLUME};
-pub use synth::{PackId, SoundSet};
+pub use rules::{choose, choose_mouse, gain, Pack, Rule, Settings, DEFAULT_VOLUME};
+pub use synth::{render_clicks, ClickSet, ClickStyle, PackId, SoundSet};
 
 #[cfg(windows)]
 pub use engine::{KeySounds, Status};

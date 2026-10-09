@@ -289,6 +289,18 @@ fn picture_sliders_go_to_the_monitor() {
 }
 
 #[test]
+fn the_contrast_slider_sends_contrast_only() {
+    // Order 073: brightness and contrast are two separate monitor codes - a contrast drag never writes brightness
+    let mut t = T::new();
+    t.ev(Ev::Press(K_CON, 340.0, 0.0, (332.0, 0.0, 168.0, 20.0)));
+    t.ev(Ev::Drag(K_CON, 500.0, 0.0, (332.0, 0.0, 168.0, 20.0)));
+    std::thread::sleep(Duration::from_millis(300));
+    let c = t.calls();
+    assert_eq!(c.iter().rfind(|c| matches!(c, FakeCall::DdcSet(_, Vcp::Contrast, _))), Some(&FakeCall::DdcSet(MonitorId(DELL.into()), Vcp::Contrast, 100)));
+    assert!(!c.iter().any(|c| matches!(c, FakeCall::DdcSet(_, Vcp::Brightness, _))), "{c:?}");
+}
+
+#[test]
 fn presets_apply_save_and_delete() {
     let mut t = T::new();
     let ps = t.p.presets();

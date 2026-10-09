@@ -16,6 +16,8 @@ use crate::error::{Result, SearchError};
 
 /// Our instance's name (its IPC window is `EVERYTHING_TASKBAR_NOTIFICATION_(BoylerUtilities)`).
 pub const INSTANCE: &str = "BoylerUtilities";
+/// Storage's own instance (Order 069): started when Measure is pressed, quit when the measure is done.
+pub const STORAGE_INSTANCE: &str = "BoylerUtilitiesStorage";
 
 /// Our instance's settings (Everything.ini): everything that would show or stay is off; only the drives `ini` lists
 /// (no drive is taken by itself).
@@ -112,7 +114,7 @@ pub fn start_ours(exe: &Path, dir: &Path, drives: &[Drive]) -> Result<Child> {
     r
 }
 
-fn start_client(exe: &Path, dir: &Path, drives: &[Drive]) -> Result<Child> {
+pub fn start_client(exe: &Path, dir: &Path, drives: &[Drive]) -> Result<Child> {
     use std::os::windows::process::CommandExt;
     const BELOW_NORMAL_PRIORITY_CLASS: u32 = 0x0000_4000;
     std::fs::create_dir_all(dir).map_err(|e| SearchError::Everything(format!("its folder: {e}")))?;
@@ -181,10 +183,15 @@ impl Drop for Ours {
 /// A loaded index is saved on `-exit` (give it `SAVE_WAIT`); one still being built is not - Everything would finish the
 /// build first (minutes), so it is ended after 3 s and leaves no index file (measured). True = it quit by itself.
 pub fn stop_ours(exe: Option<&Path>, ours: Ours, wait: Duration) -> bool {
+    stop_instance(exe, INSTANCE, ours, wait)
+}
+
+/// [`stop_ours`] for any of our instances (Order 069: Storage's own, `BoylerUtilitiesStorage`).
+pub fn stop_instance(exe: Option<&Path>, instance: &str, ours: Ours, wait: Duration) -> bool {
     let mut ours = ours;
     let child = &mut ours.child;
     if let Some(exe) = exe {
-        if let Ok(mut c) = Command::new(exe).arg("-instance").arg(INSTANCE).arg("-exit").spawn() {
+        if let Ok(mut c) = Command::new(exe).arg("-instance").arg(instance).arg("-exit").spawn() {
             // the helper gets 3 s too (never a wait without end: this runs at app exit)
             let until = Instant::now() + Duration::from_secs(3);
             while !matches!(c.try_wait(), Ok(Some(_))) && Instant::now() < until {

@@ -11,7 +11,7 @@
 //! Replaces the WMI `__InstanceCreationEvent WITHIN 1` subscriptions, which made Windows' WMI service re-read the whole
 //! process list every second for each watcher (~1.3 % of a core in WmiPrvSE).
 //!
-//! STOP = `OpenProcess(SYNCHRONIZE)` only (A_004_01) + `RegisterWaitForSingleObject`: the Windows thread pool waits,
+//! STOP = `OpenProcess(SYNCHRONIZE)` only (A_004_01; `wait_exit_no_handle` opens NO handle at all, for anti-cheat protected games, Order 063) + `RegisterWaitForSingleObject`: the Windows thread pool waits,
 //! no thread of ours per game. A process that refuses even that handle is checked by snapshot instead: at every
 //! snapshot, and when one of its windows is destroyed (`EVENT_OBJECT_DESTROY`, hooked only while such a process is
 //! waited for). Already gone when the wait starts = reported ended at once.
@@ -26,4 +26,4 @@ pub mod state;
 mod win;
 
 #[cfg(windows)]
-pub use win::{is_elevated, problem, rescan, subscribe, wait_exit, ExitWait, OnExit, StartFn, Subscription};
+pub use win::{is_elevated, problem, rescan, subscribe, wait_exit, wait_exit_no_handle, ExitWait, OnExit, StartFn, Subscription};

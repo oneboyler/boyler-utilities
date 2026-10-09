@@ -237,7 +237,17 @@ fn clean_fixture() -> FakeOs {
         .add_file(format!(r"{l}\AMD\VkCache\4.bin"), 5 * MB)
         .add_file(r"C:\Program Files (x86)\Steam\appcache\appinfo.vdf", 40 * MB)
         .add_file(format!(r"{l}\Steam\htmlcache\Cache\c1"), 60 * MB)
-        .add_file(format!(r"{l}\EpicGamesLauncher\Saved\webcache_4430\e1"), 8 * MB)
+        .add_file(format!(r"{l}\EpicGamesLauncher\Saved\webcache_4430\Cache\e1"), 8 * MB)
+        // the launchers' web logins sit beside their caches: they must survive every clean (Order 069)
+        .add_file(format!(r"{l}\Steam\htmlcache\Default\Network\Cookies"), 100)
+        .add_file(format!(r"{l}\Steam\htmlcache\Default\Login Data"), 100)
+        .add_file(format!(r"{l}\Steam\htmlcache\Default\Local Storage\leveldb\000003.log"), 100)
+        .add_file(format!(r"{l}\Steam\htmlcache\Default\Code Cache\js\cc1"), 7 * MB)
+        .add_file(format!(r"{l}\EpicGamesLauncher\Saved\webcache_4430\Cookies"), 100)
+        .add_file(format!(r"{l}\EpicGamesLauncher\Saved\webcache_4430\IndexedDB\idb1"), 100)
+        .add_file(format!(r"{l}\EpicGamesLauncher\Saved\webcache_4430\Session Storage\ss1"), 100)
+        .add_file(format!(r"{l}\EpicGamesLauncher\Saved\webcache_4430\Service Worker\Database\db1"), 100)
+        .add_file(format!(r"{l}\EpicGamesLauncher\Saved\webcache_4430\Service Worker\CacheStorage\cs1"), 3 * MB)
         .add_file(format!(r"{l}\EpicGamesLauncher\Saved\Config\keep.ini"), 1000)
         .add_file(format!(r"{l}\Riot Games\Riot Client\HttpCache\r1"), 9 * MB);
     os.set_unreadable(r"C:\Windows\Temp");
@@ -261,10 +271,11 @@ fn cleanup_measures_sizes_first_with_blocked_parts() {
     assert_eq!(shader.bytes, 65 * MB);
     assert!(shader.parts.iter().any(|p| p.name == "AMD DirectX cache" && p.state == PartState::Missing));
     let launch = plan.row(CleanKind::LauncherCaches).unwrap();
-    assert_eq!(launch.bytes, 8 * MB + 9 * MB, "Steam runs → its caches are blocked");
-    assert_eq!(launch.blocked_bytes, 100 * MB);
+    assert_eq!(launch.bytes, 8 * MB + 3 * MB + 9 * MB, "Steam runs → its caches are blocked");
+    assert_eq!(launch.blocked_bytes, 107 * MB);
     assert_eq!(launch.notes(), vec!["Close Steam first".to_string()]);
-    assert_eq!(plan.default_ticked(), CleanKind::ALL.to_vec());
+    // Order 069: shader and launcher caches start unticked
+    assert_eq!(plan.default_ticked(), vec![CleanKind::RecycleBin, CleanKind::TempFiles]);
     assert_eq!(plan.ticked_bytes(&[CleanKind::TempFiles, CleanKind::ShaderCaches]), 355 * MB + 65 * MB);
     assert!(CleanKind::ALL.iter().all(|k| !k.undoable()));
 }
@@ -293,10 +304,24 @@ fn cleanup_cleans_only_ticked_rows_keeps_in_use_and_never_follows_links() {
     // Launchers: all four cleaned (nothing running); Epic's Config stays (only webcache*).
     assert!(!os.exists(r"C:\Program Files (x86)\Steam\appcache\appinfo.vdf"));
     assert!(os.exists(r"C:\Program Files (x86)\Steam\appcache"));
-    assert!(!os.exists(format!(r"{l}\Steam\htmlcache\Cache")));
+    assert!(!os.exists(format!(r"{l}\Steam\htmlcache\Cache\c1")));
     assert!(os.exists(format!(r"{l}\EpicGamesLauncher\Saved\Config\keep.ini")));
-    assert_eq!(report.rows[1].freed_bytes, (40 + 60 + 8 + 9) * MB);
-    assert_eq!(report.freed_bytes(), 150 * MB + 117 * MB);
+    // Order 069: the launchers' web logins beside the caches survive (cookies, local/session storage, indexed db, login data)
+    for keep in [
+        r"Steam\htmlcache\Default\Network\Cookies",
+        r"Steam\htmlcache\Default\Login Data",
+        r"Steam\htmlcache\Default\Local Storage\leveldb\000003.log",
+        r"EpicGamesLauncher\Saved\webcache_4430\Cookies",
+        r"EpicGamesLauncher\Saved\webcache_4430\IndexedDB\idb1",
+        r"EpicGamesLauncher\Saved\webcache_4430\Session Storage\ss1",
+        r"EpicGamesLauncher\Saved\webcache_4430\Service Worker\Database\db1",
+    ] {
+        assert!(os.exists(format!(r"{l}\{keep}")), "a login file was deleted: {keep}");
+    }
+    assert!(!os.exists(format!(r"{l}\Steam\htmlcache\Default\Code Cache\js\cc1")));
+    assert!(!os.exists(format!(r"{l}\EpicGamesLauncher\Saved\webcache_4430\Service Worker\CacheStorage\cs1")));
+    assert_eq!(report.rows[1].freed_bytes, (40 + 60 + 7 + 8 + 3 + 9) * MB);
+    assert_eq!(report.freed_bytes(), 150 * MB + 127 * MB);
     assert_eq!(report.in_use_bytes(), 205 * MB);
     // Every change stayed inside a target folder.
     for c in os.changes() {
@@ -349,6 +374,30 @@ fn cleanup_refuses_unsafe_targets_and_unmeasured_rows() {
     assert!(!is_safe_target(Path::new(r"C:\Temp"), &k), "too shallow");
     assert!(is_safe_target(Path::new(r"C:\Windows\Temp"), &k));
     assert!(is_safe_target(Path::new(r"C:\Users\J\AppData\Local\NVIDIA\DXCache"), &k));
+    // Order 069: a launcher's web profile holds its logins - only the cache folders inside it are targets
+    let l = r"C:\Users\J\AppData\Local";
+    for bad in [
+        r"Steam\htmlcache",
+        r"Steam\htmlcache\Default",
+        r"Steam\htmlcache\Default\Network",
+        r"Steam\htmlcache\Default\Local Storage",
+        r"EpicGamesLauncher\Saved\webcache_4430",
+        r"EpicGamesLauncher\Saved\webcache_4430\Service Worker",
+        r"Code Cache",
+        r"Some App\GPUCache",
+    ] {
+        assert!(!is_safe_target(Path::new(&format!(r"{l}\{bad}")), &k), "{bad}");
+    }
+    for good in [
+        r"Steam\htmlcache\Default\Cache",
+        r"Steam\htmlcache\Default\Code Cache",
+        r"Steam\htmlcache\Default\GPUCache",
+        r"Steam\htmlcache\Default\Service Worker\CacheStorage",
+        r"EpicGamesLauncher\Saved\webcache_4430\Cache",
+        r"EpicGamesLauncher\Saved\webcache_4430\Service Worker\CacheStorage",
+    ] {
+        assert!(is_safe_target(Path::new(&format!(r"{l}\{good}")), &k), "{good}");
+    }
 
     // A known folder pointing somewhere unsafe is refused at measure time and never cleaned.
     let os = FakeOs::new();
@@ -511,4 +560,138 @@ fn pruned_tree_keeps_the_top_rows_and_a_rescanned_folder_grafts_back() {
     let j = p.find(Path::new(r"C:\Users\J")).unwrap();
     assert_eq!(strip(p.rows(j).unwrap()), strip(full.rows(full.find(Path::new(r"C:\Users\J")).unwrap()).unwrap()));
     assert_eq!(p.breadcrumb(j).unwrap().len(), 3);
+}
+
+/// Order 069 (Files view): the 20 biggest single files come out of the same walk - the same as sorting every file of the
+/// drive, also when one folder holds more big files than it keeps by name, and they carry their folder.
+#[test]
+fn the_biggest_files_are_the_top_20_of_the_walk_and_nothing_else() {
+    let os = FakeOs::new();
+    os.with_drives(vec![drive('C', DriveKind::Fixed, 900 * GB, 600 * GB)]);
+    let mut all: Vec<(u64, String)> = Vec::new();
+    // 40 files in each of 3 folders (more than the 24 each folder keeps), sizes all different
+    for (d, dir) in ["A", r"B\deep", "C"].iter().enumerate() {
+        for i in 0..40u64 {
+            let size = (1 + i * 3 + d as u64) * MB + d as u64 * 7;
+            let p = format!(r"C:\{dir}\f{i}.bin");
+            os.add_file(&p, size);
+            all.push((size, p));
+        }
+    }
+    os.add_file(r"C:\huge.iso", 50 * GB);
+    all.push((50 * GB, r"C:\huge.iso".to_string()));
+    all.sort_by_key(|a| std::cmp::Reverse(a.0));
+    let r = scan::scan_drive(&os, 'c', &ScanControl::new()).unwrap();
+    assert_eq!(r.biggest.len(), bu_storage::bigfiles::BIGGEST_FILES);
+    let got: Vec<(u64, String)> = r.biggest.iter().map(|b| (b.bytes, b.path().display().to_string().to_lowercase())).collect();
+    let want: Vec<(u64, String)> = all.iter().take(20).map(|(s, p)| (*s, p.to_lowercase())).collect();
+    assert_eq!(got, want);
+    assert_eq!(r.biggest[0].name, "huge.iso");
+    // it survives the tree being cut down
+    let cut = scan::ScanResult { tree: r.tree.pruned(), ..r.clone() };
+    assert_eq!(cut.biggest, r.biggest);
+    // few files: all of them, still biggest first
+    let os = FakeOs::new();
+    os.with_drives(vec![drive('C', DriveKind::Fixed, 900 * GB, 600 * GB)]);
+    os.add_file(r"C:\a\x.bin", 5).add_file(r"C:\a\y.bin", 9);
+    let r = scan::scan_drive(&os, 'c', &ScanControl::new()).unwrap();
+    assert_eq!(r.biggest.iter().map(|b| b.bytes).collect::<Vec<_>>(), [9, 5]);
+}
+
+/// Order 069: Delete from the Files view goes to the Recycle Bin (a file can be restored from there), refuses Windows' own
+/// places and the files Windows keeps at the top of a drive, and a file in use stays.
+#[test]
+fn recycling_a_file_moves_it_to_the_bin_and_refuses_windows_own_files() {
+    use bu_storage::bigfiles::{can_recycle, recycle};
+    let os = FakeOs::new();
+    os.with_recycle_bin(GB, 3);
+    os.add_file(r"C:\Videos\clip.mp4", 700 * MB)
+        .add_file(r"C:\pagefile.sys", 32 * GB)
+        .add_file(r"C:\Windows\big.dll", GB)
+        .add_file_in_use(r"C:\Videos\open.mp4", MB);
+    recycle(&os, Path::new(r"C:\Videos\clip.mp4")).unwrap();
+    assert!(!os.exists(r"C:\Videos\clip.mp4"));
+    assert_eq!(os.recycle_bin().unwrap(), RecycleBinInfo { bytes: GB + 700 * MB, items: 4 }, "it is in the bin now");
+    assert_eq!(os.changes(), vec![r"recycle_file c:\videos\clip.mp4".to_string()]);
+    for no in [r"C:\pagefile.sys", r"c:\HIBERFIL.SYS", r"C:\swapfile.sys", r"C:\Windows\big.dll", r"C:\Windows\System32\x.dll", r"D:\$Recycle.Bin\S-1\x", r"C:\Program Files\WindowsApps\a\b.exe", "relative.txt"] {
+        assert!(!can_recycle(Path::new(no)), "{no}");
+    }
+    assert!(can_recycle(Path::new(r"D:\Games\pagefile.sys")), "only at a drive's top");
+    assert!(can_recycle(Path::new(r"C:\Users\J\Videos\a.mp4")));
+    assert!(matches!(recycle(&os, Path::new(r"C:\pagefile.sys")), Err(StorageError::UnsafePath(_))));
+    assert!(os.exists(r"C:\pagefile.sys") && os.exists(r"C:\Windows\big.dll"));
+    assert!(recycle(&os, Path::new(r"C:\Videos\open.mp4")).is_err(), "in use");
+    assert!(os.exists(r"C:\Videos\open.mp4"));
+    assert!(matches!(recycle(&os, Path::new(r"C:\Videos\gone.mp4")), Err(StorageError::NotFound(_))));
+}
+
+/// Walk a folder tree into (path, size, kind, windows_own) lines, children in the order the view shows them.
+fn tree_lines(tree: &scan::FolderTree, id: scan::FolderId, depth: usize, out: &mut Vec<String>) {
+    for r in tree.rows(id).unwrap() {
+        match r.kind {
+            RowKind::Folder { id: child, has_subfolders, windows_own, .. } => {
+                out.push(format!("{}{}/ {} sub={has_subfolders} own={windows_own}", " ".repeat(depth), r.name, r.bytes));
+                if !windows_own {
+                    tree_lines(tree, child, depth + 1, out);
+                }
+            }
+            RowKind::File => out.push(format!("{}{} {}", " ".repeat(depth), r.name, r.bytes)),
+            RowKind::OtherFiles { count } => out.push(format!("{}[{count} other] {}", " ".repeat(depth), r.bytes)),
+        }
+    }
+}
+
+/// Order 069: a whole-drive listing (Everything's index) gives the SAME result as the walk - folders with their sizes, each
+/// folder's biggest files and the "other files" sum, the file-type totals, the biggest files overall - and is used only when
+/// the OS layer has one; a listing that fails falls back to the walk.
+#[test]
+fn a_whole_drive_listing_gives_the_same_result_as_the_walk() {
+    let walked = scan_fixture();
+    let listed = scan_fixture();
+    listed.with_listing(bu_storage::fake::FakeListingMode::On);
+    let a = scan::scan_drive(&walked, 'c', &ScanControl::new()).unwrap();
+    let ctl = ScanControl::new();
+    let b = scan::scan_drive(&listed, 'c', &ctl).unwrap();
+    assert_eq!(listed.listings_opened(), 1);
+    assert_eq!(walked.listings_opened(), 0);
+    assert_eq!(a.types, b.types, "the file-type bar");
+    assert_eq!(a.stats.files, b.stats.files);
+    assert_eq!(a.biggest, b.biggest, "the biggest files");
+    assert_eq!(a.tree.size(a.tree.root()).unwrap(), b.tree.size(b.tree.root()).unwrap());
+    let (mut la, mut lb) = (Vec::new(), Vec::new());
+    tree_lines(&a.tree, a.tree.root(), 0, &mut la);
+    tree_lines(&b.tree, b.tree.root(), 0, &mut lb);
+    // the walk cannot read System Volume Information (unreadable) and does not see the junction; the listing has no such notes
+    let skip = |v: Vec<String>| v.into_iter().filter(|l| !l.contains("Link/")).collect::<Vec<_>>();
+    assert_eq!(skip(la), skip(lb));
+    // progress reached the end
+    assert_eq!(ctl.progress().files, b.stats.files);
+    // the same numbers by hand: the Small folder keeps 24 by name and 6 more as one sum
+    let small = b.tree.find(Path::new(r"C:\Users\J\Small")).unwrap();
+    let rows = b.tree.rows(small).unwrap();
+    assert_eq!(rows.len(), 25);
+    assert!(matches!(rows[24].kind, RowKind::OtherFiles { count: 6 }), "{:?}", rows[24].kind);
+    assert_eq!(rows[24].bytes, (1..=6).sum::<u64>() * 1000);
+    // cloud files count 0
+    assert_eq!(b.tree.size(b.tree.find(Path::new(r"C:\Users\J\OneDrive")).unwrap()).unwrap(), 0);
+    // windows' own places are marked
+    assert!(b.tree.is_windows_own(b.tree.find(Path::new(r"C:\Windows")).unwrap()).unwrap());
+
+    // a listing that fails: the walk is used and the result is the same
+    let failing = scan_fixture();
+    failing.with_listing(bu_storage::fake::FakeListingMode::Failing);
+    let c = scan::scan_drive(&failing, 'c', &ScanControl::new()).unwrap();
+    assert_eq!(failing.listings_opened(), 1);
+    assert_eq!(c.types, a.types);
+    assert_eq!(c.biggest, a.biggest);
+}
+
+/// Order 069: Stop ends a listing's read between its pages (Cancelled, never a half result and never the walk).
+#[test]
+fn stopping_ends_a_listing_read() {
+    let os = scan_fixture();
+    os.with_listing(bu_storage::fake::FakeListingMode::On);
+    let ctl = ScanControl::new();
+    ctl.cancel();
+    assert!(matches!(scan::scan_drive(&os, 'c', &ctl), Err(StorageError::Cancelled)));
 }

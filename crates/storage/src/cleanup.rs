@@ -36,9 +36,14 @@ impl CleanKind {
         match self {
             CleanKind::RecycleBin => "Everything in the recycle bin, all drives",
             CleanKind::TempFiles => "Leftovers apps put in the temp folders",
-            CleanKind::ShaderCaches => "DirectX / NVIDIA / AMD · games rebuild them",
-            CleanKind::LauncherCaches => "Steam, Epic, Riot, Battle.net · web and app caches",
+            CleanKind::ShaderCaches => "DirectX / NVIDIA / AMD · games recompile them (first-run stutter)",
+            CleanKind::LauncherCaches => "Steam, Epic, Riot, Battle.net · web caches only, you stay logged in",
         }
+    }
+    /// Ticked on its own (Order 069, the owner: game and launcher caches "should be unticked anyway by default" - clearing them
+    /// makes games recompile shaders and launchers reload their caches).
+    pub fn ticked_by_default(self) -> bool {
+        matches!(self, CleanKind::RecycleBin | CleanKind::TempFiles)
     }
     /// No row can be undone: deleted files are gone. (The recycle bin's ⓘ tip says so in the design.)
     pub fn undoable(self) -> bool {
@@ -79,8 +84,10 @@ pub struct Target {
 /// `NVIDIA\DXCache`, `NVIDIA\GLCache`, `AMD\DxCache`, `AMD\DxcCache`, `AMD\GLCache` (DESIGN) + `LocalLow\NVIDIA\
 /// PerDriverVersion\DXCache` / `GLCache` (where current NVIDIA drivers put it; seen on a real PC) + `AMD\VkCache`
 /// (AMD's Vulkan shader cache; seen on a real PC). Steam's `steamapps\shadercache` is left out (DESIGN: unclear —
-/// big, re-downloaded). Launchers: Steam `appcache` + `%LocalAppData%\Steam\htmlcache` (DESIGN), Epic
-/// `%LocalAppData%\EpicGamesLauncher\Saved\webcache*` (DESIGN; `webcache_4430` seen on a real PC), Riot
+/// big, re-downloaded). Launchers: Steam `appcache` + the pure cache folders inside `%LocalAppData%\Steam\htmlcache`, Epic
+/// the same inside `%LocalAppData%\EpicGamesLauncher\Saved\webcache*` (`webcache_4430` seen on a real PC). Order 069: those
+/// two are Chromium profiles that also hold the launcher's web login (Cookies, Local Storage, Session Storage, IndexedDB,
+/// Login Data), so only [`WEB_CACHE_SUBS`] go, never the profile itself. Riot
 /// `%LocalAppData%\Riot Games\Riot Client\HttpCache` (seen on a real PC — no Riot document), Battle.net
 /// `%ProgramData%\Blizzard Entertainment\Battle.net\Cache` (Blizzard's old cache-delete guidance; not installed on
 /// a real PC, so unverified; no test fixture for it either).
@@ -106,7 +113,11 @@ pub fn targets(os: &dyn StorageOs) -> Vec<Target> {
     add(CleanKind::ShaderCaches, "AMD OpenGL cache", local("AMD\\GLCache"), None, false);
     add(CleanKind::ShaderCaches, "AMD Vulkan cache", local("AMD\\VkCache"), None, false);
     add(CleanKind::LauncherCaches, "Steam app cache", k.steam.as_ref().map(|s| s.join("appcache")), Some(STEAM), false);
-    add(CleanKind::LauncherCaches, "Steam web cache", local("Steam\\htmlcache"), Some(STEAM), false);
+    if let Some(html) = local("Steam\\htmlcache") {
+        for dir in web_cache_dirs(&html) {
+            add(CleanKind::LauncherCaches, "Steam web cache", Some(dir), Some(STEAM), false);
+        }
+    }
     if let Some(saved) = local("EpicGamesLauncher\\Saved") {
         let mut webcaches: Vec<String> = os
             .read_dir(&saved)
@@ -117,7 +128,9 @@ pub fn targets(os: &dyn StorageOs) -> Vec<Target> {
             .collect();
         webcaches.sort();
         for w in webcaches {
-            add(CleanKind::LauncherCaches, "Epic web cache", Some(saved.join(w)), Some(EPIC), false);
+            for dir in web_cache_dirs(&saved.join(w)) {
+                add(CleanKind::LauncherCaches, "Epic web cache", Some(dir), Some(EPIC), false);
+            }
         }
     }
     add(CleanKind::LauncherCaches, "Riot Client cache", local("Riot Games\\Riot Client\\HttpCache"), Some(RIOT), false);
@@ -131,9 +144,20 @@ pub fn targets(os: &dyn StorageOs) -> Vec<Target> {
     out
 }
 
+/// The folders inside a launcher's Chromium web profile (Steam `htmlcache`, Epic `webcache*`) that are pure caches. The
+/// profile's other folders and files are the launcher's web login and settings (Cookies, Network\Cookies, Local Storage,
+/// Session Storage, IndexedDB, Login Data …) and are never targets (Order 069, the owner: "do launcher cache clean logins?").
+const WEB_CACHE_SUBS: &[&str] = &["Cache", "Code Cache", "GPUCache", "Service Worker\\CacheStorage"];
+
+/// The pure cache folders of one Chromium profile root: Steam keeps its profile in `Default`, Epic in the root itself.
+fn web_cache_dirs(root: &Path) -> Vec<PathBuf> {
+    [root.to_path_buf(), root.join("Default")].iter().flat_map(|p| WEB_CACHE_SUBS.iter().map(move |s| p.join(s))).collect()
+}
+
 /// The last folder names the cleaner accepts as a target.
-const SAFE_LEAVES: &[&str] =
-    &["temp", "d3dscache", "dxcache", "glcache", "dxccache", "vkcache", "appcache", "htmlcache", "httpcache", "cache"];
+const SAFE_LEAVES: &[&str] = &["temp", "d3dscache", "dxcache", "glcache", "dxccache", "vkcache", "appcache", "httpcache", "cache"];
+/// Accepted only inside a launcher's web profile (`htmlcache` / `webcache*` somewhere above them).
+const WEB_LEAVES: &[&str] = &["code cache", "gpucache", "cachestorage"];
 
 /// A target folder is safe when it is absolute, at least two folders deep (`C:\Windows\Temp`), ends in a known cache
 /// name, and is not one of the big known folders itself.
@@ -149,7 +173,12 @@ pub fn is_safe_target(path: &Path, known: &KnownDirs) -> bool {
         Some(l) => l.to_string_lossy().to_lowercase(),
         None => return false,
     };
-    if !(SAFE_LEAVES.contains(&leaf.as_str()) || leaf.starts_with("webcache")) {
+    // inside a launcher's web profile (the profile itself is never a target)
+    let in_web_profile = path.ancestors().skip(1).filter_map(|a| a.file_name()).any(|n| {
+        let n = n.to_string_lossy().to_lowercase();
+        n == "htmlcache" || n.starts_with("webcache")
+    });
+    if !(SAFE_LEAVES.contains(&leaf.as_str()) || (WEB_LEAVES.contains(&leaf.as_str()) && in_web_profile)) {
         return false;
     }
     let same = |a: &Path, b: &Path| a.to_string_lossy().trim_end_matches('\\').eq_ignore_ascii_case(b.to_string_lossy().trim_end_matches('\\'));
@@ -346,10 +375,10 @@ impl CleanPlan {
     pub fn row(&self, kind: CleanKind) -> Option<&CleanRow> {
         self.rows.iter().find(|r| r.kind == kind)
     }
-    /// The ticks on open: every row with something in it (DESIGN: all four ticked; a 0 B row is greyed).
-    /// **unclear** in DESIGN: whether the recycle bin starts ticked — kept ticked as drawn.
+    /// The ticks on open: the rows ticked by default ([`CleanKind::ticked_by_default`]) that have something in them
+    /// (a 0 B row is greyed).
     pub fn default_ticked(&self) -> Vec<CleanKind> {
-        self.rows.iter().filter(|r| !r.is_empty()).map(|r| r.kind).collect()
+        self.rows.iter().filter(|r| !r.is_empty() && r.kind.ticked_by_default()).map(|r| r.kind).collect()
     }
     /// "Clean 14.4 GB": the ticked total.
     pub fn ticked_bytes(&self, ticked: &[CleanKind]) -> u64 {

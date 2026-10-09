@@ -62,7 +62,7 @@ fn updates_and_links_use_the_public_repo() {
     assert_eq!(update::REPO, "oneboyler/boyler-utilities");
     assert_eq!(update::page_url(true), "https://github.com/oneboyler/boyler-utilities/releases");
     assert_eq!(update::page_url(false), "https://github.com/oneboyler/boyler-utilities");
-    assert_eq!(VERSION, "1.0.2");
+    assert_eq!(VERSION, env!("CARGO_PKG_VERSION"), "the shown version is the package version (no hard-coded copy to forget on a bump)");
 }
 
 #[test]
@@ -555,10 +555,10 @@ fn licences_open_a_part_and_go_back() {
     assert!(s.describe().ends_with("lic=-"), "{}", s.describe());
     ev(&mut s, &g, Ev::Click(K_LIC), 0.0);
     assert!(s.describe().contains("lic=list:"), "{}", s.describe());
-    // the list: header, line, a group header + box per group
+    // the list: header, line, a group header + box per group (Skia, Rust, Setup, Add-ons, Cursor packs, Data)
     let mut st = CssState::default();
     let mut cx = Cx::new(0.0, false, &g, &mut st);
-    assert_eq!(s.build(&mut cx).len(), 2 + 2 * 4);
+    assert_eq!(s.build(&mut cx).len(), 2 + 2 * 6);
     let d = licences::parse(licences::SRC).unwrap();
     let icu = d.parts.iter().position(|p| p.name == "ICU").unwrap();
     ev(&mut s, &g, Ev::Click(idx(licences::K_ROW, icu)), 0.0);

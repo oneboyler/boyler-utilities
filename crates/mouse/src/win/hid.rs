@@ -91,7 +91,10 @@ fn info(path: &str) -> Option<HidInfo> {
 
 /// Every HID interface present (read-only).
 pub fn list() -> Result<Vec<HidInfo>> {
-    Ok(interface_paths()?.iter().filter_map(|p| info(p)).collect())
+    let mut all: Vec<HidInfo> = interface_paths()?.iter().filter_map(|p| info(p)).collect();
+    let extra = raw_input_mice(&all);
+    all.extend(extra);
+    Ok(all)
 }
 
 struct Handle(HANDLE);
@@ -173,4 +176,101 @@ fn wait(h: &Handle, ev: &Handle, ov: &mut OVERLAPPED, deadline: Instant, n: &mut
     unsafe { GetOverlappedResult(h.0, ov, n, false) }.map_err(|e| super::hr(op, e))?;
     let _ = unsafe { windows::Win32::System::Threading::ResetEvent(ev.0) };
     Ok(())
+}
+
+/// The device paths of every mouse Windows' Raw Input lists (`RIM_TYPEMOUSE`): the second source for "which mice are
+/// connected", for a mouse whose HID mouse collection did not show in the HID list (Order 061: a friend's Pulsar X2 V2 was
+/// not found at all). Reads Windows' list only; nothing is sent to any device.
+fn raw_input_mouse_paths() -> Vec<String> {
+    use windows::Win32::UI::Input::{GetRawInputDeviceInfoW, GetRawInputDeviceList, RAWINPUTDEVICELIST, RIDI_DEVICENAME, RIM_TYPEMOUSE};
+    let sz = size_of::<RAWINPUTDEVICELIST>() as u32;
+    let mut n = 0u32;
+    if unsafe { GetRawInputDeviceList(None, &mut n, sz) } == u32::MAX || n == 0 {
+        return Vec::new();
+    }
+    let mut list = vec![RAWINPUTDEVICELIST::default(); n as usize + 8];
+    let mut n2 = list.len() as u32;
+    let got = unsafe { GetRawInputDeviceList(Some(list.as_mut_ptr()), &mut n2, sz) };
+    if got == u32::MAX {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for d in list.iter().take(got as usize).filter(|d| d.dwType == RIM_TYPEMOUSE) {
+        let mut len = 0u32;
+        if unsafe { GetRawInputDeviceInfoW(Some(d.hDevice), RIDI_DEVICENAME, None, &mut len) } == u32::MAX || len == 0 {
+            continue;
+        }
+        let mut buf = vec![0u16; len as usize + 1];
+        let r = unsafe { GetRawInputDeviceInfoW(Some(d.hDevice), RIDI_DEVICENAME, Some(buf.as_mut_ptr() as *mut _), &mut len) };
+        if r == u32::MAX {
+            continue;
+        }
+        out.push(super::wide_to_string(&buf));
+    }
+    out
+}
+
+/// `VID_3710&PID_5406` (USB) or `VID&0002046d_PID&b037` (Bluetooth: 4-digit source + vendor id) in a device path → (vid, pid).
+pub fn ids_from_path(path: &str) -> Option<(u16, u16)> {
+    let l = path.to_ascii_lowercase();
+    let hex = |s: &str, from: usize, n: usize| -> Option<u16> { u16::from_str_radix(s.get(from..from + n)?, 16).ok() };
+    if let (Some(v), Some(p)) = (l.find("vid_"), l.find("pid_")) {
+        return Some((hex(&l, v + 4, 4)?, hex(&l, p + 4, 4)?));
+    }
+    if let (Some(v), Some(p)) = (l.find("vid&"), l.find("pid&")) {
+        // the Bluetooth form: 2 hex digits of vendor-id source + 4 of vendor id ("0002046d"), 4 of product id
+        return Some((hex(&l, v + 8, 4)?, hex(&l, p + 4, 4)?));
+    }
+    None
+}
+
+/// Mice that Windows (Raw Input) knows but the HID list has no mouse collection for, as `HidInfo` entries with the mouse's
+/// usage (1 / 2). A mouse with no USB id at all (touchpad, PS/2, a remote session) comes as vid 0 / pid 0 - one entry.
+/// Virtual devices (remote desktop, root-enumerated) are left out.
+pub fn raw_input_mice(known: &[HidInfo]) -> Vec<HidInfo> {
+    let mut out: Vec<HidInfo> = Vec::new();
+    for path in raw_input_mouse_paths() {
+        let l = path.to_ascii_lowercase();
+        if l.contains("rdp_mou") || l.contains("#root#") || l.contains("\root#") || l.contains("root#") {
+            continue;
+        }
+        let (vid, pid) = ids_from_path(&path).unwrap_or((0, 0));
+        let seen = |h: &HidInfo| h.vid == vid && h.pid == pid && h.usage_page == 0x01 && h.usage == 0x02;
+        if known.iter().any(seen) || out.iter().any(seen) {
+            continue;
+        }
+        let mut h = info(&path).unwrap_or(HidInfo {
+            path: path.clone(),
+            vid,
+            pid,
+            version: 0,
+            usage_page: 0,
+            usage: 0,
+            input_len: 0,
+            output_len: 0,
+            feature_len: 0,
+            interface: interface_number(&path),
+            product: None,
+            manufacturer: None,
+        });
+        // the ids of the path win when the device would not open (they are what Windows says it is)
+        h.vid = vid;
+        h.pid = pid;
+        h.usage_page = 0x01;
+        h.usage = 0x02;
+        out.push(h);
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ids_come_out_of_usb_and_bluetooth_paths() {
+        assert_eq!(ids_from_path(r"\?\HID#VID_3710&PID_5406&MI_00#7&1a2b#{378de44c-56ef-11d1-bc8c-00a0c91405dd}"), Some((0x3710, 0x5406)));
+        assert_eq!(ids_from_path(r"\?\HID#{00001124-0000-1000-8000-00805f9b34fb}_VID&0002046d_PID&b037#9&2&0000"), Some((0x046D, 0xB037)));
+        assert_eq!(ids_from_path(r"\?\ACPI#PNP0F13#4&1#{378de44c}"), None);
+    }
 }

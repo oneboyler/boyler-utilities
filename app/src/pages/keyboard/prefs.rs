@@ -12,6 +12,9 @@ const K_ON: &str = "on";
 const K_PACK: &str = "pack";
 const K_VOLUME: &str = "volume";
 const K_GAME: &str = "off_in_game";
+const K_REPEAT: &str = "repeat_ms";
+const K_MOUSE: &str = "mouse_on";
+const K_MOUSE_VOL: &str = "mouse_volume";
 const K_RULES: &str = "rules";
 const K_BINDS: &str = "binds";
 const K_MACROS: &str = "macros";
@@ -87,7 +90,10 @@ impl Prefs {
             s: Settings {
                 pack,
                 volume: store.i64_or(scope(), K_VOLUME, i64::from(DEFAULT_VOLUME)).clamp(0, 100) as u8,
-                off_in_game: store.bool_or(scope(), K_GAME, true),
+                off_in_game: store.bool_or(scope(), K_GAME, false),
+                repeat_ms: store.i64_or(scope(), K_REPEAT, 0).clamp(0, 80) as u8,
+                mouse_on: store.bool_or(scope(), K_MOUSE, false),
+                mouse_volume: store.i64_or(scope(), K_MOUSE_VOL, i64::from(DEFAULT_VOLUME)).clamp(0, 100) as u8,
                 rules,
             },
             binds: Binds::from_lines(store.get_list(scope(), K_BINDS).unwrap_or_default()),
@@ -101,6 +107,9 @@ impl Prefs {
         let _ = store.set_str(scope(), K_PACK, &self.s.pack.to_key());
         let _ = store.set_i64(scope(), K_VOLUME, i64::from(self.s.volume));
         let _ = store.set_bool(scope(), K_GAME, self.s.off_in_game);
+        let _ = store.set_i64(scope(), K_REPEAT, i64::from(self.s.repeat_ms));
+        let _ = store.set_bool(scope(), K_MOUSE, self.s.mouse_on);
+        let _ = store.set_i64(scope(), K_MOUSE_VOL, i64::from(self.s.mouse_volume));
         let rules: Vec<String> = self.s.rules.iter().take(MAX_RULES).map(rule_text).collect();
         let _ = store.set_list(scope(), K_RULES, &rules);
         let _ = store.set_list(scope(), K_BINDS, &self.binds.to_lines());
@@ -139,7 +148,10 @@ mod tests {
         let p = Prefs::load(&store);
         assert!(!p.on, "off by default: nothing listens");
         assert_eq!(p.s.volume, 5);
-        assert!(p.s.off_in_game);
+        assert!(!p.s.off_in_game, "off by default: sounds play in games");
+        assert_eq!(p.s.repeat_ms, 0);
+        assert!(!p.s.mouse_on, "Order 064: mouse clicks are off by default");
+        assert_eq!(p.s.mouse_volume, 5, "and quiet");
         assert_eq!(p.s.pack, Pack::Builtin(PackId::Linear));
         assert!(p.s.rules.is_empty());
         assert_eq!(p, Prefs::default());
@@ -162,7 +174,10 @@ mod tests {
             s: Settings {
                 pack: Pack::Imported("Holy Panda".into()),
                 volume: 12,
-                off_in_game: false,
+                off_in_game: true,
+                repeat_ms: 35,
+                mouse_on: true,
+                mouse_volume: 9,
                 rules: vec![Rule { exe: "discord.exe".into(), pack: None }, Rule { exe: "notepad.exe".into(), pack: Some(Pack::Builtin(PackId::Typewriter)) }],
             },
         };
@@ -176,7 +191,7 @@ mod tests {
         let text = std::fs::read_to_string(again.path()).unwrap();
         for line in text.lines().filter(|l| l.starts_with("page:keyboard")) {
             let key = line.split('\t').nth(1).unwrap();
-            assert!(["on", "pack", "volume", "off_in_game", "rules", "binds", "macros", "size"].contains(&key), "unexpected setting {key}");
+            assert!(["on", "pack", "volume", "off_in_game", "repeat_ms", "mouse_on", "mouse_volume", "rules", "binds", "macros", "size"].contains(&key), "unexpected setting {key}");
         }
     }
 

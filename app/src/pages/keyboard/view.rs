@@ -27,9 +27,9 @@ fn title_of(exe: &str) -> String {
 impl Keyboard {
     pub(super) fn view(&mut self, cx: &mut Cx) -> Vec<El> {
         let mut kids = vec![pieces::header(self.name(), None)];
+        kids.extend(self.keys_group(cx));
         kids.extend(self.sounds(cx));
         kids.extend(self.rules(cx));
-        kids.extend(self.keys_group(cx));
         kids.extend(self.macros_group(cx));
         kids.push(reset::reset_line(cx, K_RESET, Some("Windows defaults")));
         kids
@@ -54,24 +54,49 @@ impl Keyboard {
             .child(El::icon("play", 9.0, 1.0, cmix(FG2(), crate::ui::WHITE, hv)).no_hit());
         let v = self.prefs.s.volume;
         let vol = slider::slider(cx, K_VOL, f32::from(v) / 100.0, 150.0, 20.0, slider::default());
-        let rows = vec![
+        let mut rows = vec![
             group::row(false, vec![group::lbl("Sound", None), group::ctl(vec![pack, play])]),
             group::row(false, vec![group::lbl("Volume", None), group::ctl(vec![vol, slider::value_label(&format!("{v} %"))])]),
+            group::row(
+                false,
+                vec![
+                    group::lbl("Ignore repeats within", Some("For a keyboard that presses twice")),
+                    group::ctl(vec![slider::slider(cx, K_REP, f32::from(self.prefs.s.repeat_ms) / 80.0, 110.0, 20.0, slider::default()), slider::value_label(&if self.prefs.s.repeat_ms == 0 { "Off".to_string() } else { format!("{} ms", self.prefs.s.repeat_ms) })]),
+                ],
+            ),
             group::row(
                 false,
                 vec![group::lbl("Off while a game is in front", Some("Fullscreen games stay silent, so nothing plays over your game")), group::ctl(vec![toggle::toggle(cx, K_GAME, self.prefs.s.off_in_game, false)])],
             ),
             group::row(
                 false,
-                vec![group::lbl("Try it", Some("Nothing you type here is kept")), group::ctl(vec![tinput::kdin(cx, K_TRY, &self.try_text, "Type here to hear it", 230.0)])],
+                vec![
+                    group::lbl("Mouse clicks too", Some("Side buttons sound like your keys, clicks get their own sound")),
+                    group::ctl(vec![toggle::toggle(cx, K_MOUSE, self.prefs.s.mouse_on, false)]),
+                ],
             ),
         ];
+        if self.prefs.s.mouse_on {
+            let mv = self.prefs.s.mouse_volume;
+            let vol = slider::slider(cx, K_MVOL, f32::from(mv) / 100.0, 150.0, 20.0, slider::default());
+            rows.push(group::row(false, vec![group::lbl("Mouse volume", None), group::ctl(vec![vol, slider::value_label(&format!("{mv} %"))])]));
+        }
+        rows.push(group::row(
+            false,
+            vec![group::lbl("Try it", Some("Nothing you type here is kept")), group::ctl(vec![tinput::kdin(cx, K_TRY, &self.try_text, "Type here to hear it", 230.0)])],
+        ));
         let mut rest = El::col().items(AlignItems::STRETCH).children(rows).opacity(if on { 1.0 } else { 0.38 });
         if !on {
             rest = rest.no_hit();
         }
         let mut out = vec![group::gh("Key sounds"), group::grp(vec![head, rest])];
         out.push(group::gf(PRIVACY));
+        out.push(group::gf("“Mouse clicks too”: the side buttons play the key sound of your Sound, left and right click and the wheel click play a click made to suit it. Only which button went down or up is heard - never where the mouse is or what you click. Off by default; it follows “Off while a game is in front” and “Ignore repeats”."));
+        out.push(group::gf("“Ignore repeats”: a second press of the same key within that many ms plays no sound. It works on the sounds only - the app never blocks or changes what you type. While it is on, the last few keys are remembered for at most 80 ms to tell a repeat; nothing is saved. Off (0) by default."));
+        out.push(group::gf("More sounds: Sound › Get more sounds lists the community packs of mechvibes.com and downloads one with a click. A pack you already have as a .zip: Sound › Import a Mechvibes pack."));
+        if let Some(m) = &self.import_msg {
+            out.push(group::gf(&format!("Not imported: {m}")));
+        }
         if let Some(m) = &self.sound_msg {
             out.push(group::gf(&format!("The sound couldn't start: {m}")));
         }
@@ -118,14 +143,14 @@ impl Keyboard {
         let (bg, rim) = group::glass();
         let inner_w = 544.0 - 16.0;
         let pic = self.picture(cx, inner_w);
-        let hint = El::text("Click a key to change it", Font::new(12.0, 400), FG3(), lh(12.0, 1.35)).align(Align::Center).margin(8.0, 0.0, 0.0, 0.0);
+        let hint = El::text("Click a key to change it · keys in blue do something special", Font::new(12.0, 400), FG3(), lh(12.0, 1.35)).align(Align::Center).margin(8.0, 0.0, 0.0, 0.0);
         let card = El::col().items(AlignItems::STRETCH).pad(14.0, 8.0, 10.0, 8.0).radius(12.0).bg(bg).inset(&rim).child(pic).child(hint);
         let mut out = vec![head, card];
-        if self.sel.is_some() {
-            out.push(self.key_card(cx));
-        }
         out.push(self.keys_foot(cx));
-        out.push(group::gf("Keys are named after your Windows keyboard layout. A changed key glows. Remaps are listed in “Back to how your PC was”."));
+        if let Some(n) = &self.loop_note {
+            out.push(group::gf(n));
+        }
+        out.push(group::gf("Keys are named after your Windows keyboard layout. A key in blue has a remap, an action or a macro. Remaps are listed in “Back to how your PC was”."));
         out
     }
 
@@ -166,46 +191,41 @@ impl Keyboard {
         wrap
     }
 
-    /// The key's card: what this key does (the controller's part card).
-    fn key_card(&mut self, cx: &mut Cx) -> El {
-        let Some(code) = self.sel else { return El::block() };
+    /// The key's own small window (the controller's part window): what this key does - Normal / Remap / Action / Macro and
+    /// "Reset this key". Nothing of it sits in the tab.
+    fn key_window(&mut self, cx: &mut Cx) -> Option<El> {
+        let code = self.sel?;
         let app = self.app_action_on(code);
         let mode = self.want.unwrap_or_else(|| self.mode_of(code));
-        let (bg, rim) = group::glass();
-        let title = format!("{} key", self.label_of(code));
         let sub_t = if mode == Mode::Normal { "as Windows made it" } else { "changed" };
-        let head = El::row()
-            .center()
-            .gap(10.0)
-            .pad(12.0, 14.0, 6.0, 14.0)
-            .child(El::text(&title, Font::display(14.0, 600).ls(-100), FG(), lh(14.0, 1.3)).flex1().ellipsis())
-            .child(El::text(sub_t, Font::new(11.5, 400), FG3(), lh(11.5, 1.35)).none())
-            .child(button::icon_btn(cx, K_CARDX, "x", 9.0, 1.5));
         let labels: Vec<&str> = Mode::ALL.iter().map(|m| m.label()).collect();
         let on = Mode::ALL.iter().position(|m| *m == mode).unwrap_or(0);
         let seg_el = seg::seg(cx, K_MODE, &labels, on, false);
-        let mut kids = vec![head, El::row().pad(4.0, 14.0, 10.0, 14.0).child(seg_el)];
+        let state = El::row().center().gap(8.0).child(seg_el).child(El::block().flex1()).child(El::text(sub_t, Font::new(11.5, 400), FG3(), lh(11.5, 1.35)).none());
+        let mut kids = vec![state.margin(0.0, 0.0, 10.0, 0.0)];
         match mode {
             Mode::Normal => {
                 if let Some(a) = &app {
-                    kids.push(note(&format!("This key runs “{a}” (set in Settings › All shortcuts).")));
+                    kids.push(group::gf(&format!("This key runs “{a}” (set in Settings › All shortcuts).")));
+                } else {
+                    kids.push(group::gf("Pick what this key should do: another key, a ready-made action, or a macro."));
                 }
             }
             Mode::Remap => {
                 let to = self.model.remap_of(code);
                 let name = to.map(|t| if t == remap::DISABLED { "Disabled".to_string() } else { self.label_of(t) });
                 let show = if self.choosing { Show::Listening(None) } else if let Some(n) = name.as_deref() { Show::Set(n) } else { Show::Empty };
-                let field = keyfield::keyfield(cx, K_TARGET, show, self.opened_at, true).w(170.0);
+                let field = keyfield::keyfield(cx, K_TARGET, show, self.key_at, true).w(160.0);
                 let pick = dropdown::dropdown(cx, K_TPICK, "Pick from a list", None);
-                kids.push(group::row(true, vec![group::lbl("Becomes", None), group::ctl(vec![field, pick])]));
-                kids.push(note("Press the new key, click it on the picture above, or pick it from the list. Windows' own key map: one admin Yes and a restart. It works in every app and game."));
+                kids.push(group::grp(vec![group::row(true, vec![group::lbl("Becomes", None), group::ctl(vec![field, pick])])]));
+                kids.push(group::gf("Press the new key, or pick it from the list. Windows' own key map: one admin Yes and a restart. It works in every app and game."));
             }
             Mode::Action => {
                 let cur = match self.model.binds.get(code) {
                     Some(Bind::Preset(p)) => p.name().to_string(),
                     _ => app.clone().unwrap_or_else(|| "Choose an action".into()),
                 };
-                kids.push(group::row(true, vec![group::lbl("Does", None), group::ctl(vec![dropdown::dropdown(cx, K_ACT, &cur, Some(210.0))])]));
+                let mut rows = vec![group::row(true, vec![group::lbl("Does", None), group::ctl(vec![dropdown::dropdown(cx, K_ACT, &cur, Some(220.0))])])];
                 if let Some(Bind::Preset(p)) = self.model.binds.get(code) {
                     if let Some(t) = p.target() {
                         let ph = match p {
@@ -218,12 +238,13 @@ impl Keyboard {
                             Preset::OpenFolder(_) => "Folder",
                             _ => "App or file",
                         };
-                        let field = tinput::kdin(cx, K_ATEXT, t, ph, 220.0);
+                        let field = tinput::kdin(cx, K_ATEXT, t, ph, 200.0);
                         let browse = if matches!(p, Preset::OpenWeb(_)) { El::block() } else { link::link(cx, K_ABROWSE, "Browse…", 12.0) };
-                        kids.push(group::row(false, vec![group::lbl(what, None), group::ctl(vec![field, browse])]));
+                        rows.push(group::row(false, vec![group::lbl(what, None), group::ctl(vec![field, browse])]));
                     }
                 }
-                kids.push(note("Works right away. The key does this instead of its normal job; it is left alone while a game or a full-screen window is in front."));
+                kids.push(group::grp(rows));
+                kids.push(group::gf("Works right away. The key does this instead of its normal job; it is left alone while a game or a full-screen window is in front."));
             }
             Mode::Macro => {
                 let cur = match self.model.binds.get(code) {
@@ -234,19 +255,18 @@ impl Keyboard {
                 if matches!(self.model.binds.get(code), Some(Bind::Macro(_))) {
                     ctl.push(link::link(cx, K_MACEDIT, "Edit", 12.0));
                 }
-                kids.push(group::row(true, vec![group::lbl("Runs", None), group::ctl(ctl)]));
-                kids.push(note("Works right away. A macro never runs while a game or a full-screen window is in front, and never types into admin windows."));
+                kids.push(group::grp(vec![group::row(true, vec![group::lbl("Runs", None), group::ctl(ctl)])]));
+                kids.push(group::gf("Works right away. A macro never runs while a game or a full-screen window is in front, and never types into admin windows."));
             }
         }
         if let Some(e) = &self.err {
             kids.push(keyfield::error_line(e));
         }
         if mode != Mode::Normal {
-            kids.push(El::row().justify(taffy::style::JustifyContent::FLEX_END).pad(0.0, 14.0, 12.0, 14.0).child(link::link(cx, K_RESETKEY, "Reset this key", 12.0)));
-        } else {
-            kids.push(El::block().h(8.0));
+            kids.push(El::row().justify(taffy::style::JustifyContent::FLEX_END).margin(10.0, 0.0, 0.0, 0.0).child(link::link(cx, K_RESETKEY, "Reset this key", 12.0)));
         }
-        El::col().items(AlignItems::STRETCH).margin(10.0, 0.0, 0.0, 0.0).radius(12.0).bg(bg).inset(&rim).children(kids)
+        let body = El::col().items(AlignItems::STRETCH).children(kids);
+        Some(dialog::dialog(cx, K_KD, KD_W, &format!("{} key", self.label_of(code)), vec![body], vec![], true, self.key_at))
     }
 
     fn keys_foot(&mut self, cx: &mut Cx) -> El {
@@ -291,7 +311,7 @@ impl Keyboard {
                 vec![name, El::text(&on, Font::new(11.5, 400), FG2(), lh(11.5, 1.35)).none(), link::link(cx, idx(K_MEDIT, i), "Edit", 12.0)],
             ));
         }
-        rows.push(group::row(self.model.macros.is_empty(), vec![link::link(cx, K_MNEW, "+ New macro", 12.0)]));
+        rows.push(group::row(self.model.macros.is_empty(), vec![link::link(cx, K_MNEW, "+ New macro", 12.0), El::block().flex1(), link::link(cx, K_MTPL, "+ Ready-made macro", 12.0)]));
         vec![
             group::gh("Macros"),
             group::grp(rows),
@@ -320,6 +340,12 @@ impl Keyboard {
 
     pub(super) fn popups(&mut self, cx: &mut Cx) -> Option<El> {
         let mut kids: Vec<El> = Vec::new();
+        if let Some(d) = self.key_window(cx) {
+            kids.push(d);
+        }
+        if let Some(d) = self.getter(cx) {
+            kids.push(d);
+        }
         if let Some(id) = self.edit.clone() {
             if let Some(d) = self.editor(cx, &id) {
                 kids.push(d);
@@ -334,7 +360,10 @@ impl Keyboard {
                     _ => Row::Item(It::tick(label.as_str(), *on)),
                 })
                 .collect();
-            kids.push(mitems::menu(cx, K_MENU, &rows, Place::Under(a.0, a.1, a.2, a.3), a.2.max(170.0)).z(20));
+            // a long list (the ready-made actions) scrolls inside its 300 px box
+            let at = Place::Under(a.0, a.1, a.2, a.3);
+            let menu = if rows.len() > 14 { mitems::menu_scroll(cx, K_MENU, &rows, at, a.2.max(170.0)) } else { mitems::menu(cx, K_MENU, &rows, at, a.2.max(170.0)) };
+            kids.push(menu.z(20));
         }
         if kids.is_empty() {
             None
@@ -408,15 +437,39 @@ impl Keyboard {
                 if *k == K_VOL {
                     self.set_volume(slider::value_at(*r, *x), cx);
                 }
+                if *k == K_REP {
+                    self.set_repeat(slider::value_at(*r, *x));
+                }
+                if *k == K_MVOL {
+                    self.set_mouse_volume(slider::value_at(*r, *x));
+                }
                 let _ = y;
             }
             Ev::Drag(k, x, _, r) if *k == K_VOL => self.set_volume(slider::value_at(*r, *x), cx),
-            Ev::Release(k) if *k == K_VOL => self.save(),
+            Ev::Drag(k, x, _, r) if *k == K_REP => self.set_repeat(slider::value_at(*r, *x)),
+            Ev::Drag(k, x, _, r) if *k == K_MVOL => self.set_mouse_volume(slider::value_at(*r, *x)),
+            Ev::Release(k) if *k == K_VOL || *k == K_REP || *k == K_MVOL => self.save(),
             Ev::Click(k) => self.clicked(*k, cx),
             Ev::Char(k, c) => self.typed(*k, *c, cx),
             Ev::Key(k, vk) => self.key_down(*k, *vk, cx),
             Ev::Blur(k) if *k == K_TARGET => self.choosing = false,
             _ => {}
+        }
+    }
+
+    /// "Ignore repeats within": 0 (off) to 80 ms.
+    pub(super) fn set_repeat(&mut self, v: f32) {
+        self.prefs.s.repeat_ms = (v.clamp(0.0, 1.0) * 80.0).round() as u8;
+        if !self.test && self.prefs.on {
+            glue::engine().update(self.prefs.s.clone());
+        }
+    }
+
+    /// The mouse sounds' own volume, 0-100 %.
+    pub(super) fn set_mouse_volume(&mut self, v: f32) {
+        self.prefs.s.mouse_volume = (v.clamp(0.0, 1.0) * 100.0).round() as u8;
+        if !self.test && self.prefs.on {
+            glue::engine().update(self.prefs.s.clone());
         }
     }
 
@@ -429,6 +482,9 @@ impl Keyboard {
     }
 
     fn clicked(&mut self, k: Key, cx: &mut Cx) {
+        if self.get_clicked(k, cx) {
+            return;
+        }
         // the reset line
         if k == sub(K_RESET, "pc") || k == sub(K_RESET, "win") {
             let rect = self.press.filter(|(pk, _)| *pk == k).map(|(_, r)| r).unwrap_or((0.0, 0.0, 0.0, 0.0));
@@ -445,6 +501,20 @@ impl Keyboard {
                     }
                     return;
                 }
+            }
+        }
+        // the key's window: its × / a click beside it close it; a click inside is its own
+        if self.edit.is_none() && self.sel.is_some() {
+            if k == sub(K_KD, "win") {
+                return;
+            }
+            if k == sub(K_KD, "x") || k == sub(K_KD, "out") {
+                if self.pop.is_some() {
+                    self.pop = None;
+                } else {
+                    self.select(None);
+                }
+                return;
             }
         }
         // the macro window
@@ -518,6 +588,11 @@ impl Keyboard {
                 self.prefs.s.off_in_game = !self.prefs.s.off_in_game;
                 self.save();
             }
+            K_MOUSE => {
+                self.prefs.s.mouse_on = !self.prefs.s.mouse_on;
+                self.save();
+                cx.toast(if self.prefs.s.mouse_on { "Mouse clicks on" } else { "Mouse clicks off · the app stops listening to the mouse" });
+            }
             K_RADD => {
                 if let Some(path) = cx.pick_file("Pick the app", &[("Programs", "*.exe")]) {
                     let exe = path.rsplit(['\\', '/']).next().unwrap_or("").to_ascii_lowercase();
@@ -533,7 +608,6 @@ impl Keyboard {
                 self.save();
                 cx.toast("Every key is back as Windows made it · Apply remaps to save");
             }
-            K_CARDX => self.select(None),
             K_TARGET => {
                 self.choosing = true;
                 cx.focus(Some(K_TARGET));
@@ -566,6 +640,7 @@ impl Keyboard {
                 }
             }
             K_APPLY => self.start_apply(cx),
+            K_MTPL => self.open_pop(Pop::Templates, k),
             K_MNEW => {
                 if let Some(id) = self.new_macro() {
                     self.open_editor(&id, cx.now);

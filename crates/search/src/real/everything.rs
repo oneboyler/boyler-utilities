@@ -98,9 +98,14 @@ pub fn ntfs_drives(hwnd: HWND) -> String {
 
 /// `EVERYTHING_IPC_QUERY2` + the search text (UTF-16, 0-terminated), as the bytes `WM_COPYDATA` carries.
 pub fn query2_bytes(reply_hwnd: u32, search: &str, max: u32, request_flags: u32) -> Vec<u8> {
+    query2_bytes_at(reply_hwnd, search, 0, max, request_flags)
+}
+
+/// [`query2_bytes`] for the page of results that starts at `offset` (Order 069: Storage reads a whole drive in pages).
+pub fn query2_bytes_at(reply_hwnd: u32, search: &str, offset: u32, max: u32, request_flags: u32) -> Vec<u8> {
     let mut b = Vec::new();
     // reply_hwnd, reply_copydata_message, search_flags, offset, max_results, request_flags, sort_type
-    for v in [reply_hwnd, REPLY_ID, 0, 0, max, request_flags, SORT_NAME_ASCENDING] {
+    for v in [reply_hwnd, REPLY_ID, 0, offset, max, request_flags, SORT_NAME_ASCENDING] {
         b.extend_from_slice(&v.to_le_bytes());
     }
     for u in search.encode_utf16().chain(Some(0)) {
@@ -247,6 +252,123 @@ pub fn query_text(everything: HWND, text: &str, max: u32, timeout: Duration) -> 
     loop {
         if let Some(b) = REPLY.with(|r| r.borrow_mut().take()) {
             return parse_list2(&b);
+        }
+        let left = until.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(SearchError::Everything("no answer in time".into()));
+        }
+        unsafe {
+            let mut m = MSG::default();
+            while PeekMessageW(&mut m, None, 0, 0, PM_REMOVE).as_bool() {
+                let _ = TranslateMessage(&m);
+                DispatchMessageW(&m);
+            }
+            if REPLY.with(|r| r.borrow().is_some()) {
+                continue;
+            }
+            MsgWaitForMultipleObjects(None, false, (left.as_millis() as u32).clamp(1, 100), QS_ALLINPUT);
+        }
+    }
+}
+
+// ------------------------------------------------------------------------------------------------- whole-drive lists (Order 069)
+
+/// `EVERYTHING_IPC_QUERY2_REQUEST_ATTRIBUTES`
+const REQUEST_ATTRIBUTES: u32 = 0x100;
+
+/// One item of a list: a file or a folder with the size and attributes Everything's index holds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListItem {
+    pub name: String,
+    /// the folder it is in (a drive root has none)
+    pub dir: String,
+    /// bytes (a file's size; `u64::MAX` = Everything keeps none)
+    pub size: u64,
+    /// Windows file attributes (0 when none came)
+    pub attrs: u32,
+    pub is_folder: bool,
+}
+
+/// One page of a list: how many items match in all, and this page's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListPage {
+    pub total: usize,
+    pub items: Vec<ListItem>,
+}
+
+/// What a list asks for: name, folder, size, attributes (nothing else is sent - the reply is as small as it can be).
+pub const LIST_FIELDS: u32 = REQUEST_NAME | REQUEST_PATH | REQUEST_SIZE | REQUEST_ATTRIBUTES;
+
+/// The reply of a [`LIST_FIELDS`] query (`parse_list2` reads the Search tab's fields; this one the list's).
+pub fn parse_list(b: &[u8]) -> Result<ListPage> {
+    let bad = || SearchError::Everything("a reply Everything sent could not be read".into());
+    let total = u32_at(b, 0).ok_or_else(bad)? as usize;
+    let n = u32_at(b, 4).ok_or_else(bad)? as usize;
+    // the count comes from another process: it must fit the bytes actually sent (never a huge allocation)
+    if n > b.len().saturating_sub(20) / 8 {
+        return Err(bad());
+    }
+    let flags = u32_at(b, 12).ok_or_else(bad)?;
+    let mut items = Vec::with_capacity(n);
+    for i in 0..n {
+        let at = 20 + i * 8;
+        let item_flags = u32_at(b, at).ok_or_else(bad)?;
+        let mut p = u32_at(b, at + 4).ok_or_else(bad)? as usize;
+        let (mut name, mut dir, mut size, mut attrs) = (String::new(), String::new(), u64::MAX, 0u32);
+        if flags & REQUEST_NAME != 0 {
+            let (s, q) = str_at(b, p).ok_or_else(bad)?;
+            name = s;
+            p = q;
+        }
+        if flags & REQUEST_PATH != 0 {
+            let (s, q) = str_at(b, p).ok_or_else(bad)?;
+            dir = s;
+            p = q;
+        }
+        for f in [0x4u32, 0x8] {
+            if flags & f != 0 {
+                p = str_at(b, p).ok_or_else(bad)?.1;
+            }
+        }
+        if flags & REQUEST_SIZE != 0 {
+            size = u64_at(b, p).ok_or_else(bad)?;
+            p += 8;
+        }
+        // dates (created 0x20, modified 0x40, accessed 0x80): 8 bytes each, never asked
+        for f in [0x20u32, 0x40, 0x80] {
+            if flags & f != 0 {
+                p += 8;
+            }
+        }
+        if flags & REQUEST_ATTRIBUTES != 0 {
+            attrs = u32_at(b, p).ok_or_else(bad)?;
+        }
+        items.push(ListItem { name, dir, size, attrs, is_folder: item_flags & (ITEM_FOLDER | 0x2) != 0 });
+    }
+    Ok(ListPage { total, items })
+}
+
+/// One page of a list: Everything's own search text (`C:\ file:`), the page that starts at `offset`, at most `max` items.
+pub fn list_page(everything: HWND, text: &str, offset: u32, max: u32, timeout: Duration) -> Result<ListPage> {
+    let b = ask_list(everything, text, offset, max, LIST_FIELDS, timeout)?;
+    parse_list(&b)
+}
+
+/// Send one QUERY2 and wait for the reply bytes.
+fn ask_list(everything: HWND, text: &str, offset: u32, max: u32, flags: u32, timeout: Duration) -> Result<Vec<u8>> {
+    let win = ReplyWindow::new()?;
+    REPLY.with(|r| *r.borrow_mut() = None);
+    let bytes = query2_bytes_at(win.0 .0 as usize as u32, text, offset, max, flags);
+    let cds = COPYDATASTRUCT { dwData: COPYDATA_QUERY2W, cbData: bytes.len() as u32, lpData: bytes.as_ptr() as *mut _ };
+    let mut ok = 0usize;
+    let sent = unsafe { SendMessageTimeoutW(everything, WM_COPYDATA, WPARAM(win.0 .0 as usize), LPARAM(&cds as *const _ as isize), SMTO_ABORTIFHUNG, 5000, Some(&mut ok)) };
+    if sent.0 == 0 || ok == 0 {
+        return Err(SearchError::Everything("Everything did not take the query".into()));
+    }
+    let until = Instant::now() + timeout;
+    loop {
+        if let Some(b) = REPLY.with(|r| r.borrow_mut().take()) {
+            return Ok(b);
         }
         let left = until.saturating_duration_since(Instant::now());
         if left.is_zero() {

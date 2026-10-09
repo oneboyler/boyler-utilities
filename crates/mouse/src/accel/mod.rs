@@ -12,5 +12,6 @@ pub mod args;
 pub mod bytes;
 pub mod curves;
 pub mod panel;
+pub mod persist;
 pub mod service;
 pub mod switch;

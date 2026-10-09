@@ -38,6 +38,11 @@ pub struct View {
     pub per_app: PerApp,
     /// the user's own Raw Accel profile 0 (the graph is drawn on it, as the driver would run it)
     pub base: Profile,
+    /// Order 063: "another program also writes the driver" - the card's warning line (None = nothing to say)
+    pub other_writer: Option<String>,
+    /// Order 063: rows whose game was already open when its start was noticed (not switched), and rows switched now
+    pub late: Vec<bu_mouse::accel::switch::RowId>,
+    pub active: Vec<bu_mouse::accel::switch::RowId>,
     pub cursors: Option<CursorsState>,
     pub packs: Vec<Pack>,
     pub glass: bool,
@@ -46,6 +51,11 @@ pub struct View {
     pub schemes: Vec<(String, Vec<Role>)>,
     /// per bubble (Role::ALL order): the "Matches your other cursors" set, if any
     pub suggest: Vec<Option<SetId>>,
+    /// Order 066: the cursor FILE of each of the 7 bubbles (Role::ALL order) for every set the pickers list - the pickers
+    /// draw the real pictures from these
+    pub files: Vec<(SetId, Vec<Option<String>>)>,
+    /// Order 066: the files picked before with "Choose your own file…" (full paths), newest first
+    pub own_files: Vec<String>,
     pub elevated: bool,
     /// Order 036 - the change log: every item's value now (item id -> value), the reset review's "now" side
     pub vals: Vec<(String, Val)>,
@@ -97,6 +107,9 @@ pub enum Cmd {
     Import(Vec<PathBuf>),
     /// hover a row of a role's picker = try that cursor (Windows shows it until `EndPreview`)
     Preview(Role, SetId),
+    /// "Get more cursors": the downloaded .zip of a pack (name, file in the app's folder) - unpacked, added as a scheme, the
+    /// .zip deleted
+    InstallStore(String, PathBuf),
     EndPreview,
     /// the change log's reset (the frame's review, a ticked line): put one item to this value; the answer comes back on
     /// the sender (the frame waits for it)
@@ -225,7 +238,7 @@ impl Drop for Svc {
 }
 
 /// The app's own folder for the Mouse tab (packs, the copy of Raw Accel's earlier settings).
-fn data_dir() -> PathBuf {
+pub(super) fn data_dir() -> PathBuf {
     std::env::var_os("APPDATA").map(|a| PathBuf::from(a).join("Boyler Utilities").join("mouse")).unwrap_or_else(|| PathBuf::from("."))
 }
 
@@ -246,12 +259,23 @@ fn real(read_only: bool) -> Mouse<bu_mouse::win::RealOs> {
     if !read_only && std::env::var_os("APPDATA").is_some() {
         let _ = m.install_glass();
     }
-    // Raw Accel's folder (for its settings.json + writer.exe): the user's Desktop / Downloads / Documents, names only
-    let home = std::env::var("USERPROFILE").unwrap_or_default();
-    // (Order 037: first the add-ons folder - its RawAccel is the one the Add-ons page installed)
-    let roots: Vec<PathBuf> = std::iter::once(crate::addons::dir()).chain(["Desktop", "Downloads", "Documents"].iter().map(|d| PathBuf::from(&home).join(d))).collect();
-    m.accel_mut().rawaccel_dir = bu_mouse::accel::service::find_rawaccel_dir(&roots);
+    m.accel_mut().rawaccel_dir = find_rawaccel_folder();
     m
+}
+
+/// Raw Accel's folder (for its settings.json + writer.exe): the user's Desktop / Downloads / Documents, names only
+/// (Order 037: first the add-ons folder - its RawAccel is the one the Add-ons page installed).
+#[cfg(windows)]
+pub fn find_rawaccel_folder() -> Option<PathBuf> {
+    let home = std::env::var("USERPROFILE").unwrap_or_default();
+    let roots: Vec<PathBuf> = std::iter::once(crate::addons::dir()).chain(["Desktop", "Downloads", "Documents"].iter().map(|d| PathBuf::from(&home).join(d))).collect();
+    bu_mouse::accel::service::find_rawaccel_dir(&roots)
+}
+
+/// The real service for the always-on engine (nothing read, no cursor files written).
+#[cfg(windows)]
+pub fn real_bare_pub() -> Mouse<bu_mouse::win::RealOs> {
+    real_bare(false)
 }
 
 /// The VALORANT row's exe (the per-app sample row; the app picker's games are in `mod.rs`).
@@ -329,6 +353,10 @@ pub fn sample_fake_with(sample: Sample) -> Mouse<FakeOs> {
     let row = a.per_app.add_row(VAL_EXE, Target::Preset(val));
     a.per_app.set_row_label(row, "VALORANT");
     a.per_app.set_everywhere_else(Target::Off);
+    // the sample driver already runs what the card says (no "another program wrote it" line in the drawing)
+    if let Ok(cfg) = m.config_for(&m.accel_target()) {
+        m.os_mut().rawaccel_driver = bu_mouse::accel::bytes::to_bytes(&cfg);
+    }
     m
 }
 
@@ -456,7 +484,15 @@ pub fn restore<O: MouseOs>(m: &mut Mouse<O>, item: &str, raw: &str) -> Result<()
         match item {
             "cursors" => m.restore_cursor_look(raw),
             "cursor_size" => m.restore_cursor_size(raw),
-            "accel" => m.restore_driver_state(std::path::Path::new(raw)),
+            "accel" => {
+                let r = m.restore_driver_state(std::path::Path::new(raw));
+                // the always-on engine reads the card again (it is saved OFF now): a game start must not set the old curve back
+                #[cfg(windows)]
+                if r.is_ok() {
+                    super::rt::reload_soon();
+                }
+                r
+            }
             _ => return Err("Unknown setting".into()),
         }
     };
@@ -543,8 +579,12 @@ fn neon_pack() -> bu_mouse::cursors::Pack {
     bu_mouse::cursors::Pack { name: "Neon Pack".into(), roles, files: Vec::new() }
 }
 
-fn view<O: MouseOs>(m: &Mouse<O>, mice: Option<Vec<YourMouse>>, on: Option<OnMouse>) -> View {
+fn view<O: MouseOs>(m: &mut Mouse<O>, mice: Option<Vec<YourMouse>>, on: Option<OnMouse>) -> View {
     let drawing_sets = DRAWING_SETS.with(|d| d.get());
+    let (late, active) = games();
+    // the games that run now are the engine's to know; the tab's copy of the card counts them too (header, "another program wrote it")
+    m.accel_mut().per_app.set_active_rows(&active);
+    let m = &*m;
     let base = m.rawaccel_settings().ok().flatten().and_then(|c| c.profiles.first().cloned()).unwrap_or_default();
     View {
         win: m.windows_mouse().ok(),
@@ -554,12 +594,17 @@ fn view<O: MouseOs>(m: &Mouse<O>, mice: Option<Vec<YourMouse>>, on: Option<OnMou
         panel: m.accel().panel.clone(),
         per_app: m.accel().per_app.clone(),
         base,
+        other_writer: m.other_writer_line().ok().flatten(),
+        late,
+        active,
         cursors: m.cursors().ok(),
         packs: if drawing_sets { vec![neon_pack()] } else { m.packs().unwrap_or_default() },
         glass: drawing_sets || !m.glass_set().is_empty(),
         // (a test copy shows the drawing's sets only)
         schemes: if drawing_sets { Vec::new() } else { m.installed_schemes().unwrap_or_default() },
         suggest: Role::ALL.iter().map(|r| m.suggestion(*r).ok().flatten()).collect(),
+        files: if drawing_sets { Vec::new() } else { m.set_preview_files() },
+        own_files: if drawing_sets { Vec::new() } else { m.own_files().into_iter().map(|p| p.to_string_lossy().into_owned()).collect() },
         elevated: m.os().is_elevated(),
         vals: item_vals(m),
         win_def: windows_defaults(m),
@@ -585,21 +630,28 @@ fn read_first<O: MouseOs>(m: &mut Mouse<O>, mice: &[YourMouse]) -> Option<OnMous
 /// `accel_logged`: the change log already keeps "Mouse acceleration" (no copy of the driver's settings is needed);
 /// `note_if_gone`: a change whose answer finds the page gone is noted into the change log from here (the real PC only).
 fn run<O: MouseOs>(mut m: Mouse<O>, rx: Receiver<Cmd>, tx: Sender<Reply>, mut accel_logged: bool, note_if_gone: bool) {
-    // first run: the card mirrors what the installed Raw Accel runs (changes nothing on the driver)
-    let _ = m.mirror_rawaccel();
+    #[cfg(windows)]
+    TAB_HAS_ENGINE.with(|e| e.set(note_if_gone && super::rt::running()));
+    // the saved card comes back (Order 063: the switch, presets and per-game rows are kept in a file); only when nothing is
+    // saved yet (the first run) the card mirrors what the installed Raw Accel runs - it changes nothing on the driver
+    if let Ok(false) = m.load_accel() {
+        // (the mirror is not saved: the card is the user's only once they change it - a card they never turned on must not
+        // write the driver at the next start)
+        let _ = m.mirror_rawaccel();
+    }
     // every answer wakes an idle menu (the page shows it at once, not at the next mouse move)
     let send = |r: Reply| {
         let ok = tx.send(r).is_ok();
         crate::services::Waker.wake();
         ok
     };
-    if !send(Reply { view: view(&m, None, None), toast: None, reading_mouse: true, unasked: false, changes: Vec::new() }) {
+    if !send(Reply { view: view(&mut m, None, None), toast: None, reading_mouse: true, unasked: false, changes: Vec::new() }) {
         return;
     }
     let mut list = m.mice().unwrap_or_default();
     let mut on = read_first(&mut m, &list);
     let mut mice = Some(list.clone());
-    if !send(Reply { view: view(&m, mice.clone(), on.clone()), toast: None, reading_mouse: false, unasked: false, changes: Vec::new() }) {
+    if !send(Reply { view: view(&mut m, mice.clone(), on.clone()), toast: None, reading_mouse: false, unasked: false, changes: Vec::new() }) {
         return;
     }
     loop {
@@ -628,7 +680,7 @@ fn run<O: MouseOs>(mut m: Mouse<O>, rx: Receiver<Cmd>, tx: Sender<Reply>, mut ac
                     }
                     changes.push((i.to_string(), label(i).to_string(), old, new));
                 }
-                if !send(Reply { view: view(&m, mice.clone(), on.clone()), toast, reading_mouse: false, unasked: away, changes: changes.clone() }) {
+                if !send(Reply { view: view(&mut m, mice.clone(), on.clone()), toast, reading_mouse: false, unasked: away, changes: changes.clone() }) {
                     if note_if_gone {
                         for (i, l, o, n) in &changes {
                             crate::undo::note(PAGE, i, l, o, n);
@@ -645,7 +697,7 @@ fn run<O: MouseOs>(mut m: Mouse<O>, rx: Receiver<Cmd>, tx: Sender<Reply>, mut ac
                     list = now;
                     on = read_first(&mut m, &list);
                     mice = Some(list.clone());
-                    if !send(Reply { view: view(&m, mice.clone(), on.clone()), toast: None, reading_mouse: false, unasked: true, changes: Vec::new() }) {
+                    if !send(Reply { view: view(&mut m, mice.clone(), on.clone()), toast: None, reading_mouse: false, unasked: true, changes: Vec::new() }) {
                         return;
                     }
                 }
@@ -691,7 +743,13 @@ fn apply<O: MouseOs>(m: &mut Mouse<O>, mice: &[YourMouse], on: &mut Option<OnMou
             let a = m.accel_mut();
             a.panel = panel;
             a.per_app = per_app;
-            sync(m)
+            persist_apply(m, false)
+        }
+        Cmd::AccelOn(v) if engine_on() => {
+            let a = m.accel_mut();
+            a.panel.on = v;
+            a.panel.expanded = v;
+            persist_apply(m, true).or_else(|| Some(m.accel_on_toast(v)))
         }
         Cmd::AccelOn(v) => match m.set_accel_on(v) {
             Ok(t) => Some(t),
@@ -699,7 +757,7 @@ fn apply<O: MouseOs>(m: &mut Mouse<O>, mice: &[YourMouse], on: &mut Option<OnMou
         },
         Cmd::CopyCurve => match m.copy_its_curve() {
             Ok(t) => {
-                let _ = sync(m);
+                let _ = persist_apply(m, false);
                 Some(t)
             }
             Err(e) => err(e),
@@ -720,8 +778,23 @@ fn apply<O: MouseOs>(m: &mut Mouse<O>, mice: &[YourMouse], on: &mut Option<OnMou
             Err(e) => err(e),
         },
         Cmd::Preview(r, s) => m.preview_cursor(r, &s).err().and_then(err),
+        Cmd::InstallStore(name, path) => {
+            let r = std::fs::read(&path).map_err(|e| format!("couldn’t read the download: {e}")).and_then(|b| m.install_store_zip(&name, &b).map_err(|e| e.to_string()));
+            // the .zip was only the way here
+            let _ = std::fs::remove_file(&path);
+            match r {
+                Ok(_) => Some(format!("{name} installed · pick it in any cursor's list")),
+                Err(e) => Some(format!("{name} was not installed: {e}")),
+            }
+        }
         Cmd::EndPreview => m.end_preview().err().and_then(err),
-        Cmd::Reread => None,
+        Cmd::Reread => {
+            // a reset (it ran on another service) may have switched the saved card off: read it again
+            if engine_on() {
+                let _ = m.load_accel();
+            }
+            None
+        }
         Cmd::Restore(item, to, back) | Cmd::RestoreAway(item, to, back) => {
             // the frame shows the outcome (its own toast); the page's view follows from this answer
             let _ = back.send(restore(m, &item, &to.raw));
@@ -730,10 +803,46 @@ fn apply<O: MouseOs>(m: &mut Mouse<O>, mice: &[YourMouse], on: &mut Option<OnMou
     }
 }
 
+/// Is the always-on engine running (the real app)? Then it owns the driver: the tab only saves the card and asks it.
+fn engine_on() -> bool {
+    TAB_HAS_ENGINE.with(|e| e.get())
+}
+
+thread_local! {
+    /// this worker belongs to the real app with the engine running (set once in `run`; the FAKE workers of the test copies never
+    /// have it, whatever else runs in the same process)
+    static TAB_HAS_ENGINE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// A change of the card: with the engine, saved to `accel.json` and handed to the engine (it knows which games run now); else
+/// (test copies on the fake, no APPDATA) straight to the driver. `switched` = the header switch itself was clicked
+/// (only then a card that is OFF writes the driver: tuning a card that is off never touches what Raw Accel runs).
+fn persist_apply<O: MouseOs>(m: &mut Mouse<O>, switched: bool) -> Option<String> {
+    #[cfg(windows)]
+    if engine_on() {
+        let saved = m.save_accel().err().map(|e| format!("Couldn\u{2019}t save the acceleration settings: {e}"));
+        return super::rt::apply_now(switched).or(saved);
+    }
+    sync(m)
+}
+
 /// Hands the card's state to the driver (only when Raw Accel runs and something changed).
 fn sync<O: MouseOs>(m: &mut Mouse<O>) -> Option<String> {
     if !matches!(m.rawaccel_status(), Ok(RawAccelStatus::Installed { .. })) {
         return None;
     }
     m.sync_driver().err().map(|e| e.to_string())
+}
+
+/// The always-on engine's view of the games (rows not switched because the game was already open, rows switched now).
+fn games() -> (Vec<bu_mouse::accel::switch::RowId>, Vec<bu_mouse::accel::switch::RowId>) {
+    #[cfg(windows)]
+    {
+        let s = super::rt::status();
+        (s.late, s.active)
+    }
+    #[cfg(not(windows))]
+    {
+        (Vec::new(), Vec::new())
+    }
 }

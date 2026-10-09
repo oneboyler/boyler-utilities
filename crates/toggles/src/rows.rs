@@ -417,9 +417,11 @@ pub static ROWS: &[Row] = &[
     row("call_ducking", Group::Sound, "Calls turn other sounds down", "Discord or Teams calls lower your game", NONE,
         reg(&[cu(r"Software\Microsoft\Multimedia\Audio", "UserDuckingPreference", 1, 3, true)]), Broadcast::None,
         Applies::Unconfirmed, None, &["ducking", "communications", "call"], "menu-v22 L4840; Windows Sound panel, Communications tab (UserDuckingPreference)"),
-    row("mono_audio", Group::Sound, "Mono audio", "Both ears hear everything · for one earbud", NONE,
+    // Order 068, real flip run: the value was written and read back, but Settings > Accessibility > Audio still showed Mono audio
+    // OFF - Windows' audio doesn't pick the registry value up live (Settings goes through its own audio call), so: after a restart
+    row("mono_audio", Group::Sound, "Mono audio", "Both ears hear everything · for one earbud", RESTART,
         reg(&[cu(r"Software\Microsoft\Multimedia\Audio", "AccessibilityMonoMixState", 1, 0, false)]), Broadcast::None,
-        Applies::Unconfirmed, Some("ms-settings:easeofaccess-audio"), &["mono", "earbud", "stereo"], V3),
+        Applies::Restart, Some("ms-settings:easeofaccess-audio"), &["mono", "earbud", "stereo"], V3),
     row("startup_sound", Group::Sound, "Windows startup sound", "", ADMIN_RESTART,
         reg(&[dw(Hive::Hklm, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Authentication\LogonUI\BootAnimation", "DisableStartupSound", 0, 1, true)]),
         Broadcast::None, Applies::Restart, None, &["boot sound", "startup sound", "chime"], V3),
@@ -448,7 +450,10 @@ pub static ROWS: &[Row] = &[
     row("copilot", Group::PrivacyAds, "Copilot", "", NONE, Method::Copilot, Broadcast::None, Applies::Live, None,
         &["ai", "copilot"], "DESIGN §3.6 v18 (guess) + Q_005_02 pick: uninstall/reinstall the Store app (PackageManager)"),
     row("lock_screen_tips", Group::PrivacyAds, "Lock-screen tips", "Fun facts and ads on the lock screen", NONE,
-        reg(&[cu(CDM, "RotatingLockScreenOverlayEnabled", 1, 0, true), cu(CDM, "SubscribedContent-338387Enabled", 1, 0, true)]),
+        // Order 068, real flip run (Win 11 23H2 22631.6199, Oct 9): SubscribedContent-338387Enabled is Settings' Spotlight / Picture
+        // choice, not the tips - writing it 1 turned "Personalize your lock screen" from Picture into Windows spotlight (0 would turn a
+        // Spotlight lock screen into Picture). So the row reads and writes ONLY the fun-facts overlay and never touches 338387.
+        reg(&[cu(CDM, "RotatingLockScreenOverlayEnabled", 1, 0, true)]),
         Broadcast::None, Applies::Unconfirmed, Some("ms-settings:lockscreen"), &["spotlight", "fun facts", "ads", "lock screen"], V2),
     row("ads_in_settings", Group::PrivacyAds, "Ads in Settings", "Suggested content in the Settings app", NONE,
         reg(&[

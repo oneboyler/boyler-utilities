@@ -12,10 +12,14 @@
 
 pub mod accel;
 pub mod cursors;
+pub mod curfile;
+pub mod store;
+pub mod zipdir;
 pub mod device;
 pub mod error;
 pub mod fake;
 pub mod glass;
+pub mod models;
 pub mod os;
 pub mod pulsar;
 pub mod service;

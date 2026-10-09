@@ -17,6 +17,8 @@ use bu_keysound::macros::{Macro, Step};
 use bu_keysound::remap::{self, Code, Mapping};
 use bu_keysound::{Kind, Pack, PackId, Rule};
 
+pub mod gallery;
+mod getter;
 pub mod glue;
 pub mod model;
 pub mod pic;
@@ -32,7 +34,11 @@ const K_ON: Key = key("kbd.on");
 const K_PACK: Key = key("kbd.pack");
 const K_PLAY: Key = key("kbd.play");
 const K_VOL: Key = key("kbd.vol");
+const K_REP: Key = key("kbd.rep");
+const K_MTPL: Key = key("kbd.mtpl");
 const K_GAME: Key = key("kbd.game");
+const K_MOUSE: Key = key("kbd.mouse");
+const K_MVOL: Key = key("kbd.mvol");
 const K_TRY: Key = key("kbd.try");
 const K_RADD: Key = key("kbd.radd");
 const K_RAPP: Key = key("kbd.rapp");
@@ -42,7 +48,9 @@ const K_SIZE: Key = key("kbd.size");
 const K_RESETALL: Key = key("kbd.resetall");
 const K_KEY: Key = key("kbd.key");
 const K_KEYT: Key = key("kbd.keyt");
-const K_CARDX: Key = key("kbd.cardx");
+/// The key's small window (a popup like the controller's part window).
+const K_KD: Key = key("kbd.kd");
+const KD_W: f32 = 420.0;
 const K_MODE: Key = key("kbd.mode");
 const K_TARGET: Key = key("kbd.target");
 const K_TPICK: Key = key("kbd.tpick");
@@ -78,6 +86,7 @@ enum Pop {
     Target,
     Action,
     MacroList,
+    Templates,
     StepAdd,
 }
 
@@ -87,7 +96,10 @@ enum Choice {
     Heading,
     Pack(Pack),
     PackOff,
+    GetMore,
     Import,
+    ImportFolder,
+    Template(usize),
     Target(Code),
     Preset(Preset),
     AppAction(String),
@@ -107,6 +119,8 @@ pub struct Keyboard {
     w_keys: f32,
     h_keys: f32,
     sel: Option<Code>,
+    /// When the key's window opened (its open motion).
+    key_at: f64,
     /// The mode chosen on the card for a key that has no data yet.
     want: Option<Mode>,
     /// The Remap card waits for the new key (press it, or click it on the picture).
@@ -130,6 +144,14 @@ pub struct Keyboard {
     /// The user's app actions (the keys manager's), asked at open.
     app_actions: Vec<(String, String)>,
     sound_msg: Option<String>,
+    /// Why the last pack import was refused (a plain line under the sounds).
+    import_msg: Option<String>,
+    /// A key was left as Windows made it because its action pressed that same key (the line under the keyboard).
+    loop_note: Option<String>,
+    /// The "Get more sounds" window is open, the line it shows, the download job already handled.
+    get_open: bool,
+    get_msg: Option<String>,
+    get_done: Option<crate::jobs::JobId>,
 }
 
 impl Keyboard {
@@ -179,10 +201,13 @@ impl Keyboard {
         self.app_actions = crate::services::with(|s| s.action_list()).unwrap_or_default().into_iter().filter(|a| !a.id.starts_with("kbd.key.")).map(|a| (a.id, a.name)).collect();
         self.rebuild_keys();
         self.loaded = true;
+        self.drop_self_loops();
+        self.err = None;
     }
 
     /// Writes what changed to the settings file and brings the always-on parts (sounds, the keys that carry something) to it.
     fn save(&mut self) {
+        self.drop_self_loops();
         self.prefs.binds = self.model.binds.clone();
         self.prefs.macros = self.model.macros.clone();
         let prefs = self.prefs.clone();
@@ -196,11 +221,34 @@ impl Keyboard {
             let dir = glue::packs_dir(s.store.folder());
             self.sound_msg = glue::apply(&prefs, &dir).err();
             let lay = bu_keysound::layout::current();
-            glue::sync_keys(s, &prefs.binds, &lay)
+            glue::sync_keys(s, &prefs.binds, &prefs.macros, &lay)
         })
         .unwrap_or_default();
         if let Some((_, e)) = errs.into_iter().next() {
             self.err = Some(e);
+        }
+    }
+
+    /// A key whose action presses that same key (J -> a macro that presses J, F5 -> "Refresh") would run itself and never
+    /// type: it is left as Windows made it, with a plain line saying why (Order 059).
+    fn drop_self_loops(&mut self) {
+        let lay = self.layout();
+        let (kept, dropped) = bu_keysound::binds::without_self_loops(&self.model.binds, &self.model.macros, &|c| lay.vk_of(c));
+        if dropped.is_empty() {
+            return;
+        }
+        let names: Vec<String> = dropped.iter().map(|c| self.label_of(*c)).collect();
+        self.model.binds = kept;
+        let msg = format!(
+            "{} can't run something that presses {} itself - it would run itself and the key would stop typing - so it stays as Windows made it. A typed text, or a combination like Ctrl + {}, works.",
+            names.join(", "),
+            if names.len() == 1 { "that same key" } else { "their own keys" },
+            names[0]
+        );
+        self.err = Some(msg.clone());
+        self.loop_note = Some(msg);
+        if self.sel.is_some_and(|s| dropped.contains(&s)) {
+            self.want = None;
         }
     }
 
@@ -242,7 +290,9 @@ impl Keyboard {
                 }
             }
             if with_import {
-                v.push(("Import a Mechvibes pack…".into(), Choice::Import, false));
+                v.push(("Get more sounds…".into(), Choice::GetMore, false));
+                v.push(("Import a Mechvibes pack (.zip)…".into(), Choice::Import, false));
+                v.push(("Import a Mechvibes pack folder…".into(), Choice::ImportFolder, false));
             }
         };
         match p {
@@ -281,6 +331,15 @@ impl Keyboard {
                     v.push((m.name.clone(), Choice::Macro(m.id.clone()), cur.as_deref() == Some(m.id.as_str())));
                 }
                 v.push(("New macro…".into(), Choice::NewMacro, false));
+                v.push(("Ready-made".into(), Choice::Heading, false));
+                for (i, (name, _)) in bu_keysound::macros::templates().into_iter().enumerate() {
+                    v.push((name.to_string(), Choice::Template(i), false));
+                }
+            }
+            Pop::Templates => {
+                for (i, (name, _)) in bu_keysound::macros::templates().into_iter().enumerate() {
+                    v.push((name.to_string(), Choice::Template(i), false));
+                }
             }
             Pop::StepAdd => {
                 for (i, l) in ["Press a key", "Type a text", "Wait", "Open an app, file or website"].iter().enumerate() {
@@ -299,7 +358,7 @@ impl Keyboard {
 
     fn choose(&mut self, c: Choice, cx: &mut Cx) {
         let sel = self.sel;
-        match c {
+        match c.clone() {
             Choice::Heading => {}
             Choice::Pack(p) => match self.pop.map(|(q, _)| q) {
                 Some(Pop::RulePack(i)) => {
@@ -323,9 +382,24 @@ impl Keyboard {
                     self.save();
                 }
             }
-            Choice::Import => {
+            Choice::GetMore => self.open_get(cx),
+            Choice::Import | Choice::ImportFolder => {
                 self.pop = None;
-                self.import_pack(cx);
+                self.import_pack(cx, c == Choice::ImportFolder);
+            }
+            Choice::Template(i) => {
+                self.pop = None;
+                if let Some((name, steps)) = bu_keysound::macros::templates().into_iter().nth(i) {
+                    match self.model.new_macro_from(name, steps) {
+                        Ok(id) => {
+                            if let Some(s) = sel {
+                                let _ = self.model.set_macro(s, &id);
+                            }
+                            self.open_editor(&id, cx.now);
+                        }
+                        Err(e) => self.err = Some(e),
+                    }
+                }
             }
             Choice::Target(code) => {
                 if let Some(s) = sel {
@@ -444,17 +518,23 @@ impl Keyboard {
         });
     }
 
-    fn import_pack(&mut self, cx: &mut Cx) {
-        let Some(folder) = cx.pick_folder("Pick a Mechvibes sound pack folder") else { return };
+    /// "Import a Mechvibes pack": the .zip as the site hands it out, or a folder. A clear line when it isn't a pack.
+    fn import_pack(&mut self, cx: &mut Cx, folder: bool) {
+        let picked = if folder { cx.pick_folder("Pick a Mechvibes sound pack folder") } else { cx.pick_file("Pick the Mechvibes pack (.zip)", &[("Mechvibes pack", "*.zip")]) };
+        let Some(src) = picked else { return };
         let dir = crate::services::with(|s| glue::packs_dir(s.store.folder()));
         let Some(dir) = dir else { return };
-        match bu_keysound::import::install(std::path::Path::new(&folder), &dir) {
+        match bu_keysound::import::install_any(std::path::Path::new(&src), &dir) {
             Ok(p) => {
+                self.import_msg = None;
                 self.prefs.s.pack = Pack::Imported(p.name.clone());
                 self.save();
                 cx.toast(&format!("Imported {} · it is the sound now", p.name));
             }
-            Err(e) => cx.toast(&format!("Not imported: {e}")),
+            Err(e) => {
+                self.import_msg = Some(e.clone());
+                cx.toast(&format!("Not imported: {e}"));
+            }
         }
     }
 
@@ -532,26 +612,11 @@ impl Keyboard {
     }
 
     /// A key was clicked on the picture.
-    fn key_clicked(&mut self, n: usize, _cx: &mut Cx) {
+    fn key_clicked(&mut self, n: usize, cx: &mut Cx) {
         let Some(k) = self.keys.get(n % ISO_LOWER).cloned() else { return };
-        if self.choosing {
-            if let Some(from) = self.sel {
-                // the new key for the remap
-                if let Err(e) = self.model.set_remap(from, k.code) {
-                    self.err = Some(e);
-                } else {
-                    self.err = None;
-                    self.choosing = false;
-                    self.save();
-                }
-                return;
-            }
-        }
-        if self.sel == Some(k.code) {
-            self.select(None);
-        } else {
-            self.select(Some(k.code));
-        }
+        // the key's own window opens (a click on the open one's key can't happen: its dim covers the picture)
+        self.select(Some(k.code));
+        self.key_at = cx.now;
     }
 
     /// The key pressed on the remap field: its scancode is the new key.
@@ -653,6 +718,7 @@ impl Page for Keyboard {
         self.load(env);
     }
     fn close(&mut self) {
+        gallery::OPEN.store(false, std::sync::atomic::Ordering::SeqCst);
         // nothing typed on this page is kept; the engine and the keys go on (they are the switches', not the tab's)
         *self = Keyboard::default();
     }
@@ -661,16 +727,22 @@ impl Page for Keyboard {
             self.load(&Env { test: true, ..Env::default() });
         }
         self.follow_job(cx);
+        self.follow_get(cx);
         self.view(cx)
     }
     fn popup(&mut self, cx: &mut Cx) -> Option<El> {
         self.popups(cx)
     }
     fn popup_dismiss(&mut self) {
-        if self.pop.is_some() {
+        if self.get_open {
+            self.get_open = false;
+            gallery::OPEN.store(false, std::sync::atomic::Ordering::SeqCst);
+        } else if self.pop.is_some() {
             self.pop = None;
         } else if self.edit.is_some() {
             self.close_editor();
+        } else if self.sel.is_some() {
+            self.select(None);
         }
     }
     fn start(&self, s: &mut crate::services::Services) {

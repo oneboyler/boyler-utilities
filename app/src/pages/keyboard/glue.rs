@@ -5,7 +5,7 @@
 use super::prefs::Prefs;
 use crate::keys::{Action, Combo, Mods};
 use crate::services::Services;
-use bu_keysound::binds::{Bind, Binds};
+use bu_keysound::binds::{Bind, Binds, Preset};
 use bu_keysound::layout::{self, Layout};
 use bu_keysound::macros::Macro;
 use bu_keysound::remap::Code;
@@ -106,6 +106,10 @@ pub fn run_key(code: Code) -> Result<(), String> {
         (b, m)
     };
     let r = match bind {
+        Some(Bind::Preset(Preset::NextOutput)) => {
+            next_output();
+            Ok(())
+        }
         Some(Bind::Preset(p)) => send::run_preset(&p),
         Some(Bind::Macro(_)) => match mac {
             Some(m) => send::run_macro(&m),
@@ -115,6 +119,27 @@ pub fn run_key(code: Code) -> Result<(), String> {
     };
     live().last = r.as_ref().err().cloned();
     r
+}
+
+/// "Switch audio output": the next sound output that is switched on becomes Windows' default (all three roles, like picking
+/// it in the Audio tab). Done on its own short-lived thread (Core Audio wants its own COM apartment); how it ended goes to
+/// [`last_message`].
+fn next_output() {
+    let _ = std::thread::Builder::new().name("bu-next-output".into()).spawn(|| {
+        let r = (|| -> Result<(), String> {
+            let os = bu_audio::RealOs::new().map_err(|e| e.to_string())?;
+            let mut s = bu_audio::AudioService::new(os);
+            let rows = s.device_rows(bu_audio::Flow::Output).map_err(|e| e.to_string())?;
+            let on: Vec<_> = rows.iter().filter(|r| r.on).collect();
+            if on.len() < 2 {
+                return Err("There is only one sound output switched on".into());
+            }
+            let at = on.iter().position(|r| r.current).unwrap_or(on.len() - 1);
+            let next = on[(at + 1) % on.len()];
+            s.select_default(bu_audio::Flow::Output, &next.device.id).map(|_| ()).map_err(|e| e.to_string())
+        })();
+        live().last = r.err();
+    });
 }
 
 /// What the manager should say a key's action is called ("Keyboard: Caps Lock key").
@@ -130,8 +155,12 @@ fn vk_for(code: Code, lay: &dyn Layout) -> Option<u16> {
 /// Makes the keys manager's actions for the keys that carry something match `binds`: each gets its action (so it shows in
 /// Settings › All shortcuts) and its key (the key itself, no modifiers). Returns what the manager refused, by key: a numpad
 /// key, a key another action holds ("Already used by Mic mute"), a key Windows won't give. Starts / stops the game watcher.
-pub fn sync_keys(s: &mut Services, binds: &Binds, lay: &dyn Layout) -> Vec<(Code, String)> {
+pub fn sync_keys(s: &mut Services, binds: &Binds, macros: &[Macro], lay: &dyn Layout) -> Vec<(Code, String)> {
     let mut errs = Vec::new();
+    // a key whose action presses that same key would run itself and never type (Order 059): it is not registered at all, so
+    // it types as Windows made it - also for such a bind an older version saved
+    let (binds, _) = bu_keysound::binds::without_self_loops(binds, macros, &|c| lay.vk_of(c));
+    let binds = &binds;
     let have: Vec<String> = s.keys.actions().filter(|a| a.id.starts_with("kbd.key.")).map(|a| a.id.clone()).collect();
     for id in &have {
         let keep = code_of_action(id).is_some_and(|c| matches!(binds.get(c), Some(Bind::Preset(_) | Bind::Macro(_))));
@@ -207,7 +236,7 @@ pub fn start(s: &mut Services) {
     publish(&prefs.binds, &prefs.macros);
     if !prefs.binds.is_empty() {
         let lay = layout::current();
-        let _ = sync_keys(s, &prefs.binds, &lay);
+        let _ = sync_keys(s, &prefs.binds, &prefs.macros, &lay);
     }
     if prefs.on {
         let dir = packs_dir(s.store.folder());

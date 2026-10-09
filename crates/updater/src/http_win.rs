@@ -57,13 +57,27 @@ fn is_loopback(host: &str) -> bool {
     host.eq_ignore_ascii_case("localhost") || host == "127.0.0.1" || host == "[::1]"
 }
 
+impl WinHttp {
+    /// Order 066: GET of a part of a file (`bytes=<from>-<to>`, or `bytes=-<last n>` for the tail): the answer is 206 (a 2xx,
+    /// so the body goes to `sink`). Used to read one picture out of a big .zip without downloading all of it.
+    pub fn get_range(&self, url: &str, range: &str, sink: &mut dyn Write, progress: &mut dyn FnMut(u64, Option<u64>)) -> Result<Response> {
+        self.get_with(&Request { url, accept: "*/*" }, &format!("Range: bytes={range}\r\n"), sink, progress)
+    }
+}
+
 impl Http for WinHttp {
     fn get(&self, req: &Request, sink: &mut dyn Write, progress: &mut dyn FnMut(u64, Option<u64>)) -> Result<Response> {
+        self.get_with(req, "", sink, progress)
+    }
+}
+
+impl WinHttp {
+    fn get_with(&self, req: &Request, extra_headers: &str, sink: &mut dyn Write, progress: &mut dyn FnMut(u64, Option<u64>)) -> Result<Response> {
         let url = parse_url(req.url)?;
         let agent = wide(&self.user_agent);
         let host = wide(&url.host);
         let path = wide(&url.path);
-        let headers = wide(&format!("Accept: {}\r\nX-GitHub-Api-Version: 2022-11-28\r\n", req.accept));
+        let headers = wide(&format!("Accept: {}\r\nX-GitHub-Api-Version: 2022-11-28\r\n{extra_headers}", req.accept));
         let access = if is_loopback(&url.host) { WINHTTP_ACCESS_TYPE_NO_PROXY } else { WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY };
 
         // SAFETY: every pointer passed below points into the Vec<u16>s above (alive for this whole function, NUL-terminated)

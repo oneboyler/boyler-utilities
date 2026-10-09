@@ -32,6 +32,8 @@ const WM_CHECK: u32 = WM_APP + 2;
 /// After a window of a process waited for by snapshot is destroyed, one more look this much later: the process may
 /// still be ending when the destroy event arrives. A single one-shot timer per destroy burst, never a repeating poll.
 const RECHECK_MS: u32 = 1500;
+/// How many times in a row the re-check timer is set again after a window of a waited-for process was destroyed (~60 s).
+const RECHECK_ROUNDS: u32 = 40;
 
 enum Thread {
     Off,
@@ -199,9 +201,20 @@ impl ExitWait {
 /// pool wait on it. If even that is refused, snapshots decide (see the crate docs). A process already gone is reported
 /// at once, on the caller's thread, before this returns.
 pub fn wait_exit(pid: u32, on_exit: OnExit) -> ExitWait {
+    wait_exit_with(pid, on_exit, true)
+}
+
+/// The same, but NO handle to the process is ever opened - not even SYNCHRONIZE: the exit is found by process snapshots only
+/// (at every snapshot, when one of its windows is destroyed, and by a short re-check timer). For anti-cheat protected games
+/// (Order 063: "never open a handle to anti-cheat-protected processes"), whose protection may refuse or watch handles.
+pub fn wait_exit_no_handle(pid: u32, on_exit: OnExit) -> ExitWait {
+    wait_exit_with(pid, on_exit, false)
+}
+
+fn wait_exit_with(pid: u32, on_exit: OnExit, allow_handle: bool) -> ExitWait {
     let ctx = Arc::new(ExitCtx { f: Mutex::new(Some(on_exit)), ended: AtomicBool::new(false) });
     // SAFETY: SYNCHRONIZE only - no read, no query, nothing else.
-    if let Ok(process) = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, false, pid) } {
+    if let Some(process) = allow_handle.then(|| unsafe { OpenProcess(PROCESS_SYNCHRONIZE, false, pid) }).and_then(|r| r.ok()) {
         // The registration owns one reference; given back in `ExitWait::drop` after the wait is unregistered.
         let raw = Arc::into_raw(ctx.clone());
         let mut wait = HANDLE::default();
@@ -316,8 +329,11 @@ struct Local {
     /// longer be asked for its process, but the event names the thread)
     exit_pids: HashSet<u32>,
     exit_threads: HashMap<u32, u32>,
-    /// the one-shot re-check timer (0 = none)
+    /// the re-check timer (0 = none)
     recheck: usize,
+    /// how many more times the timer is set again after it fires while a snapshot-decided exit is still waited for (a game
+    /// can take a while to end after its window is gone)
+    rechecks_left: u32,
 }
 
 thread_local! {
@@ -385,6 +401,18 @@ fn run() {
                     let _ = unsafe { KillTimer(None, msg.wParam.0) };
                     if id != 0 {
                         check_now();
+                        // an exit decided by snapshots is still waited for: look again a moment later (bounded)
+                        let more = local(|l| {
+                            let left = l.rechecks_left;
+                            l.rechecks_left = left.saturating_sub(1);
+                            left > 0
+                        })
+                        .unwrap_or(false);
+                        let again = more && !shared().watch.exit_pids().is_empty();
+                        if again {
+                            // SAFETY: our own thread timer.
+                            local(|l| l.recheck = unsafe { SetTimer(None, 0, RECHECK_MS, None) });
+                        }
                     }
                     continue;
                 }
@@ -541,7 +569,8 @@ unsafe extern "system" fn on_destroy(_h: HWINEVENTHOOK, _event: u32, hwnd: HWND,
     }
     queue_check();
     local(|l| {
-        // SAFETY: our own one-shot thread timer (re-aimed, never repeating: killed when it fires).
+        l.rechecks_left = RECHECK_ROUNDS;
+        // SAFETY: our own thread timer (re-aimed; killed when it fires, set again by the loop while an exit is still waited for).
         unsafe {
             if l.recheck != 0 {
                 let _ = KillTimer(None, l.recheck);

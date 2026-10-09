@@ -357,8 +357,8 @@ fn first_run_mirrors_raw_accel_and_writes_nothing() {
     let a = m.accel();
     assert!(a.panel.on && !a.panel.expanded, "on but collapsed");
     assert_eq!(a.panel.presets[0].name, "Raw Accel");
-    assert_eq!(a.per_app.everywhere_else(), Target::Preset(a.panel.presets[0].id));
-    assert_eq!(header_line(&a.panel, &a.per_app), "everywhere else: Raw Accel");
+    assert_eq!(a.per_app.everywhere_else(), Target::Main, "the mirrored preset is the main one: it runs everywhere");
+    assert_eq!(header_line(&a.panel, &a.per_app), "Raw Accel everywhere");
     assert!(!m.sync_driver().unwrap(), "same bytes already in the driver → no write");
     assert_eq!(m.os().rawaccel_byte_writes, 0);
     assert!(!m.mirror_rawaccel().unwrap(), "only on the first run");
@@ -374,7 +374,7 @@ fn switch_off_writes_plain_1_to_1_and_on_puts_his_curve_back_byte_exact() {
     let off = bytes::read_profiles(&m.os().rawaccel_driver);
     assert_eq!(off[0].accel_x.mode, AccelMode::Noaccel);
     assert_eq!(off[0].output_dpi, 1000.0);
-    assert_eq!(m.set_accel_on(true).unwrap(), "Acceleration on · everywhere else: Raw Accel");
+    assert_eq!(m.set_accel_on(true).unwrap(), "Acceleration on · Raw Accel everywhere");
     assert_eq!(m.os().rawaccel_driver, original, "back to exactly what Raw Accel ran");
     assert_eq!(m.os().rawaccel_byte_writes, 2);
     assert!(m.os().rawaccel_writes.is_empty(), "v1.7 → the WRITE ioctl, never writer.exe");
@@ -393,7 +393,7 @@ fn per_app_switches_on_process_start_and_stop() {
     let row = m.accel_mut().per_app.add_row(r"C:\Riot Games\VALORANT\live\ShooterGame\Binaries\Win64\VALORANT-Win64-Shipping.exe", Target::Preset(fast));
     m.accel_mut().per_app.set_row_label(row, "VALORANT");
     m.accel_mut().per_app.set_everywhere_else(Target::Off);
-    assert_eq!(header_line(&m.accel().panel, &m.accel().per_app), "VALORANT: Fast · off everywhere else");
+    assert_eq!(header_line(&m.accel().panel, &m.accel().per_app), "VALORANT: Fast · otherwise Off");
     assert_eq!(m.accel().per_app.watched_names(), vec!["valorant-win64-shipping.exe".to_string()]);
     m.sync_driver().unwrap();
     assert_eq!(bytes::read_profiles(&m.os().rawaccel_driver)[0].accel_x.mode, AccelMode::Noaccel);
@@ -435,7 +435,7 @@ fn two_listed_apps_last_started_wins() {
     assert!(!exe_matches(r"C:\Games\b.exe", r"D:\Other\b.exe"));
     assert!(exe_matches("b.exe", r"D:\Other\B.EXE"));
     assert_eq!(pa.forget_preset(PresetId(9)), (vec![], true));
-    assert_eq!(pa.everywhere_else(), Target::Off);
+    assert_eq!(pa.everywhere_else(), Target::Main, "a deleted preset falls back to the main preset");
 }
 
 #[test]
@@ -522,4 +522,287 @@ fn a_denied_driver_write_is_typed() {
     m.mirror_rawaccel().unwrap();
     m.os_mut().deny_writes = 1;
     assert!(matches!(m.set_accel_on(false), Err(Error::NeedsAdmin { .. })));
+}
+
+// ---------------------------------------------------------------- Order 063: the card is kept, the driver is re-checked
+
+/// The same profile with both axes Off (what Raw Accel's "Off" / noaccel writes).
+fn off_cfg() -> DriverConfig {
+    let mut c = his_cfg();
+    c.profiles[0].accel_x = off_args();
+    c.profiles[0].accel_y = off_args();
+    c
+}
+
+#[test]
+fn same_effect_ignores_padding_and_the_stale_bytes_of_an_off_axis_only() {
+    let off = bytes::to_bytes(&off_cfg());
+    // stale numbers in an Off axis' union + its unused arguments (measured on the real driver, Oct 9: a live Off profile
+    // held an old curve's numbers there — Raw Accel's own GUI leaves them): same behaviour
+    let mut stale = off.clone();
+    let at = bytes::IO_BASE + bytes::PROFILE + 24;
+    stale[at..at + 8].copy_from_slice(&0.001f64.to_le_bytes());
+    stale[at + 16..at + 24].copy_from_slice(&1.6f64.to_le_bytes());
+    let args = bytes::IO_BASE + 544;
+    stale[args + 8 + 16..args + 8 + 24].copy_from_slice(&7.5f64.to_le_bytes());
+    assert!(!bytes::diff(&off, &stale, 1, 0, 1).is_empty(), "the plain diff does see them");
+    assert!(bytes::same_effect(&off, &stale));
+    // padding bytes never count
+    let mut pad = off.clone();
+    pad[3] = 9;
+    assert!(bytes::same_effect(&off, &pad));
+    // a real difference does: the sens multiplier, the mode, a curve number of an ON axis
+    let mut sens = off.clone();
+    let tail = bytes::IO_BASE + 4952;
+    sens[tail..tail + 8].copy_from_slice(&1200.0f64.to_le_bytes());
+    assert!(!bytes::same_effect(&off, &sens));
+    let on = bytes::to_bytes(&his_cfg());
+    assert!(!bytes::same_effect(&off, &on) && !bytes::same_effect(&on, &off));
+    let mut curve = on.clone();
+    let u = bytes::IO_BASE + bytes::PROFILE + 24;
+    curve[u] ^= 0x10;
+    assert!(!bytes::same_effect(&on, &curve), "stale bytes in an axis that is ON are a real difference");
+    // sizes / a driver that was never written (header only)
+    assert!(!bytes::same_effect(&on, &on[..bytes::IO_BASE]));
+    assert!(!bytes::same_effect(&on, &[]));
+}
+
+#[test]
+fn the_card_is_saved_and_comes_back_with_the_switch_the_presets_and_the_rows() {
+    let mut m = with_driver((1, 7, 0), Some(SETTINGS));
+    assert!(m.mirror_rawaccel().unwrap());
+    let (fast, _) = m.accel_mut().panel.save_as_preset();
+    m.accel_mut().panel.rename_preset(fast, "Fast").unwrap();
+    let row = m.accel_mut().per_app.add_row("VALORANT-Win64-Shipping.exe", Target::Preset(fast));
+    m.accel_mut().per_app.set_row_label(row, "VALORANT");
+    assert!(m.save_accel().unwrap());
+    assert!(!m.save_accel().unwrap(), "unchanged → no second write");
+    // "a restart": a new service on the same files
+    let mut again = with_driver((1, 7, 0), Some(SETTINGS));
+    again.os_mut().byte_files = m.os().byte_files.clone();
+    assert!(again.load_accel().unwrap());
+    assert_eq!(again.accel().panel, m.accel().panel);
+    assert_eq!(again.accel().per_app.rows(), m.accel().per_app.rows());
+    assert_eq!(again.accel().per_app.everywhere_else(), m.accel().per_app.everywhere_else());
+    assert!(again.accel().panel.on);
+    // damaged file: an error, the card stays empty and the file is not replaced
+    let file = again.dirs().accel_file();
+    again.os_mut().byte_files.insert(file.clone(), b"{ nope".to_vec());
+    let mut fresh = with_driver((1, 7, 0), Some(SETTINGS));
+    fresh.os_mut().byte_files = again.os().byte_files.clone();
+    assert!(fresh.load_accel().is_err());
+    assert!(fresh.accel().panel.presets.is_empty());
+    assert_eq!(fresh.os().byte_files.get(&file).map(|b| b.as_slice()), Some(&b"{ nope"[..]));
+}
+
+#[test]
+fn app_start_writes_the_driver_only_when_the_user_had_it_on_and_the_driver_differs() {
+    // nothing saved: nothing written (the Mouse tab mirrors Raw Accel when it opens)
+    let mut m = with_driver((1, 7, 0), Some(SETTINGS));
+    assert_eq!(m.start_accel().unwrap(), StartAccel::NothingSaved);
+    assert_eq!(m.os().rawaccel_byte_writes, 0);
+    // saved ON, and the driver already runs it: nothing written
+    m.mirror_rawaccel().unwrap();
+    m.save_accel().unwrap();
+    let saved = m.os().byte_files.clone();
+    let mut on = with_driver((1, 7, 0), Some(SETTINGS));
+    on.os_mut().byte_files = saved.clone();
+    assert_eq!(on.start_accel().unwrap(), StartAccel::AlreadyRunning);
+    assert_eq!(on.os().rawaccel_byte_writes, 0);
+    // saved ON, but Raw Accel's app wrote Off meanwhile: written once
+    let mut reset = with_driver((1, 7, 0), Some(SETTINGS));
+    reset.os_mut().byte_files = saved.clone();
+    reset.os_mut().rawaccel_driver = bytes::to_bytes(&off_cfg());
+    assert_eq!(reset.start_accel().unwrap(), StartAccel::Applied);
+    assert_eq!(reset.os().rawaccel_byte_writes, 1);
+    assert_eq!(bytes::read_profiles(&reset.os().rawaccel_driver)[0].accel_x.mode, AccelMode::Classic);
+    let mut header_only = with_driver((1, 7, 0), Some(SETTINGS));
+    header_only.os_mut().byte_files = saved.clone();
+    header_only.os_mut().rawaccel_driver = vec![0; bytes::IO_BASE];
+    assert_eq!(header_only.start_accel().unwrap(), StartAccel::Applied, "a driver nobody has written since the PC started");
+    // saved OFF: never written, whatever the driver runs
+    let mut off = with_driver((1, 7, 0), Some(SETTINGS));
+    off.os_mut().byte_files = saved;
+    off.load_accel().unwrap();
+    off.accel_mut().panel.on = false;
+    off.save_accel().unwrap();
+    let mut left = with_driver((1, 7, 0), Some(SETTINGS));
+    left.os_mut().byte_files = off.os().byte_files.clone();
+    assert_eq!(left.start_accel().unwrap(), StartAccel::LeftAlone);
+    assert_eq!(left.os().rawaccel_byte_writes, 0);
+    // saved ON but no driver at all
+    let mut none = Mouse::new(FakeOs::new(), AppDirs::new(r"C:\fake\appdata"));
+    none.os_mut().byte_files = on.os().byte_files.clone();
+    assert_eq!(none.start_accel().unwrap(), StartAccel::NoDriver);
+}
+
+#[test]
+fn a_game_start_sets_the_driver_again_after_another_program_wrote_it() {
+    let mut m = with_driver((1, 7, 0), Some(SETTINGS));
+    m.mirror_rawaccel().unwrap();
+    let (fast, _) = m.accel_mut().panel.save_as_preset();
+    m.accel_mut().per_app.add_row("VALORANT-Win64-Shipping.exe", Target::Preset(fast));
+    m.accel_mut().per_app.set_everywhere_else(Target::Off);
+    m.sync_driver().unwrap();
+    let writes = m.os().rawaccel_byte_writes;
+    assert!(!m.sync_driver().unwrap(), "nothing changed → no write");
+    // Raw Accel's own app opens and sends its settings.json (Off) to the driver
+    m.os_mut().rawaccel_driver = bytes::to_bytes(&off_cfg());
+    assert_eq!(m.driver_matches_card().unwrap(), Some(true), "everywhere else = Off = what it wrote");
+    m.accel_app_event(&AppEvent::Started { pid: 5, exe: "VALORANT-Win64-Shipping.exe".into(), has_window: false });
+    assert_eq!(m.driver_matches_card().unwrap(), Some(false));
+    assert!(m.sync_driver().unwrap(), "the game started → the driver is set to the game's preset again");
+    assert_eq!(m.os().rawaccel_byte_writes, writes + 1);
+    assert_eq!(bytes::read_profiles(&m.os().rawaccel_driver)[0].accel_x.mode, AccelMode::Classic);
+}
+
+#[test]
+fn another_writer_is_said_plainly() {
+    let mut m = with_driver((1, 7, 0), Some(SETTINGS));
+    m.mirror_rawaccel().unwrap();
+    assert_eq!(m.other_writer_line().unwrap(), None, "the driver runs the card");
+    // Raw Accel's app wrote Off after this app
+    m.os_mut().rawaccel_driver = bytes::to_bytes(&off_cfg());
+    let line = m.other_writer_line().unwrap().unwrap();
+    assert!(line.starts_with("The driver is not running this card right now: another program wrote it"), "{line}");
+    assert!(!line.contains("settings.json"), "no .config known → no claim about it");
+    m.os_mut().files.insert(PathBuf::from(RA_DIR).join(".config"), r#"{"DPI":2400,"AutoWriteToDriverOnStartup":true}"#.into());
+    assert!(m.other_writer_line().unwrap().unwrap().contains("sends its settings.json to the driver every time it opens"));
+    // its app is open right now
+    m.os_mut().running.push("rawaccel.exe".into());
+    assert!(m.other_writer_line().unwrap().unwrap().starts_with("Your own Raw Accel app is open. It writes the driver too"));
+    // card off + no app open: nothing to say even though the driver differs
+    m.os_mut().running.clear();
+    m.accel_mut().panel.on = false;
+    assert_eq!(m.other_writer_line().unwrap(), None);
+    // no driver → nothing
+    assert_eq!(Mouse::new(FakeOs::new(), AppDirs::new("x")).other_writer_line().unwrap(), None);
+}
+
+#[test]
+fn a_game_that_was_already_open_is_marked_late_until_its_next_launch() {
+    let mut m = with_driver((1, 7, 0), Some(SETTINGS));
+    m.mirror_rawaccel().unwrap();
+    let (fast, _) = m.accel_mut().panel.save_as_preset();
+    let row = m.accel_mut().per_app.add_row("VALORANT-Win64-Shipping.exe", Target::Preset(fast));
+    assert!(!m.accel().per_app.is_late(row));
+    assert!(!m.accel_app_event(&AppEvent::Started { pid: 9, exe: "VALORANT-Win64-Shipping.exe".into(), has_window: true }));
+    assert!(m.accel().per_app.is_late(row) && !m.accel().per_app.is_active(row));
+    assert!(m.accel_app_event(&AppEvent::Started { pid: 10, exe: "VALORANT-Win64-Shipping.exe".into(), has_window: false }));
+    assert!(!m.accel().per_app.is_late(row) && m.accel().per_app.is_active(row));
+}
+
+/// "Same numbers in = same driver values out": every curve of the card, with its defaults and with each row at its
+/// extremes, goes into the driver bytes and comes back from them as exactly the args Raw Accel's own GUI would have made —
+/// and the sens multiplier is Raw Accel's "Output DPI" (× 1000) on the user's own profile.
+#[test]
+fn what_the_card_hands_over_is_what_the_driver_reads_back() {
+    let base = his_cfg();
+    let picks: [fn(&RowSpec) -> f64; 3] = [|r| r.default, |r| r.min, |r| r.max];
+    for c in Curve::ALL {
+        for pick in picks {
+            let mut v = CurveValues::defaults(c);
+            for r in rows(c) {
+                v.values.insert(r.field, pick(&r));
+            }
+            if matches!(c, Curve::Linear | Curve::Classic) {
+                let off = v.get(Field::InputOffset);
+                if v.get(Field::CapInput) <= off {
+                    v.values.insert(Field::CapInput, (off + 30.0).min(120.0));
+                }
+            }
+            for sens in [0.1, 1.0, 1.37, 3.0] {
+                let s = Setting { args: to_args(c, &v), sens };
+                let mut cfg = base.clone();
+                cfg.profiles[0] = s.apply_to(&base.profiles[0]);
+                if !validate(&cfg.profiles[0]).is_empty() {
+                    continue;
+                }
+                let raw = bytes::to_bytes(&cfg);
+                let back = &bytes::read_profiles(&raw)[0];
+                assert_eq!(back.accel_x, s.args, "{c:?} x");
+                assert_eq!(back.accel_y, s.args, "{c:?} y (whole mode: same args)");
+                assert_eq!(back.output_dpi, sens * 1000.0, "{c:?} sens {sens}");
+                assert_eq!(back.domain_weights, base.profiles[0].domain_weights, "his own profile fields are kept");
+            }
+        }
+    }
+}
+
+#[test]
+fn putting_the_earlier_driver_state_back_also_switches_the_saved_card_off() {
+    let mut m = with_driver((1, 7, 0), Some(SETTINGS));
+    m.mirror_rawaccel().unwrap();
+    let (fast, _) = m.accel_mut().panel.save_as_preset();
+    m.accel_mut().per_app.add_row("VALORANT-Win64-Shipping.exe", Target::Preset(fast));
+    m.save_accel().unwrap();
+    // the kept earlier state: Off
+    let before = m.os().rawaccel_driver.clone();
+    let off = bytes::to_bytes(&off_cfg());
+    m.os_mut().rawaccel_driver = off.clone();
+    let kept = m.keep_driver_state(&off).unwrap();
+    m.os_mut().rawaccel_driver = before; // the card's curve runs now
+    // "a closed tab's service": nothing read yet
+    let mut cold = with_driver((1, 7, 0), Some(SETTINGS));
+    cold.os_mut().byte_files = m.os().byte_files.clone();
+    cold.os_mut().rawaccel_driver = m.os().rawaccel_driver.clone();
+    cold.restore_driver_state(&kept).unwrap();
+    assert!(bytes::same_effect(&off, &cold.os().rawaccel_driver), "the earlier state is back");
+    let mut next_start = with_driver((1, 7, 0), Some(SETTINGS));
+    next_start.os_mut().byte_files = cold.os().byte_files.clone();
+    next_start.os_mut().rawaccel_driver = cold.os().rawaccel_driver.clone();
+    assert_eq!(next_start.start_accel().unwrap(), StartAccel::LeftAlone, "the next app start does not write the card's curve over it");
+    assert_eq!(next_start.os().rawaccel_byte_writes, 0);
+    assert_eq!(next_start.accel().panel.presets.len(), 2, "presets and games are kept");
+    assert_eq!(next_start.accel().per_app.rows().len(), 1);
+}
+
+#[test]
+fn a_game_row_with_no_game_chosen_is_not_kept() {
+    let mut m = with_driver((1, 7, 0), Some(SETTINGS));
+    m.accel_mut().per_app.add_row("", Target::Main);
+    m.accel_mut().per_app.add_row("VALORANT-Win64-Shipping.exe", Target::Off);
+    assert_eq!(m.accel().per_app.watched_names(), vec!["valorant-win64-shipping.exe".to_string()], "a blank row listens for nothing");
+    m.save_accel().unwrap();
+    let mut again = with_driver((1, 7, 0), Some(SETTINGS));
+    again.os_mut().byte_files = m.os().byte_files.clone();
+    again.load_accel().unwrap();
+    assert_eq!(again.accel().per_app.rows().len(), 1);
+    assert_eq!(m.accel().per_app.rows().len(), 2, "the open card keeps its blank row until a game is picked");
+}
+
+#[test]
+fn a_damaged_saved_card_is_never_overwritten_and_an_unknown_driver_is_not_written_at_start() {
+    let mut m = with_driver((1, 7, 0), Some(SETTINGS));
+    let file = m.dirs().accel_file();
+    m.os_mut().byte_files.insert(file.clone(), b"{ torn".to_vec());
+    assert!(m.load_accel().is_err());
+    m.accel_mut().panel.on = true;
+    let e = m.save_accel().unwrap_err().to_string();
+    assert!(e.contains("not overwritten"), "{e}");
+    assert_eq!(m.os().byte_files.get(&file).map(|b| b.as_slice()), Some(&b"{ torn"[..]));
+    // a good file again (deleted by the user): saving works
+    m.os_mut().byte_files.remove(&file);
+    assert!(!m.load_accel().unwrap());
+    assert!(m.save_accel().unwrap());
+    // a driver that is not a 1.7: its state can't be read, so nothing is written at start (no writer.exe on every start)
+    let saved = m.os().byte_files.clone();
+    let mut old = with_driver((1, 6, 0), Some(SETTINGS));
+    old.os_mut().byte_files = saved;
+    assert_eq!(old.start_accel().unwrap(), StartAccel::Unreadable);
+    assert!(old.os().rawaccel_writes.is_empty() && old.os().rawaccel_byte_writes == 0);
+}
+
+#[test]
+fn the_tab_counts_the_games_the_engine_says_run() {
+    let mut m = with_driver((1, 7, 0), Some(SETTINGS));
+    m.mirror_rawaccel().unwrap();
+    let (fast, _) = m.accel_mut().panel.save_as_preset();
+    let row = m.accel_mut().per_app.add_row("VALORANT-Win64-Shipping.exe", Target::Preset(fast));
+    m.accel_mut().per_app.set_everywhere_else(Target::Off);
+    m.accel_mut().per_app.set_active_rows(&[row]);
+    assert!(m.accel().per_app.is_active(row));
+    assert_eq!(m.accel().per_app.current(), Target::Preset(fast));
+    m.accel_mut().per_app.set_active_rows(&[RowId(999)]);
+    assert_eq!(m.accel().per_app.current(), Target::Off, "an unknown row counts for nothing");
 }

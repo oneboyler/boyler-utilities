@@ -10,6 +10,9 @@ description = "Boyler Utilities - the Mouse tab's Windows features (DESIGN.md 3.
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
+# Order 066: cursor files as pictures (curfile.rs): the PNG pictures inside .cur / .ani files
+png = "0.18"
+miniz_oxide = "0.8"
 
 [target.'cfg(windows)'.dependencies]
 # Order 048: the shared window-creation start watcher + SYNCHRONIZE exit waits (replaces the WMI creation / deletion events)
@@ -32,6 +35,7 @@ windows = { version = "0.62", features = [
     "Win32_Devices_HumanInterfaceDevice",
     "Win32_Devices_DeviceAndDriverInstallation",
     "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Input",
     "Win32_UI_Input_KeyboardAndMouse",
 ] }
 
@@ -52,8 +56,10 @@ path = "examples/trigger.rs"
 
 # Order 040: the Glass set's load test (tests/glass.rs) decodes the PNG entries itself and asks Windows to load + draw every
 # file off screen (LoadImageW / GetIconInfo / DrawIconEx into a memory DC; no system cursor is ever changed).
-[dev-dependencies]
-png = "0.18"
-
 [target.'cfg(windows)'.dev-dependencies]
-windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_UI_WindowsAndMessaging"] }
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_UI_WindowsAndMessaging", "Win32_System_SystemInformation", "Win32_UI_Input_KeyboardAndMouse", "Win32_Graphics_Direct3D", "Win32_Graphics_Direct3D11", "Win32_Graphics_Dxgi", "Win32_Graphics_Dxgi_Common"] }
+
+# Order 066's real-PC proof: picks a scheme + sets the size, measures what Windows shows, puts everything back exactly.
+[[example]]
+name = "cursor-proof"
+path = "examples/cursor_proof.rs"

@@ -24,8 +24,12 @@ pub enum AppEvent {
 pub struct PresetId(pub u64);
 
 /// The right side of a row / of "Everywhere else".
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Target {
+    /// the card's own picked preset (what the switch turns on everywhere) - the default of "when none of these games are open";
+    /// never offered for a game's row
+    #[default]
+    Main,
     /// plain 1:1 (see `crate::accel::panel::off_args`)
     Off,
     Preset(PresetId),
@@ -71,12 +75,16 @@ pub fn exe_matches(row_exe: &str, process_exe: &str) -> bool {
 pub struct PerApp {
     rows: Vec<AppRow>,
     next_id: u64,
-    /// "Everywhere else", default Off
-    everywhere_else: Option<PresetId>,
+    /// "When none of these games are open", default: the main preset
+    #[serde(default)]
+    everywhere_else: Target,
     #[serde(skip)]
     active: Vec<(u32, RowId)>,
     #[serde(skip)]
     notes: Vec<SwitchNote>,
+    /// rows whose game was already showing a window when its start was noticed (not switched; cleared by the next start)
+    #[serde(skip)]
+    late: Vec<RowId>,
 }
 
 impl PerApp {
@@ -89,14 +97,11 @@ impl PerApp {
     }
 
     pub fn everywhere_else(&self) -> Target {
-        self.everywhere_else.map(Target::Preset).unwrap_or(Target::Off)
+        self.everywhere_else
     }
 
     pub fn set_everywhere_else(&mut self, t: Target) {
-        self.everywhere_else = match t {
-            Target::Off => None,
-            Target::Preset(p) => Some(p),
-        };
+        self.everywhere_else = t;
     }
 
     /// "+ Add app": a row with the current preset (the caller passes it).
@@ -133,6 +138,7 @@ impl PerApp {
     pub fn remove_row(&mut self, id: RowId) -> Option<AppRow> {
         let i = self.rows.iter().position(|r| r.id == id)?;
         self.active.retain(|(_, r)| *r != id);
+        self.late.retain(|r| *r != id);
         Some(self.rows.remove(i))
     }
 
@@ -146,19 +152,55 @@ impl PerApp {
                 apps.push(file_name(&r.exe).to_string());
             }
         }
-        let ee = self.everywhere_else == Some(p);
+        let ee = self.everywhere_else == Target::Preset(p);
         if ee {
-            self.everywhere_else = None;
+            self.everywhere_else = Target::Main;
         }
         (apps, ee)
     }
 
     /// The exe file names to watch (only these are looked at by the watcher). No rows → nothing is watched.
     pub fn watched_names(&self) -> Vec<String> {
-        let mut v: Vec<String> = self.rows.iter().map(|r| file_name(&r.exe).to_ascii_lowercase()).collect();
+        let mut v: Vec<String> = self.rows.iter().map(|r| file_name(&r.exe).to_ascii_lowercase()).filter(|n| !n.is_empty()).collect();
         v.sort();
         v.dedup();
         v
+    }
+
+    /// This row's game was already open when its start was noticed: it was NOT switched and runs unswitched until its next
+    /// launch (the row says so).
+    pub fn is_late(&self, id: RowId) -> bool {
+        self.late.contains(&id)
+    }
+
+    /// Is a listed app running (and switched to) now?
+    pub fn is_active(&self, id: RowId) -> bool {
+        self.active.iter().any(|(_, r)| *r == id)
+    }
+
+    /// After the saved card was read again: games that run now (and rows flagged late) stay as they were, by process id —
+    /// only for rows that still exist with the same exe.
+    pub fn keep_running_from(&mut self, old: &PerApp) {
+        let same = |id: RowId| match (old.rows.iter().find(|r| r.id == id), self.rows.iter().find(|r| r.id == id)) {
+            (Some(a), Some(b)) => a.exe.eq_ignore_ascii_case(&b.exe),
+            _ => false,
+        };
+        self.active = old.active.iter().filter(|(_, id)| same(*id)).copied().collect();
+        self.late = old.late.iter().filter(|id| same(**id)).copied().collect();
+    }
+
+    /// Rows with no game chosen yet (the "Add a game" row before the picker answers) are not worth keeping.
+    pub fn drop_blank_rows(&mut self) {
+        let blank: Vec<RowId> = self.rows.iter().filter(|r| r.exe.trim().is_empty()).map(|r| r.id).collect();
+        for id in blank {
+            self.remove_row(id);
+        }
+    }
+
+    /// The games that run now, as the always-on engine knows them (the open tab's own copy never sees a game start): these
+    /// rows count as running, so the tab's header and its "another program wrote the driver" check use what really applies.
+    pub fn set_active_rows(&mut self, rows: &[RowId]) {
+        self.active = rows.iter().filter(|r| self.rows.iter().any(|x| x.id == **r)).map(|r| (0, *r)).collect();
     }
 
     /// Notes for the menu since the last call.
@@ -175,10 +217,16 @@ impl PerApp {
                 }
                 let Some(row) = self.rows.iter().find(|r| exe_matches(&r.exe, exe)) else { return false };
                 if *has_window {
-                    self.notes.push(SwitchNote::TooLate { row: row.id, exe: file_name(exe).to_string() });
+                    let rid = row.id;
+                    if !self.late.contains(&rid) {
+                        self.late.push(rid);
+                    }
+                    self.notes.push(SwitchNote::TooLate { row: rid, exe: file_name(exe).to_string() });
                     return false;
                 }
-                self.active.push((*pid, row.id));
+                let rid = row.id;
+                self.late.retain(|r| *r != rid);
+                self.active.push((*pid, rid));
                 true
             }
             AppEvent::Stopped { pid } => {

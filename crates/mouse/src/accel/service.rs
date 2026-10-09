@@ -32,6 +32,8 @@ pub struct AccelState {
     pub rawaccel_dir: Option<PathBuf>,
     /// the bytes last handed to the driver (a write is skipped when nothing changed)
     last_written: Option<Vec<u8>>,
+    /// the saved card could not be read (damaged / newer version): it is never overwritten (`save_accel` refuses)
+    pub(crate) load_failed: bool,
 }
 
 /// What the card shows in its place.
@@ -41,6 +43,23 @@ pub enum RawAccelStatus {
     Installed { version: DriverVersion, dir: Option<PathBuf> },
     /// No driver: the install card (DESIGN text) + the official link.
     NotInstalled,
+}
+
+/// What `start_accel` did at app start.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StartAccel {
+    /// no saved card (the first run: the Mouse tab mirrors Raw Accel when it opens) — nothing written
+    NothingSaved,
+    /// the card was saved OFF — the driver is not touched
+    LeftAlone,
+    /// the card was ON but there is no Raw Accel driver
+    NoDriver,
+    /// the card was ON but the driver is not a 1.7 (its state can not be read, so nothing is written at start)
+    Unreadable,
+    /// the card was ON and the driver already ran it — nothing written
+    AlreadyRunning,
+    /// the card was ON and the driver ran something else — written
+    Applied,
 }
 
 impl RawAccelStatus {
@@ -83,20 +102,26 @@ pub fn is_rawaccel_name(name: &str) -> bool {
     n.starts_with("rawaccel")
 }
 
-/// Header line when on: "VALORANT: Valorant · off everywhere else" / "… · everywhere else: Default".
+/// The main preset's name for the header ("Fast"); the card's own values that are no saved preset show as "Custom".
+pub fn main_name(panel: &Panel) -> String {
+    panel.loaded.and_then(|id| panel.preset(id)).map(|p| p.name.clone()).unwrap_or_else(|| "Custom".into())
+}
+
+/// Header line when on: "Fast everywhere" - with games listed "VALORANT: Valorant · otherwise Fast" / "… · otherwise Off".
 pub fn header_line(panel: &Panel, per_app: &PerApp) -> String {
     if !panel.on {
         return "Fast flicks go further, slow aim stays the same".into();
     }
     let name = |t: Target| match t {
+        Target::Main => main_name(panel),
         Target::Off => "Off".to_string(),
         Target::Preset(id) => panel.preset(id).map(|p| p.name.clone()).unwrap_or_else(|| "Off".into()),
     };
+    if per_app.rows().is_empty() {
+        return format!("{} everywhere", main_name(panel));
+    }
     let mut parts: Vec<String> = per_app.rows().iter().map(|r| format!("{}: {}", r.label, name(r.target))).collect();
-    parts.push(match per_app.everywhere_else() {
-        Target::Off => "off everywhere else".into(),
-        t => format!("everywhere else: {}", name(t)),
-    });
+    parts.push(format!("otherwise {}", name(per_app.everywhere_else())));
     parts.join(" · ")
 }
 
@@ -158,11 +183,10 @@ impl<O: MouseOs> Mouse<O> {
         let _ = panel.rename_preset(id, MIRROR_PRESET);
         panel.on = true;
         panel.expanded = false;
-        self.accel.per_app.set_everywhere_else(Target::Preset(id));
         // Same bytes already in the driver → remember them, so the next sync does not rewrite (no 1 s write for nothing).
         if let Ok(cfg) = self.config_for(&self.accel_target()) {
             let ours = bytes::to_bytes(&cfg);
-            if ours.len() == raw.len() && bytes::diff(&ours, &raw, cfg.profiles.len(), cfg.devices.len(), 1).is_empty() {
+            if bytes::same_effect(&ours, &raw) {
                 self.accel.last_written = Some(ours);
             }
         }
@@ -194,6 +218,7 @@ impl<O: MouseOs> Mouse<O> {
         }
         match a.per_app.current() {
             Target::Off => Setting::off(),
+            Target::Main => a.panel.current_setting(),
             Target::Preset(id) if a.panel.loaded == Some(id) => a.panel.current_setting(),
             Target::Preset(id) => a.panel.preset_setting(id).unwrap_or_else(Setting::off),
         }
@@ -211,18 +236,24 @@ impl<O: MouseOs> Mouse<O> {
         Ok(cfg)
     }
 
-    /// Hands `accel_target()` to the driver if it differs from what was last handed over. Returns true when it wrote.
+    /// Hands `accel_target()` to the driver unless it already runs exactly that. Returns true when it wrote.
     /// Call it after the settle delay for app events, and after any card change.
+    /// With the 1.7 driver the driver's own READ decides (not what this service wrote last): another program — Raw Accel's
+    /// own app re-sends its settings.json every time it opens — may have changed the driver since (Order 063).
     pub fn sync_driver(&mut self) -> Result<bool> {
         let version = self.os.rawaccel_driver_version()?.ok_or_else(|| Error::RawAccelMissing("the Raw Accel driver is not running".into()))?;
         let cfg = self.config_for(&self.accel_target())?;
         let b = bytes::to_bytes(&cfg);
-        if self.accel.last_written.as_ref() == Some(&b) {
-            return Ok(false);
-        }
         if version.major == 1 && version.minor == 7 {
+            if self.os.rawaccel_read()?.is_some_and(|now| bytes::same_effect(&b, &now)) {
+                self.accel.last_written = Some(b);
+                return Ok(false);
+            }
             self.os.rawaccel_write(&b)?;
         } else {
+            if self.accel.last_written.as_ref() == Some(&b) {
+                return Ok(false);
+            }
             let dir = self.accel.rawaccel_dir.clone().ok_or_else(|| Error::RawAccelMissing(format!("driver {version}: need the Raw Accel folder for its writer.exe")))?;
             let file = self.dirs.rawaccel_settings();
             self.os.rawaccel_writer(&dir, &file, &cfg.to_json())?;
@@ -231,12 +262,77 @@ impl<O: MouseOs> Mouse<O> {
         Ok(true)
     }
 
+    /// Does the driver run what the card says now? `None` = no 1.7 driver to ask (nothing known). A read only.
+    pub fn driver_matches_card(&self) -> Result<Option<bool>> {
+        match self.os.rawaccel_driver_version()? {
+            Some(v) if v.major == 1 && v.minor == 7 => {}
+            _ => return Ok(None),
+        }
+        let want = bytes::to_bytes(&self.config_for(&self.accel_target())?);
+        Ok(self.os.rawaccel_read()?.map(|now| bytes::same_effect(&want, &now)))
+    }
+
+    /// App start (Order 063): the saved card comes back, and the driver is touched ONLY when the user had acceleration ON
+    /// and the driver doesn't already run what the card says now. A card that was off, or never saved, writes nothing.
+    pub fn start_accel(&mut self) -> Result<StartAccel> {
+        if !self.load_accel()? {
+            return Ok(StartAccel::NothingSaved);
+        }
+        if !self.accel.panel.on {
+            return Ok(StartAccel::LeftAlone);
+        }
+        match self.os.rawaccel_driver_version()? {
+            None => return Ok(StartAccel::NoDriver),
+            // a driver whose layout is unknown can not be read back: it is not written at start (writer.exe would run every time)
+            Some(v) if !(v.major == 1 && v.minor == 7) => return Ok(StartAccel::Unreadable),
+            Some(_) => {}
+        }
+        Ok(if self.sync_driver()? { StartAccel::Applied } else { StartAccel::AlreadyRunning })
+    }
+
+    /// The line for "another program also writes the driver" (shown on the card), `None` = nothing to say. Reads only:
+    /// the process list (names), Raw Accel's `.config`, the driver. Two cases: Raw Accel's own app is open right now, or the
+    /// card is on but the driver runs something else (the app wrote it after this one).
+    pub fn other_writer_line(&self) -> Result<Option<String>> {
+        if self.os.rawaccel_driver_version()?.is_none() {
+            return Ok(None);
+        }
+        if self.os.process_running("rawaccel.exe")? || self.os.process_running("writer.exe")? {
+            return Ok(Some("Your own Raw Accel app is open. It writes the driver too, and the last one to write wins. Close it to keep this card in charge.".into()));
+        }
+        if self.accel.panel.on && self.driver_matches_card()? == Some(false) {
+            let auto = self.rawaccel_auto_writes();
+            return Ok(Some(format!(
+                "The driver is not running this card right now: another program wrote it after this app{}. It is set again at the next game start or change here.",
+                if auto { " (your Raw Accel app sends its settings.json to the driver every time it opens)" } else { "" }
+            )));
+        }
+        Ok(None)
+    }
+
+    /// Raw Accel's own app writes its settings.json to the driver whenever it starts (its `.config`:
+    /// `AutoWriteToDriverOnStartup`). Read only; false when unknown.
+    pub fn rawaccel_auto_writes(&self) -> bool {
+        let Some(dir) = &self.accel.rawaccel_dir else { return false };
+        let Ok(Some(t)) = self.os.read_text(&dir.join(".config")) else { return false };
+        serde_json::from_str::<serde_json::Value>(&t).ok().and_then(|v| v.get("AutoWriteToDriverOnStartup").and_then(|b| b.as_bool())).unwrap_or(false)
+    }
+
     /// The header switch. Returns the toast (DESIGN). The driver is synced at once (a direct click, not a game event).
     pub fn set_accel_on(&mut self, on: bool) -> Result<String> {
         self.accel.panel.on = on;
         self.accel.panel.expanded = on;
         self.sync_driver()?;
-        Ok(if on { format!("Acceleration on · {}", header_line(&self.accel.panel, &self.accel.per_app)) } else { "Acceleration off · plain 1:1 everywhere".into() })
+        Ok(self.accel_on_toast(on))
+    }
+
+    /// The toast after the header switch.
+    pub fn accel_on_toast(&self, on: bool) -> String {
+        if on {
+            format!("Acceleration on · {}", header_line(&self.accel.panel, &self.accel.per_app))
+        } else {
+            "Acceleration off · plain 1:1 everywhere".into()
+        }
     }
 
     /// An app started / stopped. Returns true when what should run may have changed — then settle and `sync_driver`.
@@ -244,7 +340,7 @@ impl<O: MouseOs> Mouse<O> {
         self.accel.per_app.on_event(ev)
     }
 
-    /// × on a preset chip: apps that used it turn Off. Returns the toast "Deleted <name> · <apps>, everywhere else now Off".
+    /// × on a preset chip: apps that used it turn Off. Returns the toast "Deleted <name> · <apps>, the other games now use the main preset".
     pub fn delete_accel_preset(&mut self, id: PresetId) -> Option<String> {
         let p = self.accel.panel.delete_preset(id)?;
         let (apps, ee) = self.accel.per_app.forget_preset(id);
@@ -253,7 +349,7 @@ impl<O: MouseOs> Mouse<O> {
             parts.push(format!("{} now Off", apps.join(", ")));
         }
         if ee {
-            parts.push("everywhere else now Off".into());
+            parts.push("the other games now use the main preset".into());
         }
         Some(if parts.is_empty() { format!("Deleted {}", p.name) } else { format!("Deleted {} · {}", p.name, parts.join(", ")) })
     }
@@ -333,6 +429,8 @@ impl<O: MouseOs> Mouse<O> {
 
     /// Puts a kept driver state back (only a file of `AppDirs::rawaccel_before`): the WRITE ioctl with its bytes, when the
     /// driver doesn't run them already. The card's next change is written again (`last_written` forgotten).
+    /// The saved card goes OFF too (Order 063): else the next app start would write the card's curve back over what the
+    /// user just put back. Its presets and games stay.
     pub fn restore_driver_state(&mut self, file: &Path) -> Result<()> {
         if file.parent() != Some(self.dirs.rawaccel_before().as_path()) {
             return Err(Error::NotFound(format!("{} is not a copy of Raw Accel's settings", file.display())));
@@ -343,6 +441,12 @@ impl<O: MouseOs> Mouse<O> {
             self.os.rawaccel_write(&b)?;
         }
         self.accel.last_written = None;
+        // (a closed tab's service has not read the file yet: read it first, so saving never replaces it with an empty card)
+        if self.load_accel().unwrap_or(false) && self.accel.panel.on {
+            self.accel.panel.on = false;
+            self.accel.panel.expanded = false;
+            self.save_accel()?;
+        }
         Ok(())
     }
 }

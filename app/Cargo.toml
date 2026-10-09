@@ -1,6 +1,6 @@
 [package]
 name = "bu-app"
-version = "1.0.3"
+version = "1.0.4"
 edition = "2021"
 publish = false
 description = "Boyler Utilities - the tray app (the glass menu)"
@@ -48,6 +48,7 @@ bu-addons = { path = "../crates/addons" }
 bu-rawin = { path = "../crates/rawin" }
 # the Keyboard tab (Order 058): key sounds + key remap
 bu-keysound = { path = "../crates/keysound" }
+bu-noise = { path = "../crates/noise" }
 
 [dependencies.windows]
 version = "0.62"
@@ -96,6 +97,7 @@ features = [
   "Win32_System_WinRT",
   "Win32_System_WinRT_Composition",
   "Win32_System_WinRT_Graphics_Direct2D",
+  "Win32_UI_Accessibility",
   "Win32_UI_Controls",
   "Win32_UI_Controls_Dialogs",
   "Win32_UI_HiDpi",

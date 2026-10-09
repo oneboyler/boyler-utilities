@@ -65,8 +65,26 @@ pub enum Error {
     Io { op: String, detail: String },
 
     /// A Windows call failed. `code` is the HRESULT / Win32 / NTSTATUS value.
-    #[error("{op} failed (code {code:#x})")]
+    #[error("{}", os_words(.op, *.code))]
     Os { op: String, code: i64 },
+}
+
+/// Order 066: what the user reads when a Windows call fails - plain words, never the API's name ("SPI_SETCURSORS failed").
+/// The call's name and the code stay in `op` / `code` for logs and tests.
+fn os_words(op: &str, code: i64) -> String {
+    let what = if op.starts_with("SPI_SETCURSORS") || op.starts_with("SetSystemCursor") {
+        "Windows didn’t switch the cursors"
+    } else if op.starts_with("LoadCursorFromFile") || op.starts_with("LoadImage") {
+        "Windows couldn’t load that cursor file"
+    } else if op.starts_with("SPI_") || op.starts_with("SystemParametersInfo") {
+        "Windows didn’t take that setting"
+    } else if op.starts_with("Reg") {
+        "Windows couldn’t save that setting"
+    } else {
+        "Windows refused that change"
+    };
+    let _ = code; // (kept in the error for logs; the person reads the words)
+    what.to_string()
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

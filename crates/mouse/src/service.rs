@@ -51,6 +51,10 @@ impl AppDirs {
     pub fn rawaccel_settings(&self) -> PathBuf {
         self.data.join("rawaccel").join("settings.json")
     }
+    /// `<data>\accel.json` — the acceleration card as the user left it (switch, curve values, presets, per-app rows).
+    pub fn accel_file(&self) -> PathBuf {
+        self.data.join("accel.json")
+    }
     /// `<data>\rawaccel\before\` — copies of what Raw Accel's driver ran before the app changed it (the change log's
     /// "Back to how your PC was"; kept across restarts, one file per different state).
     pub fn rawaccel_before(&self) -> PathBuf {

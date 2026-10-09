@@ -70,6 +70,8 @@ pub fn source(name: &str) -> String {
         "gauge" => r#"<svg viewBox="0 0 20 20"><path d="M3.6 15.2a7.5 7.5 0 1 1 12.8 0"/><path d="M10 11.3l3-3"/><circle cx="10" cy="11.3" r="1.25"/><path d="M3.9 11.3h1.2M10 5v1.2M16.1 11.3h-1.2M5.7 7l.85.85M14.3 7l-.85.85"/></svg>"#,
         "bell" => r#"<svg viewBox="0 0 20 20"><path d="M10 3a4.5 4.5 0 0 0-4.5 4.5v3L4 13h12l-1.5-2.5v-3A4.5 4.5 0 0 0 10 3zM8 15.5a2 2 0 0 0 4 0"/></svg>"#,
         "plug" => r#"<svg viewBox="0 0 20 20"><path d="M7.5 3v3.5M12.5 3v3.5M5.5 6.5h9v3a4.5 4.5 0 0 1-9 0zM10 14v3"/></svg>"#,
+        // Order 062: the Noise tab's icon - a rough waveform (the drawing has none for this tab)
+        "noise" => r#"<svg viewBox="0 0 20 20"><path d="M2.5 10h1.8l1.2-3.2 1.5 6.6 1.6-9.4 1.6 11.8 1.5-8.4 1.4 4.6 1.2-2h3.2"/></svg>"#,
         "chev" => r#"<svg viewBox="0 0 9 14"><path d="M1.5 5L4.5 2l3 3M1.5 9l3 3 3-3"/></svg>"#,
         "wmin" => r#"<svg viewBox="0 0 10 10"><path d="M0 5.5h10"/></svg>"#,
         "wcls" => r#"<svg viewBox="0 0 10 10"><path d="M.6.6l8.8 8.8M9.4.6L.6 9.4"/></svg>"#,

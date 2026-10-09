@@ -33,6 +33,8 @@ pub struct FakeOs {
     /// make the next N writes of any kind fail with "access denied"
     pub deny_writes: u32,
     pub env: BTreeMap<String, String>,
+    /// exe file names the fake PC is running (`process_running`)
+    pub running: Vec<String>,
 }
 
 impl Default for FakeOs {
@@ -60,6 +62,7 @@ impl FakeOs {
             log: Vec::new(),
             deny_writes: 0,
             env: BTreeMap::new(),
+            running: Vec::new(),
         };
         f.win.insert(WinSetting::PointerSpeed, WinRaw::Num(10));
         f.win.insert(WinSetting::Precision, WinRaw::Mouse([6, 10, 1]));
@@ -142,6 +145,13 @@ impl MouseOs for FakeOs {
         self.write_gate(path)?;
         self.log.push(format!("reg_write HKCU\\{path}\\{name} = {value:?}"));
         self.reg.insert((Hive::Hkcu, path.into(), name.into()), value.clone());
+        Ok(())
+    }
+
+    fn reg_delete_value(&mut self, path: &str, name: &str) -> Result<()> {
+        self.write_gate(path)?;
+        self.log.push(format!("reg_delete HKCU\\{path}\\{name}"));
+        self.reg.remove(&(Hive::Hkcu, path.to_string(), name.to_string()));
         Ok(())
     }
 
@@ -251,6 +261,9 @@ impl MouseOs for FakeOs {
 
     fn is_elevated(&self) -> bool {
         self.elevated
+    }
+    fn process_running(&self, exe: &str) -> Result<bool> {
+        Ok(self.running.iter().any(|r| r.eq_ignore_ascii_case(exe)))
     }
     fn pause_ms(&self, _ms: u64) {}
 }

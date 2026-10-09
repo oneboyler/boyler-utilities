@@ -297,6 +297,27 @@ impl MouseOs for RealOs {
         }
     }
 
+    fn reg_delete_value(&mut self, path: &str, name: &str) -> Result<()> {
+        if matches!(self.mode, Mode::ReadOnly | Mode::ReadRequests) {
+            return Err(Error::ReadOnly(format!("reg_delete {path}\\{name}")));
+        }
+        let (root, p) = self.map(Hive::Hkcu, path);
+        unsafe {
+            let mut hk = HKEY::default();
+            let e = RegOpenKeyExW(root, &HSTRING::from(p.as_str()), None, KEY_SET_VALUE | KEY_WOW64_64KEY, &mut hk);
+            if e == ERROR_FILE_NOT_FOUND {
+                return Ok(());
+            }
+            win32(&format!("RegOpenKeyEx {p}"), e)?;
+            let e = RegDeleteValueW(hk, &HSTRING::from(name));
+            let _ = RegCloseKey(hk);
+            if e == ERROR_FILE_NOT_FOUND {
+                return Ok(());
+            }
+            win32(&format!("RegDeleteValue {name}"), e)
+        }
+    }
+
     fn reg_values(&self, hive: Hive, path: &str) -> Result<Vec<(String, RegValue)>> {
         let Some(hk) = self.open(hive, path)? else { return Ok(Vec::new()) };
         let mut out = Vec::new();
@@ -337,7 +358,10 @@ impl MouseOs for RealOs {
         if !self.record_or_refuse("SPI_SETCURSORS".into())? {
             return Ok(());
         }
-        unsafe { SystemParametersInfoW(SPI_SETCURSORS, 0, None, PERSIST) }.map_err(|e| hr("SPI_SETCURSORS", e))?;
+        // Order 066: NO update flags. SPI_SETCURSORS with SPIF_UPDATEINIFILE returns FALSE (error 0) on Windows 11 - the old
+        // call "failed" after every pick and the reload never happened. The cursors live in the registry already; the
+        // WM_SETTINGCHANGE goes out on the worker below.
+        unsafe { SystemParametersInfoW(SPI_SETCURSORS, 0, None, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0)) }.map_err(|e| hr("SPI_SETCURSORS", e))?;
         broadcast_later(SPI_SETCURSORS);
         Ok(())
     }
@@ -347,7 +371,14 @@ impl MouseOs for RealOs {
             return Ok(());
         }
         unsafe {
-            let h = LoadCursorFromFileW(&HSTRING::from(file)).map_err(|e| hr(&format!("LoadCursorFromFile {file}"), e))?;
+            // Order 066: at the size Windows' slider set (CursorBaseSize) - LoadCursorFromFile always loads 32 px, so the
+            // re-push after a reload used to undo the size slider. A multi-size .cur gives its nearest picture, a single-size
+            // one is scaled. (A file LoadImage refuses: the plain loader.)
+            let px = self.reg_read(Hive::Hkcu, crate::cursors::CURSORS_KEY, "CursorBaseSize")?.and_then(|v| v.as_dword()).unwrap_or(32).clamp(32, 256) as i32;
+            let h = match LoadImageW(None, &HSTRING::from(file), IMAGE_CURSOR, px, px, LR_LOADFROMFILE) {
+                Ok(h) => HCURSOR(h.0),
+                Err(_) => LoadCursorFromFileW(&HSTRING::from(file)).map_err(|e| hr(&format!("LoadCursorFromFile {file}"), e))?,
+            };
             // SetSystemCursor takes ownership of the cursor (destroys it later), so no DestroyCursor here.
             SetSystemCursor(h, SYSTEM_CURSOR_ID(ocr_id)).map_err(|e| hr("SetSystemCursor", e))
         }
@@ -443,6 +474,24 @@ impl MouseOs for RealOs {
             return Ok(());
         }
         rawaccel_io::run_writer(rawaccel_dir, settings_file, json)
+    }
+
+    fn process_running(&self, exe: &str) -> Result<bool> {
+        use windows::Win32::System::Diagnostics::ToolHelp::{CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS};
+        let snap = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) }.map_err(|e| hr("process list", e))?;
+        let mut e = PROCESSENTRY32W { dwSize: size_of::<PROCESSENTRY32W>() as u32, ..Default::default() };
+        let mut found = false;
+        let mut ok = unsafe { Process32FirstW(snap, &mut e) }.is_ok();
+        while ok {
+            let len = e.szExeFile.iter().position(|c| *c == 0).unwrap_or(e.szExeFile.len());
+            if String::from_utf16_lossy(&e.szExeFile[..len]).eq_ignore_ascii_case(exe) {
+                found = true;
+                break;
+            }
+            ok = unsafe { Process32NextW(snap, &mut e) }.is_ok();
+        }
+        let _ = unsafe { CloseHandle(snap) };
+        Ok(found)
     }
 
     fn is_elevated(&self) -> bool {

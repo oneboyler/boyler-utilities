@@ -174,3 +174,45 @@ fn the_installer_check_is_sha256() {
     assert_eq!(bu_search::real::ours::ZIP_SHA256.len(), 64);
     assert_eq!(bu_search::real::ours::EXE_SHA256.len(), 64);
 }
+
+/// Order 069: the list reply (name, folder, size, attributes) - Storage reads a whole drive in pages - and the page offset.
+#[test]
+fn a_list_reply_is_read_with_its_attributes_and_the_page_offset_goes_out() {
+    // 3 items: a folder, a file, an online-only file (attributes OFFLINE); flags = name | path | size | attributes
+    let items: [(u32, &str, &str, u64, u32); 3] = [
+        (1, "Clips", r"C:\Users\x\Videos", u64::MAX, 0x10),
+        (0, "ace.mp4", r"C:\Users\x\Videos\Clips", 88_298_291, 0x20),
+        (0, "big.mkv", r"C:\Users\x\OneDrive", 70_000_000_000, 0x1000),
+    ];
+    let head = 20 + 8 * items.len();
+    let mut data = Vec::new();
+    let mut offs = Vec::new();
+    for (_, name, path, size, attrs) in items {
+        offs.push((head + data.len()) as u32);
+        push_str(&mut data, name);
+        push_str(&mut data, path);
+        data.extend_from_slice(&size.to_le_bytes());
+        data.extend_from_slice(&le(attrs));
+    }
+    let mut b = Vec::new();
+    for v in [1_200_000u32, items.len() as u32, 0, everything::LIST_FIELDS, 1] {
+        b.extend_from_slice(&le(v));
+    }
+    for (i, (f, ..)) in items.iter().enumerate() {
+        b.extend_from_slice(&le(*f));
+        b.extend_from_slice(&le(offs[i]));
+    }
+    b.extend_from_slice(&data);
+    let page = everything::parse_list(&b).unwrap();
+    assert_eq!(page.total, 1_200_000);
+    assert_eq!(page.items.len(), 3);
+    assert!(page.items[0].is_folder && !page.items[1].is_folder);
+    assert_eq!((page.items[1].name.as_str(), page.items[1].dir.as_str(), page.items[1].size, page.items[1].attrs), ("ace.mp4", r"C:\Users\x\Videos\Clips", 88_298_291, 0x20));
+    assert_eq!(page.items[2].attrs, 0x1000);
+    assert!(everything::parse_list(&b[..b.len() - 5]).is_err(), "a cut reply is an error, not a crash");
+    // the page offset is the 4th number of the query
+    let q = everything::query2_bytes_at(0x1234, r"C:\ file:", 300_000, 100_000, everything::LIST_FIELDS);
+    assert_eq!(&q[12..16], &300_000u32.to_le_bytes());
+    assert_eq!(&q[16..20], &100_000u32.to_le_bytes());
+    assert_eq!(&q[20..24], &everything::LIST_FIELDS.to_le_bytes());
+}

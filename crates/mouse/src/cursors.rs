@@ -132,18 +132,18 @@ impl WinRole {
     /// The key a cursor pack's `install.inf` [Strings] section uses for this role (the common Windows pack layout).
     pub fn inf_keys(self) -> &'static [&'static str] {
         match self {
-            WinRole::Arrow => &["pointer", "arrow", "normal"],
+            WinRole::Arrow => &["pointer", "arrow", "normal", "default"],
             WinRole::Help => &["help"],
             WinRole::AppStarting => &["work", "working", "appstarting"],
             WinRole::Wait => &["busy", "wait"],
             WinRole::Crosshair => &["cross", "precision", "crosshair"],
             WinRole::IBeam => &["text", "ibeam", "beam"],
             WinRole::NWPen => &["hand", "handwriting", "pen", "nwpen"],
-            WinRole::No => &["unavailable", "unavail", "no"],
-            WinRole::SizeNS => &["vert", "sizens"],
-            WinRole::SizeWE => &["horz", "sizewe"],
-            WinRole::SizeNWSE => &["dgn1", "sizenwse"],
-            WinRole::SizeNESW => &["dgn2", "sizenesw"],
+            WinRole::No => &["unavailable", "unavailiable", "unavail", "no"],
+            WinRole::SizeNS => &["vert", "vertical", "sizens"],
+            WinRole::SizeWE => &["horz", "horizontal", "sizewe"],
+            WinRole::SizeNWSE => &["dgn1", "dng1", "diagonal_1", "sizenwse"],
+            WinRole::SizeNESW => &["dgn2", "dng2", "diagonal_2", "sizenesw"],
             WinRole::SizeAll => &["move", "sizeall"],
             WinRole::UpArrow => &["alternate", "alt", "uparrow", "up"],
             WinRole::Hand => &["link"],
@@ -165,8 +165,8 @@ impl WinRole {
             WinRole::No => &["unavailable", "unavail", "not allowed", "no"],
             WinRole::SizeNS => &["vertical", "vert", "sizens", "_ns", "ns"],
             WinRole::SizeWE => &["horizontal", "horz", "sizewe", "_ew", "ew", "we"],
-            WinRole::SizeNWSE => &["diagonal1", "dgn1", "nwse"],
-            WinRole::SizeNESW => &["diagonal2", "dgn2", "nesw"],
+            WinRole::SizeNWSE => &["diagonal-resize-1", "diagonal_1", "diagonal1", "dgn1", "nwse"],
+            WinRole::SizeNESW => &["diagonal-resize-2", "diagonal_2", "diagonal2", "dgn2", "nesw"],
             WinRole::SizeAll => &["move", "sizeall"],
             WinRole::UpArrow => &["alternate", "uparrow", "up"],
             WinRole::Hand => &["link", "hand"],
@@ -236,6 +236,9 @@ pub enum SetId {
     Scheme(String),
     /// "Your file" — one file picked for this role only
     Own,
+    /// Order 066: one of the files the user picked before with "Choose your own file…" (kept in the app's own folder),
+    /// by its full path - offered again in every picker under "Your files"
+    OwnFile(String),
     /// something set elsewhere (another scheme in Control Panel, another tool): the scheme name if known, else "Other"
     Other(String),
 }
@@ -249,6 +252,7 @@ impl SetId {
             SetId::Pack(n) => n.clone(),
             SetId::Scheme(n) => n.clone(),
             SetId::Own => "Your file".into(),
+            SetId::OwnFile(p) => Path::new(p).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "Your file".into()),
             SetId::Other(n) => n.clone(),
         }
     }
@@ -337,8 +341,8 @@ fn is_cursor_ext(p: &Path) -> bool {
     p.extension().and_then(|e| e.to_str()).map(|e| e.eq_ignore_ascii_case("cur") || e.eq_ignore_ascii_case("ani")).unwrap_or(false)
 }
 
-/// Reads `install.inf` [Strings]: key = "file.cur" → role mapping by the usual key names.
-pub fn parse_install_inf(text: &str) -> BTreeMap<WinRole, String> {
+/// `install.inf` [Strings]: lower-cased key → value (quotes taken off).
+fn inf_strings(text: &str) -> BTreeMap<String, String> {
     let mut in_strings = false;
     let mut kv: BTreeMap<String, String> = BTreeMap::new();
     for line in text.lines() {
@@ -354,6 +358,38 @@ pub fn parse_install_inf(text: &str) -> BTreeMap<WinRole, String> {
             kv.insert(k.trim().to_ascii_lowercase(), v.trim().trim_matches('"').to_string());
         }
     }
+    kv
+}
+
+/// Order 066: the scheme line of an `install.inf` (`HKCU,"Control Panel\Cursors\Schemes","<name>",,"<17 paths>"`) - the
+/// paths are in Windows' role order, each `%10%\%CUR_DIR%\%key%` with `key` a [Strings] entry. The 17 file names (empty =
+/// none); `None` = the inf has no such line.
+pub fn parse_scheme_reg(text: &str) -> Option<Vec<String>> {
+    let kv = inf_strings(text);
+    let line = text.lines().find(|l| l.to_ascii_lowercase().contains(r"control panel\cursors\schemes"))?;
+    // the last quoted part is the paths
+    let end = line.rfind('"')?;
+    let start = line[..end].rfind('"')?;
+    let paths = &line[start + 1..end];
+    let mut out: Vec<String> = Vec::new();
+    for item in paths.split(',') {
+        let last = item.rsplit('\\').next().unwrap_or(item).trim();
+        let name = match last.strip_prefix('%').and_then(|r| r.strip_suffix('%')) {
+            Some(key) => kv.get(&key.to_ascii_lowercase()).cloned().unwrap_or_default(),
+            None => last.to_string(),
+        };
+        out.push(name.rsplit(['\\', '/']).next().unwrap_or("").to_string());
+    }
+    (!out.is_empty()).then(|| {
+        out.resize(17, String::new());
+        out.truncate(17);
+        out
+    })
+}
+
+/// Reads `install.inf` [Strings]: key = "file.cur" → role mapping by the usual key names.
+pub fn parse_install_inf(text: &str) -> BTreeMap<WinRole, String> {
+    let kv = inf_strings(text);
     let mut out = BTreeMap::new();
     for r in WinRole::ALL {
         if let Some(f) = r.inf_keys().iter().find_map(|k| kv.get(*k)) {
@@ -546,6 +582,8 @@ impl<O: MouseOs> Mouse<O> {
     /// a cursor for - all but the ones that are just Windows' default files again ("Windows Default" itself).
     pub fn installed_schemes(&self) -> Result<Vec<(String, Vec<Role>)>> {
         let defaults = self.windows_default_paths()?;
+        // a scheme the app registered for one of its own packs is listed once, as the pack
+        let packs = self.packs().unwrap_or_default();
         let mut out: Vec<(String, Vec<Role>)> = Vec::new();
         for s in self.schemes()? {
             let file = |r: &WinRole| {
@@ -556,7 +594,7 @@ impl<O: MouseOs> Mouse<O> {
                 let f = file(r);
                 !f.is_empty() && !defaults.get(r).is_some_and(|d| same_path(d, &f))
             });
-            if !differs || out.iter().any(|(n, _)| *n == s.name) {
+            if !differs || out.iter().any(|(n, _)| *n == s.name) || packs.iter().any(|p| p.name == s.name) {
                 continue;
             }
             let roles: Vec<Role> = Role::ALL.iter().copied().filter(|role| role.win_roles().iter().any(|r| !file(r).is_empty())).collect();
@@ -610,6 +648,8 @@ impl<O: MouseOs> Mouse<O> {
             }
             SetId::Pack(n) => self.packs().ok().and_then(|ps| ps.into_iter().find(|p| &p.name == n)).map(|p| p.has(role)).unwrap_or(false),
             SetId::Scheme(_) => role.win_roles().iter().any(|r| self.set_file(set, *r).ok().flatten().is_some()),
+            // a file the user picked before fits any bubble
+            SetId::OwnFile(p) => Path::new(p).is_file(),
             SetId::Own | SetId::Other(_) => false,
         }
     }
@@ -636,8 +676,63 @@ impl<O: MouseOs> Mouse<O> {
                 // as the scheme stores it (%SystemRoot% unexpanded): written as REG_EXPAND_SZ, like Windows does
                 s.paths.get(i).filter(|p| !p.is_empty()).cloned()
             }
+            SetId::OwnFile(p) => Some(p.clone()),
             SetId::Own | SetId::Other(_) => None,
         })
+    }
+
+    /// Order 066: the file a set gives this bubble (its first Windows role), `%vars%` expanded - what the pickers draw as
+    /// the row's picture. `None` = the set has nothing for it (or the built-in cursor: Windows default with no file).
+    pub fn preview_path(&self, set: &SetId, role: Role) -> Option<String> {
+        let r = role.win_roles().iter().find_map(|r| self.set_file(set, *r).ok().flatten().filter(|f| !f.is_empty()))?;
+        Some(self.os.expand_env(&r))
+    }
+
+    /// Order 066: for every set the pickers list (Glass, Windows default, imported packs, every scheme Windows has) the file of
+    /// each of the 7 bubbles (`Role::ALL` order) - read once, so the view doesn't read the registry per row.
+    pub fn set_preview_files(&self) -> Vec<(SetId, Vec<Option<String>>)> {
+        let first = |r: Role| r.win_roles()[0];
+        let idx = |w: WinRole| WinRole::ALL.iter().position(|x| *x == w).unwrap_or(0);
+        let mut out: Vec<(SetId, Vec<Option<String>>)> = Vec::new();
+        let ex = |p: &str| (!p.is_empty()).then(|| self.os.expand_env(p));
+        if let Ok(d) = self.windows_default_paths() {
+            out.push((SetId::WindowsDefault, Role::ALL.iter().map(|r| d.get(&first(*r)).and_then(|p| ex(p))).collect()));
+        }
+        let g = self.glass_set();
+        if !g.is_empty() {
+            out.push((SetId::Glass, Role::ALL.iter().map(|r| g.get(&first(*r)).map(|f| self.dirs.glass().join(f).to_string_lossy().into_owned())).collect()));
+        }
+        for p in self.packs().unwrap_or_default() {
+            let dir = self.dirs.packs().join(&p.name);
+            out.push((SetId::Pack(p.name.clone()), Role::ALL.iter().map(|r| p.roles.get(&first(*r)).map(|f| dir.join(f).to_string_lossy().into_owned())).collect()));
+        }
+        for s in self.schemes().unwrap_or_default() {
+            if out.iter().any(|(id, _)| *id == SetId::Scheme(s.name.clone())) {
+                continue;
+            }
+            out.push((SetId::Scheme(s.name.clone()), Role::ALL.iter().map(|r| s.paths.get(idx(first(*r))).and_then(|p| ex(p))).collect()));
+        }
+        out
+    }
+
+    /// Order 066: the files the user picked before with "Choose your own file…" (everything under the app's own-cursors
+    /// folder, newest first; one entry per file name).
+    pub fn own_files(&self) -> Vec<PathBuf> {
+        let mut found: Vec<(std::time::SystemTime, PathBuf)> = Vec::new();
+        let Ok(rd) = std::fs::read_dir(self.dirs.own_cursors()) else { return vec![] };
+        for sub in rd.flatten() {
+            let Ok(files) = std::fs::read_dir(sub.path()) else { continue };
+            for f in files.flatten() {
+                let p = f.path();
+                if is_cursor_ext(&p) {
+                    let t = f.metadata().and_then(|m| m.modified()).unwrap_or(std::time::UNIX_EPOCH);
+                    found.push((t, p));
+                }
+            }
+        }
+        found.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+        let mut seen = std::collections::BTreeSet::new();
+        found.into_iter().filter(|(_, p)| seen.insert(p.file_name().map(|n| n.to_string_lossy().to_ascii_lowercase()).unwrap_or_default())).map(|(_, p)| p).collect()
     }
 
     /// Writes role paths, marks the scheme as the user's own mix, reloads, re-pushes (Win11 stuck-scheme bug).
@@ -919,6 +1014,23 @@ impl<O: MouseOs> Mouse<O> {
         Ok((pack, format!("Imported {pack_name} · pick it in any cursor's list"), skipped))
     }
 
+    /// A scheme the app registered for a pack: it names at least one file in the pack's folder and every other file is Windows' own.
+    pub(crate) fn scheme_is_ours(&self, s: &Scheme, own_dir: &Path, defaults: &BTreeMap<WinRole, String>) -> bool {
+        let mut any = false;
+        for (i, p) in s.paths.iter().enumerate() {
+            if p.is_empty() {
+                continue;
+            }
+            let p = self.os.expand_env(p);
+            if under(&p, own_dir) {
+                any = true;
+            } else if !WinRole::ALL.get(i).and_then(|r| defaults.get(r)).is_some_and(|d| same_path(d, &p)) {
+                return false;
+            }
+        }
+        any
+    }
+
     /// × on an imported pack: its roles go back to Windows default, then its folder is deleted (only inside the app's
     /// own packs folder). Returns the roles that went back.
     pub fn delete_pack(&mut self, name: &str) -> Result<Vec<Role>> {
@@ -933,11 +1045,26 @@ impl<O: MouseOs> Mouse<O> {
         let st = self.cursors()?;
         let gone = SetId::Pack(name.to_string());
         let hit: Vec<Role> = st.roles.iter().filter(|r| r.set == gone).map(|r| r.role).collect();
-        if !hit.is_empty() {
-            let defaults = self.windows_default_paths()?;
-            let files: Vec<(WinRole, String)> =
-                hit.iter().flat_map(|r| r.win_roles().iter().map(|w| (*w, defaults.get(w).cloned().unwrap_or_default()))).collect();
+        let own_dir = self.dirs.packs().join(name);
+        // EVERY Windows role that still points into the pack's folder goes back to Windows' own file - not only the 7 bubbles'
+        // roles (a whole-scheme switch from Windows' Mouse settings sets all 17)
+        let snap = self.cursor_snapshot()?;
+        let defaults = self.windows_default_paths()?;
+        let files: Vec<(WinRole, String)> = snap
+            .roles
+            .iter()
+            .filter(|(_, v)| v.as_ref().and_then(|v| v.as_str()).is_some_and(|p| under(&self.os.expand_env(p), &own_dir)))
+            .map(|(r, _)| (*r, defaults.get(r).cloned().unwrap_or_default()))
+            .collect();
+        if !files.is_empty() {
             self.write_roles(&files)?;
+        }
+        // the scheme the app registered for it goes too - only when it is ours: every file it names is in the pack's folder (or
+        // is Windows' own file for a role the pack has none for). A scheme of the same name the user made stays.
+        if let Some(s) = self.schemes()?.into_iter().find(|s| !s.system && s.name.eq_ignore_ascii_case(name)) {
+            if self.scheme_is_ours(&s, &own_dir, &defaults) {
+                self.os.reg_delete_value(USER_SCHEMES_KEY, &s.name)?;
+            }
         }
         let dir = self.dirs.packs().join(name);
         if dir.parent() == Some(self.dirs.packs().as_path()) {

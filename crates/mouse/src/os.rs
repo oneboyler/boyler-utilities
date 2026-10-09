@@ -146,6 +146,9 @@ pub trait MouseOs {
     fn reg_read(&self, hive: Hive, path: &str, name: &str) -> Result<Option<RegValue>>;
     /// HKCU only — the crate never writes HKLM.
     fn reg_write(&mut self, path: &str, name: &str, value: &RegValue) -> Result<()>;
+    /// Order 066: removes one value of an HKCU key (a cursor scheme the app registered, when its pack is deleted). A value or
+    /// key that is not there is fine.
+    fn reg_delete_value(&mut self, path: &str, name: &str) -> Result<()>;
     /// All values of a key (name, value). A missing key gives an empty list.
     fn reg_values(&self, hive: Hive, path: &str) -> Result<Vec<(String, RegValue)>>;
     /// SPI_SETCURSORS: Windows reloads every cursor from `HKCU\Control Panel\Cursors`.
@@ -183,6 +186,11 @@ pub trait MouseOs {
 
     // ---- process ----
     fn is_elevated(&self) -> bool;
+    /// Is a process with this exe file name running now? One process-list snapshot (names only; no process handle is
+    /// opened). Used to tell the user that Raw Accel's own app is open and writes the driver too.
+    fn process_running(&self, _exe: &str) -> Result<bool> {
+        Ok(false)
+    }
     /// The pause between two "is the mouse online?" polls (a waking mouse links within ~1-3 s). The fake returns at once.
     fn pause_ms(&self, ms: u64) {
         std::thread::sleep(std::time::Duration::from_millis(ms));

@@ -130,6 +130,29 @@ impl Macro {
     }
 }
 
+/// Ready-made macros (Order 059): (name, steps). Placeholders (an e-mail address, three sites) are for the user to edit in the
+/// macro window; every one passes [`Macro::check`].
+pub fn templates() -> Vec<(&'static str, Vec<Step>)> {
+    const CTRL: u16 = 0x11;
+    vec![
+        ("Type my e-mail", vec![Step::Type("your.name@example.com".into())]),
+        (
+            "Open 3 sites",
+            vec![
+                Step::Open("https://www.youtube.com".into()),
+                Step::Wait(500),
+                Step::Open("https://www.twitch.tv".into()),
+                Step::Wait(500),
+                Step::Open("https://mail.google.com".into()),
+            ],
+        ),
+        (
+            "Copy + search Google",
+            vec![Step::Keys(vec![CTRL, 0x43]), Step::Wait(150), Step::Open("https://www.google.com".into()), Step::Wait(1500), Step::Keys(vec![CTRL, 0x56]), Step::Keys(vec![VK_RETURN])],
+        ),
+    ]
+}
+
 /// A fresh macro id not used by `existing` (`m1`, `m2` …).
 pub fn new_id(existing: &[Macro]) -> String {
     (1..).map(|n| format!("m{n}")).find(|id| !existing.iter().any(|m| &m.id == id)).unwrap_or_else(|| "m0".into())
@@ -459,5 +482,18 @@ mod tests {
         assert_eq!(new_id(&ms), "m1");
         assert_eq!(new_id(&[Macro::new("m1", "a"), Macro::new("m2", "b")]), "m3");
         assert_eq!(new_id(&[]), "m1");
+    }
+
+    #[test]
+    fn the_ready_made_macros_are_valid_and_named() {
+        let t = templates();
+        assert_eq!(t.len(), 3);
+        for (name, steps) in t {
+            assert!(!name.is_empty() && name.chars().count() <= MAX_NAME);
+            let m = mac(steps);
+            assert_eq!(m.check(), Ok(()), "{name}");
+            assert!(!m.steps.is_empty());
+            assert!(!plan(&m).is_empty(), "{name} plans some input");
+        }
     }
 }

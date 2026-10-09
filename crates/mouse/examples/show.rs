@@ -152,6 +152,30 @@ fn main() {
                 } else {
                     println!("  DIFFERENT: ours {} bytes vs driver {} bytes; first differences (offset ours driver): {diffs:?}", ours.len(), b.len());
                 }
+                println!("  SAME EFFECT (padding and an Off axis' unused bytes ignored): {}", bytes::same_effect(&ours, &b));
+                let card = m.accel_target();
+                println!("  card state: on {} | would write {}", m.accel().panel.on, if card.args.mode == bu_mouse::accel::args::AccelMode::Noaccel { "Off".to_string() } else { format!("{:?}", card.args.mode) });
+                let le_i32 = |at: usize| i32::from_le_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]]);
+                let le_f64 = |at: usize| f64::from_le_bytes(b[at..at + 8].try_into().unwrap_or([0; 8]));
+                println!(
+                    "  driver default device: disable {} | extra-info {} | constant-poll-time {} | DPI {} | polling {} Hz | clamp {}..{}   settings.json: disable {} | constant-poll-time {} | DPI {} | polling {} Hz",
+                    b[0] != 0,
+                    b[1] != 0,
+                    b[2] != 0,
+                    le_i32(4),
+                    le_i32(8),
+                    le_f64(16),
+                    le_f64(24),
+                    cfg.default_device_config.disable,
+                    cfg.default_device_config.poll_time_lock,
+                    cfg.default_device_config.dpi,
+                    cfg.default_device_config.polling_rate
+                );
+                if let (Some(dp), Some(sp)) = (bytes::read_profiles(&b).first(), cfg.profiles.first()) {
+                    println!("  driver profile 0 == settings.json profile 0 (every field, Off axes' unused arguments included): {}", dp == sp);
+                    println!("  driver: ratios y/x {} l/r {} u/d {} | rotation {} | snap {} | speed cap {}..{} | whole {} | lp-norm {} | halflives {}/{}/{} | domain {:?} | range {:?}", dp.yx_output_dpi_ratio, dp.lr_output_dpi_ratio, dp.ud_output_dpi_ratio, dp.degrees_rotation, dp.degrees_snap, dp.speed_min, dp.speed_max, dp.speed.whole, dp.speed.lp_norm, dp.speed.input_speed_smooth_halflife, dp.speed.scale_smooth_halflife, dp.speed.output_speed_smooth_halflife, dp.domain_weights, dp.range_weights);
+                    println!("  json  : ratios y/x {} l/r {} u/d {} | rotation {} | snap {} | speed cap {}..{} | whole {} | lp-norm {} | halflives {}/{}/{} | domain {:?} | range {:?}", sp.yx_output_dpi_ratio, sp.lr_output_dpi_ratio, sp.ud_output_dpi_ratio, sp.degrees_rotation, sp.degrees_snap, sp.speed_min, sp.speed_max, sp.speed.whole, sp.speed.lp_norm, sp.speed.input_speed_smooth_halflife, sp.speed.scale_smooth_halflife, sp.speed.output_speed_smooth_halflife, sp.domain_weights, sp.range_weights);
+                }
                 let pad = bytes::padding_ranges(cfg.profiles.len(), cfg.devices.len());
                 let pad_bytes: Vec<u8> = pad.iter().flat_map(|r| r.clone()).filter_map(|i| b.get(i).copied()).collect();
                 println!("  (padding bytes in the driver copy: {} of them, non-zero: {})", pad_bytes.len(), pad_bytes.iter().filter(|x| **x != 0).count());
@@ -160,6 +184,9 @@ fn main() {
         Ok(None) => println!("driver READ: no driver"),
         Err(e) => println!("driver READ error: {e}"),
     }
+    let saved = std::env::var("APPDATA").map(|a| std::path::PathBuf::from(a).join("Boyler Utilities").join("mouse").join("accel.json")).unwrap_or_default();
+    println!("saved card file {}: {}", saved.display(), if saved.is_file() { "exists" } else { "none" });
+    println!("Raw Accel app writes the driver when it opens: {} | its app running now: {} | other-writer line: {:?}", m.rawaccel_auto_writes(), m.os().process_running("rawaccel.exe").unwrap_or(false), m.other_writer_line());
     match m.mirror_rawaccel() {
         Ok(true) => println!("mirror: the card would start ON (driver runs a curve): {}", bu_mouse::accel::service::header_line(&m.accel().panel, &m.accel().per_app)),
         Ok(false) => println!("mirror: the card would start OFF"),

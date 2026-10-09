@@ -15,6 +15,9 @@
 //! * the key sounds (Order 058, `bu-keysound`) listen with [`set_key_sound`]: every key down / up is handed straight to its
 //!   sink on this thread as a class-only [`SoundEvent`] (Space / Enter / Backspace / other + up or down; no key), a held key's
 //!   auto-repeat is dropped by a 32-byte "held now" bit map that a release clears. Nothing is queued or kept; off = unregistered;
+//! * the mouse sounds (Order 064, `bu-keysound`) listen with [`set_mouse_sound`]: every button down / up is handed straight to
+//!   its sink on this thread as a class-only [`MouseSoundEvent`] (Left / Right / Middle / Side + up or down). Moves and wheel
+//!   turns are only counted. Same rules as the key sounds: nothing queued or kept, off = unregistered;
 //! * the activity client gets one message on the first packet of any kind (moves too), then is disarmed.
 //!
 //! [`hub`] is the pure part (who needs what, which packet goes where, one wake-up per batch) and is unit-tested; `win`
@@ -24,6 +27,6 @@ pub mod hub;
 #[cfg(windows)]
 mod win;
 
-pub use hub::{RawPacket, SoundClass, SoundEvent, Stats, Target, QUEUE_CAP};
+pub use hub::{MouseButtonClass, MouseSoundEvent, RawPacket, SoundClass, SoundEvent, Stats, Target, MAX_CHATTER_MS, QUEUE_CAP};
 #[cfg(windows)]
-pub use win::{notify_on_input, set_key_sound, set_keys, stats, take_packets, SoundSink};
+pub use win::{notify_on_input, set_key_sound, set_keys, set_mouse_sound, set_sound_chatter, stats, take_packets, MouseSink, SoundSink};

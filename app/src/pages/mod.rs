@@ -21,6 +21,7 @@ pub mod display;
 pub mod keyboard;
 pub mod mouse;
 pub mod network;
+pub mod noise;
 pub mod notifications;
 pub mod performance;
 pub mod screenshots;
@@ -184,6 +185,8 @@ pub fn all() -> Vec<Box<dyn Page>> {
         Box::new(voice::Voice::default()),
         Box::new(timers::Timers::default()),
         Box::new(activity::Activity::default()),
+        // Order 062: Noise (brown / pink / white ... in the background), after Activity
+        Box::new(noise::Noise::default()),
         // Order 035: Notifications for OBS (addons-v1: a page add-on, in the top row only while on - `crate::addons::tab_visible`)
         Box::new(notifications::Notifications::default()),
         // Order 037: Add-ons (addons-v1: the puzzle, just before Settings)
@@ -202,7 +205,7 @@ mod tests {
     #[test]
     fn the_tabs_in_the_drawings_order() {
         let ids: Vec<&str> = all().iter().map(|p| p.id()).collect();
-        assert_eq!(ids, ["aud", "dsp", "shot", "cur", "kbd", "pad", "tgl", "sup", "pc", "net", "sto", "apps", "sec", "srch", "vtt", "tmr", "act", "ntf", "add", "set"]);
+        assert_eq!(ids, ["aud", "dsp", "shot", "cur", "kbd", "pad", "tgl", "sup", "pc", "net", "sto", "apps", "sec", "srch", "vtt", "tmr", "act", "nse", "ntf", "add", "set"]);
         assert_eq!(crate::ui::tab_index("Voice to text"), Some(14));
         assert_eq!(crate::ui::tab_index("tmr"), Some(15));
     }

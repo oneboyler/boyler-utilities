@@ -177,11 +177,33 @@ pub fn run_preset(p: &Preset) -> Result<(), String> {
         Preset::VolumeUp => tap(VK_VOLUME_UP),
         Preset::VolumeDown => tap(VK_VOLUME_DOWN),
         Preset::VolumeMute => tap(VK_VOLUME_MUTE),
+        Preset::NextOutput => Err("Switching the audio output is done by the app itself".into()),
+        Preset::LockPc => {
+            // SAFETY: a plain call, no arguments.
+            unsafe { windows::Win32::System::Shutdown::LockWorkStation() }.map_err(|e| format!("Windows didn't lock the PC: {}", e.message()))
+        }
+        _ if p.combo().is_some() => press_combo(p.combo().unwrap_or(&[])),
         Preset::OpenApp(t) | Preset::OpenFolder(t) | Preset::OpenWeb(t) => {
             if guard::game_in_front() {
                 return Err("Not opened: a game or full-screen window is in front".into());
             }
             shell_open(t)
         }
+        _ => Err("This action has nothing to run".into()),
     }
+}
+
+/// Presses a key combination (modifiers first, released in reverse) into the window in front - never while a game /
+/// full-screen window or an administrator window is in front (the same guard a macro has).
+fn press_combo(vks: &[u16]) -> Result<(), String> {
+    if let Some(why) = guard::input_blocked() {
+        return Err(format!("Not run: {why}"));
+    }
+    for v in vks {
+        send_key(*v, true);
+    }
+    for v in vks.iter().rev() {
+        send_key(*v, false);
+    }
+    Ok(())
 }

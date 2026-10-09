@@ -161,6 +161,18 @@ impl Rt {
         .clone()
     }
 
+    /// The runtime of this app run is made once; the per-game rules must work with the menu closed, so the watcher starts at
+    /// app start - not only when the tab was opened (Order 063: "VALORANT 1440x1080 does nothing until I open Display").
+    /// No rules saved = nothing is made (no runtime, no watcher, no thread). Real runs only.
+    #[cfg(windows)]
+    pub fn start_background() {
+        let Some(dir) = std::env::var_os("APPDATA").map(|a| PathBuf::from(a).join("Boyler Utilities")) else { return };
+        if Store::load(&dir.join(FILE_NAME)).rules.watched_names().is_empty() {
+            return;
+        }
+        let _ = Rt::shared(false);
+    }
+
     /// Writes presets + rules (nothing for a fake runtime). A failed write becomes a note.
     pub fn save(&self) {
         let Some(p) = &self.path else { return };

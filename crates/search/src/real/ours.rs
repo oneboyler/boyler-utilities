@@ -252,10 +252,19 @@ fn others_use_it() -> bool {
 /// Stop our service (the Search tab closed / the app quits) - unless another signed-in user's Search uses it. Quiet when it
 /// is not there or already stopped.
 pub fn service_stop() {
-    if others_use_it() {
+    // Order 069: one service, two kinds of instance (Search's and Storage's): the one that ends last stops it
+    if others_use_it() || any_instance_running() {
         return;
     }
     force_stop();
+}
+
+/// Our names of Everything instances: Search's and Storage's (Order 069).
+const INSTANCES: [&str; 2] = [super::host::INSTANCE, super::host::STORAGE_INSTANCE];
+
+/// Is an instance of ours (Search's or Storage's) still running in this session?
+pub fn any_instance_running() -> bool {
+    INSTANCES.iter().any(|i| super::everything::find(&super::everything::class_of(Some(i))).is_some())
 }
 
 /// Stop it, whoever uses it (the elevated helper replacing / removing our copy).

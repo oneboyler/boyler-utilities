@@ -1675,6 +1675,17 @@ impl Page for Display {
         "mon"
     }
 
+    /// Order 063: the per-game rules (resolution, vibrance...) work with the menu closed from the first moment of the app -
+    /// the watcher used to start only when this tab was opened. On its own thread (it reads the saved rules and the monitors).
+    fn background(&self, env: &Env) -> Option<Box<dyn crate::pages::Background>> {
+        #[cfg(windows)]
+        if !env.test && !crate::undo::headless() {
+            crate::offui::spawn("display-bg", Rt::start_background);
+        }
+        let _ = env;
+        None
+    }
+
     fn open(&mut self, env: &Env, now: f64) {
         #[cfg(windows)]
         let rt = if env.fake() { Rt::fake_sample() } else { Rt::shared(env.real_read) };

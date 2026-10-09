@@ -6,6 +6,10 @@
 //! CSS; rules are quoted where a part is not a shared piece.
 
 mod art;
+mod pic;
+mod store;
+#[cfg(windows)]
+pub mod rt;
 pub mod svc;
 
 use std::path::PathBuf;
@@ -74,6 +78,7 @@ const K_DCT: Key = key("cur.dct");
 const K_DBL: Key = key("cur.dbl");
 const K_SWAP: Key = key("cur.swap");
 const K_IMP: Key = key("cur.imp");
+const K_SGET: Key = key("cur.sget");
 const K_SIZE: Key = key("cur.size");
 const K_ROLE: Key = key("cur.role");
 const K_RS: Key = key("cur.rs");
@@ -129,6 +134,8 @@ struct PickRow {
     /// Glass / Windows default / the matching set (above the separator)
     top: bool,
     matches: bool,
+    /// the set's cursor file for this bubble: the row draws the real picture from it
+    file: Option<String>,
 }
 
 /// Which popup list is open.
@@ -194,6 +201,13 @@ pub struct Mouse {
     /// next build, as the pen click does
     test_rename: bool,
     test_focus: bool,
+    /// Order 066: the "Get more cursors" window
+    store_open: bool,
+    store_msg: Option<String>,
+    store_at: f64,
+    store_done: Option<crate::jobs::JobId>,
+    /// the pack being downloaded (its name), for the install after the download job
+    store_getting: Option<String>,
 }
 
 impl Mouse {
@@ -306,7 +320,7 @@ impl Mouse {
         let mut rows = Vec::new();
         if sup {
             // .ymrow{min-height:58px}: the mouse's icon tile, name, line + its web settings link
-            let sub_line = y.as_ref().map(|y| y.sub_line()).unwrap_or("Wireless · saved on the mouse itself");
+            let sub_line = y.as_ref().map(|y| format!("{} · {}", y.sub_line(), y.ids())).unwrap_or_else(|| "Wireless · saved on the mouse itself".to_string());
             let lnk = y.as_ref().and_then(|y| y.link()).map(|(t, _)| t);
             let mut head = group::row(
                 true,
@@ -374,7 +388,7 @@ impl Mouse {
                     // `.ct`'s weight: Chromium's computed 600 12px/16px
                     .child(bits::lnk(cx, K_WEB, &t, 12.0, 600, 16.0));
             }
-            let sub_line = y.as_ref().map(|y| y.sub_line()).unwrap_or("DPI and polling for this mouse aren\u{2019}t supported yet");
+            let sub_line = y.as_ref().map(|y| format!("{} \u{b7} {}", y.sub_line(), y.ids())).unwrap_or_else(|| "DPI and polling for this mouse aren\u{2019}t supported yet".to_string());
             rows.push(
                 group::row(
                     true,
@@ -382,6 +396,10 @@ impl Mouse {
                 )
                 .min_h(58.0),
             );
+        }
+        // Order 061: every other mouse Windows lists, named, with its VID:PID (so an unknown mouse can be reported)
+        for o in self.v.mice.as_ref().map(|m| m.iter().skip(1)).into_iter().flatten() {
+            rows.push(group::row(false, vec![group::lbl(&o.name, Some(&format!("Also connected \u{b7} {}", o.ids())))]));
         }
         El::block().child(gh).child(group::grp(rows))
     }
@@ -462,18 +480,25 @@ impl Mouse {
         if self.panel.on && epp {
             kids.push(self.epp_warn(cx));
         }
+        if let Some(line) = self.v.other_writer.clone() {
+            kids.push(self.writer_warn(&line));
+        }
         // .accc .acsub{display:flex;align-items:baseline;gap:8px;padding:11px 12px 3px 56px;font-size:12px;font-weight:600}
         // align-items:baseline: the layout engine's boxes have no text baselines, so the 11 px line sits where Chromium's
         // baseline alignment puts it (2 px under the 12 px one: its computed box in the dom dump)
-        kids.push(
-            El::row()
-                .items(AlignItems::FLEX_START)
-                .gap(8.0)
-                .pad(11.0, 12.0, 3.0, 56.0)
-                .child(hair56())
-                .child(El::text("Per app", Font::new(12.0, 600), FG(), lh(12.0, 1.35)).none())
-                .child(El::text("Switches when the app starts or stops · about a second, never mid-game", Font::new(11.0, 400), FG3(), lh(11.0, 1.35)).ellipsis().margin(2.0, 0.0, 0.0, 0.0)),
-        );
+        // Order 063 (the owner: the main switch turns the preset on for everything; a different preset per game is optional):
+        // no game listed = one quiet line with the add button; the title and the "when none are open" row appear with the first game
+        if !self.per_app.rows().is_empty() {
+            kids.push(
+                El::row()
+                    .items(AlignItems::FLEX_START)
+                    .gap(8.0)
+                    .pad(11.0, 12.0, 3.0, 56.0)
+                    .child(hair56())
+                    .child(El::text("Per game", Font::new(12.0, 600), FG(), lh(12.0, 1.35)).none())
+                    .child(El::text("Switches when the game starts or stops \u{b7} never mid-game", Font::new(11.0, 400), FG3(), lh(11.0, 1.35)).ellipsis().margin(2.0, 0.0, 0.0, 0.0)),
+            );
+        }
         kids.push(self.per_app_rows(cx));
         // .accc .acft{display:flex;align-items:center;gap:10px;padding:9px 12px 10px 56px;font-size:11px;color:var(--fg3)}
         // #sw .accc .acft .lnk{font-size:11px;line-height:15px}
@@ -739,9 +764,31 @@ impl Mouse {
             .child(link::link(cx, K_EPPOFF, "Turn it off", 11.5))
     }
 
+    /// "Another program also writes the driver" (Order 063): the card's amber line, same look as the Enhance-pointer-precision one.
+    fn writer_warn(&mut self, line: &str) -> El {
+        El::row()
+            .items(AlignItems::FLEX_START)
+            .gap(7.0)
+            .pad(9.0, 12.0, 10.0, 56.0)
+            .child(hair56())
+            .child(El::icon("tri", 14.0, 1.5, AMBER()).margin(1.0, 0.0, 0.0, 0.0))
+            .child(El::text(line, Font::new(11.0, 400), FG2(), 15.0).wrapping().flex1())
+    }
+
     fn per_app_rows(&mut self, cx: &mut Cx) -> El {
         let mut rows = Vec::new();
         let list: Vec<_> = self.per_app.rows().to_vec();
+        if list.is_empty() {
+            // collapsed until used (the owner: "optional to have it on different preset per game")
+            return El::row()
+                .center()
+                .gap(12.0)
+                .min_h(40.0)
+                .pad(7.0, 12.0, 7.0, 56.0)
+                .child(hair56())
+                .child(bits::addb(cx, K_ADD, "Add a game", false))
+                .child(El::text("A different preset while it is open", Font::new(11.0, 400), FG3(), lh(11.0, 1.35)).ellipsis().flex1_auto());
+        }
         for (i, r) in list.iter().enumerate() {
             let rk = idx(K_ROW, i);
             let rh = cx.hovered(rk);
@@ -751,10 +798,17 @@ impl Mouse {
             if let Some(g) = game {
                 kids.push(game_tile(g));
             }
-            let lab = if r.label.is_empty() { "Choose an app".to_string() } else { r.label.clone() };
+            let lab = if r.label.is_empty() { "Choose a game".to_string() } else { r.label.clone() };
             kids.push(El::text(lab, pieces::btn_font(13.0, 400), if r.label.is_empty() { FG3() } else { FG() }, lh(13.0, 1.35)).ellipsis().flex1_auto());
             let app = dropdown::dropdown_with(cx, sub(rk, "app"), kids, 4.0, 6.0).w(172.0);
             let pre = self.preset_btn(cx, sub(rk, "pre"), r.target);
+            // the game was already open when the app noticed it: not switched, and the row says so (Order 063)
+            let late = self.v.late.contains(&r.id);
+            let note = if late {
+                El::text("Already open \u{b7} next launch", Font::new(11.0, 400), AMBER(), lh(11.0, 1.35)).ellipsis().flex1().title("This game was already running when the app noticed it, so it keeps the settings it started with. The next launch switches.")
+            } else {
+                El::block().flex1()
+            };
             rows.push(
                 El::row()
                     .center()
@@ -766,25 +820,23 @@ impl Mouse {
                     .child(app)
                     .child(arrow())
                     .child(pre)
-                    .child(El::block().flex1())
+                    .child(note)
                     // Order 045: `h('button',{class:'rdel',title:'Remove',…})`
                     .child(rowbits::rdel(cx, sub(rk, "x"), rh).title("Remove")),
             );
         }
         // .accc .row.addr{min-height:36px}
-        rows.push(El::row().center().gap(12.0).min_h(36.0).pad(7.0, 12.0, 7.0, 56.0).children(if list.is_empty() { None } else { Some(hair56()) }).child(bits::addb(cx, K_ADD, "Add app", false)));
-        // .ael{width:172px;flex:none;padding-left:2px;font-size:12.5px;color:var(--fg2)}
-        let ee = self.per_app.everywhere_else();
-        let eb = self.preset_btn(cx, K_ELSE, ee);
+        rows.push(El::row().center().gap(12.0).min_h(36.0).pad(7.0, 12.0, 7.0, 56.0).child(hair56()).child(bits::addb(cx, K_ADD, "Add a game", false)));
+        // "When none of these games are open" -> the main preset (default) / another preset / Off
+        let eb = self.preset_btn(cx, K_ELSE, self.per_app.everywhere_else());
         rows.push(
             El::row()
                 .center()
-                .gap(8.0)
+                .gap(10.0)
                 .min_h(40.0)
                 .pad(7.0, 12.0, 7.0, 56.0)
                 .child(hair56())
-                .child(El::text("Everywhere else", Font::new(12.5, 400), FG2(), lh(12.5, 1.35)).w(172.0).none().pad(0.0, 0.0, 0.0, 2.0))
-                .child(arrow())
+                .child(El::text("When none of these games are open", Font::new(12.5, 400), FG2(), lh(12.5, 1.35)).none().pad(0.0, 0.0, 0.0, 2.0))
                 .child(eb),
         );
         El::block().children(rows)
@@ -793,6 +845,7 @@ impl Mouse {
     /// `.pu.apu{width:128px;font-size:12.5px}` `.pu.apu.offp span{color:var(--fg2)}` (the button's own font rule wins: 13 px)
     fn preset_btn(&mut self, cx: &mut Cx, k: Key, t: Target) -> El {
         let (name, off) = match t {
+            Target::Main => ("Main preset".to_string(), false),
             Target::Off => ("Off".to_string(), true),
             Target::Preset(id) => match self.panel.preset(id) {
                 Some(p) => (p.name.clone(), false),
@@ -872,6 +925,8 @@ impl Mouse {
             .none()
             // `.gh .ghr .lnk{11.5px/15px}` loses to `#sw .lnk{12px/16px}` (an id rule): Chromium's computed 12 / 16
             // Order 045: `impLnk.title='Pick .cur / .ani files or a downloaded cursor pack folder'`
+            .child(link::link(cx, K_SGET, "Get more cursors\u{2026}", 12.0).title("Cursor packs with an open licence - one click adds one"))
+            .child(pieces::separator(4.0))
             .child(link::link(cx, K_IMP, "Import cursors\u{2026}", 12.0).title("Pick .cur / .ani files or a downloaded cursor pack folder"))
             .child(pieces::separator(4.0))
             .child(El::text("Size", Font::new(11.0, 400), FG2(), lh(11.0, 1.35)).none())
@@ -894,6 +949,8 @@ impl Mouse {
             let pr = cx.active_t(k, 120.0, EASE);
             let ctx = self.menu == Some(Menu::Cursor(i));
             let look = self.look_of_role(*r);
+            // Order 066: his REAL cursor of this role (its file), the stand-in drawing only when there is no file to read
+            let real = self.v.cursors.as_ref().and_then(|c| c.roles.iter().find(|x| x.role == *r)).and_then(|x| pic::load(&x.file));
             let sc = cx.tr(k, 9, ck, 260.0, crate::anim::Bezier::new(0.3, 0.7, 0.2, 1.0));
             let spin = self.spin();
             // .crb .cpv{44x44;border-radius:12px;background:var(--ctl);box-shadow:inset 0 0 0 .5px var(--hair),0 1px 2px rgba(0,0,0,.12)}
@@ -911,7 +968,14 @@ impl Mouse {
                 .inset(&[ins])
                 .shadow(&[sh(0.0, 1.0, 2.0, 0.0, Rgba(0.0, 0.0, 0.0, 0.12))])
                 .scale(1.0 - 0.05 * pr)
-                .child(El::paint(move |g, (x, y, _, _)| art::cursor(g, &look, i, x + 7.0, y + 7.0, 30.0, sc, spin)).abs(0.0, 0.0, 0.0, 0.0).no_hit());
+                .child(
+                    El::paint(move |g, (x, y, _, _)| match &real {
+                        Some(p) => pic::paint(g, p, x + 7.0, y + 7.0, 30.0, sc),
+                        None => art::cursor(g, &look, i, x + 7.0, y + 7.0, 30.0, sc, spin),
+                    })
+                    .abs(0.0, 0.0, 0.0, 0.0)
+                    .no_hit(),
+                );
             // .crn{font-size:10.5px;line-height:13px;color:var(--fg2)} :hover/.ctx .crn{color:var(--fg)}
             let crn = El::text(r.name(), Font::new(10.5, 400), cmix(FG2(), FG(), if ctx { 1.0 } else { hv }), 13.0).none();
             // Order 045: `const t=roleTitle(r)+': '+st.name;b.title=t+' · click to change'`
@@ -938,7 +1002,7 @@ impl Mouse {
             SetId::Glass => art::GLASS,
             // an imported pack: the drawing's stand-in look (its real .cur / .ani pictures are not read yet - see the
             // report); Windows default and anything set elsewhere: Windows' own look
-            SetId::Pack(_) | SetId::Own => art::NEON,
+            SetId::Pack(_) | SetId::Own | SetId::OwnFile(_) => art::NEON,
             SetId::WindowsDefault | SetId::Other(_) | SetId::Scheme(_) => art::WIN,
         }
     }
@@ -951,6 +1015,26 @@ impl Mouse {
     /// The spinners' turn (`cspin 1.1s linear infinite`): frozen test pictures keep 0.
     fn spin(&self) -> f32 {
         0.0
+    }
+
+    /// The "when none of these games are open" list (None = a separator): the main preset (default), the presets, Off.
+    fn else_options(&self) -> Vec<Option<Target>> {
+        let mut v = vec![Some(Target::Main)];
+        if !self.panel.presets.is_empty() {
+            v.push(None);
+            v.extend(self.panel.presets.iter().map(|p| Some(Target::Preset(p.id))));
+        }
+        v.push(None);
+        v.push(Some(Target::Off));
+        v
+    }
+
+    fn else_label(&self, t: Target) -> String {
+        match t {
+            Target::Main => "Main preset".into(),
+            Target::Off => "Off".into(),
+            Target::Preset(id) => self.panel.preset(id).map(|p| p.name.clone()).unwrap_or_else(|| "Off".into()),
+        }
     }
 
     // ================================================================== popups
@@ -977,9 +1061,13 @@ impl Mouse {
             }
             Menu::Else => {
                 let cur = self.per_app.everywhere_else();
-                let mut v = vec![it("Off", cur == Target::Off), MItem::Sep];
-                v.extend(self.panel.presets.iter().map(|p| it(&p.name, cur == Target::Preset(p.id))));
-                v
+                self.else_options()
+                    .into_iter()
+                    .map(|o| match o {
+                        None => MItem::Sep,
+                        Some(t) => it(&self.else_label(t), t == cur),
+                    })
+                    .collect()
             }
             Menu::Cursor(_) => Vec::new(),
         }
@@ -1035,9 +1123,10 @@ impl Mouse {
                 self.push_accel();
             }
             Menu::Else => {
-                let t = if i == 0 { Target::Off } else { self.panel.presets.get(i - 2).map(|p| Target::Preset(p.id)).unwrap_or(Target::Off) };
-                self.per_app.set_everywhere_else(t);
-                self.push_accel();
+                if let Some(Some(t)) = self.else_options().get(i).copied() {
+                    self.per_app.set_everywhere_else(t);
+                    self.push_accel();
+                }
             }
             Menu::Cursor(_) => {}
         }
@@ -1075,12 +1164,12 @@ impl Mouse {
                 list = list.child(El::block().h(1.0).margin(4.0, 6.0, 4.0, 6.0).bg(HAIR()));
             }
             let look = self.look_of_set(&st.id);
-            list = list.child(self.cmi(cx, idx(K_MENU, n), ri, &look, &st.name, &st.note, st.id == cur, st.imp, st.matches));
+            list = list.child(self.cmi(cx, idx(K_MENU, n), ri, &look, st.file.as_deref(), &st.name, &st.note, st.id == cur, st.imp, st.matches));
             n += 1;
         }
         list = list.child(El::block().h(1.0).margin(4.0, 6.0, 4.0, 6.0).bg(HAIR()));
         // .cmi.own: a dashed tile with plus12 (13 px, --ico-on 1.6), the name in --ico-on 600
-        let k = idx(K_MENU, 50);
+        let k = idx(K_MENU, 900);
         let hv = cx.hover_t(k, 120.0, EASE);
         let own_tile = El::block()
             .size(36.0, 36.0)
@@ -1106,13 +1195,40 @@ impl Mouse {
                         .child(El::text("A .cur or .ani file", Font::new(11.0, 400), FG3(), 14.0)),
                 ),
         );
+        // Order 066: "Get more cursors" - the same dashed tile, opens the window of downloadable packs
+        let gk = idx(K_MENU, 901);
+        let ghv = cx.hover_t(gk, 120.0, EASE);
+        let get_tile = El::block()
+            .size(36.0, 36.0)
+            .none()
+            .place_center()
+            .child(El::paint(|g, (x, y, w, h)| crate::pages::display::dashed_rr(g, x, y, w, h, 8.0, DASH())).abs(0.0, 0.0, 0.0, 0.0).no_hit())
+            .child(El::icon("plus12", 13.0, 1.6, ICO_ON()));
+        list = list.child(
+            El::row()
+                .center()
+                .gap(10.0)
+                .h(46.0)
+                .pad(0.0, 9.0, 0.0, 5.0)
+                .radius(8.0)
+                .bg(HOV().mul_a(ghv))
+                .on_click(gk)
+                .cursor(Cursor::Hand)
+                .child(get_tile)
+                .child(
+                    El::col()
+                        .flex1()
+                        .child(El::text("Get more cursors…", Font::new(13.0, 600), ICO_ON(), 17.0).ellipsis())
+                        .child(El::text("Packs with an open licence", Font::new(11.0, 400), FG3(), 14.0)),
+                ),
+        );
         // .menu.curm{width:272px;padding:6px}
         let (ax, ay, aw, ah) = self.anchor;
-        let mut est = 6.0 + 30.0 + 47.0 * (n as f32 + 1.0) + 18.0 + 6.0;
+        let mut est = 6.0 + 30.0 + 47.0 * (n as f32 + 2.0) + 18.0 + 6.0;
         // Order 042: with Windows' cursor schemes the list can be taller than the window - it scrolls inside the menu
         let max_h = crate::ui::WIN_H - 16.0;
         if est > max_h {
-            let list_h = 47.0 * (n as f32 + 1.0) + 18.0 - (est - max_h);
+            let list_h = 47.0 * (n as f32 + 2.0) + 18.0 - (est - max_h);
             list = cx.scroll_box(sub(K_MENU, "sc"), vec![list]).h(list_h);
             est = max_h;
         }
@@ -1147,37 +1263,61 @@ impl Mouse {
     fn picker_sets(&self, ri: usize) -> Vec<PickRow> {
         let role = Role::ALL[ri];
         let m = self.v.suggest.get(ri).cloned().flatten();
+        // Order 066: every row draws the REAL cursor file of its set for this bubble
+        let file_of = |id: &SetId| -> Option<String> { self.v.files.iter().find(|(s, _)| s == id).and_then(|(_, f)| f.get(ri).cloned().flatten()) };
         let mut v = Vec::new();
+        // what he has right now, when it is none of the sets below (a file he picked, a mix, another tool's cursors)
+        if let Some(c) = self.v.cursors.as_ref().and_then(|c| c.roles.iter().find(|x| x.role == role)).filter(|c| matches!(c.set, SetId::Own | SetId::Other(_))) {
+            let note = if c.file.is_empty() { "Windows' built-in cursor".to_string() } else { c.file.rsplit(['\\', '/']).next().unwrap_or("").to_string() };
+            v.push(PickRow { id: c.set.clone(), name: "Your current cursors".into(), note, imp: false, top: true, matches: false, file: Some(c.file.clone()).filter(|f| !f.is_empty()) });
+        }
         if self.v.glass {
             let matches = m.as_ref() == Some(&SetId::Glass);
             let note = if matches { "Matches your other cursors" } else { "Frosted glass" };
-            v.push(PickRow { id: SetId::Glass, name: "Glass".into(), note: note.into(), imp: false, top: true, matches });
+            v.push(PickRow { id: SetId::Glass, name: "Glass".into(), note: note.into(), imp: false, top: true, matches, file: file_of(&SetId::Glass) });
         }
-        v.push(PickRow { id: SetId::WindowsDefault, name: "Windows default".into(), note: "The cursors Windows came with".into(), imp: false, top: true, matches: false });
+        v.push(PickRow {
+            id: SetId::WindowsDefault,
+            name: "Windows default".into(),
+            note: "The cursors Windows came with".into(),
+            imp: false,
+            top: true,
+            matches: false,
+            file: file_of(&SetId::WindowsDefault),
+        });
         if let Some(id) = m.as_ref().filter(|id| **id != SetId::Glass) {
             let imp = matches!(id, SetId::Pack(_));
-            v.push(PickRow { id: id.clone(), name: id.label(), note: "Matches your other cursors".into(), imp, top: true, matches: true });
+            v.push(PickRow { id: id.clone(), name: id.label(), note: "Matches your other cursors".into(), imp, top: true, matches: true, file: file_of(id) });
         }
         for p in &self.v.packs {
             let id = SetId::Pack(p.name.clone());
             if p.has(role) && m.as_ref() != Some(&id) {
-                v.push(PickRow { id, name: p.name.clone(), note: "Imported".into(), imp: true, top: false, matches: false });
+                // a pack from "Get more cursors" says so; the others were imported by hand
+                let note = if bu_mouse::store::LIST.iter().any(|l| l.name == p.name) { "Made by the community" } else { "Imported" };
+                v.push(PickRow { file: file_of(&id), id, name: p.name.clone(), note: note.into(), imp: true, top: false, matches: false });
             }
+        }
+        // the files he picked before with "Choose your own file…" - any of them can be put on this bubble again
+        for f in &self.v.own_files {
+            let name = f.rsplit(['\\', '/']).next().unwrap_or(f).to_string();
+            v.push(PickRow { id: SetId::OwnFile(f.clone()), name, note: "A file you picked".into(), imp: false, top: false, matches: false, file: Some(f.clone()) });
         }
         // Order 042: every cursor scheme Windows has installed (the owner: "is there more windows presets for cursors?")
         for (name, roles) in &self.v.schemes {
             let id = SetId::Scheme(name.clone());
             if roles.contains(&role) && m.as_ref() != Some(&id) {
-                v.push(PickRow { id, name: name.clone(), note: "Windows cursor scheme".into(), imp: false, top: false, matches: false });
+                v.push(PickRow { file: file_of(&id), id, name: name.clone(), note: "Windows cursor scheme".into(), imp: false, top: false, matches: false });
             }
         }
         v
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn cmi(&mut self, cx: &mut Cx, k: Key, ri: usize, look: &art::Look, name: &str, note: &str, on: bool, imp: bool, matches: bool) -> El {
+    fn cmi(&mut self, cx: &mut Cx, k: Key, ri: usize, look: &art::Look, file: Option<&str>, name: &str, note: &str, on: bool, imp: bool, matches: bool) -> El {
         let hv = cx.hover_t(k, 120.0, EASE);
         let look = *look;
+        // Order 066: this set's REAL cursor for the bubble (its .cur / .ani file); the stand-in only when it can't be read
+        let real = file.and_then(pic::load);
         let tile = El::block()
             .size(36.0, 36.0)
             .none()
@@ -1185,7 +1325,14 @@ impl Mouse {
             // (light, Order 033: `#sw.light .cmi .cpv{background:rgba(60,60,67,.13)}`)
             .bg(if crate::ui::is_light() { Rgba::rgba(60, 60, 67, 0.13) } else { WELL() })
             .inset(&[sh(0.0, 0.0, 0.0, 0.5, HAIR())])
-            .child(El::paint(move |g, (x, y, _, _)| art::cursor(g, &look, ri, x + 5.0, y + 5.0, 26.0, 1.0, 0.0)).abs(0.0, 0.0, 0.0, 0.0).no_hit());
+            .child(
+                El::paint(move |g, (x, y, _, _)| match &real {
+                    Some(p) => pic::paint(g, p, x + 5.0, y + 5.0, 26.0, 1.0),
+                    None => art::cursor(g, &look, ri, x + 5.0, y + 5.0, 26.0, 1.0, 0.0),
+                })
+                .abs(0.0, 0.0, 0.0, 0.0)
+                .no_hit(),
+            );
         let mut r = El::row()
             .center()
             .gap(10.0)
@@ -1403,6 +1550,16 @@ impl Page for Mouse {
         // drops the worker (its channel closes; the thread ends) and every value
         *self = Mouse::default();
     }
+    /// Order 063: the acceleration card runs without the tab: at app start the saved card comes back (the driver is written only
+    /// when the user had it on and it differs) and the games in the per-game rows are listened for. Real runs only.
+    fn background(&self, env: &Env) -> Option<Box<dyn crate::pages::Background>> {
+        #[cfg(windows)]
+        if !env.test && !crate::undo::headless() {
+            return rt::start().map(|g| Box::new(g) as Box<dyn crate::pages::Background>);
+        }
+        let _ = env;
+        None
+    }
     /// Windows' settings, the cursors and the mouse's own values are in (the frame holds the tab up to 0.4 s for them)
     fn ready(&self) -> bool {
         self.svc.as_ref().is_none_or(|s| !s.opening) && !self.reading
@@ -1419,6 +1576,7 @@ impl Page for Mouse {
         if let Some(n) = crate::addons::take_notice() {
             cx.toast(&n);
         }
+        self.follow_store(cx);
         let mut kids = vec![pieces::header(self.name(), None)];
         kids.push(self.your_mouse(cx));
         kids.push(self.accel(cx));
@@ -1439,6 +1597,10 @@ impl Page for Mouse {
             };
             layer = layer.child(el);
         }
+        if let Some(d) = self.store_window(cx) {
+            any = true;
+            layer = layer.child(d);
+        }
         if let Some((win, ticks)) = self.reset.clone() {
             any = true;
             layer = layer.child(self.reset_popup(cx, win, &ticks));
@@ -1458,6 +1620,13 @@ impl Page for Mouse {
         }
     }
     fn popup_dismiss(&mut self) {
+        if self.store_open {
+            // (no job to stop here: the window's own Done / close does that; a press beside it just closes the list)
+            self.store_open = false;
+            store::OPEN.store(false, std::sync::atomic::Ordering::SeqCst);
+            pic::forget();
+            return;
+        }
         self.dismissed = self.menu;
         self.close_menu();
         self.reset = None;
@@ -1613,6 +1782,7 @@ impl crate::undo::Resettable for Mouse {
             // for the worker would stall both. So it is put back right here, and the open tab's worker reads it again.
             let r = with_cold(&self.cold, |c| c.restore(item, &to.raw));
             self.send(Cmd::Reread);
+            self.panel_from_worker = false; // the card is read again from the worker (a reset may have switched it off)
             return r;
         }
         if self.svc.is_some() {
@@ -1637,6 +1807,7 @@ impl crate::undo::Resettable for Mouse {
         // carries the new view)
         if self.svc.is_some() && !self.fake {
             self.send(Cmd::Reread);
+            self.panel_from_worker = false; // the card is read again from the worker (a reset may have switched it off)
         }
     }
 }
@@ -1819,6 +1990,10 @@ impl Mouse {
     }
 
     fn close_menu(&mut self) {
+        if self.menu.is_some() {
+            // the pictures of a picker's rows are read again the next time one opens
+            pic::forget();
+        }
         self.menu = None;
         if self.preview.take().is_some() {
             self.send(Cmd::EndPreview);
@@ -1935,6 +2110,9 @@ impl Mouse {
     }
 
     fn click(&mut self, k: Key, now: f64, cx: &mut Cx) {
+        if self.store_clicked(k, cx) {
+            return;
+        }
         if let Some((_, ticks)) = &mut self.reset {
             for (i, t) in ticks.iter_mut().enumerate() {
                 if k == idx(K_RSP, i) {
@@ -1947,7 +2125,7 @@ impl Mouse {
         if let Some(m) = self.menu {
             if let Menu::Cursor(ri) = m {
                 let sets: Vec<SetId> = self.picker_sets(ri).into_iter().map(|r| r.id).collect();
-                for j in 0..20 {
+                for j in 0..300 {
                     if k == idx(K_MENU, j) {
                         let role = Role::ALL[ri];
                         if let Some(s) = sets.get(j).cloned() {
@@ -1969,7 +2147,12 @@ impl Mouse {
                         return;
                     }
                 }
-                if k == idx(K_MENU, 50) {
+                if k == idx(K_MENU, 901) {
+                    self.close_menu();
+                    self.open_store(cx);
+                    return;
+                }
+                if k == idx(K_MENU, 900) {
                     self.close_menu();
                     // Windows' file picker (modal over the menu, inside this click); a test copy gets BU_PICK
                     if let Some(f) = cx.pick_file_in("Choose a cursor", &[("Cursors", "*.cur;*.ani")], &cursors_dir()) {
@@ -1989,6 +2172,7 @@ impl Mouse {
         }
         let fake = self.test;
         match k {
+            _ if k == K_SGET => self.open_store(cx),
             _ if k == K_WEB => {
                 if let Some((_, url)) = self.v.mice.as_ref().and_then(|m| m.first()).and_then(|y| y.link()) {
                     open_url(url, fake);
@@ -2143,11 +2327,15 @@ impl Mouse {
                         let name = self.panel.preset(*id).map(|p| p.name.clone()).unwrap_or_default();
                         self.panel.delete_preset(*id);
                         let (apps, ee) = self.per_app.forget_preset(*id);
-                        let mut used: Vec<String> = self.per_app.rows().iter().filter(|r| apps.iter().any(|a| r.exe.ends_with(a.as_str()))).map(|r| r.label.clone()).collect();
-                        if ee {
-                            used.push("everywhere else".into());
+                        let used: Vec<String> = self.per_app.rows().iter().filter(|r| apps.iter().any(|a| r.exe.ends_with(a.as_str()))).map(|r| r.label.clone()).collect();
+                        let mut parts = Vec::new();
+                        if !used.is_empty() {
+                            parts.push(format!("{} now Off", used.join(", ")));
                         }
-                        self.say(if used.is_empty() { format!("Deleted {name}") } else { format!("Deleted {name} · {} now Off", used.join(", ")) }, now);
+                        if ee {
+                            parts.push("the other games use the main preset".to_string());
+                        }
+                        self.say(if parts.is_empty() { format!("Deleted {name}") } else { format!("Deleted {name} · {}", parts.join(", ")) }, now);
                         self.push_accel();
                         return;
                     }

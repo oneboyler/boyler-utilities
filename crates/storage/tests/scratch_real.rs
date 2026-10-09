@@ -83,6 +83,13 @@ impl StorageOs for ScratchOs {
         assert!(path.starts_with(&self.root), "delete outside scratch: {}", path.display());
         self.real.remove_dir(path)
     }
+    fn recycle_file(&self, path: &Path) -> io::Result<()> {
+        // never the real shell here: the scratch "bin" is a folder
+        assert!(path.starts_with(&self.root), "recycle outside scratch: {}", path.display());
+        let to = self.bin().join(path.file_name().unwrap());
+        fs::create_dir_all(self.bin())?;
+        fs::rename(path, to)
+    }
     fn recycle_bin(&self) -> Result<RecycleBinInfo> {
         let mut info = RecycleBinInfo::default();
         for e in self.real.read_dir(&self.bin())? {
@@ -146,7 +153,7 @@ fn real_clean_in_scratch_only_ticked_in_use_stays_junction_not_followed() {
     write(&local.join(r"Temp\locked.tmp"), 700);
     write(&root.join(r"Precious\keep.docx"), 4242);
     write(&local.join(r"NVIDIA\DXCache\s.bin"), 800);
-    write(&local.join(r"Steam\htmlcache\c.bin"), 900);
+    write(&local.join(r"Steam\htmlcache\Default\Cache\c.bin"), 900);
     write(&root.join(r"Program Files\Steam\appcache\appinfo.vdf"), 600);
     // A junction inside Temp pointing at the precious folder (junctions need no admin).
     let link = local.join(r"Temp\link");
@@ -172,7 +179,7 @@ fn real_clean_in_scratch_only_ticked_in_use_stays_junction_not_followed() {
     assert!(link.exists(), "junction left alone");
     assert_eq!(fs::read(root.join(r"Precious\keep.docx")).unwrap().len(), 4242, "junction target untouched");
     assert!(local.join(r"NVIDIA\DXCache\s.bin").exists(), "shader caches were not ticked");
-    assert!(local.join(r"Steam\htmlcache\c.bin").exists(), "Steam was running");
+    assert!(local.join(r"Steam\htmlcache\Default\Cache\c.bin").exists(), "Steam was running");
     let temp = report.rows.iter().find(|r| r.kind == Some(CleanKind::TempFiles)).unwrap();
     assert_eq!((temp.freed_bytes, temp.in_use_bytes, temp.in_use_files), (1500, 700, 1));
     assert_eq!(report.rows.iter().find(|r| r.kind == Some(CleanKind::RecycleBin)).unwrap().freed_bytes, 5000);
@@ -181,7 +188,7 @@ fn real_clean_in_scratch_only_ticked_in_use_stays_junction_not_followed() {
     os.running.lock().unwrap().clear();
     let plan = cleanup::measure(&os).unwrap();
     plan.clean(&os, &[CleanKind::LauncherCaches]).unwrap();
-    assert!(!local.join(r"Steam\htmlcache\c.bin").exists());
+    assert!(!local.join(r"Steam\htmlcache\Default\Cache\c.bin").exists());
     assert!(!root.join(r"Program Files\Steam\appcache\appinfo.vdf").exists());
 
 }

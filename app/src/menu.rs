@@ -486,6 +486,17 @@ impl Menu {
         }
     }
 
+    /// Order 072: a fullscreen window (`front`, a game) is in front: the menu stops being topmost and sits just BELOW it (not at the
+    /// top of the normal windows, which would cover the game).
+    pub fn step_back_below(&self, front: HWND) {
+        if self.noact {
+            return;
+        }
+        unsafe {
+            let _ = SetWindowPos(self.hwnd, Some(front), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        }
+    }
+
     /// Show both windows (no activation in test mode).
     pub fn show(&mut self) {
         unsafe {

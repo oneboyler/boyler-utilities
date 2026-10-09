@@ -16,7 +16,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     HWND_MESSAGE, MSG, SMTO_BLOCK, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_INPUT, WNDCLASSW,
 };
 
-use crate::hub::{Hub, KeysNeed, Posts, RawPacket, SoundEvent, Stats, Target, USAGE_PAGE_GENERIC};
+use crate::hub::{Hub, KeysNeed, MouseSoundEvent, Posts, RawPacket, SoundEvent, Stats, Target, USAGE_PAGE_GENERIC};
 
 /// Who plays the key sounds (Order 058): called on the raw thread, right after a batch is read, once per key going down
 /// or up. It gets a [`SoundEvent`] (class + up / down) and nothing else - never the key.
@@ -41,6 +41,38 @@ pub fn set_key_sound(new: Option<SoundSink>) -> Result<(), String> {
         *sink() = old_sink;
         hub().set_sound(old_on);
     })
+}
+
+/// Who plays the mouse button sounds (Order 064): called on the raw thread, once per button going down or up, with a
+/// [`MouseSoundEvent`] (button class + up / down) and nothing else.
+pub type MouseSink = std::sync::Arc<dyn Fn(MouseSoundEvent) + Send + Sync>;
+static MSINK: Mutex<Option<MouseSink>> = Mutex::new(None);
+
+fn msink() -> MutexGuard<'static, Option<MouseSink>> {
+    MSINK.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// The mouse button sounds (Order 064): Some = deliver every button down / up to `sink` as a class-only event (the mouse is
+/// registered for it, listen-only; moves and wheel turns never leave the raw thread); None = stop listening (nothing is
+/// registered for it, nothing is kept). Err = Windows refused the registration (its own text); the old setting stays.
+pub fn set_mouse_sound(new: Option<MouseSink>) -> Result<(), String> {
+    let on = new.is_some();
+    let old_sink = std::mem::replace(&mut *msink(), new);
+    let old_on = hub().set_mouse_sound(on);
+    if old_on == on {
+        return Ok(());
+    }
+    request().inspect_err(|_| {
+        *msink() = old_sink;
+        hub().set_mouse_sound(old_on);
+    })
+}
+
+/// "Ignore repeats within `ms`" for the key sounds (Order 059; 0 = off, at most 80): a key that comes down twice inside the
+/// window plays one sound. Works inside the sound client only - no input is blocked or changed, the typed keys are
+/// untouched. The filter keeps a few bytes of state while it is on and none while it is off.
+pub fn set_sound_chatter(ms: u32) {
+    hub().set_chatter(ms);
 }
 
 /// Another thread asks the raw thread to bring the registration up to date (sent; LRESULT 0 = done, else the HRESULT
@@ -266,6 +298,14 @@ fn on_input(hwnd: HWND, lp: LPARAM) {
         let s = sink().clone();
         if let Some(s) = s {
             for e in out.sounds.drain(..) {
+                s(e);
+            }
+        }
+    }
+    if !out.mouse_sounds.is_empty() {
+        let s = msink().clone();
+        if let Some(s) = s {
+            for e in out.mouse_sounds.drain(..) {
                 s(e);
             }
         }

@@ -9,8 +9,16 @@ description = "Boyler Utilities - Storage tab features (drives, what uses the sp
 name = "storage-show"
 path = "examples/show.rs"
 
+[[example]]
+name = "storage-everything"
+path = "examples/everything.rs"
+
 [dependencies]
 thiserror = "2"
+
+# Order 069: the fast whole-drive listing goes through our own Everything (its IPC + instance + service helpers)
+[target.'cfg(windows)'.dependencies]
+bu-search = { path = "../search" }
 
 [target.'cfg(windows)'.dependencies.windows]
 version = "0.62"

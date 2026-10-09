@@ -20,6 +20,7 @@ mod clipboard;
 mod d2dref;
 mod comp;
 mod effects;
+mod fullfront;
 mod droptarget;
 mod gfx;
 mod gpu;
@@ -106,6 +107,9 @@ enum Ev {
     Display,
     /// start the next page's background part (Order 048: one per wake-up, after the tray is up)
     StartBg,
+    /// another app's window came to the front (fullfront::Hook) / a one-shot re-check a moment after (Order 072)
+    Foreground,
+    FgRecheck,
 }
 
 thread_local! {
@@ -165,6 +169,10 @@ const WARM_MS: u32 = 4000;
 const TIMER_ANCHOR: usize = 8;
 /// one-shot (Order 048): the next page's background part starts (spread out after the start, `App::start_next_bg`)
 const TIMER_BG: usize = 9;
+/// one-shot (Order 072): a window that just came to the front may go fullscreen a moment later (a game) - looked at again
+/// after FG_RECHECK_MS[0], [1], [2], then never until the front window changes again
+const TIMER_FG: usize = 10;
+const FG_RECHECK_MS: [u32; 3] = [600, 1500, 3000];
 /// the gap between two pages' background parts at the start
 const BG_GAP_MS: u32 = 40;
 
@@ -245,6 +253,11 @@ extern "system" fn wndproc(h: HWND, m: u32, w: WPARAM, l: LPARAM) -> LRESULT {
             WM_TIMER if w.0 == TIMER_BG => {
                 let _ = KillTimer(Some(h), TIMER_BG);
                 push(Ev::StartBg);
+                return LRESULT(0);
+            }
+            WM_TIMER if w.0 == TIMER_FG => {
+                let _ = KillTimer(Some(h), TIMER_FG);
+                push(Ev::FgRecheck);
                 return LRESULT(0);
             }
             WM_TIMER if w.0 == TIMER_ANCHOR => {
@@ -531,6 +544,13 @@ struct App {
     open_on: Option<(String, Option<String>)>,
     /// the menu is open but another app was clicked: it sits behind (not topmost) until raised (feedback F1)
     behind: bool,
+    /// Order 072: the menu stays on top of normal windows while open (the focus may be elsewhere); `back` = it stepped
+    /// back (not topmost) because a fullscreen window (a game) is in front
+    back: bool,
+    /// the front-window notice, alive while the menu is open
+    fg_hook: Option<fullfront::Hook>,
+    /// how many of FG_RECHECK_MS are still to come
+    fg_checks: usize,
     /// the pages whose background part has not started yet (Order 048: started one at a time after the tray is up -
     /// the very first start after Setup ran them all on the UI thread before it answered anything) + what they get
     bg_todo: Vec<Box<dyn pages::Page>>,
@@ -576,7 +596,7 @@ impl App {
                         let _ = SetForegroundWindow(m.hwnd);
                     }
                 }
-            } else if self.behind {
+            } else if self.behind || self.back {
                 // open while it sits behind another app (a key that shows a tab): it comes to the front
                 self.raise();
             }
@@ -640,6 +660,12 @@ impl App {
                 }
                 self.menu = Some(m);
                 self.tray.set_open(true);
+                // Order 072: stays on top of normal windows; the notice of the front window changing (a fullscreen game
+                // comes in front -> it steps back) lives as long as the menu is open
+                self.back = false;
+                if !self.opts.offscreen && !self.opts.screen_test {
+                    self.fg_hook = fullfront::Hook::install(|| push(Ev::Foreground));
+                }
             }
             Err(e) => {
                 timing::mark(&format!("open_error_{:08x}", e.code().0), timing::now());
@@ -714,6 +740,7 @@ impl App {
     /// The menu sat behind another app: on top and focused again (tray double-click).
     fn raise(&mut self) {
         self.behind = false;
+        self.back = false;
         if let Some(m) = &mut self.menu {
             m.ui.dirty = true;
             m.set_topmost(true);
@@ -735,6 +762,12 @@ impl App {
             });
         }
         self.behind = false;
+        self.back = false;
+        self.fg_hook = None;
+        self.fg_checks = 0;
+        unsafe {
+            let _ = KillTimer(Some(self.msg), TIMER_FG);
+        }
         if self.menu.take().is_some() {
             // Order 051: the overlay may still draw on the same GPU device - the menu's GPU memory goes now
             gpu::trim_current();
@@ -1136,8 +1169,9 @@ impl App {
                     }
                 }
             }
-            Ev::TrayMenu(x, y) => match self.tray.context_menu(x, y) {
+            Ev::TrayMenu(x, y) => match self.tray.context_menu(x, y, pages::noise::glue::playing()) {
                 tray::IDM_OPEN => self.command("open"),
+                tray::IDM_STOP_NOISE => pages::noise::glue::stop(),
                 tray::IDM_QUIT => self.command("quit"),
                 _ => {}
             },
@@ -1167,6 +1201,48 @@ impl App {
                     m.re_anchor(work);
                 }
             }
+            Ev::Foreground | Ev::FgRecheck => {
+                // Order 072: the menu stays in front of normal windows; a fullscreen window (a game, a fullscreen video) in
+                // front -> it steps back so it never covers it; it is on top again when that window leaves the front
+                // (without taking the focus) or when the user opens / clicks the menu
+                if self.opts.offscreen || self.opts.screen_test {
+                    return;
+                }
+                let fresh = matches!(e, Ev::Foreground);
+                if fresh {
+                    self.fg_checks = FG_RECHECK_MS.len();
+                }
+                let Some(m) = &mut self.menu else { return };
+                if m.ui.close_t.is_some() {
+                    return;
+                }
+                let front = unsafe { GetForegroundWindow() };
+                let mut pid = 0u32;
+                if !front.is_invalid() {
+                    unsafe { GetWindowThreadProcessId(front, Some(&mut pid)) };
+                }
+                // (the app's own windows - the menu, a picker - are never "a game in front")
+                let full = pid != 0 && pid != unsafe { GetCurrentProcessId() } && fullfront::is_fullscreen(front);
+                if full && !self.back {
+                    self.back = true;
+                    self.behind = true;
+                    m.step_back_below(front);
+                } else if !full && self.back && pid != 0 {
+                    self.back = false;
+                    m.set_topmost(true);
+                }
+                m.ui.dirty = true;
+                // a window that just came to the front may go fullscreen a moment later (a game): look again, a few times
+                if !full && self.fg_checks > 0 {
+                    let ms = FG_RECHECK_MS[FG_RECHECK_MS.len() - self.fg_checks];
+                    self.fg_checks -= 1;
+                    unsafe {
+                        SetTimer(Some(self.msg), TIMER_FG, ms, None);
+                    }
+                } else {
+                    self.fg_checks = 0;
+                }
+            }
             Ev::Services => {
                 // (behind another app too: it is still on the screen - Order 041)
                 if let Some(m) = self.menu.as_mut() {
@@ -1178,8 +1254,8 @@ impl App {
                     return;
                 }
                 // the owner Oct 8 (feedback F1): the menu closes ONLY on its X or minimize button. A click on another app
-                // leaves it open; it just stops being on top, like any window, so the app clicked comes over it - the
-                // tray double-click brings it back. (A click on the tray icon itself is not "another app".)
+                // leaves it open. Order 072 (the owner, same day): and it STAYS IN FRONT of normal windows (only a fullscreen game makes
+                // it step back: Ev::Foreground); the tray double-click focuses it. (A click on the tray icon itself is not "another app".)
                 let mut pt = POINT::default();
                 unsafe {
                     let _ = GetCursorPos(&mut pt);
@@ -1188,7 +1264,6 @@ impl App {
                 if let (Some(m), false) = (&mut self.menu, on_icon) {
                     if m.ui.close_t.is_none() {
                         self.behind = true;
-                        m.set_topmost(false);
                         // behind another app it is still on the screen: timers, a stopwatch, progress bars and live pages
                         // keep moving (the owner Oct 8 test 2: "they should still be showing normally as long as the app is open
                         // not minimized"); only closing / minimizing (= closing) stops the frames
@@ -1204,6 +1279,7 @@ impl App {
             Ev::Activate => {
                 if let Some(m) = &mut self.menu {
                     self.behind = false;
+                    self.back = false;
                     m.set_topmost(true);
                     m.ui.dirty = true;
                 }
@@ -1355,7 +1431,7 @@ fn run(opts: Opts) -> Result<()> {
         let env = pages::Env { test: opts.test, real_read: opts.real_read, frozen: opts.frozen, rm: reduced_motion(), keep: keep::app() };
         let mut bg_todo = pages::all();
         bg_todo.reverse();
-        let mut app = App { msg, tray, menu: None, opts: opts.clone(), dq: None, quit: false, bg: Vec::new(), open_on: None, behind: false, bg_todo, env };
+        let mut app = App { msg, tray, menu: None, opts: opts.clone(), dq: None, quit: false, bg: Vec::new(), open_on: None, behind: false, back: false, fg_hook: None, fg_checks: 0, bg_todo, env };
         push(Ev::StartBg);
         for c in &opts.cmds {
             app.command_from(c, None);

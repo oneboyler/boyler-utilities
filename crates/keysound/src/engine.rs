@@ -12,10 +12,10 @@
 use crate::front::Front;
 use crate::kind::{kind_of, Kind};
 use crate::mixer::Mixer;
-use crate::rules::{choose, gain, Pack, Settings};
+use crate::rules::{choose, choose_mouse, gain, Pack, Settings};
 use crate::stream::Stream;
-use crate::synth::{render, SoundSet};
-use bu_rawin::{SoundEvent, SoundSink};
+use crate::synth::{render, render_clicks, ClickSet, ClickStyle, MouseButtonClass, SoundSet};
+use bu_rawin::{MouseSink, MouseSoundEvent, SoundEvent, SoundSink};
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -43,9 +43,19 @@ struct Live {
     settings: Settings,
     lib: HashMap<Pack, SoundSet>,
     imported: HashMap<String, SoundSet>,
+    /// The mouse clicks of every pack character in use (Order 064); empty while "Mouse clicks too" is off.
+    clicks: HashMap<ClickStyle, ClickSet>,
     front: Front,
     rng: u32,
     test_mute: bool,
+}
+
+/// The click that goes with a pack (a pack the user imported has none of its own).
+fn style_of(p: &Pack) -> ClickStyle {
+    match p {
+        Pack::Builtin(id) => ClickStyle::of(*id),
+        Pack::Imported(_) => ClickStyle::IMPORTED,
+    }
 }
 
 impl Live {
@@ -53,6 +63,11 @@ impl Live {
     fn ensure(&mut self) {
         let mut want: Vec<Pack> = vec![self.settings.pack.clone()];
         want.extend(self.settings.rules.iter().filter_map(|r| r.pack.clone()));
+        let styles: Vec<ClickStyle> = if self.settings.mouse_on { want.iter().map(style_of).collect() } else { Vec::new() };
+        self.clicks.retain(|k, _| styles.contains(k));
+        for st in styles {
+            self.clicks.entry(st).or_insert_with(|| render_clicks(st, BUILTIN_RATE));
+        }
         self.lib.retain(|k, _| want.contains(k));
         for p in want {
             if self.lib.contains_key(&p) {
@@ -81,12 +96,26 @@ impl Live {
     }
 }
 
+impl Live {
+    /// Each press is a little louder or softer (about +-1.2 dB): no two presses are the same.
+    fn amp_jitter(&mut self) -> f32 {
+        let mut x = self.rng;
+        x ^= x << 13;
+        x ^= x >> 17;
+        x ^= x << 5;
+        self.rng = x;
+        1.0 + ((x as f32 / u32::MAX as f32) * 2.0 - 1.0) * 0.14
+    }
+}
+
 /// What the engine is doing (for the page and the tests).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Status {
     pub enabled: bool,
     /// The output stream is open right now (sounds are playing or just played).
     pub stream_open: bool,
+    /// The mouse buttons are being listened to (Order 064: "Mouse clicks too" is on and the sounds are).
+    pub mouse_listening: bool,
     /// The output's sample rate and the stream's added delay (ms), from the last time it was opened.
     pub rate: u32,
     pub period_ms: f32,
@@ -113,6 +142,8 @@ struct Shared {
     stop_ev: isize,
     stop: AtomicBool,
     out_rate: AtomicU32,
+    /// The mouse sink is registered with the raw-input owner right now.
+    mouse_listening: AtomicBool,
     /// Nanoseconds (since `epoch`) of the oldest sound that hasn't reached the buffer yet; 0 = none.
     pending_ns: AtomicU64,
     epoch: Instant,
@@ -141,7 +172,36 @@ impl Shared {
             let rate = set.rate as f32;
             let g = gain(settings.volume);
             let jit = l.jitter();
+            let g = g * l.amp_jitter();
             (sound, g, rate / self.out_rate.load(Ordering::Relaxed).max(1) as f32 * jit)
+        };
+        self.play(&sound, g, step, t0);
+    }
+
+    /// A mouse button went down or up (called on the raw-input thread). The side buttons play the chosen pack's key sound, the
+    /// others the click that suits it; the mouse volume, the game switch and the per-app rules decide whether and how loud.
+    fn on_mouse_event(&self, e: MouseSoundEvent) {
+        let t0 = self.now_ns();
+        let (sound, g, step) = {
+            let mut l = lock(&self.live);
+            let Live { settings, lib, clicks, front, .. } = &mut *l;
+            if !settings.mouse_on {
+                return;
+            }
+            let (game, exe) = front.now();
+            let Some(pack) = choose_mouse(settings, exe, game) else { return };
+            let (sound, rate) = if e.button == MouseButtonClass::Side {
+                let Some(set) = lib.get(pack) else { return };
+                (set.get(if e.down { Kind::Down } else { Kind::Up }).clone(), set.rate)
+            } else {
+                let Some(set) = clicks.get(&style_of(pack)) else { return };
+                let Some(s) = set.get(e.button, e.down) else { return };
+                (s.clone(), set.rate)
+            };
+            let g = gain(settings.mouse_volume);
+            let jit = l.jitter();
+            let g = g * l.amp_jitter();
+            (sound, g, rate as f32 / self.out_rate.load(Ordering::Relaxed).max(1) as f32 * jit)
         };
         self.play(&sound, g, step, t0);
     }
@@ -193,6 +253,7 @@ impl KeySounds {
                     settings: Settings::default(),
                     lib: HashMap::new(),
                     imported: HashMap::new(),
+                    clicks: HashMap::new(),
                     front: Front::new(),
                     rng: seed,
                     test_mute: false,
@@ -203,6 +264,7 @@ impl KeySounds {
                 stop_ev,
                 stop: AtomicBool::new(false),
                 out_rate: AtomicU32::new(BUILTIN_RATE),
+                mouse_listening: AtomicBool::new(false),
                 pending_ns: AtomicU64::new(0),
                 epoch: Instant::now(),
             }),
@@ -213,7 +275,9 @@ impl KeySounds {
     /// Switches the sounds on: makes the packs, registers the (listen-only) key sink, starts the render thread (which
     /// sleeps until the first sound). Err = Windows refused the registration or the thread, with its own text.
     pub fn enable(&self, settings: Settings) -> Result<(), String> {
-        self.update(settings);
+        let mouse = settings.mouse_on;
+        let was_enabled = lock(&self.shared.status).enabled;
+        let updated = self.apply_settings(settings);
         self.start_thread()?;
         let sh = self.shared.clone();
         let sink: SoundSink = Arc::new(move |e| sh.on_event(e));
@@ -222,6 +286,26 @@ impl KeySounds {
             return Err(e);
         }
         lock(&self.shared.status).enabled = true;
+        // the keys work even when Windows refuses the mouse; the page shows why the clicks are silent (one try per save)
+        if was_enabled {
+            return updated;
+        }
+        self.sync_mouse(mouse).map_err(|e| format!("mouse clicks: {e}"))
+    }
+
+    /// Registers (true) or releases (false) the mouse-button sink, only when that differs from now. While "Mouse clicks too" is
+    /// off the mouse is not registered at all: nothing is read, nothing runs.
+    fn sync_mouse(&self, want: bool) -> Result<(), String> {
+        if self.shared.mouse_listening.load(Ordering::SeqCst) == want {
+            return Ok(());
+        }
+        let sink: Option<MouseSink> = want.then(|| {
+            let sh = self.shared.clone();
+            Arc::new(move |e| sh.on_mouse_event(e)) as MouseSink
+        });
+        bu_rawin::set_mouse_sound(sink)?;
+        self.shared.mouse_listening.store(want, Ordering::SeqCst);
+        lock(&self.shared.status).mouse_listening = want;
         Ok(())
     }
 
@@ -250,9 +334,11 @@ impl KeySounds {
     /// Switches the sounds off: nothing is registered with Windows any more, the thread ends, the packs are dropped (RAM).
     pub fn disable(&self) {
         let _ = bu_rawin::set_key_sound(None);
+        let _ = self.sync_mouse(false);
         self.stop_thread();
         let mut l = lock(&self.shared.live);
         l.lib.clear();
+        l.clicks.clear();
         drop(l);
         lock(&self.shared.mixer).stop_all();
         let mut s = lock(&self.shared.status);
@@ -272,9 +358,25 @@ impl KeySounds {
 
     /// New settings (pack, volume, rules, game switch). Takes effect on the next press.
     pub fn update(&self, settings: Settings) {
-        let mut l = lock(&self.shared.live);
-        l.settings = settings;
-        l.ensure();
+        if let Err(e) = self.apply_settings(settings) {
+            lock(&self.shared.status).error = Some(e);
+        }
+    }
+
+    /// [`KeySounds::update`], giving back why the mouse could not be (un)registered.
+    fn apply_settings(&self, settings: Settings) -> Result<(), String> {
+        bu_rawin::set_sound_chatter(u32::from(settings.repeat_ms));
+        let mouse = settings.mouse_on;
+        {
+            let mut l = lock(&self.shared.live);
+            l.settings = settings;
+            l.ensure();
+        }
+        // The raw thread locks `live` on every click, so the registration (which waits for that thread) is done without it.
+        if lock(&self.shared.status).enabled {
+            self.sync_mouse(mouse).map_err(|e| format!("mouse clicks: {e}"))?;
+        }
+        Ok(())
     }
 
     /// Makes an imported pack's sounds available under `name` (None removes it).

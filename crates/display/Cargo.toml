@@ -56,3 +56,7 @@ path = "examples/idle.rs"
 [[example]]
 name = "display-trigger"
 path = "examples/trigger.rs"
+
+[[example]]
+name = "display-bricon"
+path = "examples/bricon.rs"

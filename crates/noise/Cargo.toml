@@ -1,0 +1,28 @@
+[package]
+name = "bu-noise"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Boyler Utilities - Noise tab: white / pink / brown / dark brown / grey / blue noise made by ourselves (no recordings), one seamless loop in memory, one WASAPI shared stream, fade in / out, sleep timer. No UI."
+
+[lib]
+name = "bu_noise"
+
+[target.'cfg(windows)'.dependencies.windows]
+version = "0.62"
+features = [
+    "Win32_Foundation",
+    "Win32_Media_Audio",
+    "Win32_Security",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_ProcessStatus",
+    "Win32_System_Threading",
+    "Win32_System_Variant",
+    "Win32_System_WindowsProgramming",
+]
+
+# Order 062's proof on the real PC: the real stream, MUTED, process CPU while it plays
+[[example]]
+name = "noise-proof"
+path = "examples/proof.rs"

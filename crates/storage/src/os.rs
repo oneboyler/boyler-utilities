@@ -165,8 +165,33 @@ pub struct ReliabilityCounter {
     pub power_on_hours: Option<u64>,
 }
 
+/// One entry of a whole-drive listing (Order 069): a file or a folder as a fast source (Everything's index) lists it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListEntry {
+    /// The folder it is in, e.g. `C:\Users\You` (a drive's top folder is `C:`); empty = the drive itself.
+    pub dir: String,
+    pub name: String,
+    /// bytes (0 for a folder)
+    pub size: u64,
+    /// An online-only cloud file: it takes no room on the drive (counted as 0, like the walk does).
+    pub cloud_only: bool,
+}
+
+/// A drive's folders and files as a fast source reads them. Dropping it ends the source (Everything is quit then).
+pub trait DriveListing {
+    /// The next page of the drive's FOLDERS (`folders`) or FILES, at most `max`; an empty page = the end of that list. The
+    /// two lists are read one after the other.
+    fn page(&mut self, folders: bool, max: usize) -> Result<Vec<ListEntry>>;
+}
+
 /// Everything the Storage features ask Windows. `RealOs` is the Windows one; `FakeOs` is for tests.
 pub trait StorageOs: Send + Sync {
+    /// Order 069: a fast listing of the whole drive (Everything's index) for the "What's using" measure; `None` = there is
+    /// none (the walk is used), `Some(Err)` = it was tried and failed (the walk is used). `ctl` can stop the wait for it.
+    fn open_listing(&self, _letter: char, _ctl: &crate::scan::ScanControl) -> Option<Result<Box<dyn DriveListing>>> {
+        None
+    }
+
     /// All drive letters with their sizes (network drives too; [`crate::drives`] filters).
     fn drives(&self) -> Result<Vec<DriveInfo>>;
     /// One directory's entries (no `.` / `..`). `PermissionDenied` = "Can't be read".
@@ -175,6 +200,8 @@ pub trait StorageOs: Send + Sync {
     fn remove_file(&self, path: &Path) -> io::Result<()>;
     /// Delete one empty folder.
     fn remove_dir(&self, path: &Path) -> io::Result<()>;
+    /// Move one file to the Recycle Bin (Order 069: Files view, Delete) - not a permanent delete.
+    fn recycle_file(&self, path: &Path) -> io::Result<()>;
     fn recycle_bin(&self) -> Result<RecycleBinInfo>;
     /// Empty the recycle bin of every drive, no confirm / progress / sound.
     fn empty_recycle_bin(&self) -> Result<()>;
@@ -197,11 +224,17 @@ impl<T: StorageOs + ?Sized> StorageOs for &T {
     fn read_dir(&self, path: &Path) -> io::Result<Vec<RawEntry>> {
         (**self).read_dir(path)
     }
+    fn open_listing(&self, letter: char, ctl: &crate::scan::ScanControl) -> Option<Result<Box<dyn DriveListing>>> {
+        (**self).open_listing(letter, ctl)
+    }
     fn remove_file(&self, path: &Path) -> io::Result<()> {
         (**self).remove_file(path)
     }
     fn remove_dir(&self, path: &Path) -> io::Result<()> {
         (**self).remove_dir(path)
+    }
+    fn recycle_file(&self, path: &Path) -> io::Result<()> {
+        (**self).recycle_file(path)
     }
     fn recycle_bin(&self) -> Result<RecycleBinInfo> {
         (**self).recycle_bin()
