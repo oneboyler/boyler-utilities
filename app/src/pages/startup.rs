@@ -361,6 +361,10 @@ impl Startup {
             self.show_toast(t, now);
             return;
         }
+        if let Switch::Settings(uri) = e.switch {
+            self.open_settings(uri, &e.name, now);
+            return;
+        }
         if self.admin_wait.as_ref().is_some_and(|(id, ..)| *id == e.id) {
             return;
         }
@@ -394,6 +398,19 @@ impl Startup {
             });
         }
         self.show_toast(format!("Opens Explorer with {f} selected"), now);
+    }
+
+    /// A Store app's switch (Order 075): Windows keeps its StartupTask state itself, and a plain write of the registry value does not
+    /// switch it (proved on the real PC: Settings did not follow), so the click opens Settings › Apps › Startup, where its switch is.
+    fn open_settings(&mut self, uri: &'static str, name: &str, now: f64) {
+        self.opened.push(uri.to_string());
+        if !self.test && !self.real_read {
+            // started off the menu's thread, like Explorer above
+            crate::offui::spawn("startup-settings", move || {
+                let _ = std::process::Command::new("explorer.exe").arg(uri).spawn();
+            });
+        }
+        self.show_toast(format!("Opens Windows Settings › Apps › Startup · switch {name} there"), now);
     }
 
     fn search_online(&mut self, e: &StartupEntry, now: f64) {

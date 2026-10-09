@@ -78,8 +78,8 @@ fn main() {
     // another noise while it plays: the cost of making it, then it settles
     for k in [Kind::Pink, Kind::Grey] {
         let (c, t) = (cycles(), Instant::now());
-        n.set_kind(k);
-        while n.status().bytes == 0 || n.status().kind != Some(k) {
+        n.set_sound(k);
+        while n.status().bytes == 0 || n.status().sound != Some(k.into()) {
             std::thread::sleep(Duration::from_millis(10));
             if t.elapsed() > Duration::from_secs(5) {
                 break;

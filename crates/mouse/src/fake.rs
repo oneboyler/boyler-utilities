@@ -265,6 +265,9 @@ impl MouseOs for FakeOs {
     fn process_running(&self, exe: &str) -> Result<bool> {
         Ok(self.running.iter().any(|r| r.eq_ignore_ascii_case(exe)))
     }
+    fn running_processes(&self, names: &[String]) -> Result<Vec<(u32, String)>> {
+        Ok(self.running.iter().enumerate().filter(|(_, r)| names.iter().any(|n| n.eq_ignore_ascii_case(r))).map(|(i, r)| (1000 + i as u32, r.clone())).collect())
+    }
     fn pause_ms(&self, _ms: u64) {}
 }
 

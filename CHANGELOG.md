@@ -1,5 +1,14 @@
 # Boyler Utilities — What's new
 
+## 1.0.5 (2026-10-09)
+- The menu no longer blinks: switching between the GPU and CPU drawing path kept the window, glass included, instead of rebuilding it empty. Hidden Windows windows (emoji panel, clipboard) no longer count as a game in front.
+- Keyboard tab: the sound you pick stays picked (a finished download no longer takes it back). New "Play on": press + release, press only or release only, for keys and mouse.
+- Keyboard tab: much less text; "Different in some apps" is part of the Sound card; one "Import a pack…"; Get more sounds lists every pack of mechvibes.com with a search box and a play button per pack, and shows the one in use; right-click a pack you added to remove it.
+- Mouse acceleration: never overwrites a newer change made in Raw Accel itself ("Use ours again" puts it back); a listed game that is already running gets its preset at once; Linear starts from 2.6 / cap 2.0 / offset 55.
+- Timers: the big stopwatch / countdown belongs to the tab; "Your timers" lists only the timers you add. World clock: search any of 33,000+ cities.
+- Noise: your own mix - Tone, Rumble and Waves sliders, live while playing, and "Save as my sound".
+- Startup: Store apps (Spotify, Xbox, Claude…) open Windows Settings › Apps › Startup straight from their switch; Xbox, Windows Terminal and Phone Link no longer count as parts of Windows.
+
 ## 1.0.4 (2026-10-09)
 - Mouse tab: every mouse Windows lists is now found and named - by its model where known (Pulsar X2 V2 / X2A Wireless, Logitech, ASUS ROG, SteelSeries, Roccat, Glorious ...), else by the name Windows gives it - with its VID:PID shown, and the brand's settings link. Extra mice show as "Also connected".
 - Keyboard tab: Sound › Get more sounds lists the community packs of mechvibes.com with their size; one click downloads and imports one.

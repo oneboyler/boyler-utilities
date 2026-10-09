@@ -5,6 +5,7 @@
 
 use std::cell::Cell;
 use windows::Win32::Foundation::{HWND, RECT};
+use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED};
 use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONULL};
 use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
 use windows::Win32::UI::WindowsAndMessaging::*;
@@ -13,6 +14,54 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 /// window keeps its caption and sits inside the work area or just over its edges). The desktop is not one.
 pub fn covers_monitor(win: RECT, mon: RECT, has_caption: bool) -> bool {
     !has_caption && win.left <= mon.left && win.top <= mon.top && win.right >= mon.right && win.bottom >= mon.bottom
+}
+
+/// Order 079: front windows that say nothing about a game: Windows' full-monitor hosts that are mostly see-through or
+/// hidden (Alt+Tab / Task View, the emoji panel / Win+V / touch keyboard "Windows Input Experience", Start, Search:
+/// CoreWindows of the shell - a Store app's own window is an ApplicationFrameWindow), a hidden (cloaked) window and a
+/// click-through overlay. Counted as fullscreen they made the menu step back (and the next click on a normal window
+/// covered it until it was on top again: a blink); counted as normal windows they would put the menu over a game still
+/// on the screen (Alt+Tab over it). So the stay-in-front leaves the z-order as it is while one of them is in front.
+pub fn ignored(class: &str, cloaked: bool, click_through: bool) -> bool {
+    cloaked || click_through || matches!(class, "XamlExplorerHostIslandWindow" | "MultitaskingViewFrame" | "ForegroundStaging" | "Windows.UI.Core.CoreWindow")
+}
+
+/// What the front window means for the stay-in-front (Order 072 / 079).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Front {
+    /// a fullscreen window of another app (a game): the menu steps back
+    Full,
+    /// any other window (the desktop too): the menu is on top
+    Normal,
+    /// `ignored`: nothing changes
+    Ignored,
+}
+
+fn class_of(hwnd: HWND) -> String {
+    let mut class = [0u16; 64];
+    let n = unsafe { GetClassNameW(hwnd, &mut class) } as usize;
+    String::from_utf16_lossy(&class[..n.min(64)])
+}
+
+/// The front window `hwnd`, classed.
+pub fn classify(hwnd: HWND) -> Front {
+    if hwnd.is_invalid() {
+        return Front::Normal;
+    }
+    let class = class_of(hwnd);
+    let mut cloaked = 0u32;
+    let ex = unsafe {
+        let _ = DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, &mut cloaked as *mut u32 as *mut _, 4);
+        GetWindowLongW(hwnd, GWL_EXSTYLE) as u32
+    };
+    if ignored(&class, cloaked != 0, ex & WS_EX_TRANSPARENT.0 != 0 && ex & WS_EX_LAYERED.0 != 0) {
+        return Front::Ignored;
+    }
+    if is_fullscreen(hwnd) {
+        Front::Full
+    } else {
+        Front::Normal
+    }
 }
 
 /// Whether `hwnd` is a visible, not minimized, fullscreen window of some other app than the desktop / shell.
@@ -25,10 +74,7 @@ pub fn is_fullscreen(hwnd: HWND) -> bool {
             return false;
         }
         // the desktop's own windows (wallpaper host) cover the monitor too
-        let mut class = [0u16; 32];
-        let n = GetClassNameW(hwnd, &mut class) as usize;
-        let class = String::from_utf16_lossy(&class[..n.min(32)]);
-        if matches!(class.as_str(), "Progman" | "WorkerW" | "Shell_TrayWnd" | "Shell_SecondaryTrayWnd") {
+        if matches!(class_of(hwnd).as_str(), "Progman" | "WorkerW" | "Shell_TrayWnd" | "Shell_SecondaryTrayWnd") {
             return false;
         }
         let mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONULL);
@@ -101,5 +147,20 @@ mod tests {
     fn window_inside_the_monitor_or_over_the_work_area_only_is_not() {
         assert!(!covers_monitor(r(0, 0, 1920, 1040), r(0, 0, 1920, 1080), false));
         assert!(!covers_monitor(r(100, 100, 900, 700), r(0, 0, 1920, 1080), false));
+    }
+
+    #[test]
+    fn shell_hosts_hidden_and_click_through_windows_are_ignored_at_the_front() {
+        // Order 079: "Windows Input Experience" (TextInputHost, 1920x1080, no caption) on the owner's PC; Alt+Tab / Task View
+        for c in ["Windows.UI.Core.CoreWindow", "XamlExplorerHostIslandWindow", "MultitaskingViewFrame", "ForegroundStaging"] {
+            assert!(ignored(c, false, false), "{c}");
+        }
+        assert!(ignored("UnrealWindow", true, false));
+        assert!(ignored("NVOverlay", false, true));
+        // a game / a browser in F11 / a video player stay what covers_monitor says
+        // (the desktop is a normal front window: a click on it means the game left the front)
+        for c in ["UnrealWindow", "Chrome_WidgetWin_1", "UnityWndClass", "ApplicationFrameWindow", "Progman", "WorkerW"] {
+            assert!(!ignored(c, false, false), "{c}");
+        }
     }
 }

@@ -2,6 +2,7 @@
 //! plays a sound, opens a stream or touches the PC.
 
 use super::*;
+use bu_noise::{Mix, Sound};
 use crate::gfx::Gfx;
 use crate::icons::Icons;
 use crate::settings::scratch::Scratch;
@@ -34,7 +35,7 @@ fn press(p: &mut Noise, k: Key, x: f32, r: (f32, f32, f32, f32)) {
 #[test]
 fn a_fresh_page_is_brown_quiet_timer_off_and_not_playing() {
     let p = page();
-    assert_eq!(p.prefs.kind, Kind::Brown);
+    assert_eq!(p.prefs.pick, Pick::Preset(Kind::Brown));
     assert_eq!(p.prefs.volume, 10, "quiet by default");
     assert_eq!(p.prefs.sleep, None);
     assert!(!p.status().playing, "off until Play is pressed");
@@ -47,7 +48,7 @@ fn play_starts_stop_ends_and_the_button_says_which() {
     let mut p = page();
     click(&mut p, K_PLAY);
     assert!(p.status().playing);
-    assert_eq!(p.status().kind, Some(Kind::Brown));
+    assert_eq!(p.status().sound, Some(Kind::Brown.into()));
     assert_eq!(p.status().volume, 10);
     click(&mut p, K_PLAY);
     assert!(!p.status().playing);
@@ -73,9 +74,9 @@ fn a_noise_is_picked_from_the_list_and_follows_while_it_plays() {
     with_cx(|cx| assert!(p.popup(cx).is_some()));
     let pink = Kind::ALL.iter().position(|k| *k == Kind::Pink).unwrap();
     click(&mut p, idx(K_MENU, pink));
-    assert_eq!(p.prefs.kind, Kind::Pink);
+    assert_eq!(p.prefs.pick, Pick::Preset(Kind::Pink));
     assert!(p.pop.is_none(), "the list closes on a pick");
-    assert_eq!(p.status().kind, Some(Kind::Pink), "the playing noise changes");
+    assert_eq!(p.status().sound, Some(Kind::Pink.into()), "the playing noise changes");
     p.popup_dismiss();
     assert!(p.pop.is_none());
 }
@@ -151,7 +152,7 @@ fn the_remembered_values_round_trip_and_never_say_it_plays() {
     let sc = Scratch::new("noise-round");
     let mut store = SettingsStore::open(sc.dir());
     assert_eq!(Prefs::load(&store), Prefs::default());
-    let p = Prefs { kind: Kind::DarkBrown, volume: 33, sleep: Some(60) };
+    let p = Prefs { pick: Pick::Preset(Kind::DarkBrown), volume: 33, sleep: Some(60), ..Prefs::default() };
     p.save(&mut store);
     assert_eq!(Prefs::load(&store), p);
     drop(store);
@@ -160,7 +161,7 @@ fn the_remembered_values_round_trip_and_never_say_it_plays() {
     let text = std::fs::read_to_string(again.path()).unwrap();
     for line in text.lines().filter(|l| l.starts_with("page:noise")) {
         let key = line.split('\t').nth(1).unwrap();
-        assert!(["kind", "volume", "sleep"].contains(&key), "unexpected setting {key}");
+        assert!(["kind", "volume", "sleep", "custom", "mine"].contains(&key), "unexpected setting {key}");
     }
 }
 
@@ -172,7 +173,7 @@ fn broken_values_fall_back_to_the_defaults() {
     let _ = store.set_i64(scope_for_test(), "volume", 900);
     let _ = store.set_i64(scope_for_test(), "sleep", 7);
     let p = Prefs::load(&store);
-    assert_eq!(p.kind, Kind::Brown);
+    assert_eq!(p.pick, Pick::Preset(Kind::Brown));
     assert_eq!(p.volume, 100, "clamped");
     assert_eq!(p.sleep, None, "7 min is not a choice");
 }
@@ -189,7 +190,7 @@ fn the_player_is_never_made_by_looking_at_the_page_or_the_tray() {
 
 // ------------------------------------------------------------------ pictures (run: cargo test -p bu-app noise::tests::pictures -- --ignored)
 
-const SCRATCH: &str = r"C:\BoylerUtilities-scratch\N62";
+const SCRATCH: &str = r"C:\BoylerUtilities-scratch\N80";
 
 fn paint_page(p: &mut Noise, name: &str, popup: bool, w: f32) {
     let g = Gfx::new(1.0);
@@ -200,7 +201,7 @@ fn paint_page(p: &mut Noise, name: &str, popup: bool, w: f32) {
     let kids = p.build(&mut cx);
     let root = El::block().w(600.0).pad(2.0, 28.0, 18.0, 28.0).children(kids);
     let laid = Laid::new(&g, root, 600.0, None);
-    let h = (laid.height + 40.0).ceil().max(300.0);
+    let h = (laid.height + 40.0).ceil().max(if popup { 520.0 } else { 300.0 });
     let bg = crate::gfx::Rgba::rgb(29, 32, 48);
     let Some(mut s) = crate::gfx::new_surface(w as i32, h as i32) else { return };
     g.begin(s.canvas());
@@ -290,4 +291,305 @@ fn the_wake_for_the_last_minute_is_one_second_after_one_minute_left() {
         let at = p.wake_at(0.0).unwrap();
         assert!((at - (wait_ms + 150.0)).abs() < 1.0, "{left} s left: wake at {at}");
     }
+}
+
+// ------------------------------------------------------------------ Order 080: Custom, saved sounds
+
+fn pick_custom(p: &mut Noise) {
+    press(p, K_KIND, 0.0, (300.0, 150.0, 130.0, 28.0));
+    click(p, K_KIND);
+    let i = p.entries().iter().position(|e| *e == Entry::Item(Pick::Custom)).unwrap();
+    click(p, idx(K_MENU, i));
+    assert_eq!(p.prefs.pick, Pick::Custom);
+}
+
+fn drag_part(p: &mut Noise, k: Key, frac: f32) {
+    let r = (100.0, 200.0, 150.0, 20.0);
+    // the thumb centre runs from 8 to w - 8
+    let x = 100.0 + 8.0 + frac * (150.0 - 16.0);
+    with_cx(|cx| p.event(&Ev::Drag(k, x, 0.0, r), cx));
+}
+
+fn type_name(p: &mut Noise, text: &str) {
+    for c in text.chars() {
+        with_cx(|cx| p.event(&Ev::Char(K_NAME, c), cx));
+    }
+}
+
+fn key_down(p: &mut Noise, vk: u16) -> bool {
+    with_cx(|cx| {
+        p.event(&Ev::Key(K_NAME, vk), cx);
+        cx.used
+    })
+}
+
+fn list_names(p: &Noise) -> Vec<String> {
+    p.entries()
+        .iter()
+        .map(|e| match e {
+            Entry::Item(x) => x.name(),
+            Entry::Sep => "-".into(),
+            Entry::Section(s) => format!("[{s}]"),
+        })
+        .collect()
+}
+
+#[test]
+fn the_list_has_the_six_then_custom_then_my_sounds() {
+    let mut p = page();
+    assert_eq!(list_names(&p), ["White", "Pink", "Brown", "Dark brown", "Grey", "Blue", "-", "Custom"]);
+    pick_custom(&mut p);
+    click(&mut p, K_SAVE);
+    type_name(&mut p, "Rain");
+    key_down(&mut p, 0x0D);
+    assert_eq!(list_names(&p), ["White", "Pink", "Brown", "Dark brown", "Grey", "Blue", "-", "Custom", "[My sounds]", "Rain"]);
+}
+
+#[test]
+fn custom_has_three_sliders_that_change_the_playing_sound_live() {
+    let mut p = page();
+    click(&mut p, K_PLAY);
+    pick_custom(&mut p);
+    assert_eq!(p.status().sound, Some(Sound::Mix(Mix::DEFAULT)), "the mix plays after the pick");
+    drag_part(&mut p, K_TONE, 1.0);
+    drag_part(&mut p, K_RUMBLE, 0.0);
+    drag_part(&mut p, K_WAVES, 0.5);
+    assert_eq!(p.prefs.custom, Mix::new(100, 0, 50));
+    assert_eq!(p.status().sound, Some(Sound::Mix(Mix::new(100, 0, 50))), "while it plays, each move reaches the player at once");
+    drag_part(&mut p, K_TONE, 0.25);
+    assert_eq!(p.status().sound, Some(Sound::Mix(Mix::new(25, 0, 50))));
+    // the sliders go all the way to 0 and 100, also beyond the ends
+    let r = (100.0, 200.0, 150.0, 20.0);
+    press(&mut p, K_WAVES, 900.0, r);
+    assert_eq!(p.prefs.custom.waves, 100);
+    press(&mut p, K_WAVES, -50.0, r);
+    assert_eq!(p.prefs.custom.waves, 0);
+    // nothing but the three sliders changes the mix
+    assert_eq!(p.prefs.volume, 10);
+}
+
+#[test]
+fn the_sliders_show_only_for_custom_and_the_mix_is_remembered() {
+    let sc = Scratch::new("noise-custom-mem");
+    let mut store = SettingsStore::open(sc.dir());
+    let p = Prefs { pick: Pick::Custom, custom: Mix::new(12, 99, 3), ..Prefs::default() };
+    p.save(&mut store);
+    assert_eq!(Prefs::load(&store).pick, Pick::Custom);
+    assert_eq!(Prefs::load(&store).custom, Mix::new(12, 99, 3));
+    // the page: the "Your mix" group is there for Custom only
+    let mut page = page();
+    let count = |page: &mut Noise| with_cx(|cx| page.build(cx).len());
+    let plain = count(&mut page);
+    pick_custom(&mut page);
+    assert!(count(&mut page) > plain, "Custom adds a group");
+    press(&mut page, K_KIND, 0.0, (300.0, 150.0, 130.0, 28.0));
+    click(&mut page, K_KIND);
+    click(&mut page, idx(K_MENU, 0));
+    assert_eq!(count(&mut page), plain);
+}
+
+#[test]
+fn save_as_my_sound_asks_for_a_name_and_keeps_the_mix_in_the_list() {
+    let mut p = page();
+    pick_custom(&mut p);
+    drag_part(&mut p, K_TONE, 0.8);
+    drag_part(&mut p, K_WAVES, 1.0);
+    let mix = p.prefs.custom;
+    click(&mut p, K_SAVE);
+    assert_eq!(p.naming.as_deref(), Some(""), "the name field opens empty");
+    type_name(&mut p, "Ocean, deep");
+    assert_eq!(p.naming.as_deref(), Some("Ocean, deep"));
+    key_down(&mut p, 0x08);
+    assert_eq!(p.naming.as_deref(), Some("Ocean, dee"));
+    type_name(&mut p, "p");
+    let used = key_down(&mut p, 0x0D);
+    assert!(!used);
+    assert!(p.naming.is_none());
+    assert_eq!(p.prefs.mine, vec![prefs::Mine { name: "Ocean, deep".into(), mix }]);
+    assert_eq!(p.prefs.pick, Pick::Mine("Ocean, deep".into()), "it is picked (and sounds the same)");
+    assert_eq!(p.prefs.sound(), Sound::Mix(mix));
+    assert_eq!(p.prefs.pick.name(), "Ocean, deep");
+    with_cx(|cx| assert!(!p.build(cx).is_empty()));
+}
+
+#[test]
+fn naming_can_be_cancelled_and_an_empty_name_gets_the_default() {
+    let mut p = page();
+    pick_custom(&mut p);
+    click(&mut p, K_SAVE);
+    type_name(&mut p, "x");
+    click(&mut p, K_NCANCEL);
+    assert!(p.naming.is_none() && p.prefs.mine.is_empty());
+    click(&mut p, K_SAVE);
+    type_name(&mut p, "x");
+    assert!(key_down(&mut p, 0x1B), "Esc is used by the field: it does not close the menu");
+    assert!(p.naming.is_none() && p.prefs.mine.is_empty());
+    click(&mut p, K_SAVE);
+    click(&mut p, K_NSAVE);
+    assert_eq!(p.prefs.mine.len(), 1);
+    assert_eq!(p.prefs.mine[0].name, "My sound");
+    // picking something else while a name is typed drops the name
+    pick_custom(&mut p);
+    click(&mut p, K_SAVE);
+    assert!(p.naming.is_some());
+    press(&mut p, K_KIND, 0.0, (300.0, 150.0, 130.0, 28.0));
+    click(&mut p, K_KIND);
+    click(&mut p, idx(K_MENU, 0));
+    assert!(p.naming.is_none());
+}
+
+#[test]
+fn names_are_made_unique_and_short() {
+    let mut p = Prefs::default();
+    assert_eq!(p.save_mine("Rain").as_deref(), Some("Rain"));
+    assert_eq!(p.save_mine("rain").as_deref(), Some("rain 2"), "case does not make it another name");
+    assert_eq!(p.save_mine("Rain").as_deref(), Some("Rain 3"));
+    assert_eq!(p.save_mine("Brown").as_deref(), Some("Brown 2"), "not like a noise");
+    assert_eq!(p.save_mine("custom").as_deref(), Some("custom 2"), "not like Custom");
+    assert_eq!(p.save_mine("   ").as_deref(), None, "a blank name is nothing");
+    let long = p.save_mine(&"a".repeat(60)).unwrap();
+    assert_eq!(long.chars().count(), prefs::MAX_NAME);
+    let again = p.save_mine(&"a".repeat(60)).unwrap();
+    assert!(again.chars().count() <= prefs::MAX_NAME && again.ends_with(" 2") && again != long, "{again}");
+    assert_eq!(p.save_mine("tab\there\n").as_deref(), Some("tabhere"));
+}
+
+#[test]
+fn twelve_sounds_at_most() {
+    let mut p = page();
+    pick_custom(&mut p);
+    for i in 0..prefs::MAX_MINE {
+        click(&mut p, K_SAVE);
+        type_name(&mut p, &format!("s{i}"));
+        click(&mut p, K_NSAVE);
+        pick_custom(&mut p);
+    }
+    assert_eq!(p.prefs.mine.len(), prefs::MAX_MINE);
+    click(&mut p, K_SAVE);
+    assert!(p.naming.is_none(), "the list is full: no name field");
+    assert_eq!(p.prefs.save_mine("one more"), None);
+}
+
+#[test]
+fn picking_a_saved_sound_plays_its_mix_and_remove_takes_it_out() {
+    let mut p = page();
+    pick_custom(&mut p);
+    drag_part(&mut p, K_TONE, 0.2);
+    drag_part(&mut p, K_RUMBLE, 0.9);
+    let mine = p.prefs.custom;
+    click(&mut p, K_SAVE);
+    type_name(&mut p, "Rumbly");
+    click(&mut p, K_NSAVE);
+    // change Custom, then come back to the saved one
+    pick_custom(&mut p);
+    drag_part(&mut p, K_TONE, 1.0);
+    click(&mut p, K_PLAY);
+    assert_eq!(p.status().sound, Some(Sound::Mix(Mix::new(100, mine.rumble, mine.waves))));
+    press(&mut p, K_KIND, 0.0, (300.0, 150.0, 130.0, 28.0));
+    click(&mut p, K_KIND);
+    let i = p.entries().iter().position(|e| *e == Entry::Item(Pick::Mine("Rumbly".into()))).unwrap();
+    with_cx(|cx| assert!(p.popup(cx).is_some(), "the list with My sounds builds"));
+    click(&mut p, idx(K_MENU, i));
+    assert_eq!(p.prefs.pick, Pick::Mine("Rumbly".into()));
+    assert_eq!(p.status().sound, Some(Sound::Mix(mine)), "the playing sound follows");
+    assert_eq!(p.prefs.custom.tone, 100, "Custom keeps its own sliders");
+    // Remove: gone from the list; Custom holds its values so what plays does not change
+    click(&mut p, K_REMOVE);
+    assert!(p.prefs.mine.is_empty());
+    assert_eq!(p.prefs.pick, Pick::Custom);
+    assert_eq!(p.prefs.custom, mine);
+    assert_eq!(p.status().sound, Some(Sound::Mix(mine)));
+    assert!(!p.entries().iter().any(|e| matches!(e, Entry::Section(_))), "no empty My sounds heading");
+}
+
+#[test]
+fn saved_sounds_and_the_mix_round_trip_through_the_file() {
+    let sc = Scratch::new("noise-mine-round");
+    let mut store = SettingsStore::open(sc.dir());
+    let mut p = Prefs { custom: Mix::new(1, 2, 3), ..Prefs::default() };
+    p.save_mine("Rain, soft");
+    p.custom = Mix::new(90, 0, 100);
+    p.save_mine("Sea");
+    p.pick = Pick::Mine("Rain, soft".into());
+    p.save(&mut store);
+    drop(store);
+    let again = SettingsStore::open(sc.dir());
+    let q = Prefs::load(&again);
+    assert_eq!(q, p);
+    assert_eq!(q.sound(), Sound::Mix(Mix::new(1, 2, 3)));
+}
+
+#[test]
+fn broken_saved_sounds_are_skipped_and_a_missing_pick_falls_back() {
+    let sc = Scratch::new("noise-mine-broken");
+    let mut store = SettingsStore::open(sc.dir());
+    let lines = ["10,20,30,Good", "x,1,2,Bad", "1,2,3", "101,0,0,Too much", "5,5,5,   ", "7,8,9,good", "40,50,60,Second"];
+    let lines: Vec<String> = lines.iter().map(|s| s.to_string()).collect();
+    let _ = store.set_list(scope_for_test(), "mine", &lines);
+    let _ = store.set_str(scope_for_test(), "kind", "mine:Vanished");
+    let _ = store.set_str(scope_for_test(), "custom", "1,2");
+    let p = Prefs::load(&store);
+    let names: Vec<&str> = p.mine.iter().map(|m| m.name.as_str()).collect();
+    assert_eq!(names, ["Good", "Second"], "bad lines and a repeated name are dropped");
+    assert_eq!(p.pick, Pick::Preset(Kind::Brown), "a saved sound that is gone: the default");
+    assert_eq!(p.custom, Mix::DEFAULT, "a bad Custom value: the default");
+    let _ = store.set_str(scope_for_test(), "kind", "mine:SECOND");
+    assert_eq!(Prefs::load(&store).pick, Pick::Mine("Second".into()), "names are matched without case");
+}
+
+#[test]
+fn a_dragged_slider_is_written_when_the_button_comes_up_or_the_tab_closes() {
+    let mut p = page();
+    pick_custom(&mut p);
+    drag_part(&mut p, K_TONE, 0.9);
+    assert!(p.dirty);
+    with_cx(|cx| p.event(&Ev::Release(K_TONE), cx));
+    assert!(!p.dirty);
+    drag_part(&mut p, K_VOL, 0.4);
+    assert!(p.dirty, "the volume the same");
+    p.close();
+    assert!(!p.dirty);
+}
+
+#[test]
+fn every_custom_state_builds() {
+    let mut p = page();
+    let g = Gfx::new(1.0);
+    pick_custom(&mut p);
+    let build = |p: &mut Noise| {
+        let mut st = State::default();
+        let mut cx = Cx::new(0.0, false, &g, &mut st);
+        assert!(!p.build(&mut cx).is_empty());
+    };
+    build(&mut p);
+    click(&mut p, K_SAVE);
+    build(&mut p);
+    type_name(&mut p, "Name");
+    click(&mut p, K_NSAVE);
+    build(&mut p);
+    assert!(p.describe().contains("kind=mine:Name"), "{}", p.describe());
+}
+
+#[test]
+#[ignore]
+fn pictures_custom() {
+    let mut p = page();
+    pick_custom(&mut p);
+    drag_part(&mut p, K_TONE, 0.35);
+    drag_part(&mut p, K_RUMBLE, 0.3);
+    drag_part(&mut p, K_WAVES, 0.6);
+    paint_page(&mut p, "noise_custom", false, 600.0);
+    click(&mut p, K_SAVE);
+    type_name(&mut p, "Slow sea");
+    paint_page(&mut p, "noise_custom_naming", false, 600.0);
+    click(&mut p, K_NSAVE);
+    paint_page(&mut p, "noise_mine", false, 600.0);
+    click(&mut p, K_PLAY);
+    p.fake.sleep_left = Some(27 * 60);
+    pick_custom(&mut p);
+    click(&mut p, K_SAVE);
+    type_name(&mut p, "A rather long name here");
+    click(&mut p, K_NSAVE);
+    p.pop = Some((310.0, 150.0, 130.0, 28.0));
+    paint_page(&mut p, "noise_list_mine", true, 600.0);
 }

@@ -12,7 +12,7 @@
 use crate::front::Front;
 use crate::kind::{kind_of, Kind};
 use crate::mixer::Mixer;
-use crate::rules::{choose, choose_mouse, gain, Pack, Settings};
+use crate::rules::{choose, choose_mouse, gain, Pack, PlayOn, Settings};
 use crate::stream::Stream;
 use crate::synth::{render, render_clicks, ClickSet, ClickStyle, MouseButtonClass, SoundSet};
 use bu_rawin::{MouseSink, MouseSoundEvent, SoundEvent, SoundSink};
@@ -165,9 +165,14 @@ impl Shared {
         let (sound, g, step) = {
             let mut l = lock(&self.live);
             let Live { settings, lib, front, .. } = &mut *l;
+            if !settings.play_on.plays(e.down) {
+                return;
+            }
             let (game, exe) = front.now();
             let Some(pack) = choose(settings, exe, game) else { return };
             let Some(set) = lib.get(pack) else { return };
+            // "Release only" with a pack that has no key-up sound of its own plays its key sound on the release
+            let kind = if kind == Kind::Up && settings.play_on == PlayOn::Release && set.get(Kind::Up).len() <= 2 { Kind::Down } else { kind };
             let sound = set.get(kind).clone();
             let rate = set.rate as f32;
             let g = gain(settings.volume);
@@ -185,14 +190,15 @@ impl Shared {
         let (sound, g, step) = {
             let mut l = lock(&self.live);
             let Live { settings, lib, clicks, front, .. } = &mut *l;
-            if !settings.mouse_on {
+            if !settings.mouse_on || !settings.play_on.plays(e.down) {
                 return;
             }
             let (game, exe) = front.now();
             let Some(pack) = choose_mouse(settings, exe, game) else { return };
             let (sound, rate) = if e.button == MouseButtonClass::Side {
                 let Some(set) = lib.get(pack) else { return };
-                (set.get(if e.down { Kind::Down } else { Kind::Up }).clone(), set.rate)
+                let k = if e.down || (settings.play_on == PlayOn::Release && set.get(Kind::Up).len() <= 2) { Kind::Down } else { Kind::Up };
+                (set.get(k).clone(), set.rate)
             } else {
                 let Some(set) = clicks.get(&style_of(pack)) else { return };
                 let Some(s) = set.get(e.button, e.down) else { return };

@@ -40,8 +40,9 @@ pub struct View {
     pub base: Profile,
     /// Order 063: "another program also writes the driver" - the card's warning line (None = nothing to say)
     pub other_writer: Option<String>,
-    /// Order 063: rows whose game was already open when its start was noticed (not switched), and rows switched now
-    pub late: Vec<bu_mouse::accel::switch::RowId>,
+    /// Order 077: that line comes with the one-click "Use ours again" (Raw Accel set the driver after this app)
+    pub use_ours: bool,
+    /// Order 063: rows whose game runs now and was switched to
     pub active: Vec<bu_mouse::accel::switch::RowId>,
     pub cursors: Option<CursorsState>,
     pub packs: Vec<Pack>,
@@ -97,6 +98,8 @@ pub enum Cmd {
     /// the card's state as the page edited it (curve, values, presets, per app); handed to the driver if it changed
     Accel(Box<(Panel, PerApp)>),
     AccelOn(bool),
+    /// "Use ours again" on the amber line: Raw Accel set the driver after this app - the card is set again (a click, so it writes)
+    UseOurs,
     CopyCurve,
     CursorRole(Role, SetId),
     CursorSize(u32),
@@ -343,6 +346,9 @@ pub fn sample_fake_with(sample: Sample) -> Mouse<FakeOs> {
     let (def, _) = p.save_as_preset();
     let _ = p.rename_preset(def, "Default");
     p.set_curve(Curve::Linear);
+    // the drawing's numbers (Linear's own defaults are his real Raw Accel since Order 077: 2.6 / cap output 2.0)
+    p.set_value(bu_mouse::accel::panel::Field::Acceleration, 2.8);
+    p.set_value(bu_mouse::accel::panel::Field::CapOutput, 2.6);
     let (val, _) = p.save_as_preset();
     let _ = p.rename_preset(val, "Valorant");
     // chips in the drawing's order: Valorant, Default
@@ -509,7 +515,7 @@ fn watched(c: &Cmd) -> &'static [&'static str] {
         Cmd::Swap(_) => &["swap"],
         Cmd::CursorRole(..) | Cmd::RoleFile(..) | Cmd::DeletePack(_) => &["cursors"],
         Cmd::CursorSize(_) => &["cursor_size"],
-        Cmd::Accel(_) | Cmd::AccelOn(_) | Cmd::CopyCurve => &["accel"],
+        Cmd::Accel(_) | Cmd::AccelOn(_) | Cmd::UseOurs | Cmd::CopyCurve => &["accel"],
         // the mouse's own memory (not Windows), hover previews (Windows reloads them), imports (the app's own folder),
         // the change log's own resets (the frame records those)
         _ => &[],
@@ -581,10 +587,11 @@ fn neon_pack() -> bu_mouse::cursors::Pack {
 
 fn view<O: MouseOs>(m: &mut Mouse<O>, mice: Option<Vec<YourMouse>>, on: Option<OnMouse>) -> View {
     let drawing_sets = DRAWING_SETS.with(|d| d.get());
-    let (late, active) = games();
+    let active = games();
     // the games that run now are the engine's to know; the tab's copy of the card counts them too (header, "another program wrote it")
     m.accel_mut().per_app.set_active_rows(&active);
     let m = &*m;
+    let other = m.other_writer().ok().flatten();
     let base = m.rawaccel_settings().ok().flatten().and_then(|c| c.profiles.first().cloned()).unwrap_or_default();
     View {
         win: m.windows_mouse().ok(),
@@ -594,8 +601,8 @@ fn view<O: MouseOs>(m: &mut Mouse<O>, mice: Option<Vec<YourMouse>>, on: Option<O
         panel: m.accel().panel.clone(),
         per_app: m.accel().per_app.clone(),
         base,
-        other_writer: m.other_writer_line().ok().flatten(),
-        late,
+        other_writer: other.as_ref().map(|w| w.line.clone()),
+        use_ours: other.as_ref().is_some_and(|w| w.use_ours),
         active,
         cursors: m.cursors().ok(),
         packs: if drawing_sets { vec![neon_pack()] } else { m.packs().unwrap_or_default() },
@@ -755,6 +762,7 @@ fn apply<O: MouseOs>(m: &mut Mouse<O>, mice: &[YourMouse], on: &mut Option<OnMou
             Ok(t) => Some(t),
             Err(e) => err(e),
         },
+        Cmd::UseOurs => persist_apply(m, true).or_else(|| Some("Set again \u{b7} the driver runs this card".to_string())),
         Cmd::CopyCurve => match m.copy_its_curve() {
             Ok(t) => {
                 let _ = persist_apply(m, false);
@@ -834,15 +842,14 @@ fn sync<O: MouseOs>(m: &mut Mouse<O>) -> Option<String> {
     m.sync_driver().err().map(|e| e.to_string())
 }
 
-/// The always-on engine's view of the games (rows not switched because the game was already open, rows switched now).
-fn games() -> (Vec<bu_mouse::accel::switch::RowId>, Vec<bu_mouse::accel::switch::RowId>) {
+/// The always-on engine's view of the games (rows whose game runs now and was switched to).
+fn games() -> Vec<bu_mouse::accel::switch::RowId> {
     #[cfg(windows)]
     {
-        let s = super::rt::status();
-        (s.late, s.active)
+        super::rt::status().active
     }
     #[cfg(not(windows))]
     {
-        (Vec::new(), Vec::new())
+        Vec::new()
     }
 }

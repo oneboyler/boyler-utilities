@@ -5,17 +5,17 @@
 //! Calls made for what DESIGN left unclear (also in the report):
 //! - **Two listed apps at once:** the one started last wins; when it closes, the one still running takes over again;
 //!   when the last one closes, "Everywhere else" applies.
-//! - **Never mid-game:** an app that already shows a window when its start is noticed (the watcher's `has_window`) is
-//!   not switched to; a note says "it will be next launch". Its stop is then ignored as well.
+//! - **A game that is already running** (when it is added, at app start, when the switch goes on) is switched to at once, like
+//!   a game that just started (Order 077: "can't it just see if its in process?"): `Mouse::adopt_running_games` feeds it in as
+//!   a start from a process snapshot (no handle to the game).
 
 use serde::{Deserialize, Serialize};
 
 /// What the app watcher reports.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AppEvent {
-    /// A watched process started. `exe` = its full path if known, else its file name. `has_window` = it already showed
-    /// a window when the start was noticed (too late to switch).
-    Started { pid: u32, exe: String, has_window: bool },
+    /// A watched process started (or was found already running). `exe` = its full path if known, else its file name.
+    Started { pid: u32, exe: String },
     Stopped { pid: u32 },
 }
 
@@ -49,13 +49,6 @@ pub struct AppRow {
     pub target: Target,
 }
 
-/// Notes for the menu (a quiet toast later; never a prompt, never in a game).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum SwitchNote {
-    /// The app already had a window when its start was noticed: nothing switched (it will be next launch).
-    TooLate { row: RowId, exe: String },
-}
-
 fn file_name(p: &str) -> &str {
     p.rsplit(['\\', '/']).next().unwrap_or(p)
 }
@@ -80,11 +73,6 @@ pub struct PerApp {
     everywhere_else: Target,
     #[serde(skip)]
     active: Vec<(u32, RowId)>,
-    #[serde(skip)]
-    notes: Vec<SwitchNote>,
-    /// rows whose game was already showing a window when its start was noticed (not switched; cleared by the next start)
-    #[serde(skip)]
-    late: Vec<RowId>,
 }
 
 impl PerApp {
@@ -138,7 +126,6 @@ impl PerApp {
     pub fn remove_row(&mut self, id: RowId) -> Option<AppRow> {
         let i = self.rows.iter().position(|r| r.id == id)?;
         self.active.retain(|(_, r)| *r != id);
-        self.late.retain(|r| *r != id);
         Some(self.rows.remove(i))
     }
 
@@ -167,18 +154,17 @@ impl PerApp {
         v
     }
 
-    /// This row's game was already open when its start was noticed: it was NOT switched and runs unswitched until its next
-    /// launch (the row says so).
-    pub fn is_late(&self, id: RowId) -> bool {
-        self.late.contains(&id)
-    }
-
     /// Is a listed app running (and switched to) now?
     pub fn is_active(&self, id: RowId) -> bool {
         self.active.iter().any(|(_, r)| *r == id)
     }
 
-    /// After the saved card was read again: games that run now (and rows flagged late) stay as they were, by process id —
+    /// The process ids of the listed games that run now (the engine keeps an exit wait on each).
+    pub fn active_pids(&self) -> Vec<u32> {
+        self.active.iter().map(|(p, _)| *p).filter(|p| *p != 0).collect()
+    }
+
+    /// After the saved card was read again: games that run now stay as they were, by process id —
     /// only for rows that still exist with the same exe.
     pub fn keep_running_from(&mut self, old: &PerApp) {
         let same = |id: RowId| match (old.rows.iter().find(|r| r.id == id), self.rows.iter().find(|r| r.id == id)) {
@@ -186,7 +172,6 @@ impl PerApp {
             _ => false,
         };
         self.active = old.active.iter().filter(|(_, id)| same(*id)).copied().collect();
-        self.late = old.late.iter().filter(|id| same(**id)).copied().collect();
     }
 
     /// Rows with no game chosen yet (the "Add a game" row before the picker answers) are not worth keeping.
@@ -203,29 +188,15 @@ impl PerApp {
         self.active = rows.iter().filter(|r| self.rows.iter().any(|x| x.id == **r)).map(|r| (0, *r)).collect();
     }
 
-    /// Notes for the menu since the last call.
-    pub fn take_notes(&mut self) -> Vec<SwitchNote> {
-        std::mem::take(&mut self.notes)
-    }
-
     /// Feeds one event. Returns true when what should run (`current`) may have changed.
     pub fn on_event(&mut self, ev: &AppEvent) -> bool {
         match ev {
-            AppEvent::Started { pid, exe, has_window } => {
+            AppEvent::Started { pid, exe } => {
                 if self.active.iter().any(|(p, _)| p == pid) {
                     return false;
                 }
                 let Some(row) = self.rows.iter().find(|r| exe_matches(&r.exe, exe)) else { return false };
-                if *has_window {
-                    let rid = row.id;
-                    if !self.late.contains(&rid) {
-                        self.late.push(rid);
-                    }
-                    self.notes.push(SwitchNote::TooLate { row: rid, exe: file_name(exe).to_string() });
-                    return false;
-                }
                 let rid = row.id;
-                self.late.retain(|r| *r != rid);
                 self.active.push((*pid, rid));
                 true
             }

@@ -494,6 +494,24 @@ impl MouseOs for RealOs {
         Ok(found)
     }
 
+    fn running_processes(&self, names: &[String]) -> Result<Vec<(u32, String)>> {
+        use windows::Win32::System::Diagnostics::ToolHelp::{CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS};
+        let snap = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) }.map_err(|e| hr("process list", e))?;
+        let mut e = PROCESSENTRY32W { dwSize: size_of::<PROCESSENTRY32W>() as u32, ..Default::default() };
+        let mut found = Vec::new();
+        let mut ok = unsafe { Process32FirstW(snap, &mut e) }.is_ok();
+        while ok {
+            let len = e.szExeFile.iter().position(|c| *c == 0).unwrap_or(e.szExeFile.len());
+            let name = String::from_utf16_lossy(&e.szExeFile[..len]);
+            if names.iter().any(|n| n.eq_ignore_ascii_case(&name)) {
+                found.push((e.th32ProcessID, name));
+            }
+            ok = unsafe { Process32NextW(snap, &mut e) }.is_ok();
+        }
+        let _ = unsafe { CloseHandle(snap) };
+        Ok(found)
+    }
+
     fn is_elevated(&self) -> bool {
         use windows::Win32::Security::{GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY};
         use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};

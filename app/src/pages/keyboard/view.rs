@@ -2,6 +2,7 @@
 //! with the key's card, the macros and the macro window.
 
 use super::*;
+use bu_keysound::PlayOn;
 use crate::anim::EASE;
 use crate::gfx::{sh, Align, Font, Rgba};
 use crate::ui::el::{lh, Cursor, RADIUS_PILL};
@@ -9,11 +10,13 @@ use crate::ui::pieces::button::{self, Kind as BKind};
 use crate::ui::pieces::dropdown;
 use crate::ui::pieces::keyfield::{self, Show};
 use crate::ui::pieces::mitems::{self, It, Place, Row};
+use crate::ui::pieces::tip::{self, Rq};
 use crate::ui::pieces::{self, dialog, group, link, reset, seg, slider, tinput, toggle};
 use crate::ui::{cmix, ACC, CTL, CTL_H, FG, FG2, FG3, WIN_H, WIN_W};
 use taffy::style::AlignItems;
 
-const PRIVACY: &str = "The app only hears that a key went down or up, to pick the sound. Which key it was is forgotten at once: never saved, logged or sent.";
+const TIP_PRIVACY: &str = "Only that a key went down or up is heard - never which key";
+const K_TIP: Key = key("kbd.tip");
 
 fn title_of(exe: &str) -> String {
     let stem = exe.strip_suffix(".exe").unwrap_or(exe);
@@ -29,17 +32,24 @@ impl Keyboard {
         let mut kids = vec![pieces::header(self.name(), None)];
         kids.extend(self.keys_group(cx));
         kids.extend(self.sounds(cx));
-        kids.extend(self.rules(cx));
         kids.extend(self.macros_group(cx));
         kids.push(reset::reset_line(cx, K_RESET, Some("Windows defaults")));
         kids
     }
 
-    // ------------------------------------------------------------------ 1. key sounds
+    // ------------------------------------------------------------------ 1. key sounds (+ different in some apps, one card)
+
+    /// A small "i" with a one-line tip (the page keeps its explanations here instead of in paragraphs).
+    fn info(&self, cx: &mut Cx, n: usize, text: &str) -> El {
+        tip::rq(cx, idx(K_TIP, n), Rq::Info, 16.0, text, false)
+    }
 
     fn sounds(&mut self, cx: &mut Cx) -> Vec<El> {
         let on = self.prefs.on;
-        let head = group::row(true, vec![group::lbl("Key sounds", Some("A soft sound on every key press")), group::ctl(vec![toggle::toggle(cx, K_ON, on, false)])]);
+        let head = group::row(
+            true,
+            vec![group::lbl("Key sounds", Some("A soft sound on every key press")), group::ctl(vec![self.info(cx, 0, TIP_PRIVACY), toggle::toggle(cx, K_ON, on, false)])],
+        );
         let pack = dropdown::dropdown(cx, K_PACK, &self.pack_name(&self.prefs.s.pack), Some(170.0));
         let hv = cx.hover_t(K_PLAY, 150.0, EASE);
         let play = El::block()
@@ -54,25 +64,34 @@ impl Keyboard {
             .child(El::icon("play", 9.0, 1.0, cmix(FG2(), crate::ui::WHITE, hv)).no_hit());
         let v = self.prefs.s.volume;
         let vol = slider::slider(cx, K_VOL, f32::from(v) / 100.0, 150.0, 20.0, slider::default());
+        let labels: Vec<&str> = PlayOn::ALL.iter().map(|p| p.label()).collect();
+        let at = PlayOn::ALL.iter().position(|p| *p == self.prefs.s.play_on).unwrap_or(0);
+        let play_on = seg::seg(cx, K_PLAYON, &labels, at, true);
+        let repeats = if self.prefs.s.repeat_ms == 0 { "Off".to_string() } else { format!("{} ms", self.prefs.s.repeat_ms) };
         let mut rows = vec![
             group::row(false, vec![group::lbl("Sound", None), group::ctl(vec![pack, play])]),
             group::row(false, vec![group::lbl("Volume", None), group::ctl(vec![vol, slider::value_label(&format!("{v} %"))])]),
+            group::row(false, vec![group::lbl("Play on", None), group::ctl(vec![play_on])]),
             group::row(
                 false,
                 vec![
-                    group::lbl("Ignore repeats within", Some("For a keyboard that presses twice")),
-                    group::ctl(vec![slider::slider(cx, K_REP, f32::from(self.prefs.s.repeat_ms) / 80.0, 110.0, 20.0, slider::default()), slider::value_label(&if self.prefs.s.repeat_ms == 0 { "Off".to_string() } else { format!("{} ms", self.prefs.s.repeat_ms) })]),
+                    group::lbl("Ignore repeats within", None),
+                    group::ctl(vec![
+                        self.info(cx, 1, "A second press of the same key within this time makes no sound"),
+                        slider::slider(cx, K_REP, f32::from(self.prefs.s.repeat_ms) / 80.0, 110.0, 20.0, slider::default()),
+                        slider::value_label(&repeats),
+                    ]),
                 ],
             ),
             group::row(
                 false,
-                vec![group::lbl("Off while a game is in front", Some("Fullscreen games stay silent, so nothing plays over your game")), group::ctl(vec![toggle::toggle(cx, K_GAME, self.prefs.s.off_in_game, false)])],
+                vec![group::lbl("Off while a game is in front", None), group::ctl(vec![self.info(cx, 2, "Nothing plays over a fullscreen game"), toggle::toggle(cx, K_GAME, self.prefs.s.off_in_game, false)])],
             ),
             group::row(
                 false,
                 vec![
-                    group::lbl("Mouse clicks too", Some("Side buttons sound like your keys, clicks get their own sound")),
-                    group::ctl(vec![toggle::toggle(cx, K_MOUSE, self.prefs.s.mouse_on, false)]),
+                    group::lbl("Mouse clicks too", None),
+                    group::ctl(vec![self.info(cx, 3, "Only which button went down or up is heard - never where the mouse is"), toggle::toggle(cx, K_MOUSE, self.prefs.s.mouse_on, false)]),
                 ],
             ),
         ];
@@ -85,15 +104,12 @@ impl Keyboard {
             false,
             vec![group::lbl("Try it", Some("Nothing you type here is kept")), group::ctl(vec![tinput::kdin(cx, K_TRY, &self.try_text, "Type here to hear it", 230.0)])],
         ));
+        rows.extend(self.rules(cx));
         let mut rest = El::col().items(AlignItems::STRETCH).children(rows).opacity(if on { 1.0 } else { 0.38 });
         if !on {
             rest = rest.no_hit();
         }
         let mut out = vec![group::gh("Key sounds"), group::grp(vec![head, rest])];
-        out.push(group::gf(PRIVACY));
-        out.push(group::gf("“Mouse clicks too”: the side buttons play the key sound of your Sound, left and right click and the wheel click play a click made to suit it. Only which button went down or up is heard - never where the mouse is or what you click. Off by default; it follows “Off while a game is in front” and “Ignore repeats”."));
-        out.push(group::gf("“Ignore repeats”: a second press of the same key within that many ms plays no sound. It works on the sounds only - the app never blocks or changes what you type. While it is on, the last few keys are remembered for at most 80 ms to tell a repeat; nothing is saved. Off (0) by default."));
-        out.push(group::gf("More sounds: Sound › Get more sounds lists the community packs of mechvibes.com and downloads one with a click. A pack you already have as a .zip: Sound › Import a Mechvibes pack."));
         if let Some(m) = &self.import_msg {
             out.push(group::gf(&format!("Not imported: {m}")));
         }
@@ -103,26 +119,20 @@ impl Keyboard {
         out
     }
 
-    // ------------------------------------------------------------------ 2. different in some apps
+    // ------------------------------------------------------------------ 2. different in some apps (rows of the same card)
 
     fn rules(&mut self, cx: &mut Cx) -> Vec<El> {
-        let on = self.prefs.on;
-        let mut rows = Vec::new();
+        let mut rows = vec![group::row(
+            false,
+            vec![group::lbl("Different in some apps", None), group::ctl(vec![self.info(cx, 4, "Everywhere else uses the sound above"), link::link(cx, K_RADD, "+ Add app", 12.0)])],
+        )];
         for (i, r) in self.prefs.s.rules.clone().iter().enumerate() {
             let app = dropdown::dropdown(cx, idx(K_RAPP, i), &title_of(&r.exe), Some(190.0));
             let pack = dropdown::dropdown(cx, idx(K_RPACK, i), &r.pack.as_ref().map(|p| self.pack_name(p)).unwrap_or_else(|| "Off".into()), Some(150.0));
             let del = button::icon_btn(cx, idx(K_RDEL, i), "x", 9.0, 1.5);
-            rows.push(group::row(
-                i == 0,
-                vec![app, El::text("→", Font::new(13.0, 400), FG3(), lh(13.0, 1.35)).none(), pack, El::block().flex1(), del],
-            ));
+            rows.push(group::row(false, vec![app, El::text("→", Font::new(13.0, 400), FG3(), lh(13.0, 1.35)).none(), pack, El::block().flex1(), del]));
         }
-        rows.push(group::row(self.prefs.s.rules.is_empty(), vec![link::link(cx, K_RADD, "+ Add app", 12.0)]));
-        let mut b = El::col().items(AlignItems::STRETCH).children(vec![group::grp(rows)]).opacity(if on { 1.0 } else { 0.38 });
-        if !on {
-            b = b.no_hit();
-        }
-        vec![group::gh("Different in some apps"), b, group::gf("Everywhere else uses the sound above. A game in front stays silent while “Off while a game is in front” is on.")]
+        rows
     }
 
     // ------------------------------------------------------------------ 3. the keyboard picture
@@ -150,7 +160,6 @@ impl Keyboard {
         if let Some(n) = &self.loop_note {
             out.push(group::gf(n));
         }
-        out.push(group::gf("Keys are named after your Windows keyboard layout. A key in blue has a remap, an action or a macro. Remaps are listed in “Back to how your PC was”."));
         out
     }
 
@@ -208,7 +217,7 @@ impl Keyboard {
                 if let Some(a) = &app {
                     kids.push(group::gf(&format!("This key runs “{a}” (set in Settings › All shortcuts).")));
                 } else {
-                    kids.push(group::gf("Pick what this key should do: another key, a ready-made action, or a macro."));
+                    kids.push(group::gf("Pick what this key should do"));
                 }
             }
             Mode::Remap => {
@@ -218,7 +227,7 @@ impl Keyboard {
                 let field = keyfield::keyfield(cx, K_TARGET, show, self.key_at, true).w(160.0);
                 let pick = dropdown::dropdown(cx, K_TPICK, "Pick from a list", None);
                 kids.push(group::grp(vec![group::row(true, vec![group::lbl("Becomes", None), group::ctl(vec![field, pick])])]));
-                kids.push(group::gf("Press the new key, or pick it from the list. Windows' own key map: one admin Yes and a restart. It works in every app and game."));
+                kids.push(group::gf("Press the new key, or pick it · needs one admin Yes and a restart"));
             }
             Mode::Action => {
                 let cur = match self.model.binds.get(code) {
@@ -244,7 +253,7 @@ impl Keyboard {
                     }
                 }
                 kids.push(group::grp(rows));
-                kids.push(group::gf("Works right away. The key does this instead of its normal job; it is left alone while a game or a full-screen window is in front."));
+                kids.push(group::gf("Works right away · not while a game is in front"));
             }
             Mode::Macro => {
                 let cur = match self.model.binds.get(code) {
@@ -256,7 +265,7 @@ impl Keyboard {
                     ctl.push(link::link(cx, K_MACEDIT, "Edit", 12.0));
                 }
                 kids.push(group::grp(vec![group::row(true, vec![group::lbl("Runs", None), group::ctl(ctl)])]));
-                kids.push(group::gf("Works right away. A macro never runs while a game or a full-screen window is in front, and never types into admin windows."));
+                kids.push(group::gf("Works right away · not while a game is in front"));
             }
         }
         if let Some(e) = &self.err {
@@ -275,7 +284,7 @@ impl Keyboard {
         let na = self.model.bind_count();
         let text = if dirty {
             "Remaps not applied yet · Windows asks for admin once, then it needs a restart".to_string()
-        } else if self.restart {
+        } else if self.restart || glue::restart_pending() {
             "Saved · restart Windows to use the remaps".to_string()
         } else if nr + na > 0 {
             let mut parts = Vec::new();
@@ -315,7 +324,7 @@ impl Keyboard {
         vec![
             group::gh("Macros"),
             group::grp(rows),
-            group::gf("A macro is a list of steps: press keys, type a text, wait, open something. Put one on a key from the picture above. It never runs while a game or a full-screen window is in front, and never types into admin windows."),
+            group::gf("Put a macro on a key from the picture above · it never runs while a game is in front"),
         ]
     }
 
@@ -350,6 +359,10 @@ impl Keyboard {
             if let Some(d) = self.editor(cx, &id) {
                 kids.push(d);
             }
+        }
+        if let Some((name, (x, y))) = self.ask_del.clone() {
+            let q = mitems::confirm(cx, K_DELQ, &format!("Remove {name}?"), "Its files are deleted from this PC. A downloaded sound can be got again.", "Cancel", "Remove", BKind::Red, Place::At(x, y), 260.0);
+            kids.push(q.z(30));
         }
         if let Some((p, a)) = self.pop {
             let list = self.list(p);
@@ -452,6 +465,7 @@ impl Keyboard {
             Ev::Click(k) => self.clicked(*k, cx),
             Ev::Char(k, c) => self.typed(*k, *c, cx),
             Ev::Key(k, vk) => self.key_down(*k, *vk, cx),
+            Ev::Context(k, x, y) => self.ask_remove(*k, *x, *y),
             Ev::Blur(k) if *k == K_TARGET => self.choosing = false,
             _ => {}
         }
@@ -482,6 +496,15 @@ impl Keyboard {
     }
 
     fn clicked(&mut self, k: Key, cx: &mut Cx) {
+        // "Remove this sound?" - the question owns the next click
+        if let Some((name, _)) = self.ask_del.clone() {
+            self.ask_del = None;
+            if k == sub(K_DELQ, "go") {
+                self.pop = None;
+                self.remove_pack(&name, cx);
+            }
+            return;
+        }
         if self.get_clicked(k, cx) {
             return;
         }
@@ -647,6 +670,13 @@ impl Keyboard {
                 }
             }
             _ => {
+                for (i, p) in PlayOn::ALL.iter().enumerate() {
+                    if k == idx(K_PLAYON, i) {
+                        self.prefs.s.play_on = *p;
+                        self.save();
+                        return;
+                    }
+                }
                 for (i, s) in Size::ALL.iter().enumerate() {
                     if k == idx(K_SIZE, i) {
                         self.change_size(*s);
@@ -703,6 +733,8 @@ impl Keyboard {
         let mut sel = false;
         if k == K_TRY {
             nbox::type_char(&mut self.try_text, &mut sel, c, 40, Filter::Any);
+        } else if k == K_GSEARCH {
+            crate::ui::pieces::search::edit_char(&mut self.get_q, c);
         } else if k == K_ATEXT {
             if let Some(code) = self.sel {
                 if let Some(Bind::Preset(p)) = self.model.binds.get(code).cloned() {
@@ -764,6 +796,8 @@ impl Keyboard {
         }
         if k == K_TRY && back {
             self.try_text.pop();
+        } else if k == K_GSEARCH {
+            crate::ui::pieces::search::edit_key(&mut self.get_q, vk);
         } else if k == K_ATEXT && back {
             if let Some(code) = self.sel {
                 if let Some(Bind::Preset(p)) = self.model.binds.get(code).cloned() {

@@ -225,8 +225,10 @@ fn card_defaults_rows_and_mapping_like_raw_accels_gui() {
     assert!(!panel.on, "a new user starts off");
     assert_eq!(panel.curve, Curve::Linear);
     assert_eq!(panel.sens, 1.0);
-    // the Linear defaults ARE the sample Raw Accel args, field for field (GUI rule: defaults + shown fields; exponent 2)
-    assert_eq!(to_args(Curve::Linear, &panel.current_values()), his_cfg().profiles[0].accel_x);
+    // the Linear defaults are his REAL Raw Accel settings (Order 077: Gain, acceleration 2.6, offset 55, cap output 2.0): the sample args with those two numbers
+    let mut real = his_cfg().profiles[0].accel_x.clone();
+    (real.acceleration, real.cap.y) = (2.6, 2.0);
+    assert_eq!(to_args(Curve::Linear, &panel.current_values()), real);
     let v = CurveValues::defaults(Curve::Linear);
     let labels: Vec<&str> = visible_rows(Curve::Linear, &v).iter().map(|r| r.label).collect();
     assert_eq!(labels, vec!["Acceleration", "Input offset", "Cap: output"]);
@@ -398,19 +400,20 @@ fn per_app_switches_on_process_start_and_stop() {
     m.sync_driver().unwrap();
     assert_eq!(bytes::read_profiles(&m.os().rawaccel_driver)[0].accel_x.mode, AccelMode::Noaccel);
     // the game starts (no window yet) → Fast
-    assert!(m.accel_app_event(&AppEvent::Started { pid: 42, exe: "VALORANT-Win64-Shipping.exe".into(), has_window: false }));
-    m.sync_driver().unwrap();
+    assert!(m.accel_app_event(&AppEvent::Started { pid: 42, exe: "VALORANT-Win64-Shipping.exe".into() }));
+    m.sync_driver_auto().unwrap();
     let run = bytes::read_profiles(&m.os().rawaccel_driver);
     assert_eq!((run[0].accel_x.mode, run[0].accel_x.acceleration), (AccelMode::Classic, 1.0));
     // other processes change nothing
-    assert!(!m.accel_app_event(&AppEvent::Started { pid: 7, exe: "notepad.exe".into(), has_window: false }));
+    assert!(!m.accel_app_event(&AppEvent::Started { pid: 7, exe: "notepad.exe".into() }));
     // it stops → Off again
     assert!(m.accel_app_event(&AppEvent::Stopped { pid: 42 }));
-    m.sync_driver().unwrap();
+    m.sync_driver_auto().unwrap();
     assert_eq!(bytes::read_profiles(&m.os().rawaccel_driver)[0].accel_x.mode, AccelMode::Noaccel);
-    // too late (already has a window): no switch, a note
-    assert!(!m.accel_app_event(&AppEvent::Started { pid: 43, exe: "VALORANT-Win64-Shipping.exe".into(), has_window: true }));
-    assert_eq!(m.accel_mut().per_app.take_notes(), vec![SwitchNote::TooLate { row, exe: "VALORANT-Win64-Shipping.exe".into() }]);
+    // a game found already open counts as started too (no "too late" any more)
+    assert!(m.accel_app_event(&AppEvent::Started { pid: 43, exe: "VALORANT-Win64-Shipping.exe".into() }));
+    assert!(m.accel().per_app.is_active(row));
+    assert!(m.accel_app_event(&AppEvent::Stopped { pid: 43 }));
     // deleting the preset turns the row Off
     assert_eq!(m.delete_accel_preset(fast), Some("Deleted Fast · VALORANT-Win64-Shipping.exe now Off".into()));
     assert_eq!(m.accel().per_app.rows()[0].target, Target::Off);
@@ -423,8 +426,8 @@ fn two_listed_apps_last_started_wins() {
     let _b = pa.add_row(r"C:\Games\b.exe", Target::Preset(PresetId(2)));
     pa.set_everywhere_else(Target::Preset(PresetId(9)));
     assert_eq!(pa.current(), Target::Preset(PresetId(9)));
-    pa.on_event(&AppEvent::Started { pid: 1, exe: r"C:\x\A.EXE".into(), has_window: false });
-    pa.on_event(&AppEvent::Started { pid: 2, exe: r"C:\Games\b.exe".into(), has_window: false });
+    pa.on_event(&AppEvent::Started { pid: 1, exe: r"C:\x\A.EXE".into() });
+    pa.on_event(&AppEvent::Started { pid: 2, exe: r"C:\Games\b.exe".into() });
     assert_eq!(pa.current(), Target::Preset(PresetId(2)));
     pa.on_event(&AppEvent::Stopped { pid: 2 });
     assert_eq!(pa.current(), Target::Preset(PresetId(1)));
@@ -609,13 +612,29 @@ fn app_start_writes_the_driver_only_when_the_user_had_it_on_and_the_driver_diffe
     on.os_mut().byte_files = saved.clone();
     assert_eq!(on.start_accel().unwrap(), StartAccel::AlreadyRunning);
     assert_eq!(on.os().rawaccel_byte_writes, 0);
-    // saved ON, but Raw Accel's app wrote Off meanwhile: written once
+    // saved ON, but Raw Accel's app wrote Off after this app set the driver (Order 077): the driver is left alone
     let mut reset = with_driver((1, 7, 0), Some(SETTINGS));
     reset.os_mut().byte_files = saved.clone();
     reset.os_mut().rawaccel_driver = bytes::to_bytes(&off_cfg());
-    assert_eq!(reset.start_accel().unwrap(), StartAccel::Applied);
+    assert_eq!(reset.start_accel().unwrap(), StartAccel::RawAccelChanged, "no note of an earlier write of this app, and the driver runs something");
+    assert_eq!(reset.os().rawaccel_byte_writes, 0);
+    assert_eq!(reset.other_writer().unwrap().map(|w| w.use_ours), Some(true), "the card says so, with the one click");
+    // ... and the click sets the card (a user action always writes)
+    assert!(reset.sync_driver().unwrap());
     assert_eq!(reset.os().rawaccel_byte_writes, 1);
     assert_eq!(bytes::read_profiles(&reset.os().rawaccel_driver)[0].accel_x.mode, AccelMode::Classic);
+    assert_eq!(reset.other_writer().unwrap(), None);
+    // this app wrote the driver before (a note of it is kept in a file) and the driver still runs exactly that
+    let mut ours = with_driver((1, 7, 0), Some(SETTINGS));
+    ours.os_mut().byte_files = reset.os().byte_files.clone();
+    ours.os_mut().rawaccel_driver = reset.os().rawaccel_driver.clone();
+    assert_eq!(ours.start_accel().unwrap(), StartAccel::AlreadyRunning);
+    // ... when Raw Accel set something else meanwhile, a restart of the app leaves it (the note survives the restart)
+    let mut later = with_driver((1, 7, 0), Some(SETTINGS));
+    later.os_mut().byte_files = reset.os().byte_files.clone();
+    later.os_mut().rawaccel_driver = bytes::to_bytes(&off_cfg());
+    assert_eq!(later.start_accel().unwrap(), StartAccel::RawAccelChanged);
+    assert_eq!(later.os().rawaccel_byte_writes, 0);
     let mut header_only = with_driver((1, 7, 0), Some(SETTINGS));
     header_only.os_mut().byte_files = saved.clone();
     header_only.os_mut().rawaccel_driver = vec![0; bytes::IO_BASE];
@@ -637,7 +656,7 @@ fn app_start_writes_the_driver_only_when_the_user_had_it_on_and_the_driver_diffe
 }
 
 #[test]
-fn a_game_start_sets_the_driver_again_after_another_program_wrote_it() {
+fn a_game_start_never_writes_over_a_newer_raw_accel_write_but_a_click_does() {
     let mut m = with_driver((1, 7, 0), Some(SETTINGS));
     m.mirror_rawaccel().unwrap();
     let (fast, _) = m.accel_mut().panel.save_as_preset();
@@ -646,14 +665,32 @@ fn a_game_start_sets_the_driver_again_after_another_program_wrote_it() {
     m.sync_driver().unwrap();
     let writes = m.os().rawaccel_byte_writes;
     assert!(!m.sync_driver().unwrap(), "nothing changed → no write");
-    // Raw Accel's own app opens and sends its settings.json (Off) to the driver
-    m.os_mut().rawaccel_driver = bytes::to_bytes(&off_cfg());
-    assert_eq!(m.driver_matches_card().unwrap(), Some(true), "everywhere else = Off = what it wrote");
-    m.accel_app_event(&AppEvent::Started { pid: 5, exe: "VALORANT-Win64-Shipping.exe".into(), has_window: false });
-    assert_eq!(m.driver_matches_card().unwrap(), Some(false));
-    assert!(m.sync_driver().unwrap(), "the game started → the driver is set to the game's preset again");
+    // a game start with nobody else involved: the driver is set to the game's preset (it runs what this app set last)
+    m.accel_app_event(&AppEvent::Started { pid: 5, exe: "VALORANT-Win64-Shipping.exe".into() });
+    assert!(m.sync_driver_auto().unwrap());
     assert_eq!(m.os().rawaccel_byte_writes, writes + 1);
     assert_eq!(bytes::read_profiles(&m.os().rawaccel_driver)[0].accel_x.mode, AccelMode::Classic);
+    // he applies a curve in Raw Accel's own window while the game runs; the game closes (this app would set Off) → left alone
+    let mut theirs = his_cfg();
+    theirs.profiles[0].accel_x.acceleration = 2.6;
+    theirs.profiles[0].accel_y.acceleration = 2.6;
+    m.os_mut().rawaccel_driver = bytes::to_bytes(&theirs);
+    let writes = m.os().rawaccel_byte_writes;
+    m.accel_app_event(&AppEvent::Stopped { pid: 5 });
+    assert!(!m.sync_driver_auto().unwrap(), "Raw Accel set it after this app: left alone");
+    assert_eq!(m.os().rawaccel_byte_writes, writes);
+    // the same for the next game start
+    m.accel_app_event(&AppEvent::Started { pid: 6, exe: "VALORANT-Win64-Shipping.exe".into() });
+    assert!(!m.sync_driver_auto().unwrap());
+    assert_eq!(m.os().rawaccel_byte_writes, writes);
+    assert!(m.other_writer().unwrap().is_some_and(|w| w.use_ours));
+    // a change made in this app's own card, or its "Use ours again", is a click: it writes
+    assert!(m.sync_driver().unwrap());
+    assert_eq!(m.os().rawaccel_byte_writes, writes + 1);
+    assert_eq!(m.other_writer().unwrap(), None);
+    // a driver nobody has written since the PC started (no profile at all) is set by a game start
+    m.os_mut().rawaccel_driver = vec![0; bytes::IO_BASE];
+    assert!(m.sync_driver_auto().unwrap());
 }
 
 #[test]
@@ -664,7 +701,7 @@ fn another_writer_is_said_plainly() {
     // Raw Accel's app wrote Off after this app
     m.os_mut().rawaccel_driver = bytes::to_bytes(&off_cfg());
     let line = m.other_writer_line().unwrap().unwrap();
-    assert!(line.starts_with("The driver is not running this card right now: another program wrote it"), "{line}");
+    assert!(line.starts_with("Raw Accel changed the driver after this app set it"), "{line}");
     assert!(!line.contains("settings.json"), "no .config known → no claim about it");
     m.os_mut().files.insert(PathBuf::from(RA_DIR).join(".config"), r#"{"DPI":2400,"AutoWriteToDriverOnStartup":true}"#.into());
     assert!(m.other_writer_line().unwrap().unwrap().contains("sends its settings.json to the driver every time it opens"));
@@ -680,16 +717,40 @@ fn another_writer_is_said_plainly() {
 }
 
 #[test]
-fn a_game_that_was_already_open_is_marked_late_until_its_next_launch() {
+fn a_game_that_is_already_running_gets_its_preset_at_once() {
     let mut m = with_driver((1, 7, 0), Some(SETTINGS));
     m.mirror_rawaccel().unwrap();
     let (fast, _) = m.accel_mut().panel.save_as_preset();
+    m.accel_mut().panel.set_value(Field::Acceleration, 1.0);
+    m.accel_mut().panel.update_loaded();
     let row = m.accel_mut().per_app.add_row("VALORANT-Win64-Shipping.exe", Target::Preset(fast));
-    assert!(!m.accel().per_app.is_late(row));
-    assert!(!m.accel_app_event(&AppEvent::Started { pid: 9, exe: "VALORANT-Win64-Shipping.exe".into(), has_window: true }));
-    assert!(m.accel().per_app.is_late(row) && !m.accel().per_app.is_active(row));
-    assert!(m.accel_app_event(&AppEvent::Started { pid: 10, exe: "VALORANT-Win64-Shipping.exe".into(), has_window: false }));
-    assert!(!m.accel().per_app.is_late(row) && m.accel().per_app.is_active(row));
+    m.accel_mut().per_app.set_everywhere_else(Target::Off);
+    // not open: nothing found
+    assert!(m.adopt_running_games().unwrap().is_empty());
+    assert!(!m.accel().per_app.is_active(row));
+    // open already (a process snapshot, any case, other programs ignored): it counts as started
+    m.os_mut().running = vec!["notepad.exe".into(), "valorant-win64-shipping.EXE".into()];
+    let found = m.adopt_running_games().unwrap();
+    assert_eq!(found.len(), 1);
+    assert!(m.accel().per_app.is_active(row) && m.accel().per_app.active_pids() == vec![found[0].0]);
+    assert_eq!(header_line(&m.accel().panel, &m.accel().per_app), "VALORANT-Win64-Shipping: Preset 2 · otherwise Off");
+    assert!(m.sync_driver().unwrap(), "its preset is set at once");
+    assert_eq!(bytes::read_profiles(&m.os().rawaccel_driver)[0].accel_x.acceleration, 1.0, "the game's preset, not the main one (2.8)");
+    // asked again: it is known already (by process id), nothing new
+    assert!(m.adopt_running_games().unwrap().is_empty());
+    // its start heard as well (the same process): still one active game; its stop ends it
+    assert!(!m.accel_app_event(&AppEvent::Started { pid: found[0].0, exe: "VALORANT-Win64-Shipping.exe".into() }));
+    assert!(m.accel_app_event(&AppEvent::Stopped { pid: found[0].0 }));
+    assert!(!m.accel().per_app.is_active(row));
+    // app start with the card ON and the game open: the game's preset is what the driver gets
+    m.save_accel().unwrap();
+    let mut fresh = with_driver((1, 7, 0), Some(SETTINGS));
+    fresh.os_mut().byte_files = m.os().byte_files.clone();
+    fresh.os_mut().running = vec!["VALORANT-Win64-Shipping.exe".into()];
+    fresh.os_mut().rawaccel_driver = vec![0; bytes::IO_BASE];
+    assert_eq!(fresh.start_accel().unwrap(), StartAccel::Applied);
+    assert!(fresh.accel().per_app.is_active(row));
+    assert_eq!(bytes::read_profiles(&fresh.os().rawaccel_driver)[0].accel_x.mode, AccelMode::Classic);
 }
 
 /// "Same numbers in = same driver values out": every curve of the card, with its defaults and with each row at its

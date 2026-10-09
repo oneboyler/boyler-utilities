@@ -6,13 +6,17 @@
 //! - at app start loads the saved card and writes the driver ONLY when the user had acceleration ON and the driver does not
 //!   already run it (`Mouse::start_accel`); a card that was off, or never saved, writes nothing;
 //! - listens (`AppWatcher`, event-driven, no polling) for the games in the per-game rows - none listed = no watcher at all;
-//! - on a game start / stop sets the driver to what the card says (only when the driver differs: its own READ decides);
+//! - on a game start / stop sets the driver to what the card says (only when the driver differs: its own READ decides - and never
+//!   over a NEWER write of Raw Accel's own app: `Mouse::sync_driver_auto`, Order 077);
+//! - a listed game that is ALREADY running (when added, at app start, when the switch goes on) gets its preset at once: a process
+//!   snapshot finds it (`Mouse::adopt_running_games`), no handle to the game;
 //! - sleeps otherwise (blocked on its channel: 0 % CPU).
 //!
 //! The Mouse tab does not write the driver itself on the real PC: it saves the card to the file and calls [`apply_now`],
 //! which takes this engine's lock, reads the file and syncs - so the games that are running are never forgotten.
 //! No handle is ever opened to a game (the watcher uses window events, a process list and SYNCHRONIZE-only waits).
 
+use std::collections::HashSet;
 use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -29,8 +33,6 @@ const STOP_SETTLE: Duration = Duration::from_millis(500);
 /// What the Mouse tab shows about the games (read without waiting for the engine's lock).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Status {
-    /// rows whose game was already open when its start was noticed: not switched, runs as "when none of these games are open"
-    pub late: Vec<RowId>,
     /// rows whose game runs now and was switched to
     pub active: Vec<RowId>,
     /// which source hears the games ("window creation + process snapshot (no admin)"), `None` = none listed / not running
@@ -49,6 +51,8 @@ struct Inner {
     watcher: Option<AppWatcher>,
     /// the names the watcher listens for now (a tab edit that changes no game leaves it alone: no gap with nobody listening)
     names: Vec<String>,
+    /// the processes that have an exit wait now (a game's STOP is heard by it)
+    waited: HashSet<u32>,
     tx: Sender<Msg>,
 }
 
@@ -71,6 +75,7 @@ impl Inner {
         if names.is_empty() {
             self.watcher = None;
             self.names.clear();
+            self.waited.clear();
             return;
         }
         if self.watcher.is_some() && names == self.names {
@@ -83,17 +88,29 @@ impl Inner {
             }
         }
         let tx = self.tx.clone();
+        // (a new watcher holds no exit waits yet)
+        self.waited.clear();
         self.watcher = AppWatcher::start(names, move |ev| {
             let _ = tx.send(Msg::App(ev));
         })
         .ok();
     }
 
+    /// Listed games that run already count as running (Order 077), and every running game has an exit wait.
+    fn adopt(&mut self) {
+        let _ = self.m.adopt_running_games();
+        let Some(w) = &self.watcher else { return };
+        for pid in self.m.accel().per_app.active_pids() {
+            if self.waited.insert(pid) {
+                w.watch_exit(pid);
+            }
+        }
+    }
+
     fn publish(&self, status: &Mutex<Status>) {
         let a = self.m.accel();
         let rows: Vec<RowId> = a.per_app.rows().iter().map(|r| r.id).collect();
         *lock(status) = Status {
-            late: rows.iter().copied().filter(|r| a.per_app.is_late(*r)).collect(),
             active: rows.iter().copied().filter(|r| a.per_app.is_active(*r)).collect(),
             source: self.watcher.as_ref().and_then(|w| w.active_source()),
         };
@@ -107,7 +124,7 @@ pub fn start() -> Option<Guard> {
         return None;
     }
     let (tx, rx) = channel::<Msg>();
-    let eng = Engine { inner: Mutex::new(Inner { m: super::svc::real_bare_pub(), watcher: None, names: Vec::new(), tx: tx.clone() }), tx, status: Mutex::new(Status::default()) };
+    let eng = Engine { inner: Mutex::new(Inner { m: super::svc::real_bare_pub(), watcher: None, names: Vec::new(), waited: HashSet::new(), tx: tx.clone() }), tx, status: Mutex::new(Status::default()) };
     if ENGINE.set(eng).is_err() {
         return None;
     }
@@ -138,6 +155,7 @@ fn run(eng: &'static Engine, rx: Receiver<Msg>) {
         g.m.accel_mut().rawaccel_dir = super::svc::find_rawaccel_folder();
         let _ = g.m.start_accel();
         g.sync_watcher();
+        g.adopt();
         g.publish(&eng.status);
     }
     // when the driver is next set: a start at once, a stop after a short wait
@@ -151,6 +169,15 @@ fn run(eng: &'static Engine, rx: Receiver<Msg>) {
             Ok(Msg::Quit) | Err(RecvTimeoutError::Disconnected) => break,
             Ok(Msg::App(ev)) => {
                 let mut g = lock(&eng.inner);
+                match &ev {
+                    // (the watcher gave a started process its exit wait itself)
+                    AppEvent::Started { pid, .. } => {
+                        g.waited.insert(*pid);
+                    }
+                    AppEvent::Stopped { pid } => {
+                        g.waited.remove(pid);
+                    }
+                }
                 if g.m.accel_app_event(&ev) {
                     let at = match ev {
                         AppEvent::Started { .. } => Instant::now(),
@@ -169,7 +196,7 @@ fn run(eng: &'static Engine, rx: Receiver<Msg>) {
                 due = None;
                 let mut g = lock(&eng.inner);
                 if g.m.accel().panel.on {
-                    let _ = g.m.sync_driver();
+                    let _ = g.m.sync_driver_auto();
                 }
                 g.publish(&eng.status);
             }
@@ -185,6 +212,7 @@ fn reload(g: &mut Inner) {
         g.m.accel_mut().per_app.keep_running_from(&active);
     }
     g.sync_watcher();
+    g.adopt();
 }
 
 /// The Mouse tab saved the card: read it, listen for its games, and set the driver now (blocks for the driver's own ~1 s
@@ -269,6 +297,71 @@ mod tests {
         // a tab edit while the card is off: nothing is written (no switch click), and it answers at once
         assert_eq!(apply_now(false), None);
         drop(guard);
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+}
+
+#[cfg(test)]
+mod proof_077 {
+    use super::*;
+
+    /// Order 077 proof on the REAL PC (`cargo test -p bu-app proof_077 -- --ignored --test-threads=1 --nocapture`): a listed game that is
+    /// ALREADY running is found by the engine at its start from a process snapshot (the stand-in "game" is explorer.exe, always
+    /// running; no handle is opened to it) and counts as switched-to; the card is OFF so nothing is written to the driver.
+    /// APPDATA points to a scratch folder; the driver is only ever READ.
+    #[test]
+    #[ignore]
+    fn proof_077_a_game_that_is_already_running_is_found_at_start() {
+        let scratch = std::env::temp_dir().join(format!("BoylerUtilities-test-accel-077-{}", std::process::id()));
+        let dir = scratch.join("Boyler Utilities").join("mouse");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut m = Mouse::new(bu_mouse::fake::FakeOs::new(), bu_mouse::AppDirs::new(&dir));
+        m.accel_mut().per_app.add_row("explorer.exe", bu_mouse::accel::switch::Target::Off);
+        m.accel_mut().per_app.add_row("no-such-game-077.exe", bu_mouse::accel::switch::Target::Off);
+        m.save_accel().unwrap();
+        let file = m.dirs().accel_file();
+        std::fs::write(file, m.os().byte_files.values().next().cloned().unwrap()).unwrap();
+        std::env::set_var("APPDATA", &scratch);
+        let guard = start().expect("the engine starts");
+        let t0 = std::time::Instant::now();
+        while status().source.is_none() && t0.elapsed().as_secs() < 5 {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let st = status();
+        println!("listening: {:?}; rows running (found by the snapshot): {} of 2 after {} ms", st.source, st.active.len(), t0.elapsed().as_millis());
+        assert_eq!(st.active.len(), 1, "explorer.exe (running) is found, the game that does not exist is not");
+        drop(guard);
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    /// Order 077 proof on the REAL PC (same command): his real Raw Accel driver is READ through a read-only service (any write
+    /// would be refused), the saved card (scratch file) is ON with a curve that is not what the driver runs and no note of an
+    /// earlier write of this app exists - the app start must leave the driver alone (`RawAccelChanged`) and its bytes must
+    /// be the same before and after.
+    #[test]
+    #[ignore]
+    fn proof_077_app_start_leaves_a_newer_raw_accel_write_alone() {
+        use bu_mouse::accel::panel::Field;
+        use bu_mouse::accel::service::StartAccel;
+        let scratch = std::env::temp_dir().join(format!("BoylerUtilities-test-accel-077b-{}", std::process::id()));
+        let dir = scratch.join("Boyler Utilities").join("mouse");
+        std::fs::create_dir_all(&dir).unwrap();
+        // a card that is ON with Linear / acceleration 0.05 (not what any Raw Accel setup runs)
+        let mut card = Mouse::new(bu_mouse::fake::FakeOs::new(), bu_mouse::AppDirs::new(&dir));
+        card.accel_mut().panel.on = true;
+        card.accel_mut().panel.set_value(Field::Acceleration, 0.05);
+        card.save_accel().unwrap();
+        std::fs::write(card.dirs().accel_file(), card.os().byte_files.values().next().cloned().unwrap()).unwrap();
+        let mut m = Mouse::new(bu_mouse::win::RealOs::read_only(), bu_mouse::AppDirs::new(&dir));
+        let Some(before) = m.driver_state().unwrap() else { return println!("no Raw Accel 1.7 driver here: nothing to prove") };
+        if bu_mouse::accel::bytes::read_profiles(&before).is_empty() {
+            return println!("the driver holds no profile (nobody wrote it since boot): a start would set it - not the case to prove");
+        }
+        let r = m.start_accel().unwrap();
+        let after = m.driver_state().unwrap().unwrap();
+        println!("start_accel = {r:?}; driver bytes before == after: {}", before == after);
+        assert_eq!(r, StartAccel::RawAccelChanged);
+        assert_eq!(before, after);
         let _ = std::fs::remove_dir_all(&scratch);
     }
 }

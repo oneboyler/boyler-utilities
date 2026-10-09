@@ -10,7 +10,7 @@
 //! at all it tries again every 2 s and the sleep timer keeps counting.
 
 use crate::player::Core;
-use crate::kind::Kind;
+use crate::sound::Sound;
 use crate::stream::{self, Stream};
 use crate::synth::make_loop;
 use std::ffi::c_void;
@@ -46,7 +46,7 @@ pub struct Status {
     pub playing: bool,
     /// A stop is fading out.
     pub stopping: bool,
-    pub kind: Option<Kind>,
+    pub sound: Option<Sound>,
     pub volume: u8,
     /// Seconds until the sleep timer ends it.
     pub sleep_left: Option<u32>,
@@ -151,9 +151,10 @@ impl Noise {
         self.shared.test_mute.store(mute, Ordering::Release);
     }
 
-    /// Play `kind` at `volume` %, with the sleep timer (`sleep_minutes`) counting from now. Already playing (or fading out):
+    /// Play `sound` (a Kind or a Mix) at `volume` %, with the sleep timer (`sleep_minutes`) counting from now. Already playing (or fading out):
     /// it carries on / fades back in with these values.
-    pub fn play(&self, kind: Kind, volume: u8, sleep_minutes: Option<u32>) {
+    pub fn play(&self, sound: impl Into<Sound>, volume: u8, sleep_minutes: Option<u32>) {
+        let sound = sound.into();
         let sh = &self.shared;
         let mut st = lock(&sh.st);
         let now = sh.now();
@@ -161,7 +162,7 @@ impl Noise {
             if let Some(c) = st.core.as_mut() {
                 if !c.is_done() {
                     c.resume();
-                    c.set_kind(kind);
+                    c.set_sound(sound);
                     c.set_volume(volume);
                     c.set_sleep(now, sleep_minutes);
                     drop(st);
@@ -175,7 +176,7 @@ impl Noise {
         st.thread = None;
         st.gen += 1;
         let gen = st.gen;
-        let mut c = Core::new(kind, volume, 48_000);
+        let mut c = Core::new(sound, volume, 48_000);
         c.set_sleep(now, sleep_minutes);
         st.core = Some(c);
         st.alive = true;
@@ -199,9 +200,10 @@ impl Noise {
     }
 
     /// Another noise (while it plays: fades to it).
-    pub fn set_kind(&self, k: Kind) {
+    pub fn set_sound(&self, s: impl Into<Sound>) {
+        let s = s.into();
         if let Some(c) = lock(&self.shared.st).core.as_mut() {
-            c.set_kind(k);
+            c.set_sound(s);
         }
         self.shared.poke();
     }
@@ -245,7 +247,7 @@ impl Noise {
         Status {
             playing: st.alive && !c.is_some_and(|c| c.is_done()),
             stopping: c.is_some_and(|c| c.is_stopping()),
-            kind: c.map(|c| c.kind()),
+            sound: c.map(|c| c.sound()),
             volume: c.map_or(0, |c| c.volume()),
             sleep_left: c.and_then(|c| c.sleep_left(now)).map(|s| s.ceil() as u32),
             error: st.error.clone(),
@@ -274,7 +276,7 @@ fn run(sh: Arc<Shared>, gen: u64) {
     let mut device_checked = Instant::now();
     let mut drain_until: Option<Instant> = None;
     let mut scratch: Vec<f32> = Vec::new();
-    let mut gen_job: Option<(Kind, JoinHandle<crate::synth::Loop>)> = None;
+    let mut gen_job: Option<(Sound, JoinHandle<crate::synth::Loop>)> = None;
     let mut stopping_since: Option<Instant> = None;
     let mut wrote_any = false;
 
@@ -321,20 +323,20 @@ fn run(sh: Arc<Shared>, gen: u64) {
         // (on a short-lived plain-priority thread: ~0.1 s of work that must neither starve the top-ups nor run at the audio
         // thread's raised priority)
         if gen_job.as_ref().is_some_and(|(_, j)| j.is_finished()) {
-            if let Some((kind, j)) = gen_job.take() {
+            if let Some((sound, j)) = gen_job.take() {
                 if let Ok(l) = j.join() {
                     if let Some(c) = lock(&sh.st).core.as_mut() {
-                        c.set_loop(kind, l);
+                        c.set_loop(sound, l);
                     }
                 }
             }
         }
         if gen_job.is_none() && drain_until.is_none() {
             let need = lock(&sh.st).core.as_ref().and_then(|c| c.needs_loop());
-            if let (Some(kind), Some(s)) = (need, stream.as_ref()) {
+            if let (Some(sound), Some(s)) = (need, stream.as_ref()) {
                 let rate = s.rate;
-                if let Ok(j) = std::thread::Builder::new().name("bu-noise-make".into()).spawn(move || make_loop(kind, rate)) {
-                    gen_job = Some((kind, j));
+                if let Ok(j) = std::thread::Builder::new().name("bu-noise-make".into()).spawn(move || make_loop(sound, rate)) {
+                    gen_job = Some((sound, j));
                 }
             }
         }

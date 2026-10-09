@@ -5,7 +5,7 @@
 use crate::settings::{Scope, SettingsStore};
 use bu_keysound::binds::Binds;
 use bu_keysound::macros::{self, Macro};
-use bu_keysound::{Pack, Rule, Settings, DEFAULT_VOLUME};
+use bu_keysound::{Pack, PlayOn, Rule, Settings, DEFAULT_VOLUME};
 
 pub const PAGE: &str = "keyboard";
 const K_ON: &str = "on";
@@ -15,6 +15,7 @@ const K_GAME: &str = "off_in_game";
 const K_REPEAT: &str = "repeat_ms";
 const K_MOUSE: &str = "mouse_on";
 const K_MOUSE_VOL: &str = "mouse_volume";
+const K_PLAY_ON: &str = "play_on";
 const K_RULES: &str = "rules";
 const K_BINDS: &str = "binds";
 const K_MACROS: &str = "macros";
@@ -94,6 +95,7 @@ impl Prefs {
                 repeat_ms: store.i64_or(scope(), K_REPEAT, 0).clamp(0, 80) as u8,
                 mouse_on: store.bool_or(scope(), K_MOUSE, false),
                 mouse_volume: store.i64_or(scope(), K_MOUSE_VOL, i64::from(DEFAULT_VOLUME)).clamp(0, 100) as u8,
+                play_on: PlayOn::from_key(store.str_or(scope(), K_PLAY_ON, "both")),
                 rules,
             },
             binds: Binds::from_lines(store.get_list(scope(), K_BINDS).unwrap_or_default()),
@@ -110,6 +112,7 @@ impl Prefs {
         let _ = store.set_i64(scope(), K_REPEAT, i64::from(self.s.repeat_ms));
         let _ = store.set_bool(scope(), K_MOUSE, self.s.mouse_on);
         let _ = store.set_i64(scope(), K_MOUSE_VOL, i64::from(self.s.mouse_volume));
+        let _ = store.set_str(scope(), K_PLAY_ON, self.s.play_on.key());
         let rules: Vec<String> = self.s.rules.iter().take(MAX_RULES).map(rule_text).collect();
         let _ = store.set_list(scope(), K_RULES, &rules);
         let _ = store.set_list(scope(), K_BINDS, &self.binds.to_lines());
@@ -152,6 +155,7 @@ mod tests {
         assert_eq!(p.s.repeat_ms, 0);
         assert!(!p.s.mouse_on, "Order 064: mouse clicks are off by default");
         assert_eq!(p.s.mouse_volume, 5, "and quiet");
+        assert_eq!(p.s.play_on, PlayOn::Both, "Order 076: press + release is the default");
         assert_eq!(p.s.pack, Pack::Builtin(PackId::Linear));
         assert!(p.s.rules.is_empty());
         assert_eq!(p, Prefs::default());
@@ -178,6 +182,7 @@ mod tests {
                 repeat_ms: 35,
                 mouse_on: true,
                 mouse_volume: 9,
+                play_on: PlayOn::Release,
                 rules: vec![Rule { exe: "discord.exe".into(), pack: None }, Rule { exe: "notepad.exe".into(), pack: Some(Pack::Builtin(PackId::Typewriter)) }],
             },
         };
@@ -191,7 +196,7 @@ mod tests {
         let text = std::fs::read_to_string(again.path()).unwrap();
         for line in text.lines().filter(|l| l.starts_with("page:keyboard")) {
             let key = line.split('\t').nth(1).unwrap();
-            assert!(["on", "pack", "volume", "off_in_game", "repeat_ms", "mouse_on", "mouse_volume", "rules", "binds", "macros", "size"].contains(&key), "unexpected setting {key}");
+            assert!(["on", "pack", "volume", "off_in_game", "repeat_ms", "mouse_on", "mouse_volume", "play_on", "rules", "binds", "macros", "size"].contains(&key), "unexpected setting {key}");
         }
     }
 

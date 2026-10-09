@@ -353,7 +353,7 @@ impl<O: StartupOs> Startup<O> {
                         location: format!("Store app {} (StartupTask {})", t.package_family, t.task_id),
                         enabled: matches!(t.state, 2 | 4),
                         impact: if impact_source == ImpactSource::Report { ImpactState::NotMeasured } else { ImpactState::Unknown },
-                        windows_own: t.package_family.starts_with("Microsoft"),
+                        windows_own: store_app_is_windows_part(&t.package_family, t.publisher.as_deref()),
                         switch: Switch::Settings(SETTINGS_STARTUP_APPS),
                         approved: None,
                         source: Source::StoreApp { package_family: t.package_family, task_id: t.task_id },
@@ -661,7 +661,9 @@ impl<O: StartupOs> Startup<O> {
             self.program(&quoted).map(|(p, _)| p)
         });
         let info = prog.as_deref().map(|p| self.os.file_info(p)).unwrap_or_default();
-        let windows_own = t.path.to_lowercase().starts_with(r"\microsoft\") || self.windows_own(&info, prog.as_deref());
+        // a task under \Microsoft\Windows\ is Windows' own unless its program says another company made it (Order 074)
+        let in_windows_folder = t.path.to_lowercase().starts_with(r"\microsoft\windows\");
+        let windows_own = (in_windows_folder && (info.company.is_none() || is_microsoft(&info))) || self.windows_own(&info, prog.as_deref());
         let switch = if windows_own && !self.policy.windows_tasks_switchable {
             Switch::Locked(LockReason::WindowsOwnTask)
         } else {
@@ -729,6 +731,21 @@ fn hive_name(h: Hive) -> &'static str {
         Hive::CurrentUser => "HKCU",
         Hive::LocalMachine => "HKLM",
     }
+}
+
+/// A Store app that is a PART OF WINDOWS (Order 074): Windows' own packages (`MicrosoftWindows.*` = publisher "Microsoft Windows",
+/// `Microsoft.Windows.*`, `Windows.*`) and the Microsoft.* components that ship inside it (Start feed, Windows Security).
+/// Everyone else - Spotify, Claude, iTunes, and Microsoft's own apps that are not Windows (Xbox, Phone Link, Windows Terminal) -
+/// is an ordinary row, whatever the startup kind. The publisher must say Microsoft too, so no other company's package can pass.
+fn store_app_is_windows_part(package_family: &str, publisher: Option<&str>) -> bool {
+    if !publisher.is_some_and(|p| p.to_lowercase().contains("microsoft")) {
+        return false;
+    }
+    let name = package_family.split('_').next().unwrap_or("").to_lowercase();
+    name.starts_with("microsoftwindows.")
+        || name.starts_with("microsoft.windows.")
+        || name.starts_with("windows.")
+        || matches!(name.as_str(), "microsoft.startexperiencesapp" | "microsoft.sechealthui")
 }
 
 fn is_microsoft(info: &os::FileInfo) -> bool {

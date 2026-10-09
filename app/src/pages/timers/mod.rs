@@ -1,7 +1,8 @@
 //! The Timers tab (menu-v22 page `tmr`, Order 018). The v21 design ("one clean timer with no blobby backgrounds"):
 //! the header switch Stopwatch / Countdown / World clock; ONE timer on the page itself (its name, the big time, the
-//! countdown's line, its buttons, then its options: On screen + Move, Sound at the end + ▶, its key); under it ONE list of
-//! all timers (World clock: the places), each with play / pause and its own On-screen switch; the timers on the screen
+//! countdown's line, its buttons, then its options: On screen + Move, Sound at the end + ▶, its key); under it "Your timers"
+//! (Order 078: only the ones added with "New timer", hidden while there are none; World clock: the places, added by a search
+//! over an offline list of cities), each with play / pause and its own On-screen switch; the timers on the screen
 //! itself (overlay.rs). The timers live in `model` (they keep running with the menu closed); this page only shows them.
 
 mod model;
@@ -17,7 +18,7 @@ use crate::pages::{Env, Page};
 use crate::ui::cx::{Cx, Ev};
 use crate::ui::el::{idx, key, lh, sub, Cursor, El, Key};
 use crate::ui::pieces::keyfield::{self, Show};
-use crate::ui::pieces::{self, btn_font, dropdown, group, link, mbtn, rowbits, seg, tinput};
+use crate::ui::pieces::{self, btn_font, dropdown, group, link, mbtn, rowbits, search, seg, tinput};
 use crate::ui::{cmix, ACC, ACC_S, CTL, CTL_H, FG, FG2, FG3, GREEN, HAIR, HOV, TRK, WHITE};
 use model::{Kind, Mode};
 
@@ -36,8 +37,13 @@ const K_ADD: Key = key("tmr.add");
 const K_MENU: Key = key("tmr.menu");
 const K_ROW: Key = key("tmr.row");
 const K_PLACE: Key = key("tmr.place");
+/// Order 078: the search box inside the "Add a place" list (its results are `idx(K_MENU, i)`)
+const K_CQ: Key = key("tmr.cq");
 const K_HERO: Key = key("tmr.hero");
 const LABELS: [&str; 3] = ["Stopwatch", "Countdown", "World clock"];
+
+/// Order 078: the "Add a place" list's width
+const POP_W: f32 = 300.0;
 
 /// `cdend`: .55 s ease-in-out, 3 times
 const END_MS: f64 = 550.0;
@@ -55,6 +61,9 @@ pub struct Timers {
     kerr: Option<(String, f64)>,
     /// the "Add a place" list is open: the button's box (window coordinates)
     menu: Option<(f32, f32, f32, f32)>,
+    /// Order 078: what is typed in that list's search box, and the result the arrow keys stand on
+    cq: String,
+    cq_sel: usize,
     toast: Option<(String, f64)>,
     /// the mode switch's fade-up started
     hero_at: Option<f64>,
@@ -299,13 +308,18 @@ impl Timers {
                 rows.push(El::text("No places yet.", Font::new(12.0, 400), FG2(), lh(12.0, 1.35)).pad(13.0, 12.0, 13.0, 12.0));
             }
         } else {
+            // Order 078: only the timers that were added; the big Stopwatch / Countdown on top is the tab's own
             let items = self.with(|m| {
-                m.timers
-                    .iter()
+                m.listed()
                     .map(|t| (t.id, t.kind, t.name.clone(), t.kind_text(), t.short_text(), t.share_left(), t.running(), t.screen, t.rgba(), t.id == m.sel))
                     .collect::<Vec<_>>()
             });
             count = items.len();
+            if count == 0 {
+                // nothing added: no "Your timers" title, no empty box - just the button to add one
+                let add = mbtn::mbtn(cx, K_ADD, mbtn::Mb::Icon("plus12", "New timer"), false);
+                return El::block().child(El::row().center().margin(20.0, 12.0, 7.0, 12.0).child(El::row().center().ml_auto().child(add)));
+            }
             for (i, it) in items.into_iter().enumerate() {
                 let tid = it.0;
                 let mut r = timer_row(cx, i == 0, it);
@@ -586,6 +600,7 @@ impl Page for Timers {
         });
         self.kerr = None;
         self.menu = None;
+        self.cq.clear();
         self.toast = None;
         self.hero_at = None;
         self.end_at = None;
@@ -702,7 +717,49 @@ impl Page for Timers {
             }
             Ev::Press(k, x, y, b) if *k == K_ADD => {
                 let _ = (x, y);
-                self.menu = if self.menu.is_some() { None } else { Some(*b) };
+                // (only the World clock's button opens a list; in Stopwatch / Countdown it adds a timer on the click)
+                if self.with(|m| m.mode) == Mode::Clk {
+                    self.menu = if self.menu.is_some() { None } else { Some(*b) };
+                    // it opens with the search box ready to type in
+                    self.cq.clear();
+                    self.cq_sel = 0;
+                    if self.menu.is_some() {
+                        cx.focus(Some(K_CQ));
+                    }
+                }
+            }
+            // (the list is gone - Esc closed it - but the field kept the focus: it hears nothing and lets go)
+            Ev::Char(k, _) | Ev::Key(k, _) if *k == K_CQ && self.menu.is_none() => cx.focus(None),
+            Ev::Char(k, c) if *k == K_CQ => {
+                if self.cq.chars().count() < 40 {
+                    search::edit_char(&mut self.cq, *c);
+                    self.cq_sel = 0;
+                }
+            }
+            Ev::Key(k, vk) if *k == K_CQ => match *vk {
+                0x0D => {
+                    // the row under the pointer is the highlighted one; else the arrowed one
+                    let at = (0..model::FOUND_MAX).find(|&i| cx.hovered(idx(K_MENU, i))).unwrap_or(self.cq_sel);
+                    if self.pick_found(at) {
+                        cx.focus(None);
+                    }
+                }
+                0x26 => self.cq_sel = self.cq_sel.saturating_sub(1),
+                0x28 => {
+                    let q = self.cq.clone();
+                    let n = self.with(|m| m.search_places(&q).len());
+                    self.cq_sel = (self.cq_sel + 1).min(n.saturating_sub(1));
+                }
+                0x08 => {
+                    self.cq.pop();
+                    self.cq_sel = 0;
+                }
+                _ => {}
+            },
+            Ev::Click(k) if *k == sub(K_CQ, "x") => {
+                self.cq.clear();
+                self.cq_sel = 0;
+                cx.focus(Some(K_CQ));
             }
             Ev::Char(k, c) if *k == K_NAME => {
                 if let Some((s, all)) = self.name_edit.as_mut() {
@@ -791,32 +848,66 @@ impl Page for Timers {
         // names, keys, switches: the screen follows (nothing in test copies)
         overlay::sync();
     }
+    /// Order 078: "Add a place" = a search box over every city of the offline list (type 2+ letters): each result shows its
+    /// country and the time there now; a click (or Enter on the first / the arrowed one) adds it.
     fn popup(&mut self, cx: &mut Cx) -> Option<El> {
         let (bx, by, bw, bh) = self.menu?;
-        let items: Vec<dropdown::Item> = self.with(|m| m.places_left()).into_iter().map(|(_, label)| dropdown::Item { label, checked: false, disabled: false }).collect();
-        if items.is_empty() {
-            self.menu = None;
-            return None;
+        let found = self.with(|m| m.search_places(&self.cq));
+        self.cq_sel = self.cq_sel.min(found.len().saturating_sub(1));
+        // the box: 300 px wide, 5 px padding; the search field fills it
+        let inner = POP_W - 10.0;
+        let mut kids = vec![search::search(cx, K_CQ, &self.cq, "Search any city or country", false).w(inner)];
+        let mut h = 10.0 + 28.0;
+        if found.is_empty() {
+            // `.mhead`-like hint line
+            let typed = self.cq.chars().filter(|c| c.is_alphanumeric()).count() >= 2;
+            let text = if typed { "No place found" } else { "Type a city, a town or a country" };
+            kids.push(El::text(text, Font::new(12.0, 400), FG3(), lh(12.0, 1.35)).pad(8.0, 6.0, 6.0, 6.0));
+            h += 8.0 + 16.0 + 6.0;
+        } else {
+            let any_hover = (0..found.len()).any(|i| cx.hovered(idx(K_MENU, i)));
+            for (i, f) in found.iter().enumerate() {
+                let k = idx(K_MENU, i);
+                let on = if any_hover { cx.hovered(k) } else { i == self.cq_sel };
+                let (c1, c2) = if on { (WHITE, WHITE) } else { (FG(), FG2()) };
+                let day = match f.day {
+                    d if d > 0 => " · tomorrow",
+                    d if d < 0 => " · yesterday",
+                    _ => "",
+                };
+                let mut r = El::row()
+                    .center()
+                    .gap(8.0)
+                    .h(28.0)
+                    .pad(0.0, 10.0, 0.0, 10.0)
+                    .radius(5.0)
+                    .child(El::text(f.place.city, Font::new(13.0, 400), c1, lh(13.0, 1.35)).ellipsis().flex1_auto())
+                    .child(El::text(f.place.land, Font::new(12.0, 400), c2, lh(12.0, 1.35)).none())
+                    .child(El::text(format!("{}{day}", f.time), Font::new(12.5, 600).tnum(), c1, lh(12.5, 1.35)).align(Align::Right).min_w(44.0).none())
+                    .on_click(k)
+                    .cursor(Cursor::Hand);
+                if on {
+                    r = r.bg(ACC());
+                }
+                kids.push(r);
+            }
+            h += 4.0 + 28.0 * found.len() as f32;
         }
-        // placeMenu: under the button, its left edge on the button's; too wide -> its right edge on the button's
-        let min_w = 150f32.max(bw);
-        let tw = items.iter().map(|i| cx.g.text_width(&i.label, Font::new(13.0, 400))).fold(0.0, f32::max);
-        let mw = (10.0 + 6.0 + 14.0 + 6.0 + tw + 14.0).max(min_w);
-        let mh = 10.0 + 26.0 * items.len() as f32;
+        // under the button, its left edge on the button's; too wide -> its right edge on the button's
         let mut left = bx;
         let mut top = by + bh + 4.0;
-        if left + mw > crate::ui::WIN_W - 8.0 {
-            left = 8f32.max(bx + bw - mw);
+        if left + POP_W > crate::ui::WIN_W - 8.0 {
+            left = 8f32.max(bx + bw - POP_W);
         }
-        if top + mh > crate::ui::WIN_H - 8.0 {
-            top = 8f32.max(by - mh - 4.0);
+        if top + h > crate::ui::WIN_H - 8.0 {
+            top = 8f32.max(by - h - 4.0);
         }
-        let list = dropdown::menu(cx, K_MENU, &items, left.round(), top.round(), min_w);
         // a click beside the list closes it (the frame's popup layer takes every click while a popup is open)
-        Some(list)
+        Some(dropdown::menu_box(cx, K_MENU, left.round(), top.round(), POP_W, h, 300.0, kids))
     }
     fn popup_dismiss(&mut self) {
         self.menu = None;
+        self.cq.clear();
     }
     fn describe(&self) -> String {
         model::with_existing(|m| {
@@ -826,7 +917,7 @@ impl Page for Timers {
                 m.mode,
                 sel,
                 m.timers.iter().map(|t| format!("{}{}", t.name, if t.screen { "*" } else { "" })).collect::<Vec<_>>().join(","),
-                m.places.iter().map(|p| p.city.clone()).collect::<Vec<_>>().join(","),
+                m.places.iter().map(|p| p.place.city).collect::<Vec<_>>().join(","),
                 m.pills(self.shown).len(),
                 overlay::window_exists(),
                 overlay::timer_armed(),
@@ -915,12 +1006,8 @@ impl Timers {
                 }
             }
             _ => {
-                if let Some(i) = (0..zones_len()).find(|&i| idx(K_MENU, i) == k) {
-                    let city = self.with(|m| m.places_left().get(i).map(|p| p.0));
-                    if let Some(c) = city {
-                        self.with(|m| m.add_place(c));
-                    }
-                    self.menu = None;
+                if let Some(i) = (0..model::FOUND_MAX).find(|&i| idx(K_MENU, i) == k) {
+                    let _ = self.pick_found(i);
                 } else if let Some(id) = self.row_part(k, "") {
                     self.apply_name();
                     self.apply_time();
@@ -945,23 +1032,24 @@ impl Timers {
                     self.with(|m| m.remove(id));
                     drop_action(id);
                 } else if let Some(i) = self.place_part(k, "sb") {
-                    self.with(|m| {
-                        let c = m.places.get(i).map(|p| p.city.clone());
-                        if let Some(c) = c {
-                            m.toggle_place_screen(&c);
-                        }
-                    });
+                    self.with(|m| m.toggle_place_screen(i));
                 } else if let Some(i) = self.place_part(k, "del") {
-                    self.with(|m| {
-                        let c = m.places.get(i).map(|p| p.city.clone());
-                        if let Some(c) = c {
-                            m.remove_place(&c);
-                        }
-                    });
+                    self.with(|m| m.remove_place(i));
                 }
             }
         }
         overlay::sync();
+    }
+
+    /// The result `i` of the "Add a place" search is added to the list; the box closes.
+    fn pick_found(&mut self, i: usize) -> bool {
+        let q = self.cq.clone();
+        let Some(f) = self.with(|m| m.search_places(&q).get(i).cloned()) else { return false };
+        self.with(|m| m.add_place(f.place));
+        self.menu = None;
+        self.cq.clear();
+        self.cq_sel = 0;
+        true
     }
 
     /// Which timer a row key (or one of its parts) belongs to.
@@ -980,10 +1068,6 @@ impl Timers {
         let n = self.with(|m| m.places.len());
         (0..n).find(|&i| sub(idx(K_PLACE, i), part) == k)
     }
-}
-
-fn zones_len() -> usize {
-    bu_timers::zones::PLACES.len()
 }
 
 impl Drop for Timers {
@@ -1012,4 +1096,13 @@ fn kerr(cx: &mut Cx, key: Key, text: &str, shown_at: f64) -> El {
     let e = crate::anim::EASE_OUT_CSS.ease(t) as f32;
     let _ = key;
     El::text(text, Font::new(11.5, 400), crate::ui::RED(), 15.0).align(crate::gfx::Align::Center).pad(4.0, 0.0, 0.0, 0.0).w_pct(100.0).opacity(e).translate(0.0, -3.0 * (1.0 - e))
+}
+
+/// Test copy only (Order 079 flicker probe, command `tmrtick`): the fake timer clock moves `ms` on.
+pub(crate) fn test_advance_clock(ms: u64) {
+    model::with_existing(|m| {
+        if let Some(fc) = &m.fake_clock {
+            fc.advance_ms(ms);
+        }
+    });
 }

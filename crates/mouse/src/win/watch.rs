@@ -2,8 +2,7 @@
 //! A_004_02), with the shared `bu_procwatch` watcher since Order 048 (one watcher for Display and Mouse). Event-driven,
 //! nothing injected, no WMI and no polling on a normal start.
 //!
-//! START = the app's PROCESS starting, before its window is on screen ("never mid-game", NOTE_004_01). Sources, tried
-//! in order:
+//! START = the app's PROCESS starting, before its window is on screen. Sources, tried in order:
 //! 1. `Win32_ProcessStartTrace` (WMI over the kernel trace) — exact, at creation, needs ADMIN; only tried when this
 //!    process runs elevated (checked on the token), so a normal start never touches WMI at all.
 //! 2. `WindowCreationStarts` — bu-procwatch: a new top-level window anywhere makes it take one process snapshot and
@@ -14,8 +13,9 @@
 //!
 //! Only exe names from the user's rows are listened for. With no rows there is no subscription at all.
 //!
-//! LATE = when the start is reported, the process already shows a visible top-level window (`EnumWindows`; no handle to
-//! the app). Reported as `has_window: true`; the switcher then does NOT switch ("never mid-game").
+//! ALREADY RUNNING (Order 077): a listed game that runs when it is added / when the app starts / when the switch goes on is not
+//! "too late" any more - `Mouse::adopt_running_games` finds it in a process snapshot and the engine gives it an exit wait
+//! with [`AppWatcher::watch_exit`] (still no handle to the game).
 //!
 //! STOP = `bu_procwatch::wait_exit_no_handle` (Order 063: NO handle to the game at all - not even SYNCHRONIZE; an anti-cheat
 //! protected game such as VALORANT is never opened): the exit is found by process snapshots - at every snapshot, when one of
@@ -27,9 +27,6 @@ use crate::error::{Error, Result};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
-use windows::core::BOOL;
-use windows::Win32::Foundation::{HWND, LPARAM};
-use windows::Win32::UI::WindowsAndMessaging::{EnumWindows, GetWindowThreadProcessId, IsWindowVisible};
 
 use super::wmi;
 
@@ -92,27 +89,6 @@ pub fn default_sources() -> Vec<Arc<dyn ProcessStartSource>> {
     v
 }
 
-/// True when the process already shows a top-level window (`EnumWindows`; no handle to the process).
-pub fn has_visible_window(pid: u32) -> bool {
-    struct F {
-        pid: u32,
-        found: bool,
-    }
-    unsafe extern "system" fn cb(h: HWND, lp: LPARAM) -> BOOL {
-        let f = unsafe { &mut *(lp.0 as *mut F) };
-        let mut p = 0u32;
-        unsafe { GetWindowThreadProcessId(h, Some(&mut p)) };
-        if p == f.pid && unsafe { IsWindowVisible(h) }.as_bool() {
-            f.found = true;
-            return BOOL(0);
-        }
-        BOOL(1)
-    }
-    let mut f = F { pid, found: false };
-    let _ = unsafe { EnumWindows(Some(cb), LPARAM(&mut f as *mut F as isize)) };
-    f.found
-}
-
 /// The live subscription, its source's index and name.
 type Running = Option<(Box<dyn Send>, usize, &'static str)>;
 type EventSink = Arc<dyn Fn(AppEvent) + Send + Sync>;
@@ -145,8 +121,7 @@ impl Inner {
         if self.stopped.load(Ordering::Acquire) {
             return;
         }
-        let has_window = has_visible_window(pid);
-        (self.sink)(AppEvent::Started { pid, exe, has_window });
+        (self.sink)(AppEvent::Started { pid, exe });
         // After Started: a process already gone is reported Stopped at once (from inside `wait_exit`), never before.
         self.wait_exit(pid);
     }
@@ -249,6 +224,12 @@ impl AppWatcher {
     /// Which source is listening now (for the report / the menu's diagnostics).
     pub fn active_source(&self) -> Option<&'static str> {
         lock(&self.inner.running).as_ref().map(|(_, _, n)| *n)
+    }
+
+    /// Waits for this process to end (no handle to it) and reports `Stopped` then - for a game found already running, whose
+    /// start was fed in by the caller. A process already gone reports `Stopped` at once.
+    pub fn watch_exit(&self, pid: u32) {
+        self.inner.wait_exit(pid);
     }
 
     /// Reports a start for this process as a source would (tests; also lets the menu hand over a process it knows).

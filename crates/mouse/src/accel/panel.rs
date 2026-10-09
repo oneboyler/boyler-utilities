@@ -11,6 +11,7 @@
 //!   Motivity starts at 1.05 (the drawing's 1 + one .05 step: Raw Accel refuses 1).
 //! - "Off" (a row's target, "Everywhere else", or the switch off) = Raw Accel's "Off" curve (noaccel) with sens 1.0 —
 //!   plain 1:1; the driver stays installed and running.
+//! - Linear's defaults are the owner's real Raw Accel settings (Order 077): Gain, Acceleration 2.6, Cap output 2.0, offset 55.
 //! - Raising Input offset to or past Cap: input while Cap type is Input / Both moves Cap: input to min(120, offset + 30),
 //!   the same rule DESIGN gives for switching the cap type (Raw Accel refuses "cap < offset").
 
@@ -118,10 +119,10 @@ pub fn rows(c: Curve) -> Vec<RowSpec> {
     use Field::*;
     match c {
         Curve::Linear => vec![
-            r(Acceleration, "Acceleration", 0.05, 5.0, 0.05, 2, false, 2.8),
+            r(Acceleration, "Acceleration", 0.05, 5.0, 0.05, 2, false, 2.6),
             r(InputOffset, "Input offset", 0.0, 120.0, 1.0, 0, false, 55.0),
             r(CapInput, "Cap: input", 1.0, 120.0, 1.0, 0, false, 15.0),
-            r(CapOutput, "Cap: output", 1.0, 5.0, 0.05, 2, true, 2.6),
+            r(CapOutput, "Cap: output", 1.0, 5.0, 0.05, 2, true, 2.0),
         ],
         Curve::Classic => vec![
             r(Acceleration, "Acceleration", 0.001, 0.1, 0.001, 3, false, 0.020),

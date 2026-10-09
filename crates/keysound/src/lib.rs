@@ -51,7 +51,7 @@ mod stream;
 pub mod watch;
 
 pub use kind::{kind_of, Kind, KINDS};
-pub use rules::{choose, choose_mouse, gain, Pack, Rule, Settings, DEFAULT_VOLUME};
+pub use rules::{choose, choose_mouse, gain, Pack, PlayOn, Rule, Settings, DEFAULT_VOLUME};
 pub use synth::{render_clicks, ClickSet, ClickStyle, PackId, SoundSet};
 
 #[cfg(windows)]

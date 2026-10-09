@@ -1,7 +1,7 @@
 //! World clock (menu-v21/v22 Timers › World clock): your own time and the time in other places.
 //!
-//! * The places a user can add are the drawing's list ([`PLACES`]: city, country, Windows time zone key). Each place's
-//!   time comes from **Windows' own time zone rules** (`EnumDynamicTimeZoneInformation` +
+//! * The places a user can add are searched in [`crate::cities`] (about 33 000 places: city, country, Windows time zone
+//!   key). Each place's time comes from **Windows' own time zone rules** (`EnumDynamicTimeZoneInformation` +
 //!   `SystemTimeToTzSpecificLocalTimeEx`), so summer time and rule changes are Windows' — no table of offsets here.
 //! * "Your time" = Windows' local time; its name = the city of your time zone that is the capital of the country set in
 //!   Windows (Settings › Time & language › Region), e.g. "Zagreb" for "(UTC+01:00) Sarajevo, Skopje, Warsaw, Zagreb" + HR;
@@ -18,24 +18,6 @@ pub struct Place {
     pub land: &'static str,
     /// The Windows time zone key (HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Time Zones\<key>).
     pub zone: &'static str,
-}
-
-/// The drawing's places, in its order (CITIES).
-pub const PLACES: [Place; 10] = [
-    Place { city: "New York", land: "USA", zone: "Eastern Standard Time" },
-    Place { city: "Los Angeles", land: "USA", zone: "Pacific Standard Time" },
-    Place { city: "London", land: "UK", zone: "GMT Standard Time" },
-    Place { city: "Tokyo", land: "Japan", zone: "Tokyo Standard Time" },
-    Place { city: "Sydney", land: "Australia", zone: "AUS Eastern Standard Time" },
-    Place { city: "Dubai", land: "UAE", zone: "Arabian Standard Time" },
-    Place { city: "São Paulo", land: "Brazil", zone: "E. South America Standard Time" },
-    Place { city: "Seoul", land: "South Korea", zone: "Korea Standard Time" },
-    Place { city: "Berlin", land: "Germany", zone: "W. Europe Standard Time" },
-    Place { city: "Singapore", land: "Singapore", zone: "Singapore Standard Time" },
-];
-
-pub fn place(city: &str) -> Option<Place> {
-    PLACES.iter().copied().find(|p| p.city == city)
 }
 
 /// A wall-clock time: date, time and weekday (0 = Sunday).
@@ -141,24 +123,33 @@ pub struct WorldView {
     pub places: Vec<(String, String, String)>,
 }
 
-/// The world clock's view for a list of places (cities of [`PLACES`]); unknown cities / zones show "—".
-pub fn world_view(os: &dyn ZoneOs, cities: &[&str]) -> WorldView {
+/// The world clock's view for a list of places; a zone this PC doesn't have shows "—".
+pub fn world_view(os: &dyn ZoneOs, list: &[Place]) -> WorldView {
     let utc = os.utc_now().as_secs() as i64;
     let my_off = os.local_offset_at(utc);
     let me = civil_at(utc, my_off);
     let my_days = days_from_civil(me.year, me.month, me.day);
-    let places = cities
+    let places = list
         .iter()
-        .map(|c| match place(c).and_then(|p| os.offset_at(p.zone, utc).map(|o| (p, o))) {
-            Some((p, off)) => {
+        .map(|p| match os.offset_at(p.zone, utc) {
+            Some(off) => {
                 let t = civil_at(utc, off);
                 let dd = days_from_civil(t.year, t.month, t.day) - my_days;
-                (c.to_string(), hhmm(&t), place_line(p.land, off - my_off, dd))
+                (p.city.to_string(), hhmm(&t), place_line(p.land, off - my_off, dd))
             }
-            None => (c.to_string(), "\u{2014}".into(), String::new()),
+            None => (p.city.to_string(), "\u{2014}".into(), String::new()),
         })
         .collect();
     WorldView { home_name: os.home_name(), home_time: hhmm(&me), home_line: home_line(&me), places }
+}
+
+/// The time in a place now, for a search result: ("04:37", +1 = tomorrow / −1 = yesterday / 0); `None` = this PC has no
+/// such zone.
+pub fn place_time(os: &dyn ZoneOs, p: &Place) -> Option<(String, i64)> {
+    let utc = os.utc_now().as_secs() as i64;
+    let me = civil_at(utc, os.local_offset_at(utc));
+    let t = civil_at(utc, os.offset_at(p.zone, utc)?);
+    Some((hhmm(&t), days_from_civil(t.year, t.month, t.day) - days_from_civil(me.year, me.month, me.day)))
 }
 
 /// How long until the shown minute changes (the app wakes then; nothing ticks in between).
@@ -227,6 +218,15 @@ impl ZoneOs for FakeZones {
             "Korea Standard Time" => 540,
             "W. Europe Standard Time" => 120,
             "Singapore Standard Time" => 480,
+            "India Standard Time" => 330,
+            "China Standard Time" => 480,
+            "Central Standard Time" => -300,
+            "Romance Standard Time" => 120,
+            "Central European Standard Time" => 120,
+            "Russian Standard Time" => 180,
+            "Turkey Standard Time" => 180,
+            "Cen. Australia Standard Time" => 630,
+            "Hawaiian Standard Time" => -600,
             _ => return None,
         })
     }
@@ -353,7 +353,8 @@ mod tests {
 
     #[test]
     fn the_drawings_places() {
-        let v = world_view(&FakeZones::default(), &["New York", "Tokyo"]);
+        let list = [crate::cities::find("New York", "USA").unwrap(), crate::cities::find("Tokyo", "Japan").unwrap()];
+        let v = world_view(&FakeZones::default(), &list);
         assert_eq!(v.home_name, "Zagreb");
         assert_eq!(v.home_time, "21:37");
         assert_eq!(v.places[0], ("New York".into(), "15:37".into(), "USA · \u{2212}6 h".into()));

@@ -60,6 +60,10 @@ impl AppDirs {
     pub fn rawaccel_before(&self) -> PathBuf {
         self.data.join("rawaccel").join("before")
     }
+    /// `<data>\rawaccel\written.bin` - the driver bytes this app set last (so an app restart can tell a newer write of Raw Accel).
+    pub fn accel_written(&self) -> PathBuf {
+        self.data.join("rawaccel").join("written.bin")
+    }
 }
 
 /// The Mouse tab's service.

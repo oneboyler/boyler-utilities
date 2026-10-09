@@ -117,6 +117,12 @@ pub struct Menu {
     pub last_frame: f64,
     /// the swap chain's waitable fired and no frame has used it yet (waiting on it again would lose it)
     pub slot: bool,
+    /// Order 079: the swap chains the glass still shows while the new ones (made by `rebuild`) get their first frames,
+    /// and how many presents on the new ones are still to come before the glass is switched over to them
+    retired: Option<(Swap, Swap)>,
+    switch_in: u8,
+    /// the glass shows the new chains: the retired ones go at the next frame
+    drop_retired: bool,
 }
 
 pub fn register_classes(wndproc: WNDPROC) -> Result<()> {
@@ -309,6 +315,9 @@ impl Menu {
                 presented_once: false,
                 last_frame: now,
                 slot: false,
+                retired: None,
+                switch_in: 0,
+                drop_retired: false,
             };
             ui::remember_widths(&m.g, &m.ui.device_names());
             crate::timing::note("open_step widths");
@@ -477,6 +486,7 @@ impl Menu {
     /// outside no longer closes the menu). The owned shadow window follows its owner (SetWindowPos: a window made
     /// topmost / non-topmost takes its owned windows along).
     pub fn set_topmost(&self, on: bool) {
+        FLK_Z.with(|z| z.set(z.get() + 1));
         if self.noact {
             return;
         }
@@ -489,6 +499,7 @@ impl Menu {
     /// Order 072: a fullscreen window (`front`, a game) is in front: the menu stops being topmost and sits just BELOW it (not at the
     /// top of the normal windows, which would cover the game).
     pub fn step_back_below(&self, front: HWND) {
+        FLK_Z.with(|z| z.set(z.get() + 1));
         if self.noact {
             return;
         }
@@ -517,6 +528,11 @@ impl Menu {
     pub fn frame(&mut self, now: f64) -> Result<()> {
         let p0 = timing::now();
         let c0 = if crate::testmode::env("BU_PROF").is_some() { timing::thread_cpu_ms() } else { 0.0 };
+        // Order 079: the swap chains the glass switched away from last frame go now
+        if self.drop_retired {
+            self.retired = None;
+            self.drop_retired = false;
+        }
         self.ui.update(now);
         // Settings › Glass style changed (a click on the Settings page): the glass brush and the window's tint / rim /
         // bubbles follow at once
@@ -559,9 +575,10 @@ impl Menu {
         self.glass.set_offset_y(frac);
         let p2 = timing::now();
         // Order 051: back on the GPU after a lost device (RETRY_MS later), or onto the CPU path when it is lost now
-        if self.gpu.is_none() && self.retry_at.is_some_and(|t| now >= t) {
-            // (Order 052 item 0: shaders still compiling - asked again a moment later; the worker wakes the menu when done)
-            self.retry_at = (!crate::shadercache::warm()).then_some(now + 250.0);
+        // (Order 052 item 0: shaders still compiling - not before the worker is done; it wakes the menu then. Order 079: it went
+        // back at once and the next shader still missing sent it straight back to the CPU - two rebuilds every ~250 ms)
+        if self.gpu.is_none() && self.retry_at.is_some_and(|t| now >= t) && crate::shadercache::warm() {
+            self.retry_at = None;
             if let Some(g) = gpu::get(Some(self.mon)) {
                 if let Err(e) = self.rebuild(Some(g)) {
                     timing::note(&format!("gpu retry failed {:08x}", e.code().0));
@@ -583,6 +600,7 @@ impl Menu {
             return Ok(());
         }
         let p3 = timing::now();
+        let probe = if flk_probe_on() { self.flk_read() } else { None };
         if let Err(e) = self.present(d) {
             if self.gpu.is_some() && (gpu::is_lost_error(&e) || self.gpu.as_ref().is_some_and(|g| g.lost())) {
                 // the frame is drawn again on the CPU at once: no blank window (Order 052 item 0: also a frame that was
@@ -604,6 +622,16 @@ impl Menu {
                 self.present(d)?;
             } else {
                 return Err(e);
+            }
+        } else if let Some(px) = probe {
+            flk_check(px, d, self.w, self.h);
+        }
+        // Order 079: a rebuild's new swap chains hold a presented frame now (two presents: the first is surely on the
+        // screen by the second) - the glass shows them from here and the old ones go
+        if self.switch_in > 0 {
+            self.switch_in -= 1;
+            if self.switch_in == 0 {
+                self.switch_glass()?;
             }
         }
         // (a refresh asked after an empty frame is not needed any more: the swap chain paces again)
@@ -641,7 +669,8 @@ impl Menu {
             self.presented_once = true;
             timing::first_present(now);
         }
-        self.ui.dirty = false;
+        // (a rebuild's second present is still to come: one more frame, whatever else moves - Order 079)
+        self.ui.dirty = self.switch_in > 0 || self.drop_retired;
         Ok(())
     }
 
@@ -671,18 +700,38 @@ impl Menu {
         self.rebuild(None)
     }
 
-    /// The menu's swap chains, glass and layers again on `gpu` (None = the CPU path); the next frame paints everything.
+    /// The menu's swap chains and layers again on `gpu` (None = the CPU path); the next frame paints everything.
+    /// Order 079 (the owner: "sometimes the program will be flashing on and off"): the window's compositor, target and glass
+    /// STAY. Before, they were closed and made again here: the window was composed empty until the new ones showed a
+    /// frame - and this runs twice for every shader the GPU path has not compiled yet (to the CPU and back), many times
+    /// an hour. Now the glass keeps showing the old swap chains until the new ones have presented (`switch_glass`).
     fn rebuild(&mut self, gpu: Option<Rc<Gpu>>) -> Result<()> {
         let t = timing::now();
-        self.glass.close();
         drop_tiles();
         ui::reset_caches();
         self.ui.clear_dock_cache();
         let (gpu, chain, mask) = make_swaps(gpu, &self.g, self.w, self.h)?;
-        let (cw, ch) = chain.size();
-        self.glass = Glass::new(self.hwnd, (chain.swap(), cw, ch), mask.swap(), None, self.w as f32, self.h as f32, RADIUS * self.scale, self.mode)?;
-        self.chain = chain;
-        self.mask = mask;
+        if matches!(self.mode, crate::comp::GlassMode::Host | crate::comp::GlassMode::BlurBehind) {
+            // (chains already switched away from, still waiting to go: they go now)
+            if self.drop_retired {
+                self.retired = None;
+                self.drop_retired = false;
+            }
+            let old = (std::mem::replace(&mut self.chain, chain), std::mem::replace(&mut self.mask, mask));
+            // (a switch still waiting: the chains made for it were never shown - they simply go; the shown ones stay)
+            if self.retired.is_none() {
+                self.retired = Some(old);
+            }
+            // (on the very first frames the old chains never showed anything: switched after one present)
+            self.switch_in = if self.presented_once { 2 } else { 1 };
+        } else {
+            // the test-only glass modes (own capture / GPU capture): made again whole, as before
+            self.glass.close();
+            let (cw, ch) = chain.size();
+            self.glass = Glass::new(self.hwnd, (chain.swap(), cw, ch), mask.swap(), None, self.w as f32, self.h as f32, RADIUS * self.scale, self.mode)?;
+            self.chain = chain;
+            self.mask = mask;
+        }
         self.ly = Layers::new(gpu.clone(), self.w, self.h)?;
         self.lc = surf_on(gpu.as_ref(), self.w, self.h)?;
         self.gpu = gpu;
@@ -695,9 +744,50 @@ impl Menu {
         Ok(())
     }
 
+    /// Order 079: the glass shows the swap chains `rebuild` made (they hold a presented frame now); the old ones go.
+    fn switch_glass(&mut self) -> Result<()> {
+        let (cw, ch) = self.chain.size();
+        if let Err(e) = self.glass.attach((self.chain.swap(), cw, ch), self.mask.swap()) {
+            // (the compositor refused: the glass made again whole, the old way)
+            timing::note(&format!("glass attach failed {:08x}: made again", e.code().0));
+            self.glass.close();
+            self.glass = Glass::new(self.hwnd, (self.chain.swap(), cw, ch), self.mask.swap(), None, self.w as f32, self.h as f32, RADIUS * self.scale, self.mode)?;
+            self.glass.set_opacity(self.last_alpha as f32 / 255.0);
+        }
+        // (the old chains go at the next frame, after the compositor has taken the change)
+        self.drop_retired = true;
+        self.ui.dirty = true;
+        timing::note("glass switched to the new swap chains");
+        Ok(())
+    }
+
+    /// Order 079 probe (test copy, BU_FLK=1): the frame about to be presented, read back whole (what DWM gets).
+    fn flk_read(&mut self) -> Option<Vec<u8>> {
+        let info = sk::ImageInfo::new((self.w, self.h), sk::ColorType::BGRA8888, sk::AlphaType::Premul, None);
+        let mut px = vec![0u8; (self.w * self.h * 4) as usize];
+        self.lc.read_pixels(&info, &mut px, (self.w * 4) as usize, (0, 0)).then_some(px)
+    }
+
     /// Which path draws the menu now (test command `gpustate`).
     pub fn gpu_state(&self) -> String {
         format!("path={} chain_gpu={} device_alive={}", if self.gpu.is_some() { "gpu" } else { "cpu" }, self.chain.is_gpu(), gpu::alive())
+    }
+
+    /// Test only (`pathflip`, Order 079): what a shader missing on the GPU / the worker done does - the GPU path to the
+    /// CPU one, or back.
+    pub fn switch_path_for_test(&mut self) -> Result<()> {
+        match self.gpu.clone() {
+            Some(g) => {
+                self.rebuild(None)?;
+                gpu::keep(g);
+            }
+            None => {
+                if let Some(g) = gpu::get(Some(self.mon)) {
+                    self.rebuild(Some(g))?;
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Test only (`gpulose`): the device removed as a driver crash would.
@@ -1403,6 +1493,10 @@ impl Drop for Menu {
             self.glass.close();
             self.chain.release();
             self.mask.release();
+            if let Some((c, m)) = self.retired.take() {
+                c.release();
+                m.release();
+            }
             // (the GPU tile goes too: nothing of ours may keep the device alive while the menu is closed - Order 051)
             drop_tiles();
             // (the capture chain is the worker's: not touched here, it goes when the worker lets go of it)
@@ -1859,4 +1953,65 @@ fn sys_highlight() -> Rgba {
         let c = GetSysColor(COLOR_HIGHLIGHT);
         Rgba::rgb((c & 0xff) as u8, ((c >> 8) & 0xff) as u8, ((c >> 16) & 0xff) as u8)
     }
+}
+
+/// Order 079 probe (test copy only, BU_FLK=1): every presented frame is compared with the one before it OUTSIDE the
+/// rectangle the present says changed. A pixel that differs there is one the screen shows old or new depending on when
+/// DWM composes the window again (a blink); `blank` = pixels inside the window (16 px in) with no paint at all.
+pub fn flk_probe_on() -> bool {
+    crate::testmode::env("BU_FLK").is_some()
+}
+
+thread_local! {
+    static FLK_PREV: std::cell::RefCell<Option<Vec<u8>>> = const { std::cell::RefCell::new(None) };
+    /// frames, partial frames, partial frames with a pixel changed outside their rect, frames with blank pixels
+    pub static FLK_STATS: std::cell::Cell<(u64, u64, u64, u64)> = const { std::cell::Cell::new((0, 0, 0, 0)) };
+    /// z-order calls (set_topmost / step_back_below)
+    pub static FLK_Z: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+fn flk_check(px: Vec<u8>, d: Dirty, w: i32, h: i32) {
+    let (mut n, mut part, mut bad, mut blank) = FLK_STATS.with(|s| s.get());
+    n += 1;
+    let mut nb = 0usize;
+    for y in 16..(h - 16).max(16) {
+        for x in 16..(w - 16).max(16) {
+            if px[((y * w + x) * 4 + 3) as usize] == 0 {
+                nb += 1;
+            }
+        }
+    }
+    if nb > 0 {
+        blank += 1;
+        timing::note(&format!("flk blank frame {n} pixels {nb}"));
+    }
+    if let Dirty::Rect(r) = d {
+        part += 1;
+        FLK_PREV.with(|p| {
+            if let Some(prev) = p.borrow().as_ref() {
+                let (mut cnt, mut mx, mut first, mut bb) = (0usize, 0u8, None, (i32::MAX, i32::MAX, i32::MIN, i32::MIN));
+                for y in 0..h {
+                    for x in 0..w {
+                        if x >= r.left && x < r.right && y >= r.top && y < r.bottom {
+                            continue;
+                        }
+                        let i = ((y * w + x) * 4) as usize;
+                        let dd = (0..4).map(|k| px[i + k].abs_diff(prev[i + k])).max().unwrap_or(0);
+                        if dd > 0 {
+                            cnt += 1;
+                            mx = mx.max(dd);
+                            first.get_or_insert((x, y));
+                            bb = (bb.0.min(x), bb.1.min(y), bb.2.max(x), bb.3.max(y));
+                        }
+                    }
+                }
+                if cnt > 0 {
+                    bad += 1;
+                    timing::note(&format!("flk outside frame {n} rect {:?} diff {cnt} max {mx} first {:?} box {:?}", (r.left, r.top, r.right, r.bottom), first, bb));
+                }
+            }
+        });
+    }
+    FLK_PREV.with(|p| *p.borrow_mut() = Some(px));
+    FLK_STATS.with(|s| s.set((n, part, bad, blank)));
 }

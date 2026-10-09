@@ -72,11 +72,43 @@ const K_MDDEL: Key = key("kbd.mddel");
 const K_MDDONE: Key = key("kbd.mddone");
 const K_STEP: Key = key("kbd.step");
 const K_RESET: Key = key("kbd.reset");
+const K_PLAYON: Key = key("kbd.playon");
+/// The Get-more-sounds window: its search box and a row's play button.
+const K_GSEARCH: Key = key("kbd.gsearch");
+const K_GPLAY: Key = key("kbd.gplay");
+/// The "Remove this sound?" question (right-click on an imported or downloaded sound in the list).
+const K_DELQ: Key = key("kbd.delq");
 
 /// The job that writes the remaps (the admin prompt never holds the menu).
 const JOB_APPLY: &str = "kbd.apply";
 /// The second box of the ISO Enter is `K_KEY` index + this.
 const ISO_LOWER: usize = 1000;
+
+/// Job ends already acted on. The page is made new every time its tab opens, but a finished job stays in the job list: without
+/// this, an old "Get" download that ended earlier would be acted on again at every open and make its pack the sound again
+/// (Order 076, the owner: "i change the sound, switch tabs, come back and its back to ... the one i had selected before").
+struct Seen<T>(Vec<T>);
+
+impl<T: PartialEq + Copy> Seen<T> {
+    /// True the first time `id` is asked, false ever after.
+    fn first(&mut self, id: T) -> bool {
+        if self.0.contains(&id) {
+            return false;
+        }
+        if self.0.len() >= 64 {
+            self.0.remove(0);
+        }
+        self.0.push(id);
+        true
+    }
+}
+
+static SEEN: std::sync::Mutex<Seen<(&'static str, crate::jobs::JobId)>> = std::sync::Mutex::new(Seen(Vec::new()));
+
+/// Is this the first time the page sees the end of job `id` of the job kind `key`?
+fn first_end(key: &'static str, id: crate::jobs::JobId) -> bool {
+    SEEN.lock().unwrap_or_else(|p| p.into_inner()).first((key, id))
+}
 
 /// A list that is open (its anchor = the button's box, from the press before the click).
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -98,7 +130,6 @@ enum Choice {
     PackOff,
     GetMore,
     Import,
-    ImportFolder,
     Template(usize),
     Target(Code),
     Preset(Preset),
@@ -136,8 +167,6 @@ pub struct Keyboard {
     rec_at: Option<f64>,
     listen_step: Option<usize>,
     opened_at: f64,
-    /// The apply job already handled.
-    job_done: Option<crate::jobs::JobId>,
     /// Remaps were written this session: Windows needs a restart for them.
     restart: bool,
     test: bool,
@@ -148,10 +177,13 @@ pub struct Keyboard {
     import_msg: Option<String>,
     /// A key was left as Windows made it because its action pressed that same key (the line under the keyboard).
     loop_note: Option<String>,
-    /// The "Get more sounds" window is open, the line it shows, the download job already handled.
+    /// The "Get more sounds" window is open and the line it shows.
     get_open: bool,
     get_msg: Option<String>,
-    get_done: Option<crate::jobs::JobId>,
+    /// The search box of the Get-more-sounds window.
+    get_q: String,
+    /// "Remove this sound?" is asked for this imported pack, at this place.
+    ask_del: Option<(String, (f32, f32))>,
 }
 
 impl Keyboard {
@@ -283,7 +315,7 @@ impl Keyboard {
             }
             let imp = self.imported();
             if !imp.is_empty() {
-                v.push(("Imported".into(), Choice::Heading, false));
+                v.push(("Imported or downloaded · right-click to remove".into(), Choice::Heading, false));
                 for n in imp {
                     let p = Pack::Imported(n.clone());
                     v.push((n, Choice::Pack(p.clone()), cur == Some(&p)));
@@ -291,8 +323,7 @@ impl Keyboard {
             }
             if with_import {
                 v.push(("Get more sounds…".into(), Choice::GetMore, false));
-                v.push(("Import a Mechvibes pack (.zip)…".into(), Choice::Import, false));
-                v.push(("Import a Mechvibes pack folder…".into(), Choice::ImportFolder, false));
+                v.push(("Import a pack…".into(), Choice::Import, false));
             }
         };
         match p {
@@ -383,9 +414,9 @@ impl Keyboard {
                 }
             }
             Choice::GetMore => self.open_get(cx),
-            Choice::Import | Choice::ImportFolder => {
+            Choice::Import => {
                 self.pop = None;
-                self.import_pack(cx, c == Choice::ImportFolder);
+                self.import_pack(cx);
             }
             Choice::Template(i) => {
                 self.pop = None;
@@ -509,18 +540,23 @@ impl Keyboard {
         if !self.prefs.on || self.test {
             return;
         }
-        let p = p.clone();
+        let (p, play_on) = (p.clone(), self.prefs.s.play_on);
         // the key-up sound a moment after the key-down (a short-lived thread, only for this click)
         std::thread::spawn(move || {
-            glue::engine().preview(&p, Kind::Down);
+            if play_on.plays(true) {
+                glue::engine().preview(&p, Kind::Down);
+            }
             std::thread::sleep(std::time::Duration::from_millis(90));
-            glue::engine().preview(&p, Kind::Up);
+            if play_on.plays(false) {
+                glue::engine().preview(&p, Kind::Up);
+            }
         });
     }
 
-    /// "Import a Mechvibes pack": the .zip as the site hands it out, or a folder. A clear line when it isn't a pack.
-    fn import_pack(&mut self, cx: &mut Cx, folder: bool) {
-        let picked = if folder { cx.pick_folder("Pick a Mechvibes sound pack folder") } else { cx.pick_file("Pick the Mechvibes pack (.zip)", &[("Mechvibes pack", "*.zip")]) };
+    /// "Import a pack…": ONE picker for the .zip as the site hands it out or a pack folder (a folder is picked by the
+    /// config.json inside it: a file dialog can't pick both kinds). A clear line when it isn't a pack.
+    fn import_pack(&mut self, cx: &mut Cx) {
+        let picked = cx.pick_file("Pick a Mechvibes pack: its .zip, or the config.json inside its folder", &[("Mechvibes pack (.zip or config.json)", "*.zip;config.json")]);
         let Some(src) = picked else { return };
         let dir = crate::services::with(|s| glue::packs_dir(s.store.folder()));
         let Some(dir) = dir else { return };
@@ -536,6 +572,53 @@ impl Keyboard {
                 cx.toast(&format!("Not imported: {e}"));
             }
         }
+    }
+
+    /// Right-click on an imported or downloaded sound in the list: ask before removing it.
+    fn ask_remove(&mut self, k: Key, x: f32, y: f32) {
+        if self.pop.is_none() {
+            return;
+        }
+        for i in 0..64 {
+            if k == idx(K_MENU, i) {
+                if let Some(p) = self.pop.map(|(p, _)| p) {
+                    if let Some((_, Choice::Pack(Pack::Imported(n)), _)) = self.list(p).get(i).cloned() {
+                        self.ask_del = Some((n, (x, y)));
+                    }
+                }
+                return;
+            }
+        }
+    }
+
+    /// The pack is gone from the PC: the settings that used it go back to a sound that exists (the general sound to Linear,
+    /// a program's own sound to Off) and the engine lets its sounds go. Pure state; the files are `remove_pack`.
+    fn forget_pack(&mut self, name: &str) -> bool {
+        let gone = Pack::Imported(name.to_string());
+        let was_in_use = self.prefs.s.pack == gone;
+        if was_in_use {
+            self.prefs.s.pack = Pack::Builtin(bu_keysound::PackId::Linear);
+        }
+        for r in self.prefs.s.rules.iter_mut().filter(|r| r.pack.as_ref() == Some(&gone)) {
+            r.pack = None;
+        }
+        was_in_use
+    }
+
+    /// "Remove" was confirmed: the pack's folder is deleted, the settings that used it fall back.
+    fn remove_pack(&mut self, name: &str, cx: &mut Cx) {
+        let dir = crate::services::with(|s| glue::packs_dir(s.store.folder()));
+        if !self.test {
+            let Some(dir) = dir else { return };
+            if let Err(e) = bu_keysound::import::remove(&dir, name) {
+                cx.toast(&format!("Not removed: {e}"));
+                return;
+            }
+            glue::engine().set_imported(name, None);
+        }
+        let was_in_use = self.forget_pack(name);
+        self.save();
+        cx.toast(&if was_in_use { format!("{name} removed · the sound is Linear again") } else { format!("{name} removed") });
     }
 
     fn new_macro(&mut self) -> Option<String> {
@@ -661,16 +744,16 @@ impl Keyboard {
     fn follow_job(&mut self, cx: &mut Cx) {
         let Some(v) = cx.job(JOB_APPLY) else { return };
         let Some(end) = v.end.clone() else { return };
-        if self.job_done == Some(v.id) {
+        if !first_end(JOB_APPLY, v.id) {
             return;
         }
-        self.job_done = Some(v.id);
         match end {
             crate::jobs::End::Done(_) => {
                 let before = self.model.applied.clone();
                 let now = self.model.pending.clone();
                 self.model.mark_applied();
                 self.restart = true;
+                glue::set_restart_pending();
                 cx.record(
                     "remap",
                     "Key remaps",
@@ -728,15 +811,24 @@ impl Page for Keyboard {
         }
         self.follow_job(cx);
         self.follow_get(cx);
+        self.follow_preview(cx);
         self.view(cx)
     }
     fn popup(&mut self, cx: &mut Cx) -> Option<El> {
         self.popups(cx)
     }
     fn popup_dismiss(&mut self) {
-        if self.get_open {
+        if self.ask_del.is_some() {
+            self.ask_del = None;
+        } else if self.get_open {
             self.get_open = false;
             gallery::OPEN.store(false, std::sync::atomic::Ordering::SeqCst);
+            // a preview still going stops too (the window closed some other way than Done)
+            crate::services::with(|s| {
+                if let Some(v) = s.jobs.view_key(gallery::JOB_PREVIEW) {
+                    s.jobs.stop(v.id);
+                }
+            });
         } else if self.pop.is_some() {
             self.pop = None;
         } else if self.edit.is_some() {
@@ -802,6 +894,7 @@ impl crate::undo::Resettable for Keyboard {
         self.model.applied = maps.clone();
         self.model.pending = maps;
         self.restart = true;
+        glue::set_restart_pending();
         Ok(())
     }
 }

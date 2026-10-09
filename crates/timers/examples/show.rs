@@ -46,12 +46,22 @@ fn main() {
         peak,
         chime_wav().len()
     );
-    // the World clock from Windows' own time zone rules (read-only)
+    // the World clock from Windows' own time zone rules (read-only), places found in the offline list
     #[cfg(windows)]
     {
         let z = bu_timers::zones::RealZones;
-        let cities: Vec<&str> = bu_timers::zones::PLACES.iter().map(|p| p.city).collect();
-        let w = bu_timers::zones::world_view(&z, &cities);
+        let t0 = std::time::Instant::now();
+        let first = bu_timers::cities::search("zag", 8);
+        println!("city list: {} places; first search ('zag') took {:?}", bu_timers::cities::count(), t0.elapsed());
+        let mut list = Vec::new();
+        for q in ["new york", "tokyo", "sao pau", "mumbai", "reykjav", "sydney", "zagreb"] {
+            let t0 = std::time::Instant::now();
+            let hits = bu_timers::cities::search(q, 8);
+            println!("  search {q:<9} -> {} hits in {:?}: {}", hits.len(), t0.elapsed(), hits.iter().take(3).map(|p| format!("{} · {}", p.city, p.land)).collect::<Vec<_>>().join(" | "));
+            list.extend(hits.first().copied());
+        }
+        let _ = first;
+        let w = bu_timers::zones::world_view(&z, &list);
         println!("world clock: {} {} ({})", w.home_name, w.home_time, w.home_line);
         for (c, t, l) in &w.places {
             println!("  {c:<12} {t}  {l}");

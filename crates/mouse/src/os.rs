@@ -191,6 +191,11 @@ pub trait MouseOs {
     fn process_running(&self, _exe: &str) -> Result<bool> {
         Ok(false)
     }
+    /// The processes running now whose exe file name is one of `names` (lower case): (pid, file name). One process-list
+    /// snapshot - no process handle is opened (the games are never touched). For a listed game that is already running.
+    fn running_processes(&self, _names: &[String]) -> Result<Vec<(u32, String)>> {
+        Ok(Vec::new())
+    }
     /// The pause between two "is the mouse online?" polls (a waking mouse links within ~1-3 s). The fake returns at once.
     fn pause_ms(&self, ms: u64) {
         std::thread::sleep(std::time::Duration::from_millis(ms));

@@ -633,3 +633,55 @@ fn saved_task_and_service_go_back() {
     }
     assert!(State::from_text("maybe").is_none() && Target::from_text("flag|HKXX|Run|a").is_none());
 }
+
+fn store(family: &str, task: &str, publisher: &str) -> StoreStartupTask {
+    StoreStartupTask {
+        package_family: family.into(),
+        task_id: task.into(),
+        state: 2,
+        display_name: Some(task.into()),
+        publisher: Some(publisher.into()),
+        logo: None,
+    }
+}
+
+/// Order 074 (the owner: "why is spotify windows only"): a Store app is "Windows" only when it is a part of Windows - every other
+/// publisher, and Microsoft's own apps that are not Windows (Xbox, Phone Link, Windows Terminal), are ordinary rows, whatever the
+/// startup kind.
+#[test]
+fn only_parts_of_windows_are_windows_store_apps() {
+    let f = FakeOs::new()
+        .store(store("SpotifyAB.SpotifyMusic_zpdnekdrzrea0", "SpotifyLauncher", "Spotify AB"))
+        .store(store("Claude_pzs8sxrjxfjjc", "ClaudeStartup", "Anthropic, PBC"))
+        .store(store("Microsoft.GamingApp_8wekyb3d8bbwe", "Xbox", "Microsoft Corporation"))
+        .store(store("Microsoft.YourPhone_8wekyb3d8bbwe", "YourPhone.Start", "Microsoft Corporation"))
+        .store(store("Microsoft.WindowsTerminal_8wekyb3d8bbwe", "Term", "Microsoft Corporation"))
+        .store(store("Microsoft.StartExperiencesApp_8wekyb3d8bbwe", "Feed", "Microsoft Corporation"))
+        .store(store("MicrosoftWindows.CrossDevice_cw5n1h2txyewy", "CrossDevice.Start", "Microsoft Windows"))
+        .store(store("Windows.Fake_abc", "Spoof", "Some Other Company"));
+    let l = Startup::new(f).list();
+    let own = |id: &str| l.entries.iter().find(|e| e.id.starts_with(id)).unwrap().windows_own;
+    assert!(!own("store|SpotifyAB"));
+    assert!(!own("store|Claude_"));
+    assert!(!own("store|Microsoft.GamingApp"));
+    assert!(!own("store|Microsoft.YourPhone"));
+    assert!(!own("store|Microsoft.WindowsTerminal"));
+    assert!(own("store|Microsoft.StartExperiencesApp"));
+    assert!(own("store|MicrosoftWindows.CrossDevice"));
+    assert!(!own("store|Windows.Fake"), "a package must also be published by Microsoft");
+}
+
+/// Order 074: a task in \Microsoft\Windows\ is Windows' own - but one whose program names another company is an ordinary task,
+/// and a Microsoft task outside \Microsoft\Windows\ (Office, Edge) is not a part of Windows.
+#[test]
+fn a_task_is_windows_only_when_microsoft_made_it_in_the_windows_folder() {
+    let f = pc()
+        .file(r"C:\Program Files\Vendor\vtask.exe", "Vendor Inc.", "Vendor task")
+        .task(task(r"\Microsoft\Windows\Vendor\VTask", true, r"C:\Program Files\Vendor\vtask.exe"))
+        .task(task(r"\Microsoft\Office\Sync", true, r"C:\Program Files\Updater\upd.exe"));
+    let l = Startup::new(f).list();
+    let own = |p: &str| find(&l, p).windows_own;
+    assert!(own(r"task|\Microsoft\Windows\Foo\WinTask"));
+    assert!(!own(r"task|\Microsoft\Windows\Vendor\VTask"));
+    assert!(!own(r"task|\Microsoft\Office\Sync"));
+}

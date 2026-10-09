@@ -19,6 +19,52 @@ pub fn gain(volume: u8) -> f32 {
     PEAK_AT_FULL * 10f32.powf(-RANGE_DB * (1.0 - v / 100.0) / 20.0)
 }
 
+/// "Play on" (Order 076): which half of a press makes the sound - keys and mouse buttons alike.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PlayOn {
+    /// A sound when the key / button goes down and another when it comes up (the default).
+    #[default]
+    Both,
+    /// Only when it goes down.
+    Press,
+    /// Only when it comes up.
+    Release,
+}
+
+impl PlayOn {
+    pub const ALL: [PlayOn; 3] = [PlayOn::Both, PlayOn::Press, PlayOn::Release];
+
+    /// The text kept in the settings file.
+    pub fn key(self) -> &'static str {
+        match self {
+            PlayOn::Both => "both",
+            PlayOn::Press => "press",
+            PlayOn::Release => "release",
+        }
+    }
+
+    pub fn from_key(s: &str) -> PlayOn {
+        PlayOn::ALL.into_iter().find(|p| p.key() == s).unwrap_or_default()
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            PlayOn::Both => "Press + release",
+            PlayOn::Press => "Press only",
+            PlayOn::Release => "Release only",
+        }
+    }
+
+    /// Does a key / button going `down` (true) or up (false) make a sound?
+    pub fn plays(self, down: bool) -> bool {
+        match self {
+            PlayOn::Both => true,
+            PlayOn::Press => down,
+            PlayOn::Release => !down,
+        }
+    }
+}
+
 /// A sound pack: one of ours, or one the user imported (its folder name under the app's pack folder).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Pack {
@@ -65,6 +111,8 @@ pub struct Settings {
     pub mouse_on: bool,
     /// The mouse sounds' own volume (0-100, default [`DEFAULT_VOLUME`]).
     pub mouse_volume: u8,
+    /// "Play on" (Order 076): press + release (default), press only or release only - for the keys and the mouse.
+    pub play_on: PlayOn,
 }
 
 impl Default for Settings {
@@ -77,6 +125,7 @@ impl Default for Settings {
             rules: Vec::new(),
             mouse_on: false,
             mouse_volume: DEFAULT_VOLUME,
+            play_on: PlayOn::Both,
         }
     }
 }
@@ -183,6 +232,18 @@ mod tests {
         assert!((gain(100) - 0.5).abs() < 1e-6);
         assert!((gain(5) - 0.5 * 10f32.powf(-40.0 * 0.95 / 20.0)).abs() < 1e-6);
         assert!(gain(50) > gain(5) && gain(100) > gain(50));
+    }
+
+    #[test]
+    fn play_on_picks_which_half_of_a_press_sounds() {
+        assert_eq!(Settings::default().play_on, PlayOn::Both, "press + release is the default");
+        assert!(PlayOn::Both.plays(true) && PlayOn::Both.plays(false));
+        assert!(PlayOn::Press.plays(true) && !PlayOn::Press.plays(false));
+        assert!(!PlayOn::Release.plays(true) && PlayOn::Release.plays(false));
+        for p in PlayOn::ALL {
+            assert_eq!(PlayOn::from_key(p.key()), p);
+        }
+        assert_eq!(PlayOn::from_key("nonsense"), PlayOn::Both);
     }
 
     #[test]

@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex};
 
 pub const JOB_LIST: &str = "kbd.gallery";
 pub const JOB_GET: &str = "kbd.get";
+pub const JOB_PREVIEW: &str = "kbd.gprev";
 
 /// What the window paints.
 #[derive(Clone, Debug, Default)]
@@ -25,6 +26,8 @@ pub struct Gal {
     pub error: Option<String>,
     /// the pack being downloaded (site id) and its progress text
     pub getting: Option<(String, String)>,
+    /// the pack being fetched to be heard (site id): its play button waits
+    pub previewing: Option<String>,
 }
 
 static GAL: Mutex<Option<Gal>> = Mutex::new(None);
@@ -247,6 +250,76 @@ pub fn get_job(
             }
             Err(e) => Err(crate::jobs::JobError::Failed(e)),
         }
+    }
+}
+
+/// The name a pack has in the engine while it is heard before it is got (no folder can have it: `folder_name` never makes it).
+const PREVIEW_NAME: &str = "\u{1}preview";
+
+/// A few keys: (sound, wait before it in ms).
+const PREVIEW_KEYS: [(bu_keysound::Kind, u64); 10] = [
+    (bu_keysound::Kind::Down, 0),
+    (bu_keysound::Kind::Up, 80),
+    (bu_keysound::Kind::Down, 170),
+    (bu_keysound::Kind::Up, 70),
+    (bu_keysound::Kind::Down, 200),
+    (bu_keysound::Kind::Up, 80),
+    (bu_keysound::Kind::Space, 260),
+    (bu_keysound::Kind::Up, 90),
+    (bu_keysound::Kind::Enter, 320),
+    (bu_keysound::Kind::Up, 90),
+];
+
+/// Job: the play button of a row. Fetches the pack in memory, plays a few keys of it through the engine and lets it go -
+/// nothing is written to disk, nothing is kept. Works while the key sounds are off too (the engine then runs only for this,
+/// listening to no key, and stops again unless the switch was turned on meanwhile).
+pub fn preview_job(
+    p: Listed,
+    fetch: Arc<dyn Fetch + Send + Sync>,
+    mut settings: bu_keysound::Settings,
+) -> impl FnOnce(&crate::jobs::JobCtx) -> Result<String, crate::jobs::JobError> + Send + 'static {
+    move |job| {
+        // (cleared however the job ends, a panic included)
+        struct Clear;
+        impl Drop for Clear {
+            fn drop(&mut self) {
+                update(|g| g.previewing = None);
+            }
+        }
+        update(|g| g.previewing = Some(p.id.clone()));
+        let _clear = Clear;
+        job.status("Loading the sound…");
+        let r = (|| -> Result<(), String> {
+            let bytes = gallery::download(&*fetch, &p, &mut |_, _| {})?;
+            let heard = bu_keysound::import::preview_zip(&bytes, &p.name)?;
+            if job.stopped() || !OPEN.load(std::sync::atomic::Ordering::SeqCst) {
+                return Ok(());
+            }
+            let e = super::glue::engine();
+            let was_on = e.status().enabled;
+            if !was_on {
+                settings.mouse_on = false;
+                e.enable_without_keys(settings)?;
+            }
+            e.set_imported(PREVIEW_NAME, Some(heard.set));
+            let pack = bu_keysound::Pack::Imported(PREVIEW_NAME.to_string());
+            for (kind, wait) in PREVIEW_KEYS {
+                if job.stopped() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(wait));
+                e.preview(&pack, kind);
+            }
+            // let the last sound ring out, then let the pack go
+            std::thread::sleep(std::time::Duration::from_millis(1200));
+            e.set_imported(PREVIEW_NAME, None);
+            if !was_on && !super::glue::sounds_on() {
+                e.disable();
+            }
+            Ok(())
+        })();
+
+        r.map(|_| String::new()).map_err(crate::jobs::JobError::Failed)
     }
 }
 

@@ -3,7 +3,7 @@
 
 #[cfg(windows)]
 fn main() {
-    use bu_startup::{real::RealOs, ImpactState, Kind, Startup, StartupOs, Switch, View};
+    use bu_startup::{real::RealOs, ImpactState, Startup, StartupOs, Switch, View};
 
     let profile = std::env::var("USERPROFILE").unwrap_or_default();
     let user = std::env::var("USERNAME").unwrap_or_default();
@@ -52,7 +52,7 @@ fn main() {
             "[{}] {}{} | {} | {} | {} | {}",
             if e.enabled { "on " } else { "off" },
             anon(&e.name),
-            if e.windows_own && e.kind != Kind::Normal { " (Windows)" } else { "" },
+            if e.windows_own { " (Windows)" } else { "" },
             e.publisher.as_deref().map(anon).unwrap_or_else(|| "-".into()),
             anon(&e.location),
             impact,

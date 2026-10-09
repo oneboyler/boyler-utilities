@@ -9,6 +9,10 @@ description = "Boyler Utilities - Timers tab features (stopwatch, countdown, on-
 name = "timers-show"
 path = "examples/show.rs"
 
+[[example]]
+name = "timers-gencities"
+path = "examples/gen_cities.rs"
+
 [dependencies]
 thiserror = "2"
 

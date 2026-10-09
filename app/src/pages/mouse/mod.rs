@@ -68,6 +68,7 @@ const K_ADD: Key = key("cur.add");
 const K_ELSE: Key = key("cur.else");
 const K_COPY: Key = key("cur.copy");
 const K_OPEN: Key = key("cur.openra");
+const K_USEOURS: Key = key("cur.useours");
 const K_GIT: Key = key("cur.git");
 /// addons-v1: the card's Get (the feature add-on "Mouse acceleration", the same job as the Add-ons page's)
 const K_RAGET: Key = key("cur.raget");
@@ -481,7 +482,7 @@ impl Mouse {
             kids.push(self.epp_warn(cx));
         }
         if let Some(line) = self.v.other_writer.clone() {
-            kids.push(self.writer_warn(&line));
+            kids.push(self.writer_warn(cx, &line));
         }
         // .accc .acsub{display:flex;align-items:baseline;gap:8px;padding:11px 12px 3px 56px;font-size:12px;font-weight:600}
         // align-items:baseline: the layout engine's boxes have no text baselines, so the 11 px line sits where Chromium's
@@ -496,7 +497,7 @@ impl Mouse {
                     .pad(11.0, 12.0, 3.0, 56.0)
                     .child(hair56())
                     .child(El::text("Per game", Font::new(12.0, 600), FG(), lh(12.0, 1.35)).none())
-                    .child(El::text("Switches when the game starts or stops \u{b7} never mid-game", Font::new(11.0, 400), FG3(), lh(11.0, 1.35)).ellipsis().margin(2.0, 0.0, 0.0, 0.0)),
+                    .child(El::text("Switches when the game starts or stops", Font::new(11.0, 400), FG3(), lh(11.0, 1.35)).ellipsis().margin(2.0, 0.0, 0.0, 0.0)),
             );
         }
         kids.push(self.per_app_rows(cx));
@@ -765,14 +766,20 @@ impl Mouse {
     }
 
     /// "Another program also writes the driver" (Order 063): the card's amber line, same look as the Enhance-pointer-precision one.
-    fn writer_warn(&mut self, line: &str) -> El {
-        El::row()
+    fn writer_warn(&mut self, cx: &mut Cx, line: &str) -> El {
+        let row = El::row()
             .items(AlignItems::FLEX_START)
             .gap(7.0)
             .pad(9.0, 12.0, 10.0, 56.0)
             .child(hair56())
             .child(El::icon("tri", 14.0, 1.5, AMBER()).margin(1.0, 0.0, 0.0, 0.0))
-            .child(El::text(line, Font::new(11.0, 400), FG2(), 15.0).wrapping().flex1())
+            .child(El::text(line, Font::new(11.0, 400), FG2(), 15.0).wrapping().flex1());
+        // Raw Accel set the driver after this app: one click sets the card again (Order 077)
+        if self.v.use_ours {
+            row.child(link::link(cx, K_USEOURS, "Use ours again", 11.5))
+        } else {
+            row
+        }
     }
 
     fn per_app_rows(&mut self, cx: &mut Cx) -> El {
@@ -802,13 +809,7 @@ impl Mouse {
             kids.push(El::text(lab, pieces::btn_font(13.0, 400), if r.label.is_empty() { FG3() } else { FG() }, lh(13.0, 1.35)).ellipsis().flex1_auto());
             let app = dropdown::dropdown_with(cx, sub(rk, "app"), kids, 4.0, 6.0).w(172.0);
             let pre = self.preset_btn(cx, sub(rk, "pre"), r.target);
-            // the game was already open when the app noticed it: not switched, and the row says so (Order 063)
-            let late = self.v.late.contains(&r.id);
-            let note = if late {
-                El::text("Already open \u{b7} next launch", Font::new(11.0, 400), AMBER(), lh(11.0, 1.35)).ellipsis().flex1().title("This game was already running when the app noticed it, so it keeps the settings it started with. The next launch switches.")
-            } else {
-                El::block().flex1()
-            };
+            let note = El::block().flex1();
             rows.push(
                 El::row()
                     .center()
@@ -2226,6 +2227,7 @@ impl Mouse {
                 self.push_accel();
             }
             _ if k == K_EPPOFF => self.send(Cmd::Precision(false)),
+            _ if k == K_USEOURS => self.send(Cmd::UseOurs),
             _ if k == K_ADD => {
                 let t = self.panel.loaded.or_else(|| self.panel.presets.first().map(|p| p.id)).map(Target::Preset).unwrap_or(Target::Off);
                 let id = self.per_app.add_row("", t);

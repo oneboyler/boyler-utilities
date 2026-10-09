@@ -7,6 +7,7 @@
 //!   the "On screen" look settings). Drawing them is a later UI order; keys are mapped by a later app-layer order.
 //! * [`sound`]     — the soft end chime, made in memory (the drawing's three-tone recipe), played through a [`SoundOs`].
 //! * [`zones`]     — the World clock: your time + places, from Windows' own time zone rules (read-only).
+//! * [`cities`]    — the offline list of about 33 000 places the World clock searches (name, country, Windows zone).
 //! * [`alarm`]     — a thread that SLEEPS until the next deadline (no polling) and wakes the app once.
 //!
 //! The clock is [`MonoClock`] = `std::time::Instant` (Windows: QueryPerformanceCounter — monotonic, not moved by clock
@@ -15,6 +16,7 @@
 
 pub mod alarm;
 pub mod bars;
+pub mod cities;
 mod clock;
 pub mod countdown;
 mod error;

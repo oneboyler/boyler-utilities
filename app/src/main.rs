@@ -895,6 +895,26 @@ impl App {
                     }
                 }
             }
+            // test-only (Order 079): the flicker probe's counts (BU_FLK=1) into the timing log
+            "flkstats" => {
+                let (n, part, bad, blank) = menu::FLK_STATS.with(|s| s.get());
+                timing::note(&format!("flkstats {arg} frames {n} partial {part} outside_changed {bad} blank {blank} z_changes {}", menu::FLK_Z.with(|z| z.get())));
+            }
+            // test-only (Order 079): tmrrun:<ms>|<steps> = the test copy's timer clock moves <ms> every <ms>, <steps> times
+            "tmrrun" => {
+                if let Some((ms, n)) = arg.split_once('|').and_then(|(a, b)| Some((a.parse::<u64>().ok()?, b.parse::<u64>().ok()?))) {
+                    let t = timing::now();
+                    SCHED.with(|s| s.borrow_mut().extend((1..=n).map(|i| (t + (i * ms) as f64, format!("tmrtick:{ms}")))));
+                }
+            }
+            // test-only (Order 079): what the app does when the menu window is activated / another app comes to the front
+            "act" => push(Ev::Activate),
+            "fg" => push(Ev::Foreground),
+            "tmrtick" => {
+                if let Ok(ms) = arg.parse::<u64>() {
+                    pages::timers::test_advance_clock(ms);
+                }
+            }
             // test-only (Order 051): which path draws the menu (timing log), and a lost GPU device (ID3D12Device5::RemoveDevice)
             "gpustate" => {
                 let st = self.menu.as_ref().map(|m| m.gpu_state()).unwrap_or_else(|| format!("menu closed device_alive={}", gpu::alive()));
@@ -927,6 +947,14 @@ impl App {
             "ovclick" => pages::screenshots::overlay::window::test_click(arg),
             "ovlose" => pages::screenshots::overlay::window::test_lose_gpu(),
             "ovclose" => pages::screenshots::overlay::window::test_close(),
+            // test-only (Order 079): the menu moved from the GPU path to the CPU one or back (as for a missing shader)
+            "pathflip" => {
+                if let Some(m) = &mut self.menu {
+                    if let Err(e) = m.switch_path_for_test() {
+                        timing::note(&format!("pathflip failed {:08x}", e.code().0));
+                    }
+                }
+            }
             "gpulose" => {
                 if let Some(m) = &self.menu {
                     m.lose_gpu_for_test();
@@ -1222,7 +1250,14 @@ impl App {
                     unsafe { GetWindowThreadProcessId(front, Some(&mut pid)) };
                 }
                 // (the app's own windows - the menu, a picker - are never "a game in front")
-                let full = pid != 0 && pid != unsafe { GetCurrentProcessId() } && fullfront::is_fullscreen(front);
+                let class = if pid != 0 && pid != unsafe { GetCurrentProcessId() } { fullfront::classify(front) } else { fullfront::Front::Normal };
+                // Order 079: Alt+Tab, Win+V, the emoji panel, a hidden or click-through window in front: neither a game nor a
+                // sign that the game left - the menu stays where it is
+                if class == fullfront::Front::Ignored {
+                    self.fg_checks = 0;
+                    return;
+                }
+                let full = class == fullfront::Front::Full;
                 if full && !self.back {
                     self.back = true;
                     self.behind = true;

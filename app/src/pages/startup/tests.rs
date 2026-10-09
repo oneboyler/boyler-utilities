@@ -413,3 +413,30 @@ fn the_reset_review_never_holds_the_menu() {
     assert!(p.list.as_ref().unwrap().entries[ix(&p, "Steam")].enabled, "back to how the PC was");
     crate::services::shutdown();
 }
+
+/// Order 075: a Store app's switch opens Windows Settings › Apps › Startup (a plain write of its registry value does not switch it);
+/// the app changes nothing itself, so there is nothing in the change log.
+#[test]
+fn a_store_apps_switch_opens_windows_settings() {
+    use bu_startup::os::StoreStartupTask;
+    start();
+    let mut p = page();
+    p.svc.as_ref().unwrap().fake().unwrap().state().store.push(StoreStartupTask {
+        package_family: "SpotifyAB.SpotifyMusic_zpdnekdrzrea0".into(),
+        task_id: "Spotify".into(),
+        state: 1,
+        display_name: Some("Spotify Store".into()),
+        publisher: Some("Spotify AB".into()),
+        logo: None,
+    });
+    p.reload();
+    settle(&mut p);
+    let i = ix(&p, "Spotify Store");
+    click_sup(&mut p, idx(K_TG, i));
+    assert_eq!(p.opened, vec!["ms-settings:startupapps".to_string()], "a test copy logs instead of opening");
+    assert_eq!(p.toast.as_ref().unwrap().0, "Opens Windows Settings › Apps › Startup · switch Spotify Store there");
+    assert!(!p.list.as_ref().unwrap().entries[ix(&p, "Spotify Store")].enabled, "nothing changed");
+    assert!(p.svc.as_ref().unwrap().fake().unwrap().state().writes.is_empty());
+    assert!(crate::services::with(|s| read_record(&s.store, "sup", "store|SpotifyAB.SpotifyMusic_zpdnekdrzrea0|Spotify")).flatten().is_none());
+    crate::services::shutdown();
+}

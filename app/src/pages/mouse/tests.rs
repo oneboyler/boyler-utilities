@@ -875,22 +875,24 @@ fn per_game_is_optional_and_the_when_none_row_comes_with_the_first_game() {
     assert_eq!(m.v.per_app.everywhere_else(), Target::Main);
 }
 
-/// Order 063: a game that was already open when the app noticed it is not switched - the row says so; and another program
-/// writing the driver gets its amber line on the card.
+/// Order 077: another program writing the driver gets its amber line on the card; when Raw Accel set the driver after this app
+/// the line comes with "Use ours again" (one click), and a game that was already open is no longer said to be "next launch".
 #[test]
-fn a_late_game_and_another_writer_are_said_on_the_card() {
+fn another_writer_is_said_on_the_card_with_one_click_to_use_ours() {
     let mut m = opened();
     m.panel.expanded = true;
-    let row = m.per_app.rows()[0].id;
-    m.v.late = vec![row];
     m.v.other_writer = Some("Your own Raw Accel app is open. It writes the driver too, and the last one to write wins. Close it to keep this card in charge.".into());
-    let l = render_page(&mut m, if let Ok(d) = std::env::var("BU_PIC_OUT") { Some(format!("{d}/mouse_063_late_and_writer.png")) } else { None }.as_deref());
-    assert!(has_text(&l, "Already open \u{b7} next launch"));
+    let l = render_page(&mut m, if let Ok(d) = std::env::var("BU_PIC_OUT") { Some(format!("{d}/mouse_077_writer.png")) } else { None }.as_deref());
     assert!(has_text(&l, &m.v.other_writer.clone().unwrap()));
-    m.v.late.clear();
+    assert!(!has_text(&l, "Use ours again") && !has_text(&l, "Already open \u{b7} next launch") && !has_text(&l, "never mid-game"));
+    m.v.other_writer = Some("Raw Accel changed the driver after this app set it, so this app leaves it as it is. Game starts and app starts don\u{2019}t write over it.".into());
+    m.v.use_ours = true;
+    let l = render_page(&mut m, if let Ok(d) = std::env::var("BU_PIC_OUT") { Some(format!("{d}/mouse_077_use_ours.png")) } else { None }.as_deref());
+    assert!(has_text(&l, "Use ours again"));
     m.v.other_writer = None;
+    m.v.use_ours = false;
     let l = render_page(&mut m, None);
-    assert!(!has_text(&l, "Already open \u{b7} next launch"));
+    assert!(!has_text(&l, "Use ours again"));
 }
 
 /// Order 061: a mouse the app can't set yet (the X2 V2 on the shared CompX id) is named with its VID:PID and the Pulsar link,

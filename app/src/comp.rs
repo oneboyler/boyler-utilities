@@ -32,6 +32,8 @@ pub struct Glass {
     mode: GlassMode,
     /// the rounded edge's coverage (the glass is masked by it); kept for `restyle`
     mask_brush: CompositionSurfaceBrush,
+    /// the brush showing the menu's own swap chain; kept for `attach` (Order 079)
+    content_brush: CompositionSurfaceBrush,
 }
 
 /// The blur Windows' host backdrop already has, in CSS px: the Liquid style's 13 px (the drawing's number stood for it,
@@ -282,7 +284,7 @@ impl Glass {
         let kids = root.Children()?;
         kids.InsertAtTop(&glass)?;
         kids.InsertAtTop(&content)?;
-        Ok(Glass { compositor, _target: target, root, content, glass, geom, mode, mask_brush })
+        Ok(Glass { compositor, _target: target, root, content, glass, geom, mode, mask_brush, content_brush: sb })
     }
 
     /// Settings › Glass style changed while the menu is open: the glass brush again with that style's numbers (Host mode;
@@ -293,6 +295,18 @@ impl Glass {
         }
         let light = crate::ui::is_light();
         self.glass.SetBrush(&host_brush(&self.compositor, &self.mask_brush, n.saturate, n.brightness, style_extra_sigma(n.blur_px), adapt(&n, light))?)
+    }
+
+    /// Order 079: show other swap chains (the menu moved between the GPU and the CPU path) in the SAME visuals: the window's
+    /// compositor, target and glass effect stay, so the window is never composed without them (closing and making them
+    /// again left it empty for a moment - a blink). The new chains must hold a presented frame already.
+    pub fn attach(&self, chain: (&IDXGISwapChain2, u32, u32), mask: &IDXGISwapChain2) -> Result<()> {
+        let ci: ICompositorInterop = self.compositor.cast()?;
+        let m = unsafe { ci.CreateCompositionSurfaceForSwapChain(mask)? };
+        let c = unsafe { ci.CreateCompositionSurfaceForSwapChain(chain.0)? };
+        self.mask_brush.SetSurface(&m)?;
+        self.content_brush.SetSurface(&c)?;
+        self.content.SetSize(Vector2 { X: chain.1 as f32, Y: chain.2 as f32 })
     }
 
     /// Opacity of the whole flyout (glass + content), for the open / close fade.

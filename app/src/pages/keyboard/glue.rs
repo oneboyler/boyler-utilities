@@ -15,6 +15,23 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 static ENGINE: OnceLock<KeySounds> = OnceLock::new();
+/// The Key sounds switch as the last `apply` saw it (a worker thread can not reach the settings, which live on the UI thread).
+static SOUNDS_ON: AtomicBool = AtomicBool::new(false);
+/// Remaps were written this run: Windows needs a restart for them (the page is made new at every open, this is not).
+static RESTART: AtomicBool = AtomicBool::new(false);
+
+pub fn restart_pending() -> bool {
+    RESTART.load(Ordering::Acquire)
+}
+
+pub fn set_restart_pending() {
+    RESTART.store(true, Ordering::Release);
+}
+
+/// Are the key sounds switched on (as of the last change)?
+pub fn sounds_on() -> bool {
+    SOUNDS_ON.load(Ordering::Acquire)
+}
 
 /// The engine (made on first use; making it opens nothing and starts nothing).
 pub fn engine() -> &'static KeySounds {
@@ -30,6 +47,7 @@ pub fn packs_dir(settings_folder: &Path) -> PathBuf {
 /// thread ends, the sounds are dropped. Imported packs the settings use are read from `dir` first (one that can't be read
 /// is left out: its keys stay silent). Err = Windows' own refusal text.
 pub fn apply(prefs: &Prefs, dir: &Path) -> Result<(), String> {
+    SOUNDS_ON.store(prefs.on, Ordering::Release);
     if !prefs.on {
         engine().disable();
         return Ok(());

@@ -7,6 +7,7 @@ use crate::gfx::Gfx;
 use crate::icons::Icons;
 use crate::ui::cx::State;
 use crate::ui::lay::Laid;
+use bu_keysound::PlayOn;
 
 fn page() -> Keyboard {
     let mut p = Keyboard::default();
@@ -366,9 +367,9 @@ fn the_repeat_window_follows_its_slider_and_a_bad_pack_says_why() {
     assert_eq!(p.prefs.s.repeat_ms, 80);
     p.set_repeat(0.0);
     assert_eq!(p.prefs.s.repeat_ms, 0);
-    // the pack list offers the .zip and the folder
+    // Order 076: ONE import item (the picker takes a .zip or a pack folder)
     let names: Vec<String> = p.list(Pop::Pack).into_iter().map(|(l, _, _)| l).collect();
-    assert!(names.iter().any(|n| n.contains("(.zip)")) && names.iter().any(|n| n.contains("folder")), "{names:?}");
+    assert_eq!(names.iter().filter(|n| n.starts_with("Import")).collect::<Vec<_>>(), ["Import a pack…"], "{names:?}");
 }
 
 /// Order 059 (the owner: J -> a macro with "J" "doesnt work anymore at all, its like an infinite loop"): a key that would press
@@ -493,4 +494,146 @@ fn picture_get_more_sounds() {
     with_cx(|cx| p.open_get(cx));
     p.opened_at = -1000.0;
     paint_page_to(&mut p, "kbd_get", true, r"C:\BoylerUtilities-scratch\F61");
+}
+
+// ------------------------------------------------------------------ Order 076
+
+/// Order 076, the owner: "i change the sound, switch tabs, come back and its back to ... the one i had selected before" (a
+/// downloaded pack). Cause: the page is made new at every open, but the finished "Get" job stays in the job list - the page
+/// acted on its end again and made the downloaded pack the sound again. A job's end is acted on once.
+#[test]
+fn a_sound_picked_after_a_download_stays_when_the_tab_is_reopened() {
+    crate::services::init(windows::Win32::Foundation::HWND::default(), true);
+    // a "Get" that ended earlier (its job stays in the list)
+    let id = crate::services::with(|s| s.start_job(gallery::JOB_GET, |_| Ok("Downloaded".to_string())).unwrap()).unwrap();
+    for _ in 0..200 {
+        if crate::services::with(|s| s.job(gallery::JOB_GET)).flatten().is_some_and(|v| v.end.is_some()) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let build = |p: &mut Keyboard| {
+        let g = Gfx::new(1.0);
+        let mut st = State::default();
+        let mut cx = Cx::new(0.0, false, &g, &mut st);
+        cx.page = "kbd";
+        p.build(&mut cx);
+    };
+    let mut p = page();
+    build(&mut p);
+    assert_eq!(p.prefs.s.pack, Pack::Imported("Downloaded".into()), "the first time, the download is the sound ({id:?})");
+    // he picks another sound in the list
+    p.pop = Some((Pop::Pack, (0.0, 0.0, 170.0, 24.0)));
+    with_cx(|cx| p.choose(Choice::Pack(Pack::Builtin(PackId::Tactile)), cx));
+    assert_eq!(p.prefs.s.pack, Pack::Builtin(PackId::Tactile));
+    // he leaves the tab and comes back, twice
+    for _ in 0..2 {
+        p.close();
+        p.open(&Env { test: true, ..Env::default() }, 0.0);
+        build(&mut p);
+        assert_eq!(p.prefs.s.pack, Pack::Builtin(PackId::Tactile), "the pick is still the sound");
+    }
+    crate::services::shutdown();
+}
+
+#[test]
+fn a_jobs_end_is_acted_on_once() {
+    let mut s = Seen(Vec::new());
+    assert!(s.first(("a", 1u32)));
+    assert!(!s.first(("a", 1)));
+    assert!(s.first(("b", 1)) && s.first(("a", 2)));
+    for i in 10..200u32 {
+        s.first(("a", i));
+    }
+    assert!(s.0.len() <= 64, "the list never grows");
+}
+
+#[test]
+fn play_on_is_a_three_way_choice_for_keys_and_mouse_and_is_saved() {
+    let mut p = page();
+    assert_eq!(p.prefs.s.play_on, PlayOn::Both);
+    click(&mut p, idx(K_PLAYON, 1));
+    assert_eq!(p.prefs.s.play_on, PlayOn::Press);
+    click(&mut p, idx(K_PLAYON, 2));
+    assert_eq!(p.prefs.s.play_on, PlayOn::Release);
+    click(&mut p, idx(K_PLAYON, 0));
+    assert_eq!(p.prefs.s.play_on, PlayOn::Both);
+    let labels: Vec<&str> = PlayOn::ALL.iter().map(|x| x.label()).collect();
+    assert_eq!(labels, ["Press + release", "Press only", "Release only"]);
+}
+
+#[test]
+fn the_search_box_narrows_the_get_more_sounds_list_by_name_or_tag() {
+    let l = |name: &str, tags: &[&str]| bu_keysound::gallery::Listed { id: "x".into(), name: name.into(), tags: tags.iter().map(|t| t.to_string()).collect(), pre_installed: false };
+    let (a, b) = (l("Model F XT", &["keyboard", "retro"]), l("Bubble pop", &["fun"]));
+    assert!(getter::matches(&a, "") && getter::matches(&b, "  "));
+    assert!(getter::matches(&a, "model") && !getter::matches(&b, "model"));
+    assert!(getter::matches(&a, "RETRO") && !getter::matches(&b, "retro"), "tags count, any letter case");
+    let mut p = page();
+    with_cx(|cx| p.open_get(cx));
+    with_cx(|cx| p.event(&Ev::Char(K_GSEARCH, 'b'), cx));
+    with_cx(|cx| p.event(&Ev::Char(K_GSEARCH, 'u'), cx));
+    assert_eq!(p.get_q, "bu");
+    with_cx(|cx| p.event(&Ev::Key(K_GSEARCH, 0x08), cx));
+    assert_eq!(p.get_q, "b");
+    click(&mut p, sub(K_GSEARCH, "x"));
+    assert!(p.get_q.is_empty());
+    // the window builds with a search that matches nothing, and with an installed pack in use
+    p.get_q = "zzz".into();
+    with_cx(|cx| assert!(p.getter(cx).is_some()));
+    p.get_q.clear();
+    p.prefs.s.pack = Pack::Imported("Bubble pop".into());
+    with_cx(|cx| assert!(p.getter(cx).is_some()));
+}
+
+#[test]
+fn an_imported_sound_is_removed_after_asking_and_the_settings_fall_back() {
+    let mut p = page();
+    let gone = Pack::Imported("Holy Panda".into());
+    p.prefs.s.pack = gone.clone();
+    p.prefs.s.rules = vec![Rule { exe: "notepad.exe".into(), pack: Some(gone.clone()) }, Rule { exe: "chrome.exe".into(), pack: Some(Pack::Builtin(PackId::Clicky)) }];
+    // the question is asked first; a click elsewhere (or Esc) cancels it and removes nothing
+    p.ask_del = Some(("Holy Panda".into(), (10.0, 10.0)));
+    with_cx(|cx| assert!(p.popups(cx).is_some())); // the question is painted
+    p.popup_dismiss();
+    assert!(p.ask_del.is_none());
+    assert_eq!(p.prefs.s.pack, gone);
+    p.ask_del = Some(("Holy Panda".into(), (10.0, 10.0)));
+    click(&mut p, sub(K_DELQ, "no"));
+    assert!(p.ask_del.is_none());
+    assert_eq!(p.prefs.s.pack, gone);
+    // Remove: the general sound goes back to Linear, the program's own sound to Off, others stay
+    p.ask_del = Some(("Holy Panda".into(), (10.0, 10.0)));
+    click(&mut p, sub(K_DELQ, "go"));
+    assert!(p.ask_del.is_none());
+    assert_eq!(p.prefs.s.pack, Pack::Builtin(PackId::Linear));
+    assert_eq!(p.prefs.s.rules[0].pack, None);
+    assert_eq!(p.prefs.s.rules[1].pack, Some(Pack::Builtin(PackId::Clicky)));
+    // a pack that was not in use changes nothing but itself
+    assert!(!p.forget_pack("Other"));
+}
+
+/// Order 076's pictures (run: cargo test -p bu-app keyboard::tests::pictures_076 -- --ignored): the one Sound card with
+/// "Different in some apps" inside it, the pack list, the "Remove?" question and the Get-more-sounds window with a search.
+#[test]
+#[ignore]
+fn pictures_076() {
+    const DIR: &str = r"C:\BoylerUtilities-scratch\KB76";
+    let mut p = page();
+    p.prefs.on = true;
+    p.prefs.s.mouse_on = true;
+    p.prefs.s.play_on = PlayOn::Release;
+    p.prefs.s.rules = vec![Rule { exe: "discord.exe".into(), pack: None }, Rule { exe: "notepad.exe".into(), pack: Some(Pack::Builtin(PackId::Typewriter)) }];
+    paint_page_to(&mut p, "kb76_card", false, DIR);
+    p.pop = Some((Pop::Pack, (330.0, 160.0, 170.0, 24.0)));
+    p.ask_del = Some(("Holy Panda".into(), (360.0, 230.0)));
+    paint_page_to(&mut p, "kb76_remove", true, DIR);
+    p.pop = None;
+    p.ask_del = None;
+    p.prefs.s.pack = Pack::Imported("Bubble pop".into());
+    with_cx(|cx| p.open_get(cx));
+    p.opened_at = -1000.0;
+    paint_page_to(&mut p, "kb76_get", true, DIR);
+    p.get_q = "b".into();
+    paint_page_to(&mut p, "kb76_get_search", true, DIR);
 }

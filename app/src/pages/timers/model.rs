@@ -11,7 +11,7 @@ use std::time::Duration;
 use bu_timers::parse::{format_countdown, format_stopwatch};
 use bu_timers::sound::SoundOs;
 use bu_timers::stopwatch::LapRow;
-use bu_timers::zones::{self, ZoneOs};
+use bu_timers::zones::{self, Place, ZoneOs};
 use bu_timers::{Clock, FakeClock, FakeSound, MonoClock};
 
 use crate::gfx::Rgba;
@@ -49,6 +49,8 @@ pub enum Kind {
 pub struct Timer {
     pub id: u32,
     pub kind: Kind,
+    /// Order 078: the tab's own Stopwatch / Countdown (the big one on top): never in "Your timers", never removed
+    pub own: bool,
     pub name: String,
     pub colour: u32,
     /// "On screen"
@@ -109,9 +111,20 @@ impl Timer {
 /// A place of the World clock list.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PlaceItem {
-    pub city: String,
+    pub place: Place,
     pub screen: bool,
 }
+
+/// One result of the "Add a place" search: the place and its time there now ("04:37", a day later / earlier / the same).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Found {
+    pub place: Place,
+    pub time: String,
+    pub day: i64,
+}
+
+/// How many results the "Add a place" box shows.
+pub const FOUND_MAX: usize = 8;
 
 /// One pill of the on-screen timers (#tbars .tbx).
 #[derive(Clone, Debug, PartialEq)]
@@ -156,6 +169,9 @@ pub struct Model {
     pub sel: u32,
     pub mode: Mode,
     pub places: Vec<PlaceItem>,
+    /// Order 078: the tab's own Stopwatch / Countdown (0 = not made yet; the Countdown is made when first shown)
+    own_sw: u32,
+    own_cd: u32,
     pub spot: Spot,
     /// "Move": the on-screen timers can be dragged on the screen
     pub moving: bool,
@@ -164,7 +180,9 @@ pub struct Model {
     /// how many times the chime played (tests read it; the sound itself goes through `sound`)
     pub chimes: u32,
     /// the world clock of the current minute (Windows' zone rules are read once a minute, not per frame)
-    world_cache: RefCell<Option<(u64, Vec<String>, zones::WorldView)>>,
+    world_cache: RefCell<Option<(u64, Vec<Place>, zones::WorldView)>>,
+    /// the last "Add a place" search: (what was typed, the UTC minute, the results) - the page asks on every build
+    found_cache: RefCell<Option<(String, u64, Vec<Found>)>>,
 }
 
 thread_local! {
@@ -206,12 +224,33 @@ impl Model {
             sel: 0,
             mode: Mode::Sw,
             places: Vec::new(),
+            own_sw: 0,
+            own_cd: 0,
             spot: Spot::default(),
             moving: false,
             ended: Vec::new(),
             chimes: 0,
             world_cache: RefCell::new(None),
+            found_cache: RefCell::new(None),
         }
+    }
+
+    /// The tab's own timer of a kind (made on first use).
+    fn own_id(&mut self, kind: Kind) -> u32 {
+        let have = if kind == Kind::Sw { self.own_sw } else { self.own_cd };
+        if have != 0 && self.get(have).is_some() {
+            return have;
+        }
+        let id = self.add(kind, if kind == Kind::Sw { "Stopwatch" } else { "Countdown" });
+        if let Some(t) = self.get_mut(id) {
+            t.own = true;
+        }
+        if kind == Kind::Sw {
+            self.own_sw = id;
+        } else {
+            self.own_cd = id;
+        }
+        id
     }
 
     /// The real model: Windows' clock, sound and time zones; one stopwatch to start with.
@@ -221,8 +260,7 @@ impl Model {
         #[cfg(not(windows))]
         let (sound, zones): (Box<dyn SoundOs>, Box<dyn ZoneOs>) = (Box::new(FakeSound::default()), Box::new(zones::FakeZones::default()));
         let mut m = Model::empty(false, Clk(Arc::new(MonoClock::new())), None, sound, zones);
-        let id = m.add(Kind::Sw, "Stopwatch");
-        m.sel = id;
+        m.sel = m.own_id(Kind::Sw);
         m
     }
 
@@ -232,8 +270,7 @@ impl Model {
     pub fn fake(frozen: bool) -> Model {
         let fc = FakeClock::new();
         let mut m = Model::empty(true, Clk(Arc::new(fc.clone())), Some(fc.clone()), Box::new(FakeSound::default()), Box::new(zones::FakeZones::default()));
-        let a = m.add(Kind::Sw, "Stopwatch");
-        m.sel = a;
+        m.sel = m.own_id(Kind::Sw);
         if frozen {
             let b = m.add(Kind::Cd, "Pizza");
             let c = m.add(Kind::Cd, "Ultimate");
@@ -249,7 +286,7 @@ impl Model {
                 t.cd.start_pause();
             }
             fc.advance(Duration::from_millis(199_500));
-            m.places = vec![PlaceItem { city: "New York".into(), screen: false }, PlaceItem { city: "Tokyo".into(), screen: false }];
+            m.places = ["New York", "Tokyo"].iter().filter_map(|c| bu_timers::cities::search(c, 1).first().copied()).map(|place| PlaceItem { place, screen: false }).collect();
         }
         m
     }
@@ -262,6 +299,7 @@ impl Model {
         self.timers.push(Timer {
             id,
             kind,
+            own: false,
             name: name.into(),
             colour,
             screen: false,
@@ -282,22 +320,33 @@ impl Model {
         self.get(self.sel)
     }
 
-    /// The header switch (`tmSetMode`): Stopwatch / Countdown pick the first timer of that kind (or make one).
+    /// The header switch (`tmSetMode`): Stopwatch / Countdown show the tab's OWN timer of that kind (made when first shown);
+    /// a click on the kind already shown while a listed timer is picked brings the own one back.
     pub fn set_mode(&mut self, m: Mode) -> bool {
-        if m == self.mode {
-            return false;
-        }
-        self.mode = m;
         let want = match m {
             Mode::Sw => Kind::Sw,
             Mode::Cd => Kind::Cd,
-            Mode::Clk => return true,
+            Mode::Clk => {
+                if m == self.mode {
+                    return false;
+                }
+                self.mode = m;
+                return true;
+            }
         };
+        let own = self.own_id(want);
+        if m == self.mode {
+            // the shown kind clicked again: a listed timer picked -> the own one comes back
+            if self.sel == own {
+                return false;
+            }
+            self.sel = own;
+            return true;
+        }
+        // coming from another kind (or the world clock): a picked timer of this kind stays picked
+        self.mode = m;
         if self.selected().map(|t| t.kind) != Some(want) {
-            self.sel = match self.timers.iter().find(|t| t.kind == want) {
-                Some(t) => t.id,
-                None => self.add(want, if want == Kind::Sw { "Stopwatch" } else { "Countdown" }),
-            };
+            self.sel = own;
         }
         true
     }
@@ -310,31 +359,34 @@ impl Model {
         }
     }
 
-    /// "New timer" (`tmAdd`): "Stopwatch 2", "Countdown 3"... of the current kind, picked.
+    /// "New timer" (`tmAdd`): "Stopwatch 2", "Countdown 3"... of the current kind, picked. (The tab's own one is number 1.)
     pub fn add_new(&mut self) -> u32 {
         let kind = if self.mode == Mode::Cd { Kind::Cd } else { Kind::Sw };
-        let n = self.timers.iter().filter(|t| t.kind == kind).count() + 1;
+        let n = self.timers.iter().filter(|t| t.kind == kind && !t.own).count() + 2;
         let id = self.add(kind, &format!("{} {}", if kind == Kind::Sw { "Stopwatch" } else { "Countdown" }, n));
         self.sel = id;
         id
     }
 
-    /// The row's × (`tmRemove`): the pick moves to another timer of the same kind (or any, or a new one).
+    /// The row's × (`tmRemove`): only a timer that was added; if it was the picked one the tab's own timer of its kind is
+    /// shown again. Nothing is made new - removing the last one leaves the list empty.
     pub fn remove(&mut self, id: u32) {
-        let Some(i) = self.timers.iter().position(|t| t.id == id) else { return };
+        let Some(i) = self.timers.iter().position(|t| t.id == id && !t.own) else { return };
         let t = self.timers.remove(i);
         if t.id == self.sel {
-            self.sel = match self.timers.iter().find(|x| x.kind == t.kind).or(self.timers.first()) {
-                Some(x) => x.id,
-                None => self.add(t.kind, if t.kind == Kind::Sw { "Stopwatch" } else { "Countdown" }),
-            };
+            self.sel = self.own_id(t.kind);
             if self.mode != Mode::Clk {
-                self.mode = if self.get(self.sel).map(|x| x.kind) == Some(Kind::Sw) { Mode::Sw } else { Mode::Cd };
+                self.mode = if t.kind == Kind::Sw { Mode::Sw } else { Mode::Cd };
             }
         }
         if self.moving && !self.timers.iter().any(|t| t.screen) {
             self.moving = false;
         }
+    }
+
+    /// The timers of "Your timers": the ones that were added (not the tab's own two).
+    pub fn listed(&self) -> impl Iterator<Item = &Timer> {
+        self.timers.iter().filter(|t| !t.own)
     }
 
     /// Start / Stop / Pause / Resume / Again (`tmToggle`).
@@ -397,22 +449,43 @@ impl Model {
         self.timers.iter().find(|t| t.id != id && t.key.as_deref() == Some(key)).map(|t| format!("Timer \u{b7} {}", t.name))
     }
 
-    pub fn add_place(&mut self, city: &str) {
-        if zones::place(city).is_some() && !self.places.iter().any(|p| p.city == city) {
-            self.places.push(PlaceItem { city: city.into(), screen: false });
+    pub fn add_place(&mut self, p: Place) {
+        if !self.places.iter().any(|x| x.place == p) {
+            self.places.push(PlaceItem { place: p, screen: false });
+            *self.found_cache.borrow_mut() = None;
         }
     }
-    pub fn remove_place(&mut self, city: &str) {
-        self.places.retain(|p| p.city != city);
+    pub fn remove_place(&mut self, i: usize) {
+        if i < self.places.len() {
+            self.places.remove(i);
+            *self.found_cache.borrow_mut() = None;
+        }
     }
-    pub fn toggle_place_screen(&mut self, city: &str) {
-        if let Some(p) = self.places.iter_mut().find(|p| p.city == city) {
+    pub fn toggle_place_screen(&mut self, i: usize) {
+        if let Some(p) = self.places.get_mut(i) {
             p.screen = !p.screen;
         }
     }
-    /// The places not in the list yet (the "Add a place" menu): (city, "City · Country").
-    pub fn places_left(&self) -> Vec<(&'static str, String)> {
-        zones::PLACES.iter().filter(|p| !self.places.iter().any(|x| x.city == p.city)).map(|p| (p.city, format!("{} \u{b7} {}", p.city, p.land))).collect()
+    /// The "Add a place" box: the places that fit what was typed (2 letters or more) that are not in the list yet, with their
+    /// time now - at most [`FOUND_MAX`]. The same typing in the same minute is not searched again.
+    pub fn search_places(&self, q: &str) -> Vec<Found> {
+        let minute = self.utc_minute();
+        if let Some((cq, m, v)) = self.found_cache.borrow().as_ref() {
+            if cq == q && *m == minute {
+                return v.clone();
+            }
+        }
+        let found: Vec<Found> = bu_timers::cities::search(q, FOUND_MAX + self.places.len())
+            .into_iter()
+            .filter(|p| !self.places.iter().any(|x| x.place == *p))
+            .take(FOUND_MAX)
+            .map(|place| {
+                let (time, day) = zones::place_time(self.zones.as_ref(), &place).unwrap_or(("—".into(), 0));
+                Found { place, time, day }
+            })
+            .collect();
+        *self.found_cache.borrow_mut() = Some((q.to_string(), minute, found.clone()));
+        found
     }
 
     /// Order 055: the UTC minute the world clock shows now (a change of it = the clock's text changed; no strings built).
@@ -428,15 +501,14 @@ impl Model {
 
     pub fn world(&self) -> zones::WorldView {
         let minute = self.utc_minute();
-        let cities: Vec<String> = self.places.iter().map(|p| p.city.clone()).collect();
+        let list: Vec<Place> = self.places.iter().map(|p| p.place).collect();
         if let Some((m, c, w)) = self.world_cache.borrow().as_ref() {
-            if *m == minute && *c == cities {
+            if *m == minute && *c == list {
                 return w.clone();
             }
         }
-        let refs: Vec<&str> = cities.iter().map(|c| c.as_str()).collect();
-        let w = zones::world_view(self.zones.as_ref(), &refs);
-        *self.world_cache.borrow_mut() = Some((minute, cities, w.clone()));
+        let w = zones::world_view(self.zones.as_ref(), &list);
+        *self.world_cache.borrow_mut() = Some((minute, list, w.clone()));
         w
     }
     /// Tests: a new "now" or new zones take effect at once.
@@ -444,6 +516,7 @@ impl Model {
     pub fn set_zones(&mut self, z: Box<dyn ZoneOs>) {
         self.zones = z;
         *self.world_cache.borrow_mut() = None;
+        *self.found_cache.borrow_mut() = None;
     }
 
     /// Countdowns that reached zero: they finish once (the chime if their sound is on) -> `ended`.
@@ -569,7 +642,7 @@ impl Model {
         let w = self.world();
         for (p, (city, time, _)) in self.places.iter().zip(w.places) {
             if p.screen {
-                v.push(Pill { key: format!("c{city}"), name: city, time, colour: Rgba::hex(0x8e8e93), line: None, low: false });
+                v.push(Pill { key: format!("c{}/{}", city, p.place.land), name: city, time, colour: Rgba::hex(0x8e8e93), line: None, low: false });
             }
         }
         v

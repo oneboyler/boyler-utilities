@@ -26,3 +26,8 @@ features = [
 [[example]]
 name = "noise-proof"
 path = "examples/proof.rs"
+
+# Order 080: the same for your own mix (slider drag included)
+[[example]]
+name = "noise-proof-mix"
+path = "examples/proof_mix.rs"

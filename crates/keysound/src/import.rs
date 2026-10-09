@@ -364,6 +364,12 @@ pub fn install_any(src: &Path, root: &Path) -> Result<Imported, String> {
     if src.is_dir() {
         return install(src, root);
     }
+    // the one picker takes a .zip or a pack folder: a folder is picked by its config.json (a file dialog can't pick both)
+    if src.file_name().is_some_and(|n| n.eq_ignore_ascii_case("config.json")) {
+        if let Some(dir) = src.parent() {
+            return install(dir, root);
+        }
+    }
     let is_zip = src.extension().is_some_and(|e| e.eq_ignore_ascii_case("zip"));
     let len = std::fs::metadata(src).map_err(|e| format!("can't read {}: {e}", src.display()))?.len();
     if len > MAX_ZIP {
@@ -371,7 +377,7 @@ pub fn install_any(src: &Path, root: &Path) -> Result<Imported, String> {
     }
     let bytes = std::fs::read(src).map_err(|e| format!("can't read {}: {e}", src.display()))?;
     if !is_zip && !bytes.starts_with(b"PK") {
-        return Err("This isn't a Mechvibes pack: pick the .zip you downloaded, or the pack's folder".into());
+        return Err("This isn't a Mechvibes pack: pick the .zip you downloaded, or the config.json inside the pack's folder".into());
     }
     let fallback = src.file_stem().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "Imported".into());
     install_zip(&bytes, &fallback, root)
@@ -379,6 +385,18 @@ pub fn install_any(src: &Path, root: &Path) -> Result<Imported, String> {
 
 /// [`install_any`] for a zip already in memory; `fallback` names a pack whose config has no name.
 pub fn install_zip(zip: &[u8], fallback: &str, root: &Path) -> Result<Imported, String> {
+    let (pack, config, files) = decode_zip(zip, fallback)?;
+    put(pack, &config, &files, root)
+}
+
+/// A zip read and decoded in memory, nothing written (Order 076: the "Get more sounds" play button hears a pack first).
+pub fn preview_zip(zip: &[u8], fallback: &str) -> Result<Imported, String> {
+    decode_zip(zip, fallback).map(|d| d.0)
+}
+
+type Decoded = (Imported, String, Vec<(String, Vec<u8>)>);
+
+fn decode_zip(zip: &[u8], fallback: &str) -> Result<Decoded, String> {
     let entries = bu_addons::zip::read(zip, MAX_UNPACKED).map_err(|_| "This isn't a Mechvibes pack: that .zip can't be read (damaged, encrypted or not a zip)".to_string())?;
     let norm = |n: &str| n.replace(std::path::MAIN_SEPARATOR, "/");
     // the shallowest config.json (not macOS' __MACOSX copies)
@@ -416,7 +434,7 @@ pub fn install_zip(zip: &[u8], fallback: &str, root: &Path) -> Result<Imported, 
             files.push((f, e.data.clone()));
         }
     }
-    put(pack, &config, &files, root)
+    Ok((pack, config, files))
 }
 
 /// Writes a decoded pack into `root\<name>` (a free folder name; a failure removes what was written).
@@ -654,6 +672,9 @@ mod tests {
         let snd = wav(44_100, 500, 1);
         // top level, deflated
         let z = bu_addons::zip::build(&[("config.json", &cfg[..]), ("sound.wav", &snd[..]), ("readme.txt", &b"x"[..])], true);
+        // Order 076: hearing a pack first reads it in memory and writes nothing
+        assert_eq!(preview_zip(&z, "pack").unwrap().name, "Zipped Switch");
+        assert!(!root.exists(), "a preview keeps nothing");
         let p = install_zip(&z, "pack", &root).unwrap();
         assert_eq!(p.name, "Zipped Switch");
         assert!(root.join("Zipped Switch").join("sound.wav").is_file());
@@ -669,6 +690,8 @@ mod tests {
         std::fs::write(ex.join("inner").join("config.json"), cfg).unwrap();
         std::fs::write(ex.join("inner").join("sound.wav"), &snd).unwrap();
         assert_eq!(install_any(&ex, &root).unwrap().name, "Zipped Switch 3");
+        // Order 076: the one picker takes a pack folder by its config.json
+        assert_eq!(install_any(&ex.join("inner").join("config.json"), &root).unwrap().name, "Zipped Switch 4");
         // not packs: each says why, nothing is installed
         let err = |r: Result<Imported, String>| r.unwrap_err();
         let nocfg = bu_addons::zip::build(&[("a.txt", &b"hi"[..])], true);
@@ -680,7 +703,7 @@ mod tests {
         std::fs::write(&txt, "hello").unwrap();
         assert!(err(install_any(&txt, &root)).contains("isn't a Mechvibes pack"));
         assert!(err(install_any(&base.join("empty-folder-that-is-not-there"), &root)).contains("can't read"));
-        assert_eq!(installed(&root).len(), 3);
+        assert_eq!(installed(&root).len(), 4);
         let _ = std::fs::remove_dir_all(&base);
     }
 }
