@@ -18,6 +18,7 @@ pub mod apps;
 pub mod audio;
 pub mod controller;
 pub mod display;
+pub mod keyboard;
 pub mod mouse;
 pub mod network;
 pub mod notifications;
@@ -162,13 +163,15 @@ pub trait Page {
     }
 }
 
-/// Every tab, in the top row's order (the drawing's PAGES list, menu-v22).
+/// Every tab, in the top row's order (the drawing's PAGES list, keyboard-v1).
 pub fn all() -> Vec<Box<dyn Page>> {
     vec![
         Box::new(audio::Audio::new()),
         Box::new(display::Display::default()),
         Box::new(screenshots::Screenshots::default()),
         Box::new(mouse::Mouse::default()),
+        // Order 058: Keyboard (key sounds + key remap), right after Mouse (keyboard-v1)
+        Box::new(keyboard::Keyboard::default()),
         Box::new(controller::Controller::default()),
         Box::new(tweaks::Tweaks::default()),
         Box::new(startup::Startup::default()),
@@ -199,9 +202,9 @@ mod tests {
     #[test]
     fn the_tabs_in_the_drawings_order() {
         let ids: Vec<&str> = all().iter().map(|p| p.id()).collect();
-        assert_eq!(ids, ["aud", "dsp", "shot", "cur", "pad", "tgl", "sup", "pc", "net", "sto", "apps", "sec", "srch", "vtt", "tmr", "act", "ntf", "add", "set"]);
-        assert_eq!(crate::ui::tab_index("Voice to text"), Some(13));
-        assert_eq!(crate::ui::tab_index("tmr"), Some(14));
+        assert_eq!(ids, ["aud", "dsp", "shot", "cur", "kbd", "pad", "tgl", "sup", "pc", "net", "sto", "apps", "sec", "srch", "vtt", "tmr", "act", "ntf", "add", "set"]);
+        assert_eq!(crate::ui::tab_index("Voice to text"), Some(14));
+        assert_eq!(crate::ui::tab_index("tmr"), Some(15));
     }
 
     /// A page's boxes land where Chromium lays out the drawing (menu-v22, tools/ref/dom_dump.js): the header `.ph` at
@@ -211,7 +214,7 @@ mod tests {
         let g = Gfx::new(1.0);
         let mut st = State::default();
         let env = Env { test: true, ..Env::default() };
-        for (tab, want) in [(1usize, None), (6, Some((402.64f32, 60.0f32, 169.36f32, 28.0f32)))] {
+        for (tab, want) in [(1usize, None), (7, Some((402.64f32, 60.0f32, 169.36f32, 28.0f32)))] {
             let mut pages = all();
             pages[tab].open(&env, 0.0);
             let mut cx = Cx::new(0.0, false, &g, &mut st);

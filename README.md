@@ -15,6 +15,7 @@ Double-click the tray icon and pick a tab.
   <img src="docs/screenshots.png" alt="Screenshots: drawing on a capture" width="560">
 
 - **Mouse**: pointer speed, cursors (a glass set is built in), size, and an acceleration curve per game. DPI, polling rate and battery for supported mice.
+- **Keyboard**: a picture of your keyboard - click any key to remap it, give it an action or a macro. Optional key sounds (clean keyboard or satisfying ones) that never store what you type.
 
   <img src="docs/mouse.png" alt="Mouse acceleration curve (light theme)" width="420">
 

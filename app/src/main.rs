@@ -1482,6 +1482,8 @@ fn run(opts: Opts) -> Result<()> {
             }
             // Order 047: Audio's switches put back by a Reset on its worker are saved here (menu open or not)
             pages::audio::drain_pending_rules();
+            // Order 058: a game came to the front / left - the keys that carry a macro or an action follow
+            pages::keyboard::glue::drain_pending();
             // changes noted from other threads (`undo::note`) go into the change log
             if undo::pending() {
                 services::with(|s| undo::flush(&mut s.store));

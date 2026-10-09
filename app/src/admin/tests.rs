@@ -128,6 +128,7 @@ pub(crate) struct FakeSys {
     pub(crate) fix: bu_quickfix::fake::FakeFixOs,
     pub(crate) sto: Arc<bu_storage::FakeOs>,
     pub(crate) temp_cleans: Arc<AtomicUsize>,
+    pub(crate) scancode: Arc<Mutex<Vec<bu_keysound::remap::Mapping>>>,
 }
 
 struct AudRef(Arc<Mutex<bu_audio::FakeOs>>);
@@ -205,6 +206,10 @@ impl Sys for CopySys {
         self.w.temp_cleans.fetch_add(1, Ordering::SeqCst);
         Ok((1000, 3, 200, 1))
     }
+    fn scancode_map(&mut self, maps: &[bu_keysound::remap::Mapping]) -> Result<(), String> {
+        *self.w.scancode.lock().unwrap() = maps.to_vec();
+        Ok(())
+    }
 }
 
 pub(crate) fn world() -> FakeSys {
@@ -262,7 +267,7 @@ pub(crate) fn world() -> FakeSys {
             ..Default::default()
         },
     );
-    FakeSys { t, net, st: Arc::new(st), sec, aud: Arc::new(Mutex::new(a)), fix, sto: Arc::new(sto), temp_cleans: Arc::new(AtomicUsize::new(0)) }
+    FakeSys { t, net, st: Arc::new(st), sec, aud: Arc::new(Mutex::new(a)), fix, sto: Arc::new(sto), temp_cleans: Arc::new(AtomicUsize::new(0)), scancode: Arc::new(Mutex::new(Vec::new())) }
 }
 
 fn raw_service(name: &str, start: bu_startup::ServiceStart) -> bu_startup::os::RawService {
@@ -325,6 +330,14 @@ fn every_op() -> Vec<Op> {
         Op::RestorePoint { description: "Boyler Utilities \u{b7} 7 Oct 2026".into() },
         Op::CleanWindowsTemp,
         Op::DiskHealth(1),
+        Op::ScancodeMap {
+            maps: vec![
+                bu_keysound::remap::Mapping { from: 0x3A, to: 0x01 },
+                bu_keysound::remap::Mapping { from: 0xE038, to: 0xE01D },
+                bu_keysound::remap::Mapping { from: 0xE05B, to: 0 },
+            ],
+        },
+        Op::ScancodeMap { maps: vec![] },
     ]
 }
 
@@ -387,6 +400,15 @@ fn bad_input_is_refused() {
         s(&["disk-health", "128"]),
         s(&["disk-health", "C:"]),
         s(&["clean-windows-temp", r"C:\Users"]),
+        s(&["scancode-map"]),
+        s(&["scancode-map", "3a"]),
+        s(&["scancode-map", "3a:3a"]),
+        s(&["scancode-map", "3a:1,3a:2"]),
+        s(&["scancode-map", "0:1"]),
+        s(&["scancode-map", "zz:1"]),
+        s(&["scancode-map", "3a:12345"]),
+        s(&["scancode-map", "3a:1,"]),
+        s(&["scancode-map", "-", "extra"]),
     ];
     for b in bad {
         assert!(Op::parse(&b).is_err(), "accepted {b:?}");
@@ -400,13 +422,14 @@ fn each_purpose_allows_only_its_ops() {
     assert_eq!(allowed(Purpose::Repair), ["kill", "spawn"].iter().map(|x| x.to_string()).collect());
     assert_eq!(allowed(Purpose::RestorePoint), ["restore-point", "restore-status"].iter().map(|x| x.to_string()).collect());
     assert_eq!(allowed(Purpose::Storage), ["clean-windows-temp", "disk-health"].iter().map(|x| x.to_string()).collect());
+    assert_eq!(allowed(Purpose::Keyboard), ["scancode-map"].iter().map(|x| x.to_string()).collect());
     assert_eq!(allowed(Purpose::Network), ["net-adapter", "net-dns"].iter().map(|x| x.to_string()).collect());
     // the reset puts settings back - never a scan, a restore, a removal, a program, a clean-up
     let reset = allowed(Purpose::Reset);
     for no in ["defender-offline", "defender-restore", "defender-remove-active", "spawn", "kill", "clean-windows-temp", "restore-point", "disk-health"] {
         assert!(!reset.contains(no), "{no}");
     }
-    for yes in ["reg-set", "reg-delete", "usb-suspend", "net-adapter", "net-dns", "approved", "task", "service", "defender-allow", "defender-disallow", "audio-endpoint"] {
+    for yes in ["reg-set", "reg-delete", "usb-suspend", "net-adapter", "net-dns", "approved", "task", "service", "defender-allow", "defender-disallow", "audio-endpoint", "scancode-map"] {
         assert!(reset.contains(yes), "{yes}");
     }
     assert!(!Purpose::Tweaks.allows(&Op::NetAdapter { id: ETH.into(), on: true }));
@@ -580,6 +603,13 @@ fn network_startup_security_audio_storage_checks() {
     let h = a.call(Purpose::Storage, Op::DiskHealth(1)).unwrap();
     assert_eq!(exec::parse_health(&h).unwrap().reliability.unwrap().power_on_hours, Some(12345));
     assert_eq!(a.call(Purpose::Storage, Op::CleanWindowsTemp), Ok(s(&["1000", "3", "200", "1"])));
+    // keyboard: the Scancode Map is written exactly as asked, and only under its own purpose (or a reset)
+    let maps = vec![bu_keysound::remap::Mapping { from: 0x3A, to: 0x01 }];
+    assert_eq!(a.call(Purpose::Keyboard, Op::ScancodeMap { maps: maps.clone() }), Ok(vec![]));
+    assert_eq!(*w.scancode.lock().unwrap(), maps);
+    assert!(matches!(a.call(Purpose::Storage, Op::ScancodeMap { maps: maps.clone() }), Err(AdminError::Refused(_))));
+    assert_eq!(a.call(Purpose::Reset, Op::ScancodeMap { maps: vec![] }), Ok(vec![]));
+    assert!(w.scancode.lock().unwrap().is_empty(), "reset removes the map");
     // restore point
     assert_eq!(a.call(Purpose::RestorePoint, Op::RestorePoint { description: "Boyler Utilities \u{b7} 7 Oct 2026".into() }), Ok(s(&["accepted"])));
     assert!(exec::parse_restore_status(&a.call(Purpose::RestorePoint, Op::RestoreStatus).unwrap()).is_some());

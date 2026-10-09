@@ -12,6 +12,9 @@
 //!   (`GetRawInputBuffer`), so a fast mouse (8000 packets a second) costs one wake-up of this thread per batch;
 //! * the keys client is woken (one `PostMessageW` per batch) only for packets that matter: key packets, and mouse
 //!   packets with button / wheel flags. A pure mouse move never leaves this thread — it is only counted ([`stats`]);
+//! * the key sounds (Order 058, `bu-keysound`) listen with [`set_key_sound`]: every key down / up is handed straight to its
+//!   sink on this thread as a class-only [`SoundEvent`] (Space / Enter / Backspace / other + up or down; no key), a held key's
+//!   auto-repeat is dropped by a 32-byte "held now" bit map that a release clears. Nothing is queued or kept; off = unregistered;
 //! * the activity client gets one message on the first packet of any kind (moves too), then is disarmed.
 //!
 //! [`hub`] is the pure part (who needs what, which packet goes where, one wake-up per batch) and is unit-tested; `win`
@@ -21,6 +24,6 @@ pub mod hub;
 #[cfg(windows)]
 mod win;
 
-pub use hub::{RawPacket, Stats, Target, QUEUE_CAP};
+pub use hub::{RawPacket, SoundClass, SoundEvent, Stats, Target, QUEUE_CAP};
 #[cfg(windows)]
-pub use win::{notify_on_input, set_keys, stats, take_packets};
+pub use win::{notify_on_input, set_key_sound, set_keys, stats, take_packets, SoundSink};

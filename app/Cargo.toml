@@ -1,6 +1,6 @@
 [package]
 name = "bu-app"
-version = "1.0.2"
+version = "1.0.3"
 edition = "2021"
 publish = false
 description = "Boyler Utilities - the tray app (the glass menu)"
@@ -46,6 +46,8 @@ bu-obs = { path = "../crates/obs" }
 bu-addons = { path = "../crates/addons" }
 # Order 048: the process's one Raw Input owner (its own thread; mouse moves never reach the UI thread)
 bu-rawin = { path = "../crates/rawin" }
+# the Keyboard tab (Order 058): key sounds + key remap
+bu-keysound = { path = "../crates/keysound" }
 
 [dependencies.windows]
 version = "0.62"

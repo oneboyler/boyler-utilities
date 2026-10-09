@@ -16,7 +16,32 @@ use windows::Win32::UI::WindowsAndMessaging::{
     HWND_MESSAGE, MSG, SMTO_BLOCK, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_INPUT, WNDCLASSW,
 };
 
-use crate::hub::{Hub, KeysNeed, Posts, RawPacket, Stats, Target, USAGE_PAGE_GENERIC};
+use crate::hub::{Hub, KeysNeed, Posts, RawPacket, SoundEvent, Stats, Target, USAGE_PAGE_GENERIC};
+
+/// Who plays the key sounds (Order 058): called on the raw thread, right after a batch is read, once per key going down
+/// or up. It gets a [`SoundEvent`] (class + up / down) and nothing else - never the key.
+pub type SoundSink = std::sync::Arc<dyn Fn(SoundEvent) + Send + Sync>;
+static SINK: Mutex<Option<SoundSink>> = Mutex::new(None);
+
+fn sink() -> MutexGuard<'static, Option<SoundSink>> {
+    SINK.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// The key sounds (Order 058): Some = deliver every key down / up to `sink` as a class-only event (the keyboard is
+/// registered for it, listen-only); None = stop listening (nothing is registered for it, nothing is kept). Err = Windows
+/// refused the registration (its own text); the old setting stays.
+pub fn set_key_sound(new: Option<SoundSink>) -> Result<(), String> {
+    let on = new.is_some();
+    let old_sink = std::mem::replace(&mut *sink(), new);
+    let old_on = hub().set_sound(on);
+    if old_on == on {
+        return Ok(());
+    }
+    request().inspect_err(|_| {
+        *sink() = old_sink;
+        hub().set_sound(old_on);
+    })
+}
 
 /// Another thread asks the raw thread to bring the registration up to date (sent; LRESULT 0 = done, else the HRESULT
 /// of Windows' refusal).
@@ -235,6 +260,15 @@ fn on_input(hwnd: HWND, lp: LPARAM) {
             }
         }
         drain(&mut h, &mut out);
+    }
+    // the key sounds go FIRST (the tightest path press -> sound): straight from this thread, no message, no queue
+    if !out.sounds.is_empty() {
+        let s = sink().clone();
+        if let Some(s) = s {
+            for e in out.sounds.drain(..) {
+                s(e);
+            }
+        }
     }
     if let Some(t) = out.keys {
         if !post(t) {

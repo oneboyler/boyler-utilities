@@ -43,6 +43,7 @@ TARGET = 'x86_64-pc-windows-msvc'
 #   skia.txt                  LICENSE_SKIA of the prebuilt skia-binaries (skia-bindings 0.153.3 OUT_DIR)
 #   rust-skia.txt             github.com/rust-skia/rust-skia tag 0.153.3 LICENSE (skia-safe / skia-bindings ship none)
 #   taffy.txt                 github.com/DioxusLabs/taffy tag v0.14.0 LICENSE (the crate ships none)
+#   ogg.txt                   the LICENSE of the ogg crate 0.8.0 (BSD-3-Clause; the generator doesn't know its file name)
 #   zlib.txt ... expat.txt    the LICENSE / COPYING files of the commits pinned in github.com/rust-skia/skia tag
 #                             m153-0.101.2 DEPS (chromium / skia googlesource mirrors)
 #   everything.txt            www.voidtools.com/License.txt (Everything 1.4, the MSI the setup installs)
@@ -73,6 +74,7 @@ CRATE_FILES = {
     'skia-safe': 'rust-skia.txt',
     'skia-bindings': 'rust-skia.txt',
     'taffy': 'taffy.txt',
+    'ogg': 'ogg.txt',
 }
 PREFER = ['MIT', 'Zlib', 'Apache-2.0', 'BSD-3-Clause', 'Unicode-3.0', 'Unlicense', '0BSD']
 TITLES = {
@@ -94,7 +96,7 @@ FILE_NAMES = {
     '0BSD': ['license-0bsd'],
 }
 
-COPYRIGHT = re.compile(r'^\s*[*#]?\s*((portions\s+)?copyright\s*(\(c\)|©|\d|:|\[)|\(c\)\s|©)', re.I)
+COPYRIGHT = re.compile(r'^\s*[*#]?\s*((portions\s+)?copyright\s*(\(c\)|©|\d|:|\[)|\(c\)\s+\d|©)', re.I)
 TITLE = re.compile(r'^\s*(the\s+)?mit\s+license(\s*\(mit\))?\s*$', re.I)
 
 

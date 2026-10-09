@@ -5,8 +5,8 @@
 
 // the name Windows shows (Task Manager, the file's properties)
 1 VERSIONINFO
-FILEVERSION 1,0,1,0
-PRODUCTVERSION 1,0,1,0
+FILEVERSION 1,0,3,0
+PRODUCTVERSION 1,0,3,0
 FILEOS 0x40004
 FILETYPE 0x1
 BEGIN
@@ -17,8 +17,8 @@ BEGIN
       VALUE "FileDescription", "Boyler Utilities"
       VALUE "ProductName", "Boyler Utilities"
       VALUE "OriginalFilename", "Boyler Utilities.exe"
-      VALUE "FileVersion", "1.0.2"
-      VALUE "ProductVersion", "1.0.2"
+      VALUE "FileVersion", "1.0.3"
+      VALUE "ProductVersion", "1.0.3"
     END
   END
   BLOCK "VarFileInfo"

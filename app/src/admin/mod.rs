@@ -45,13 +45,25 @@ pub enum Purpose {
     Repair,
     RestorePoint,
     Storage,
+    /// The Keyboard tab's key remap: Windows' Scancode Map (Order 058).
+    Keyboard,
     /// "Back to how your PC was" / "Windows defaults" / the uninstaller's undo: every op that puts a setting back.
     Reset,
 }
 
 impl Purpose {
-    pub const ALL: [Purpose; 9] =
-        [Purpose::Tweaks, Purpose::Network, Purpose::Startup, Purpose::Security, Purpose::Audio, Purpose::Repair, Purpose::RestorePoint, Purpose::Storage, Purpose::Reset];
+    pub const ALL: [Purpose; 10] = [
+        Purpose::Tweaks,
+        Purpose::Network,
+        Purpose::Startup,
+        Purpose::Security,
+        Purpose::Audio,
+        Purpose::Repair,
+        Purpose::RestorePoint,
+        Purpose::Storage,
+        Purpose::Keyboard,
+        Purpose::Reset,
+    ];
 
     pub fn name(self) -> &'static str {
         match self {
@@ -63,6 +75,7 @@ impl Purpose {
             Purpose::Repair => "repair",
             Purpose::RestorePoint => "restore-point",
             Purpose::Storage => "storage",
+            Purpose::Keyboard => "keyboard",
             Purpose::Reset => "reset",
         }
     }
@@ -85,6 +98,7 @@ impl Purpose {
             Purpose::Repair => matches!(op, Spawn(_) | Kill(_)),
             Purpose::RestorePoint => matches!(op, RestoreStatus | RestorePoint { .. }),
             Purpose::Storage => matches!(op, CleanWindowsTemp | DiskHealth(_)),
+            Purpose::Keyboard => matches!(op, ScancodeMap { .. }),
             Purpose::Reset => matches!(
                 op,
                 RegSet { .. }
@@ -99,6 +113,7 @@ impl Purpose {
                     | DefenderAllow(_)
                     | DefenderDisallow(_)
                     | AudioEndpoint { .. }
+                    | ScancodeMap { .. }
             ),
         }
     }
@@ -209,6 +224,10 @@ pub enum Op {
     CleanWindowsTemp,
     /// Read-only health of physical disk N.
     DiskHealth(u32),
+    // ---- Keyboard
+    /// Windows' Scancode Map (HKLM `Keyboard Layout`): exactly these remaps; none = remove the map. Checked with the
+    /// Keyboard crate's own rules (each key once, never onto itself, at most 64).
+    ScancodeMap { maps: Vec<bu_keysound::remap::Mapping> },
 }
 
 /// Longest text field (a registry path, a task path, a file path).
@@ -370,6 +389,10 @@ impl Op {
             Op::RestorePoint { description } => vec!["restore-point".into(), description.clone()],
             Op::CleanWindowsTemp => vec!["clean-windows-temp".into()],
             Op::DiskHealth(n) => vec!["disk-health".into(), n.to_string()],
+            Op::ScancodeMap { maps } => vec![
+                "scancode-map".into(),
+                if maps.is_empty() { "-".into() } else { maps.iter().map(|m| format!("{:x}:{:x}", m.from, m.to)).collect::<Vec<_>>().join(",") },
+            ],
         }
     }
 
@@ -527,10 +550,38 @@ impl Op {
                 }
                 Op::DiskHealth(n)
             }
+            "scancode-map" => {
+                want(1)?;
+                Op::ScancodeMap { maps: parse_maps(&f[1])? }
+            }
             other => return Err(format!("unknown action {:?}", other.chars().take(40).collect::<String>())),
         };
         Ok(op)
     }
+}
+
+/// "3a:1,e038:e01d" (hex scancode pairs, from:to) or "-" (none) -> checked remaps.
+fn parse_maps(s: &str) -> Result<Vec<bu_keysound::remap::Mapping>, String> {
+    if s == "-" {
+        return Ok(Vec::new());
+    }
+    let hex16 = |t: &str| -> Result<u16, String> {
+        if t.is_empty() || t.len() > 4 || !t.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(format!("bad scancode {t:?}"));
+        }
+        u16::from_str_radix(t, 16).map_err(|_| format!("bad scancode {t:?}"))
+    };
+    let parts: Vec<&str> = s.split(',').collect();
+    if parts.len() > bu_keysound::remap::MAX_MAPPINGS {
+        return Err("too many remaps".into());
+    }
+    let mut maps = Vec::with_capacity(parts.len());
+    for p in parts {
+        let (a, b) = p.split_once(':').ok_or("a remap is from:to")?;
+        maps.push(bu_keysound::remap::Mapping { from: hex16(a)?, to: hex16(b)? });
+    }
+    bu_keysound::remap::check(&maps)?;
+    Ok(maps)
 }
 
 /// How an op went wrong, as the normal app sees it.

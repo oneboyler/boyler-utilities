@@ -1,0 +1,43 @@
+[package]
+name = "bu-keysound"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Boyler Utilities - Keyboard tab: key sounds (our own synth, one low-latency WASAPI stream, the key is forgotten at once) and key remap (Windows' Scancode Map). No UI."
+
+[lib]
+name = "bu_keysound"
+
+[dependencies]
+# the process's one Raw Input owner: the key sounds listen through it (class + up / down only)
+bu-rawin = { path = "../rawin" }
+# "Import a Mechvibes pack": its config.json + Ogg Vorbis audio (pure Rust decoder; WAV is read by hand)
+serde_json = "1"
+lewton = "0.10"
+
+[target.'cfg(windows)'.dependencies.windows]
+version = "0.62"
+features = [
+    "Win32_Foundation",
+    "Win32_Media_Audio",
+    "Win32_Security",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Variant",
+    "Win32_System_Registry",
+    "Win32_System_Threading",
+    "Win32_UI_Accessibility",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+]
+
+# Order 058's proof: press -> sound latency of the mixer path + the real stream (muted), on this PC
+[[example]]
+name = "keysound-latency"
+path = "examples/latency.rs"
+
+# Order 058's read-only proof on the real PC: layout labels, the Scancode Map Windows has, game / admin window in front
+[[example]]
+name = "keysound-show"
+path = "examples/show.rs"

@@ -36,6 +36,8 @@ pub trait Sys {
     fn storage(&mut self) -> Result<Arc<dyn bu_storage::StorageOs>, String>;
     /// Empty Windows' own Temp folder: (freed bytes, freed files, in-use bytes, in-use files).
     fn clean_windows_temp(&mut self) -> Result<(u64, u64, u64, u64), String>;
+    /// Write Windows' Scancode Map (empty = remove it).
+    fn scancode_map(&mut self, maps: &[bu_keysound::remap::Mapping]) -> Result<(), String>;
 }
 
 /// The program streams of one copy: id → its control (for Kill).
@@ -280,6 +282,10 @@ pub fn run(op: &Op, sys: &mut dyn Sys, streams: &Streams, out: Arc<dyn Fn(&[&[u8
             let (fb, ff, ub, uf) = sys.clean_windows_temp().map_err(failed)?;
             Ok(vec![fb.to_string(), ff.to_string(), ub.to_string(), uf.to_string()])
         }
+        Op::ScancodeMap { maps } => {
+            sys.scancode_map(maps).map_err(failed)?;
+            Ok(vec![])
+        }
         Op::DiskHealth(n) => {
             let st = sys.storage().map_err(failed)?;
             if !st.physical_disks().map_err(failed)?.iter().any(|d| d.number == *n) {
@@ -502,6 +508,9 @@ impl Sys for RealSys {
     }
     fn clean_windows_temp(&mut self) -> Result<(u64, u64, u64, u64), String> {
         temp::clean()
+    }
+    fn scancode_map(&mut self, maps: &[bu_keysound::remap::Mapping]) -> Result<(), String> {
+        bu_keysound::remap::real::write(maps)
     }
 }
 

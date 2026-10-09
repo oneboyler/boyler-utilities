@@ -1,5 +1,9 @@
 # Boyler Utilities — What's new
 
+## 1.0.3 (2026-10-09)
+- New Keyboard tab: a picture of your keyboard - click any key to remap it, give it an action (media, volume, mic mute, screenshot, open an app or website) or a macro.
+- Key sounds (off until you turn them on): clean keyboard sounds and satisfying ones, quiet by default, silent while a game is in front. The app only uses the key to pick the sound and forgets it at once - nothing is stored.
+
 ## 1.0.2 (2026-10-09)
 - Changing the resolution live: the menu and its Keep / Revert bar now stay on the monitor you changed instead of jumping to your other screen.
 

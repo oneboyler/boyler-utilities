@@ -23,6 +23,70 @@ pub enum RawPacket {
     Mouse { buttons: u16 },
 }
 
+/// RAWKEYBOARD.Flags: the key went up (0 = down).
+pub const RI_KEY_BREAK: u16 = 1;
+/// RAWKEYBOARD.Flags: an extended (E0) key; E1 is the Pause key's own sequence.
+pub const RI_KEY_E0: u16 = 2;
+pub const RI_KEY_E1: u16 = 4;
+
+/// What the key SOUNDS may hear of a key (Order 058): one of four classes, never the key itself. Space, Enter and
+/// Backspace sound different from the rest; every other key is `Other`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SoundClass {
+    Other,
+    Space,
+    Enter,
+    Backspace,
+}
+
+/// One key going down or up, as the sounds hear it. By design this holds NO key identity (no VKey, no scan code): the
+/// key is used to pick the class and forgotten at once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SoundEvent {
+    pub class: SoundClass,
+    pub down: bool,
+}
+
+/// The one thing the sound client's repeat filter keeps: WHICH of the 256 scan codes are held down right now (a 32-byte
+/// bit map, so a held key's auto-repeat doesn't machine-gun the sound). It is a state, never a history: a release clears
+/// the bit, nothing is ever appended, it never leaves the raw thread (see [`Hub::held_count`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct Held([u64; 4]);
+
+impl Held {
+    const fn new() -> Self {
+        Held([0; 4])
+    }
+    fn bit(code: u8) -> (usize, u64) {
+        ((code >> 6) as usize, 1u64 << (code & 63))
+    }
+    /// Sets the bit; true when it was clear (a new press).
+    fn press(&mut self, code: u8) -> bool {
+        let (w, m) = Self::bit(code);
+        let fresh = self.0[w] & m == 0;
+        self.0[w] |= m;
+        fresh
+    }
+    /// Clears the bit.
+    fn release(&mut self, code: u8) {
+        let (w, m) = Self::bit(code);
+        self.0[w] &= !m;
+    }
+    fn count(&self) -> u32 {
+        self.0.iter().map(|w| w.count_ones()).sum()
+    }
+}
+
+/// The class of a virtual key (Space / Enter / Backspace, else Other).
+pub fn sound_class(vk: u16) -> SoundClass {
+    match vk {
+        0x20 => SoundClass::Space,
+        0x0D => SoundClass::Enter,
+        0x08 => SoundClass::Backspace,
+        _ => SoundClass::Other,
+    }
+}
+
 /// Counters for the proof that mouse moves stay on the raw thread.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Stats {
@@ -43,6 +107,9 @@ pub struct Posts {
     pub keys: Option<Target>,
     /// The activity watcher's one-shot "input came" (it is disarmed already; the registration must be redone).
     pub activity: Option<Target>,
+    /// Key sounds to play (Order 058), in the order they happened; the shell hands them to the sound client once the lock
+    /// is let go. Empty (and never allocated) while nobody listens for sounds.
+    pub sounds: Vec<SoundEvent>,
 }
 
 /// What the keys client asked for last (put back if Windows refuses the new one).
@@ -58,6 +125,10 @@ pub struct Hub {
     keys: KeysNeed,
     /// The activity watcher waits for the first input (armed) → where to post it.
     activity: Option<Target>,
+    /// The key-sound client listens (Order 058): key packets become [`SoundEvent`]s, nothing else is kept.
+    sound: bool,
+    /// Repeat filter of the sound client (see [`Held`]); empty while nobody listens.
+    held: Held,
     /// What is registered with Windows now (keyboard, mouse).
     pub registered: (bool, bool),
     queue: VecDeque<RawPacket>,
@@ -77,6 +148,8 @@ impl Hub {
         Hub {
             keys: KeysNeed { keyboard: false, mouse: false, target: None },
             activity: None,
+            sound: false,
+            held: Held::new(),
             registered: (false, false),
             queue: VecDeque::new(),
             posted: false,
@@ -84,10 +157,11 @@ impl Hub {
         }
     }
 
-    /// (keyboard, mouse) Windows must deliver: what the keys need, and both while the activity watcher is armed.
+    /// (keyboard, mouse) Windows must deliver: what the keys need, the keyboard while the key sounds listen, and both
+    /// while the activity watcher is armed.
     pub fn wanted(&self) -> (bool, bool) {
         let a = self.activity.is_some();
-        (self.keys.keyboard || a, self.keys.mouse || a)
+        (self.keys.keyboard || self.sound || a, self.keys.mouse || a)
     }
 
     /// The registration calls that bring Windows to [`Hub::wanted`]: (usage, true = register / false = remove).
@@ -123,6 +197,41 @@ impl Hub {
         std::mem::replace(&mut self.activity, target)
     }
 
+    /// The key-sound client listens (true) or lets go (false). Returns the old setting. Either way the repeat filter
+    /// starts empty: nothing about keys survives a change.
+    pub fn set_sound(&mut self, on: bool) -> bool {
+        self.held = Held::new();
+        std::mem::replace(&mut self.sound, on)
+    }
+
+    /// How many keys the repeat filter thinks are held (0 when nothing is held; the proof that nothing piles up).
+    pub fn held_count(&self) -> u32 {
+        self.held.count()
+    }
+
+    /// How many packets wait for the keys client (the sounds never add to this).
+    pub fn queued(&self) -> usize {
+        self.queue.len()
+    }
+
+    /// A key packet for the sound client: the sound event, or None (a repeat of a held key, a fake key, the Pause key's
+    /// E1 sequence). The key is looked at here and forgotten: only the class and up / down leave.
+    #[inline]
+    fn sound_of(&mut self, vk: u16, make: u16, flags: u16) -> Option<SoundEvent> {
+        if vk == 0 || vk >= 0xFF || flags & RI_KEY_E1 != 0 {
+            return None;
+        }
+        let code = (make & 0x7F) as u8 | if flags & RI_KEY_E0 != 0 { 0x80 } else { 0 };
+        if flags & RI_KEY_BREAK != 0 {
+            self.held.release(code);
+            Some(SoundEvent { class: sound_class(vk), down: false })
+        } else if self.held.press(code) {
+            Some(SoundEvent { class: sound_class(vk), down: true })
+        } else {
+            None
+        }
+    }
+
     /// One packet of a batch. Pure moves are only counted; key packets / mouse buttons and wheel go to the keys client
     /// while it needs that device; the first packet of any kind fires (and disarms) the activity watcher.
     #[inline]
@@ -130,6 +239,13 @@ impl Hub {
         self.stats.packets_seen += 1;
         if let Some(t) = self.activity.take() {
             out.activity = Some(t);
+        }
+        if self.sound {
+            if let RawPacket::Key { vk, make, flags } = p {
+                if let Some(e) = self.sound_of(vk, make, flags) {
+                    out.sounds.push(e);
+                }
+            }
         }
         let for_keys = match p {
             RawPacket::Key { .. } => self.keys.keyboard,
@@ -265,7 +381,7 @@ mod tests {
         h.set_activity(Some(ACT));
         h.registered = h.wanted();
         let out = batch(&mut h, &[mouse(0), mouse(0), key(0x41)]);
-        assert_eq!(out, Posts { keys: None, activity: Some(ACT) }, "a move is enough; the key isn't the keys' device");
+        assert_eq!(out, Posts { keys: None, activity: Some(ACT), sounds: vec![] }, "a move is enough; the key isn't the keys' device");
         assert_eq!(batch(&mut h, &[mouse(0)]).activity, None, "once only");
         // the keyboard is dropped again, the keys' mouse stays
         assert_eq!(h.changes(), vec![(USAGE_KEYBOARD, false)]);
@@ -281,5 +397,102 @@ mod tests {
         assert!(h.changes().is_empty());
         assert_eq!(h.set_activity(Some(ACT)), None);
         assert_eq!(h.set_activity(None), Some(ACT));
+    }
+
+    fn kdown(vk: u16, make: u16) -> RawPacket {
+        RawPacket::Key { vk, make, flags: 0 }
+    }
+    fn kup(vk: u16, make: u16) -> RawPacket {
+        RawPacket::Key { vk, make, flags: RI_KEY_BREAK }
+    }
+    fn ev(class: SoundClass, down: bool) -> SoundEvent {
+        SoundEvent { class, down }
+    }
+
+    #[test]
+    fn sounds_hear_class_and_direction_only() {
+        let mut h = Hub::new();
+        h.set_sound(true);
+        let out = batch(&mut h, &[kdown(0x41, 0x1E), kup(0x41, 0x1E), kdown(0x20, 0x39), kup(0x20, 0x39), kdown(0x0D, 0x1C), kdown(0x08, 0x0E)]);
+        assert_eq!(
+            out.sounds,
+            vec![
+                ev(SoundClass::Other, true),
+                ev(SoundClass::Other, false),
+                ev(SoundClass::Space, true),
+                ev(SoundClass::Space, false),
+                ev(SoundClass::Enter, true),
+                ev(SoundClass::Backspace, true)
+            ]
+        );
+        assert_eq!(out.keys, None, "the sounds never wake the keys client");
+    }
+
+    #[test]
+    fn a_held_keys_auto_repeat_is_one_sound() {
+        let mut h = Hub::new();
+        h.set_sound(true);
+        let out = batch(&mut h, &[kdown(0x41, 0x1E), kdown(0x41, 0x1E), kdown(0x41, 0x1E), kdown(0x42, 0x30), kup(0x41, 0x1E), kdown(0x41, 0x1E)]);
+        let downs = out.sounds.iter().filter(|e| e.down).count();
+        assert_eq!(downs, 3, "A once, B once, A again after its release; the repeats are silent");
+        // an extended key has its own scan code: the right Ctrl isn't the left one
+        let out = batch(&mut h, &[kdown(0x11, 0x1D), RawPacket::Key { vk: 0x11, make: 0x1D, flags: RI_KEY_E0 }]);
+        assert_eq!(out.sounds.len(), 2);
+    }
+
+    #[test]
+    fn fake_keys_and_the_pause_sequence_are_ignored() {
+        let mut h = Hub::new();
+        h.set_sound(true);
+        let out = batch(&mut h, &[kdown(0xFF, 0), kdown(0, 0), RawPacket::Key { vk: 0x13, make: 0x1D, flags: RI_KEY_E1 }]);
+        assert!(out.sounds.is_empty());
+        assert_eq!(h.held_count(), 0);
+    }
+
+    /// Order 058's promise: the key is used to pick the sound and forgotten. After a whole text was typed (and every key
+    /// released) the sound client's state is empty, no packet waited in any queue, and the event type has no key in it.
+    #[test]
+    fn nothing_keeps_the_keys() {
+        let mut h = Hub::new();
+        h.set_sound(true); // the sounds ONLY: no keys client at all
+        let text = "the quick brown fox - hunter2";
+        let mut seen = 0usize;
+        for (i, c) in text.chars().enumerate() {
+            let vk = 0x41 + (c as u16 % 26);
+            let make = 0x10 + (i as u16 % 40);
+            let out = batch(&mut h, &[kdown(vk, make), kup(vk, make)]);
+            seen += out.sounds.len();
+        }
+        assert_eq!(seen, text.chars().count() * 2);
+        assert_eq!(h.held_count(), 0, "every key was released: nothing is left in the repeat filter");
+        assert_eq!(h.queued(), 0, "the sounds never put a packet in the keys queue");
+        assert!(h.take().is_empty());
+        // held right now (a state, not a history) ...
+        batch(&mut h, &[kdown(0x41, 0x1E), kdown(0x42, 0x30)]);
+        assert_eq!(h.held_count(), 2);
+        // ... and gone the moment the sounds stop listening
+        h.set_sound(false);
+        assert_eq!(h.held_count(), 0);
+        let out = batch(&mut h, &[kdown(0x41, 0x1E)]);
+        assert!(out.sounds.is_empty(), "off = nothing is heard");
+        assert_eq!(h.held_count(), 0, "off = nothing is kept");
+        // the event is exactly (class, down): two bytes of information and no key
+        assert_eq!(std::mem::size_of::<SoundEvent>(), 2);
+    }
+
+    #[test]
+    fn the_sounds_need_the_keyboard_registered_and_let_go_when_off() {
+        let mut h = Hub::new();
+        assert_eq!(h.wanted(), (false, false));
+        h.set_sound(true);
+        assert_eq!(h.wanted(), (true, false));
+        assert_eq!(h.changes(), vec![(USAGE_KEYBOARD, true)]);
+        h.registered = h.wanted();
+        // the keys client shares the keyboard: removing the sounds keeps it registered
+        h.set_keys(true, false, Some(KEYS));
+        h.set_sound(false);
+        assert!(h.changes().is_empty());
+        h.set_keys(false, false, None);
+        assert_eq!(h.changes(), vec![(USAGE_KEYBOARD, false)]);
     }
 }
