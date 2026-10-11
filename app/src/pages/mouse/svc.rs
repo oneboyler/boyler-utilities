@@ -644,7 +644,7 @@ fn run<O: MouseOs>(mut m: Mouse<O>, rx: Receiver<Cmd>, tx: Sender<Reply>, mut ac
     if let Ok(false) = m.load_accel() {
         // (the mirror is not saved: the card is the user's only once they change it - a card they never turned on must not
         // write the driver at the next start)
-        let _ = m.mirror_rawaccel();
+        let _ = m.start_from_rawaccel();
     }
     // every answer wakes an idle menu (the page shows it at once, not at the next mouse move)
     let send = |r: Reply| {

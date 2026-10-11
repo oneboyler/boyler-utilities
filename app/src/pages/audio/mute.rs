@@ -591,11 +591,14 @@ impl MuteUi {
         // Sound: `row('Sound',[sndChange, toggle])`
         let chg = if snd.enabled { link::link(cx, K_SND_CHG, if s.snd_open { "Hide" } else { "Change" }, 12.0) } else { link::link(cx, K_SND_CHG, "Change", 12.0).opacity(0.0).no_hit() };
         rows.push(stag(1, plain_row(false, "Sound", None, vec![chg, toggle::toggle(cx, K_SND, snd.enabled, false)])));
+        // Order 092: the Volume slider sits right under the switch while the sound is on (it used to hide behind "Change")
+        let vol_row = plain_row(false, "Volume", None, vec![sl(cx, K_VOL, snd.volume as f32 / 100.0, &format!("{} %", snd.volume))]);
+        let vt = card::fold_t(cx, sub(K_MM, "xpvol"), snd.enabled);
+        rows.push(card::drop_out(cx, vol_row, 406.0, vt));
         let snd_rows = El::col()
             .items(AlignItems::STRETCH)
             .child(plain_row(false, "On mute", None, vec![self.pick(cx, K_SND_MUTE, snd.on_mute.label()), self.pb(cx, K_PV_MUTE, snd.on_mute.can_preview())]))
-            .child(plain_row(false, "On unmute", None, vec![self.pick(cx, K_SND_UNMUTE, snd.on_unmute.label()), self.pb(cx, K_PV_UNMUTE, snd.on_unmute.can_preview())]))
-            .child(plain_row(false, "Volume", None, vec![sl(cx, K_VOL, snd.volume as f32 / 100.0, &format!("{} %", snd.volume))]));
+            .child(plain_row(false, "On unmute", None, vec![self.pick(cx, K_SND_UNMUTE, snd.on_unmute.label()), self.pb(cx, K_PV_UNMUTE, snd.on_unmute.can_preview())]));
         let ft = card::fold_t(cx, sub(K_MM, "xpsnd"), snd.enabled && s.snd_open);
         rows.push(card::drop_out(cx, snd_rows, 406.0, ft));
         // Icon on screen

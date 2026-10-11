@@ -1,4 +1,4 @@
-//! Which sound a key event gets. The ONLY thing taken from the key is its class (see `bu_rawin::SoundEvent`).
+//! Which of a pack's five sounds a key event gets: from its class (see `bu_rawin::SoundEvent`).
 
 use bu_rawin::{SoundClass, SoundEvent};
 
@@ -38,7 +38,7 @@ mod tests {
 
     #[test]
     fn classes_pick_their_sound() {
-        let e = |class, down| SoundEvent { class, down };
+        let e = |class, down| SoundEvent { class, down, key: 0x1E };
         assert_eq!(kind_of(e(SoundClass::Other, true)), Kind::Down);
         assert_eq!(kind_of(e(SoundClass::Space, true)), Kind::Space);
         assert_eq!(kind_of(e(SoundClass::Enter, true)), Kind::Enter);
@@ -48,16 +48,17 @@ mod tests {
         }
     }
 
-    /// Order 058: the key is forgotten at once. The type this crate is given is (class, down) and nothing more, so
-    /// there is no key to store: two bytes, and the whole engine API takes only that.
+    /// Order 058 / 090: the event is (class, down, scan code) and nothing more - no text, no time, no window. The scan code picks
+    /// a key's own sound and a made pack's pitch; the pack's five sounds still come from the class alone.
     #[test]
-    fn the_engine_never_sees_a_key() {
-        assert_eq!(std::mem::size_of::<SoundEvent>(), 2);
-        // the only way in is `kind_of(SoundEvent)`: 5 possible sounds, so at most log2(5) bits of the key survive
+    fn the_event_is_small_and_the_pack_sound_comes_from_the_class() {
+        assert_eq!(std::mem::size_of::<SoundEvent>(), 4);
         let mut seen = std::collections::HashSet::new();
         for class in [SoundClass::Other, SoundClass::Space, SoundClass::Enter, SoundClass::Backspace] {
             for down in [true, false] {
-                seen.insert(kind_of(SoundEvent { class, down }) as usize);
+                for key in [0x1E, 0x30, 0xE01C] {
+                    seen.insert(kind_of(SoundEvent { class, down, key }) as usize);
+                }
             }
         }
         assert_eq!(seen.len(), KINDS);

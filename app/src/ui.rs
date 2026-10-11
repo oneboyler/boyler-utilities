@@ -35,6 +35,8 @@ pub const RADIUS: f32 = 14.0;
 /// the page area: `.right` margin-top 52 + padding-top 4
 pub const PAGE_TOP: f32 = 56.0;
 pub const PAGE_H: f32 = WIN_H - PAGE_TOP;
+/// Order 097: the menu sits behind a full-screen game (set by the main loop): a page that animates by itself stops while it is.
+pub static COVERED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 // ------------------------------------------------------------------ colour tokens (#sw, menu-v22): the theme's palette
 // Order 033: every token reads the current theme. Dark = the dark glass exactly as before; light = the drawing's

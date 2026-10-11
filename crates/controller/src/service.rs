@@ -4,7 +4,8 @@
 //! - Every change re-reads the file first (Steam may have saved its own copy since), changes only the lines it needs and
 //!   writes the whole file in one replace. Steam re-reads a game's layout when the game window gets focus (measured live
 //!   with a real pad: "Loaded Config for Local Selection Path … 252950" on focus; a Cross/Circle swap worked
-//!   without a Steam restart). The app never starts, closes or restarts Steam.
+//!   without a Steam restart). The app closes / starts Steam only on the "Restart Steam to apply" click (the light colour:
+//!   Steam keeps the controller's preferences in memory while it runs, Order 085).
 //! - Before the FIRST write of a file the app keeps its original bytes (`<backups>\<account>\<path under Steam>.original`,
 //!   or a `.absent` marker if the app created the file) — "Back to how your PC was" puts them back.
 //! - Every write is one undo step (all files it touched); undo refuses when the file changed since (someone else wrote).
@@ -660,6 +661,63 @@ impl<O: SteamOs> ControllerService<O> {
             &[(PrefSetting::LedRed, Some(&r)), (PrefSetting::LedGreen, Some(&g)), (PrefSetting::LedBlue, Some(&b))],
             "light bar colour",
         )
+    }
+
+    // ------------------------------------------------------------------------------------------ "Restart Steam to apply" (Order 085)
+    //
+    // Steam reads `preferences_<serial>.vdf` when the controller connects / Steam starts and keeps its own copy while it runs
+    // (measured Oct 10: the file holds the colour the app wrote and Steam's log has no reload line; Steam itself rewrote the
+    // file within seconds of the pad connecting). So a colour written while Steam runs reaches the pad only after Steam
+    // restarts - and a Steam that writes its copy back on exit must not undo it: the colour is written AGAIN after Steam has
+    // closed, before it starts. The caller (the page's worker) runs the steps in this order and waits between them:
+    // `restart_check` -> `light_values` -> `steam_shutdown` -> (wait: `steam_closed`) -> `keep_light` -> `steam_start_minimised`.
+
+    /// Refuses while Steam is closed (nothing to restart) or a game runs (never closes a game's Steam under it).
+    pub fn restart_check(&self) -> Result<()> {
+        if !self.os.steam_running() {
+            return Err(Error::SteamClosed);
+        }
+        if self.os.game_running() {
+            return Err(Error::GameRunning);
+        }
+        Ok(())
+    }
+
+    /// The light settings (colour + brightness) as the controller's file holds them now: what must survive the restart.
+    pub fn light_values(&self, serial: &str) -> Result<Vec<(PrefSetting, Option<String>)>> {
+        let p = self.preferences()?.into_iter().find(|p| p.serial == serial).ok_or_else(|| Error::PadGone(serial.to_string()))?;
+        Ok([PrefSetting::LedRed, PrefSetting::LedGreen, PrefSetting::LedBlue, PrefSetting::LedBrightness]
+            .into_iter()
+            .map(|s| (s, p.get(s).map(str::to_string)))
+            .collect())
+    }
+
+    /// Steam's clean shutdown (`steam.exe -shutdown`); refused again if a game started in the meantime.
+    pub fn steam_shutdown(&self) -> Result<()> {
+        if self.os.game_running() {
+            return Err(Error::GameRunning);
+        }
+        self.os.steam_shutdown()
+    }
+
+    /// Has Steam's process ended?
+    pub fn steam_closed(&self) -> bool {
+        !self.os.steam_running()
+    }
+
+    /// With Steam closed: write the wanted light values into the file if it does not hold them (a closing Steam may have
+    /// written its own copy back). Returns whether it had to write.
+    pub fn keep_light(&mut self, serial: &str, wanted: &[(PrefSetting, Option<String>)]) -> Result<bool> {
+        let path = self.steam.config_dir().join(format!("preferences_{serial}.vdf"));
+        let before = self.read_text_exact(&path)?;
+        let v: Vec<(PrefSetting, Option<&str>)> = wanted.iter().map(|(s, v)| (*s, v.as_deref())).collect();
+        self.set_preferences(serial, &v, "light colour kept over a Steam restart")?;
+        Ok(self.read_text_exact(&path)? != before)
+    }
+
+    /// Start Steam again, minimised (`steam.exe -silent`).
+    pub fn steam_start_minimised(&self) -> Result<()> {
+        self.os.steam_start_minimised()
     }
 
     /// "Back to how your PC was" for one controller's settings.

@@ -470,6 +470,8 @@ pub struct ButtonView {
     pub settings: Vec<(PressSetting, Option<i64>)>,
     /// How many extra bindings the Regular press has (a key combo); writing an action replaces them with one.
     pub extra_bindings: usize,
+    /// Order 090: the button runs a macro (Steam's extra commands with fire start delays): its commands; empty = no macro.
+    pub macro_cmds: Vec<crate::layout::MacroCmd>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -527,7 +529,7 @@ impl Layout {
     pub fn button_view(&self, set: u32, kind: PadKind, id: ButtonId) -> ButtonView {
         let name = id.name(kind);
         let Some(src) = id.source() else {
-            return ButtonView { id, name, fixed: true, presses: vec![], settings: vec![], extra_bindings: 0 };
+            return ButtonView { id, name, fixed: true, presses: vec![], settings: vec![], extra_bindings: 0, macro_cmds: vec![] };
         };
         let mode = self.group_mode(set, src);
         let place = id.place(mode.as_deref()).expect("has a source");
@@ -543,7 +545,8 @@ impl Layout {
             })
             .collect();
         let extra = self.bindings(set, place.source, place.input, Press::Full).len().saturating_sub(1);
-        ButtonView { id, name, fixed: id.is_fixed(), presses, settings, extra_bindings: extra }
+        let macro_cmds = if self.is_macro(set, place.source, place.input) { self.macro_cmds(set, place.source, place.input) } else { vec![] };
+        ButtonView { id, name, fixed: id.is_fixed(), presses, settings, extra_bindings: extra, macro_cmds }
     }
 
     pub fn stick_view(&self, set: u32, side: Side) -> StickView {
@@ -607,6 +610,8 @@ impl Layout {
 pub enum Change {
     /// What one press of a button does.
     ButtonAction { button: ButtonId, press: Press, action: Action },
+    /// Order 090: the button's macro (Steam plays it): its Regular / Start commands become these.
+    ButtonMacro { button: ButtonId, cmds: Vec<crate::layout::MacroCmd> },
     /// A Regular-press setting (or the chord's button); `None` = Steam's default.
     ButtonSetting { button: ButtonId, setting: PressSetting, value: Option<i64> },
     StickMode { side: Side, mode: StickMode },
@@ -629,7 +634,7 @@ impl Change {
     /// Is this change possible on this pad (no gyro / touchpad on an Xbox pad, no back buttons on a plain DualSense)?
     pub fn fits(&self, kind: PadKind) -> bool {
         match self {
-            Change::ButtonAction { button, .. } | Change::ButtonSetting { button, .. } => button.on(kind) && !button.is_fixed(),
+            Change::ButtonAction { button, .. } | Change::ButtonSetting { button, .. } | Change::ButtonMacro { button, .. } => button.on(kind) && !button.is_fixed(),
             Change::GyroMode { .. } | Change::GyroSetting { .. } => kind.has_gyro(),
             Change::TouchMode { .. } | Change::TouchClick { .. } | Change::TouchSetting { .. } => kind.has_touchpad(),
             _ => true,
@@ -645,7 +650,17 @@ impl Layout {
                 let src = button.source().ok_or_else(|| crate::layout::LayoutError::NoGroup("PS button".into()))?;
                 let mode = self.group_mode(set, src);
                 let p = button.place(mode.as_deref()).expect("has a source");
+                // Order 090: a plain action on a button that runs a macro ends the macro first (no extra command left)
+                if matches!(press, Press::Full | Press::Start) && self.is_macro(set, p.source, p.input) {
+                    self.set_macro(set, p.source, p.new_mode, p.input, &[])?;
+                }
                 self.set_action(set, p.source, p.new_mode, p.input, *press, action)
+            }
+            Change::ButtonMacro { button, cmds } => {
+                let src = button.source().ok_or_else(|| crate::layout::LayoutError::NoGroup("PS button".into()))?;
+                let mode = self.group_mode(set, src);
+                let p = button.place(mode.as_deref()).expect("has a source");
+                self.set_macro(set, p.source, p.new_mode, p.input, cmds)
             }
             Change::ButtonSetting { button, setting, value } => {
                 let src = button.source().ok_or_else(|| crate::layout::LayoutError::NoGroup("PS button".into()))?;
@@ -709,7 +724,13 @@ impl PadView {
                 if b.fixed {
                     return;
                 }
+                if !b.macro_cmds.is_empty() {
+                    out.push(Change::ButtonMacro { button: id, cmds: b.macro_cmds.clone() });
+                }
                 for (press, action) in &b.presses {
+                    if !b.macro_cmds.is_empty() && matches!(press, Press::Full | Press::Start) {
+                        continue;
+                    }
                     out.push(Change::ButtonAction { button: id, press: *press, action: action.clone() });
                 }
                 for (setting, value) in &b.settings {

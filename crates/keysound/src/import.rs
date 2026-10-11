@@ -183,6 +183,81 @@ fn resample(v: &[f32], from: u32, to: u32) -> Vec<f32> {
     limit(out, to)
 }
 
+/// Order 090: one sound of the user's own ("Your sound" on a key, "Make a pack from one sound"), decoded: mono f32 at its own
+/// rate. Cloning is cheap (shared samples).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Clip {
+    pub rate: u32,
+    pub mono: Arc<[f32]>,
+}
+
+/// The longest sound of your own kept (a funny noise on a key may run a bit; a file can't be made huge to eat memory).
+pub const MAX_OWN_SECONDS: f32 = 10.0;
+
+/// Reads one sound file of the user's: WAV or Ogg Vorbis here, anything else (MP3 above all) through Windows' own decoder.
+/// Cut to [`MAX_OWN_SECONDS`], soft edges, loudest sample at the packs' level. Call it through [`crate::safe::read_sound`]
+/// (a broken file must not be able to end the app).
+pub fn read_sound_file(path: &Path) -> Result<Clip, String> {
+    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let len = std::fs::metadata(path).map_err(|_| format!("{name} can't be read"))?.len();
+    if len > MAX_FILE {
+        return Err(format!("{name} is too big ({} MB)", len / 1024 / 1024));
+    }
+    if len == 0 {
+        return Err(format!("{name} is empty"));
+    }
+    let bytes = std::fs::read(path).map_err(|e| format!("{name}: {e}"))?;
+    let ours = (bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WAVE")) || bytes.starts_with(b"OggS");
+    let (rate, mono) = if ours {
+        let a = decode(&name, &bytes)?;
+        (a.rate, a.mono)
+    } else {
+        os_decode(path, &name)?
+    };
+    clip_of(rate, mono)
+}
+
+#[cfg(windows)]
+fn os_decode(path: &Path, _name: &str) -> Result<(u32, Vec<f32>), String> {
+    crate::mf::decode_file(path, (MAX_OWN_SECONDS * 192_000.0) as usize)
+}
+
+#[cfg(not(windows))]
+fn os_decode(_path: &Path, name: &str) -> Result<(u32, Vec<f32>), String> {
+    Err(format!("{name}: only WAV and Ogg Vorbis can be read here"))
+}
+
+/// Raw samples -> a [`Clip`]: cut, soft edges (1 ms), the loudest sample at [`PEAK`].
+pub fn clip_of(rate: u32, mut v: Vec<f32>) -> Result<Clip, String> {
+    if !(8000..=192_000).contains(&rate) {
+        return Err(format!("unusable sound ({rate} Hz)"));
+    }
+    v.truncate((MAX_OWN_SECONDS * rate as f32) as usize);
+    for x in v.iter_mut() {
+        if !x.is_finite() {
+            *x = 0.0;
+        }
+    }
+    let peak = v.iter().fold(0.0f32, |m, x| m.max(x.abs()));
+    if v.len() < 2 || peak < 1.0e-5 {
+        return Err("there is no sound in this file (silence)".into());
+    }
+    let fade = (rate as usize / 1000).max(1).min(v.len() / 2);
+    let n = v.len();
+    for i in 0..fade {
+        let f = i as f32 / fade as f32;
+        v[i] *= f;
+        v[n - 1 - i] *= f;
+    }
+    // (measured again after the fade: a sound that starts at full level lost its first peak to it)
+    let peak = v.iter().fold(0.0f32, |m, x| m.max(x.abs())).max(1.0e-6);
+    let scale = PEAK / peak;
+    for x in v.iter_mut() {
+        *x *= scale;
+    }
+    Ok(Clip { rate, mono: Arc::from(v.into_boxed_slice()) })
+}
+
 fn decode(name: &str, bytes: &[u8]) -> Result<Audio, String> {
     let lower = name.to_ascii_lowercase();
     let a = if bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WAVE") {

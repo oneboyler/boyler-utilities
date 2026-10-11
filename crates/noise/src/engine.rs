@@ -60,6 +60,9 @@ pub struct Status {
     pub opens: u32,
     /// Frames written to the stream so far: it advances at the sample rate while the device plays them.
     pub written: u64,
+    /// Seconds of sound written to the stream so far, all plays of this player added up (at the stream's own rate): the
+    /// listening tracker reads it at Play and at Stop, so a sleeping PC or a missing output is never counted as listened.
+    pub played: f64,
 }
 
 #[derive(Default)]
@@ -71,6 +74,7 @@ struct State {
     rate: u32,
     opens: u32,
     written: u64,
+    played: f64,
     /// The number of the worker that owns `core` (a new `play` makes a new one).
     gen: u64,
 }
@@ -255,6 +259,7 @@ impl Noise {
             bytes: c.map_or(0, |c| c.bytes()),
             opens: st.opens,
             written: st.written,
+            played: st.played,
         }
     }
 }
@@ -382,7 +387,10 @@ fn run(sh: Arc<Shared>, gen: u64) {
             if let Some(s) = stream.as_ref() {
                 match s.write(&scratch) {
                     Ok(()) => {
-                        lock(&sh.st).written += u64::from(want);
+                        let mut st = lock(&sh.st);
+                        st.written += u64::from(want);
+                        st.played += f64::from(want) / f64::from(st.rate.max(1));
+                        drop(st);
                         wrote_any = true;
                     }
                     Err(_) => lost = true,

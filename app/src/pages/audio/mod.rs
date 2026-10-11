@@ -41,6 +41,7 @@ const K_IN_PCT: Key = key("aud.inpct");
 const K_OUT_PICK: Key = key("aud.outpick");
 const K_IN_PICK: Key = key("aud.inpick");
 const K_MIC: Key = key("aud.mic");
+const K_SPK: Key = key("aud.spk");
 const K_MML: Key = key("aud.mml");
 const K_KEEP: Key = key("aud.keep");
 const K_NEW_VOL: Key = key("aud.newvol");
@@ -180,6 +181,8 @@ struct St {
     /// Order 047: the mic's mute state read off the menu's thread after a change (`tick` takes it)
     mic_read: std::sync::Arc<std::sync::Mutex<Option<bool>>>,
     muted: bool,
+    /// Order 081: the default output device is muted (the Output row's speaker icon, like the mic icon of the Input row)
+    out_muted: bool,
     mute: Option<mute::MuteUi>,
     review: Option<Review>,
     toast: Option<(String, f64)>,
@@ -394,6 +397,11 @@ impl St {
             self.out = s.output.as_ref().map(|(id, v)| (id.clone(), v.volume));
             changed = true;
         }
+        let out_muted = s.output.as_ref().is_some_and(|o| o.1.muted);
+        if !holding && out_muted != self.out_muted {
+            self.out_muted = out_muted;
+            changed = true;
+        }
         if !holding && !dragging(K_IN_VOL) && !editing(K_IN_PCT) && !same_dev(&s.input, &self.inp) {
             self.inp = s.input.as_ref().map(|(id, v)| (id.clone(), v.volume));
             changed = true;
@@ -447,7 +455,7 @@ impl St {
         self.last = now;
         if self.frozen {
             // the drawing's frozen sample (dom_dump's freeze): devices .70 / .62 with their peaks, apps .55 .12 .30 0 0
-            self.vo = Level { l: 0.70, pk: 0.82, pt: now + 1e9 };
+            self.vo = Level { l: if self.out_muted { 0.0 } else { 0.70 }, pk: if self.out_muted { 0.0 } else { 0.82 }, pt: now + 1e9 };
             self.vi = Level { l: if self.muted { 0.0 } else { 0.62 }, pk: if self.muted { 0.0 } else { 0.74 }, pt: now + 1e9 };
             const LV: [f32; 5] = [0.55, 0.12, 0.30, 0.0, 0.0];
             const PK: [f32; 5] = [0.06, 0.25, 0.04, 0.0, 0.0];
@@ -475,11 +483,11 @@ impl St {
                 r.lv.app(t, now, dt);
             }
             let o = fs.output(sum, now);
-            self.vo.device(o, now, dt);
+            self.vo.device(if self.out_muted { 0.0 } else { o }, now, dt);
             let i = if self.muted { 0.0 } else { fs.input(now) };
             self.vi.device(i, now, dt);
         } else {
-            self.vo.device(s.output_level, now, dt);
+            self.vo.device(if self.out_muted { 0.0 } else { s.output_level }, now, dt);
             self.vi.device(if self.muted { 0.0 } else { s.input_level }, now, dt);
             for r in self.apps.iter_mut() {
                 let raw = s.app_levels.iter().find(|x| x.0 == r.group).map(|x| x.1).unwrap_or(0.0);
@@ -787,15 +795,19 @@ fn dev_row(cx: &mut Cx, st: &mut St, flow: Flow) -> El {
     let vol = dev.as_ref().map(|d| d.1).unwrap_or(0.0);
     let list = if out { &st.outs } else { &st.ins };
     let name = dev.as_ref().and_then(|d| list.iter().find(|x| x.device.id == d.0)).map(|d| d.device.name.clone()).unwrap_or_default();
-    let icon = if out {
-        dvi("spk")
+    // v21: the Input row's mic icon IS the mute button (Order 081: the Output row's speaker icon is the same button for the
+    // output device). `.dvi.dmb{width:30px;height:30px;margin:-4px;border-radius:50%;
+    // transition:background .15s ease,transform .12s ease}` `:hover{background:var(--ctl-h)}` `:hover svg{stroke:var(--fg)}`
+    // `:active{transform:scale(.9)}` `.m{background:rgba(255,69,58,.16)}` `.m svg{stroke:var(--red)}` `.sl{opacity:0}` `.m .sl{opacity:1}`
+    let (kb, is_muted, ico, tip) = if out {
+        (K_SPK, st.out_muted, "spkS", if st.out_muted { "Unmute speakers" } else { "Mute speakers" })
     } else {
-        // v21: the Input row's mic icon IS the mute button. `.dvi.dmb{width:30px;height:30px;margin:-4px;border-radius:50%;
-        // transition:background .15s ease,transform .12s ease}` `:hover{background:var(--ctl-h)}` `:hover svg{stroke:var(--fg)}`
-        // `:active{transform:scale(.9)}` `.m{background:rgba(255,69,58,.16)}` `.m svg{stroke:var(--red)}` `.sl{opacity:0}` `.m .sl{opacity:1}`
-        let hv = cx.hover_t(K_MIC, 150.0, EASE);
-        let pr = cx.active_t(K_MIC, 120.0, EASE);
-        let m = cx.tr(K_MIC, 5, if st.muted { 1.0 } else { 0.0 }, 150.0, EASE);
+        (K_MIC, st.muted, "micS", if st.muted { "Unmute mic" } else { "Mute mic" })
+    };
+    let icon = {
+        let hv = cx.hover_t(kb, 150.0, EASE);
+        let pr = cx.active_t(kb, 120.0, EASE);
+        let m = cx.tr(kb, 5, if is_muted { 1.0 } else { 0.0 }, 150.0, EASE);
         let bg = cmix(CTL_H().mul_a(hv), Rgba::rgba(255, 69, 58, 0.16), m);
         let stroke = cmix(cmix(ICO(), FG(), hv), RED(), m);
         El::grid()
@@ -806,11 +818,11 @@ fn dev_row(cx: &mut Cx, st: &mut St, flow: Flow) -> El {
             .bg(bg)
             .place_center()
             .scale(1.0 - 0.1 * pr)
-            .on_click(K_MIC)
+            .on_click(kb)
             .cursor(Cursor::Hand)
             // `micB.title=S.muted?'Unmute mic':'Mute mic'`
-            .title(if st.muted { "Unmute mic" } else { "Mute mic" })
-            .child(El::icon("micS", 22.0, 1.5, stroke).class_op("sl", m).no_hit())
+            .title(tip)
+            .child(El::icon(ico, 22.0, 1.5, stroke).class_op("sl", m).no_hit())
     };
     // `.dvr .lbl{flex:none;width:46px}`
     let mut lbl = El::col().w(46.0).none().child(El::text(if out { "Output" } else { "Input" }, Font::new(13.0, 400), FG(), lh(13.0, 1.35)).ellipsis());
@@ -831,7 +843,7 @@ fn dev_row(cx: &mut Cx, st: &mut St, flow: Flow) -> El {
     // (Order 047: the level is read when the live pass paints it - `St::live`, written by `tick`)
     let src = st.live.clone();
     // `.vis.mut{opacity:.35}` (transition .3 s) - the Input's pill while the mic is muted
-    let vis_op = if out { 1.0 } else { cx.tr(kv, 9, if st.muted { 0.35 } else { 1.0 }, 300.0, EASE) };
+    let vis_op = cx.tr(kv, 9, if is_muted { 0.35 } else { 1.0 }, 300.0, EASE);
     let vis = El::paint(move |g, r| {
         let lv = {
             let s = src.borrow();
@@ -1091,6 +1103,7 @@ impl Page for Audio {
             mic,
             mic_read: Default::default(),
             muted,
+            out_muted: false,
             mute: None,
             review: None,
             toast: None,
@@ -1436,7 +1449,7 @@ impl Page for Audio {
         let vol = |d: &Option<(String, f32)>| d.as_ref().map(|d| (d.1 * 100.0).round()).unwrap_or(0.0);
         let r = svc::rules();
         let mut s = format!(
-            "out={} in={} outvol={} invol={} keep={} newapps={} newvol={} micmuted={} menu={} mute={} review={}",
+            "out={} in={} outvol={} invol={} keep={} newapps={} newvol={} micmuted={} menu={} mute={} review={} outmuted={}",
             id(&st.out),
             id(&st.inp),
             vol(&st.out),
@@ -1447,7 +1460,8 @@ impl Page for Audio {
             st.muted,
             st.menu.as_ref().map(|m| if m.flow == Flow::Output { "out" } else { "in" }).unwrap_or("none"),
             st.mute.is_some(),
-            st.review.as_ref().map(|r| if r.win { "win" } else { "pc" }).unwrap_or("none")
+            st.review.as_ref().map(|r| if r.win { "win" } else { "pc" }).unwrap_or("none"),
+            st.out_muted
         );
         for a in &st.apps {
             s += &format!("\napp {} vol={} muted={}", a.name, (a.vol * 100.0).round(), a.muted);
@@ -1530,6 +1544,15 @@ fn click(st: &mut St, k: Key, now: f64) {
                 st.menu = None;
             } else {
                 st.open_menu(flow);
+            }
+        }
+        K_SPK => {
+            // Order 081: the default output device's own mute, on the worker like the other device commands; the icon
+            // shows the flip at once and then follows the worker's answer
+            if let Some((id, _)) = st.out.clone() {
+                st.out_muted = !st.out_muted;
+                let m = st.out_muted;
+                st.run(Cmd::DeviceMute(id, m), now);
             }
         }
         K_MIC => {

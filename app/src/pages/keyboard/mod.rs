@@ -1,11 +1,15 @@
-//! The Keyboard tab (Order 058): key sounds, a keyboard picture (remap / action / macro per key) and the macro builder.
+//! The Keyboard tab (Order 058, rebuilt in Order 090 to keyboard-v8.html): the keyboard FIRST - click a key = its window
+//! (Normal / Remap / Action / Macro with the macro's steps right there + its Sound: the pack's sound and your own on top);
+//! drag a box, Ctrl- or Shift-click = several keys ("N keys" window: one sound for all, pitch and loudness Same / Rising /
+//! A little random). Then the "Keyboard sounds" card, folded like Mouse acceleration: Sound (the packs, yours, downloaded or
+//! imported, Get more sounds…, Import…, Make a pack from one sound…), Volume, Play on, More (Ignore repeats within 0-400 ms,
+//! Off while a game is in front, Try it, Different in some apps). Macros are made and edited only in a key's window.
 //! Engine: `crates/keysound` (bu-keysound); the always-on part is `glue.rs`, what is remembered `prefs.rs`, what the picture
-//! edits `model.rs`, the keyboard drawing `pic.rs`, the page's boxes `view.rs`. Drawing: boss\mockups\keyboard-v2.html.
+//! edits `model.rs`, the keyboard drawing `pic.rs`, the page's boxes `view.rs`, the shared window parts `pages::btnwin`.
 //!
-//! Key sounds are OFF by default and while off nothing listens. The pressed key is used only to pick the sound and is
-//! forgotten at once (bu-rawin hands the sounds a class + up / down, never a key). A remap is Windows' own key map (one admin
-//! Yes, a restart); a key's action or macro works at once through the keys manager, and is left alone while a game or a
-//! full-screen window is in front.
+//! Key sounds are OFF by default and while off nothing listens. The pressed key is used only to pick its sound and is not
+//! kept. A remap is Windows' own key map (one admin Yes, a restart); a key's action or macro works at once through the keys
+//! manager, and is left alone while a game or a full-screen window is in front.
 
 use crate::pages::{Env, Page};
 use crate::ui::cx::{Cx, Ev};
@@ -13,10 +17,10 @@ use crate::ui::el::{idx, key, sub, El, Key};
 use crate::ui::pieces::nbox::{self, Filter};
 use bu_keysound::binds::{Bind, Preset};
 use bu_keysound::layout::Layout;
-use bu_keysound::macros::{Macro, Step};
 use bu_keysound::remap::{self, Code, Mapping};
-use bu_keysound::{Kind, Pack, PackId, Rule};
+use bu_keysound::{Pack, PackId, Rule};
 
+mod detect;
 pub mod gallery;
 mod getter;
 pub mod glue;
@@ -24,6 +28,7 @@ pub mod model;
 pub mod pic;
 pub mod prefs;
 mod view;
+pub use view::combo_of;
 #[cfg(test)]
 mod tests;
 
@@ -35,11 +40,29 @@ const K_PACK: Key = key("kbd.pack");
 const K_PLAY: Key = key("kbd.play");
 const K_VOL: Key = key("kbd.vol");
 const K_REP: Key = key("kbd.rep");
-const K_MTPL: Key = key("kbd.mtpl");
 const K_GAME: Key = key("kbd.game");
-const K_MOUSE: Key = key("kbd.mouse");
-const K_MVOL: Key = key("kbd.mvol");
 const K_TRY: Key = key("kbd.try");
+/// Order 090: the Keyboard sounds card (folds like Mouse acceleration), its header and chevron.
+const K_CARD: Key = key("kbd.card");
+const K_CARDH: Key = key("kbd.cardh");
+const K_CHEV: Key = key("kbd.chev");
+/// The picture's background (a press there starts a box), the picking line's Clear / Change N keys.
+const K_PICBG: Key = key("kbd.picbg");
+const K_CLR: Key = key("kbd.clr");
+const K_CHG: Key = key("kbd.chg");
+/// The key window's Sound part and macro editor (pages::btnwin), the "N keys" window.
+const K_SND: Key = key("kbd.snd");
+const K_MAC: Key = key("kbd.mac");
+const K_KN: Key = key("kbd.kn");
+/// "Make a pack from one sound": the window, its two file boxes (+ their ×), the variation, the picture, the name, Save.
+const K_MP: Key = key("kbd.mp");
+const K_MPP: Key = key("kbd.mpp");
+const K_MPR: Key = key("kbd.mpr");
+const K_MPV: Key = key("kbd.mpv");
+const K_MPNAME: Key = key("kbd.mpname");
+const K_MPSAVE: Key = key("kbd.mpsave");
+/// The width of the choice + slider column of the pack maker's Pitch / Loudness rows (pack-noise-v1).
+const MAKE_VARY_W: f32 = 330.0;
 const K_RADD: Key = key("kbd.radd");
 const K_RAPP: Key = key("kbd.rapp");
 const K_RPACK: Key = key("kbd.rpack");
@@ -50,27 +73,16 @@ const K_KEY: Key = key("kbd.key");
 const K_KEYT: Key = key("kbd.keyt");
 /// The key's small window (a popup like the controller's part window).
 const K_KD: Key = key("kbd.kd");
-const KD_W: f32 = 420.0;
+const KD_W: f32 = 440.0;
 const K_MODE: Key = key("kbd.mode");
 const K_TARGET: Key = key("kbd.target");
 const K_TPICK: Key = key("kbd.tpick");
 const K_ACT: Key = key("kbd.act");
 const K_ATEXT: Key = key("kbd.atext");
 const K_ABROWSE: Key = key("kbd.abrowse");
-const K_MACDD: Key = key("kbd.macdd");
-const K_MACEDIT: Key = key("kbd.macedit");
 const K_RESETKEY: Key = key("kbd.resetkey");
 const K_APPLY: Key = key("kbd.apply");
-const K_MNEW: Key = key("kbd.mnew");
-const K_MEDIT: Key = key("kbd.medit");
 const K_MENU: Key = key("kbd.menu");
-const K_MD: Key = key("kbd.md");
-const K_MDNAME: Key = key("kbd.mdname");
-const K_MDADD: Key = key("kbd.mdadd");
-const K_MDREC: Key = key("kbd.mdrec");
-const K_MDDEL: Key = key("kbd.mddel");
-const K_MDDONE: Key = key("kbd.mddone");
-const K_STEP: Key = key("kbd.step");
 const K_RESET: Key = key("kbd.reset");
 const K_PLAYON: Key = key("kbd.playon");
 /// The Get-more-sounds window: its search box and a row's play button.
@@ -81,6 +93,8 @@ const K_DELQ: Key = key("kbd.delq");
 
 /// The job that writes the remaps (the admin prompt never holds the menu).
 const JOB_APPLY: &str = "kbd.apply";
+/// Order 096: which keyboard is plugged in (picks the picture size).
+const JOB_DETECT: &str = "kbd.detect";
 /// The second box of the ISO Enter is `K_KEY` index + this.
 const ISO_LOWER: usize = 1000;
 
@@ -117,26 +131,50 @@ enum Pop {
     RulePack(usize),
     Target,
     Action,
-    MacroList,
-    Templates,
-    StepAdd,
 }
 
 /// What a row of the open list means.
 #[derive(Debug, Clone, PartialEq)]
 enum Choice {
     Heading,
+    /// A separator line.
+    Sep,
     Pack(Pack),
     PackOff,
     GetMore,
     Import,
-    Template(usize),
+    /// Order 090: "Make a pack from one sound…".
+    MakePack,
     Target(Code),
     Preset(Preset),
     AppAction(String),
-    Macro(String),
-    NewMacro,
-    Step(u8),
+}
+
+/// A press on the picture that may become a box (Order 090: pick several keys like files on the desktop).
+#[derive(Debug, Clone, PartialEq)]
+struct Band {
+    /// The picture's top-left in window px.
+    origin: (f32, f32),
+    start: (f32, f32),
+    now: (f32, f32),
+    /// The picked keys when it started (Ctrl / Shift add to them).
+    base: Vec<Code>,
+    add: bool,
+    moved: bool,
+}
+
+/// "Make a pack from one sound" while its window is open.
+#[derive(Debug, Clone)]
+struct MakePack {
+    /// (full path of the picked file, its name)
+    press: Option<(String, String)>,
+    release: Option<(String, String)>,
+    vary: bu_keysound::Vary,
+    name: String,
+    /// The name was typed (a new press file no longer renames it).
+    named: bool,
+    opened: f64,
+    msg: Option<String>,
 }
 
 #[derive(Default)]
@@ -161,11 +199,6 @@ pub struct Keyboard {
     /// A red line in the key card (the keys manager's refusal, "numpad keys can't …").
     err: Option<String>,
     try_text: String,
-    /// The macro being edited (its id) and the window's state.
-    edit: Option<String>,
-    rec: bool,
-    rec_at: Option<f64>,
-    listen_step: Option<usize>,
     opened_at: f64,
     /// Remaps were written this session: Windows needs a restart for them.
     restart: bool,
@@ -182,8 +215,25 @@ pub struct Keyboard {
     get_msg: Option<String>,
     /// The search box of the Get-more-sounds window.
     get_q: String,
-    /// "Remove this sound?" is asked for this imported pack, at this place.
-    ask_del: Option<(String, (f32, f32))>,
+    /// "Remove this sound?" is asked for this imported / downloaded / made pack, at this place.
+    ask_del: Option<(Pack, (f32, f32))>,
+    /// Order 090: the keys picked for "Change N keys" (in picking order), the key a Shift-click spans from, a box being drawn.
+    pick: Vec<Code>,
+    anchor: Option<Code>,
+    band: Option<Band>,
+    /// The "N keys" window is open (for `pick`), since when.
+    many: bool,
+    many_at: f64,
+    /// The key / N keys window's Sound part and the key window's macro editor.
+    snd: crate::pages::btnwin::SoundEd,
+    med: crate::pages::btnwin::MacroEd,
+    /// The Keyboard sounds card is open (starts folded; switching on opens it).
+    card_open: bool,
+    /// "Make a pack from one sound" and its press / release files decoded (to hear them).
+    make: Option<MakePack>,
+    make_clips: (Option<bu_keysound::import::Clip>, Option<bu_keysound::import::Clip>),
+    /// Which pack the open list's right-click asked about (for the made packs, whose rows aren't Imported).
+    made_list: Vec<String>,
 }
 
 impl Keyboard {
@@ -284,10 +334,19 @@ impl Keyboard {
         }
     }
 
+    /// The packs made from one sound (Order 090), by name.
+    fn made(&self) -> Vec<String> {
+        let dir = crate::services::with(|s| glue::packs_dir(s.store.folder()));
+        match (self.test, dir) {
+            (false, Some(d)) => glue::made_list(&d),
+            _ => self.made_list.clone(),
+        }
+    }
+
     fn pack_name(&self, p: &Pack) -> String {
         match p {
             Pack::Builtin(id) => id.name().to_string(),
-            Pack::Imported(n) => n.clone(),
+            Pack::Imported(n) | Pack::Made(n) => n.clone(),
         }
     }
 
@@ -304,6 +363,7 @@ impl Keyboard {
     /// The rows of the open list and what each means (the same for painting and for the click).
     fn list(&self, p: Pop) -> Vec<(String, Choice, bool)> {
         let mut v: Vec<(String, Choice, bool)> = Vec::new();
+        // Order 090 (v8): built-in · Your packs · Downloaded or imported · Get more sounds… · Import… · Make a pack from one sound…
         let packs = |v: &mut Vec<(String, Choice, bool)>, cur: Option<&Pack>, with_import: bool| {
             v.push(("Keyboard".into(), Choice::Heading, false));
             for id in PackId::ALL.iter().filter(|p| p.is_keyboard()) {
@@ -313,17 +373,27 @@ impl Keyboard {
             for id in PackId::ALL.iter().filter(|p| !p.is_keyboard()) {
                 v.push((id.name().into(), Choice::Pack(Pack::Builtin(*id)), cur == Some(&Pack::Builtin(*id))));
             }
+            let made = self.made();
+            if !made.is_empty() {
+                v.push(("Your packs \u{b7} right-click to remove".into(), Choice::Heading, false));
+                for n in made {
+                    let p = Pack::Made(n.clone());
+                    v.push((n, Choice::Pack(p.clone()), cur == Some(&p)));
+                }
+            }
             let imp = self.imported();
             if !imp.is_empty() {
-                v.push(("Imported or downloaded · right-click to remove".into(), Choice::Heading, false));
+                v.push(("Downloaded or imported \u{b7} right-click to remove".into(), Choice::Heading, false));
                 for n in imp {
                     let p = Pack::Imported(n.clone());
                     v.push((n, Choice::Pack(p.clone()), cur == Some(&p)));
                 }
             }
             if with_import {
-                v.push(("Get more sounds…".into(), Choice::GetMore, false));
-                v.push(("Import a pack…".into(), Choice::Import, false));
+                v.push((String::new(), Choice::Sep, false));
+                v.push(("Get more sounds\u{2026}".into(), Choice::GetMore, false));
+                v.push(("Import\u{2026}".into(), Choice::Import, false));
+                v.push(("Make a pack from one sound\u{2026}".into(), Choice::MakePack, false));
             }
         };
         match p {
@@ -356,27 +426,6 @@ impl Keyboard {
                     }
                 }
             }
-            Pop::MacroList => {
-                let cur = self.sel.and_then(|c| self.model.binds.get(c)).and_then(|b| if let Bind::Macro(m) = b { Some(m.clone()) } else { None });
-                for m in &self.model.macros {
-                    v.push((m.name.clone(), Choice::Macro(m.id.clone()), cur.as_deref() == Some(m.id.as_str())));
-                }
-                v.push(("New macro…".into(), Choice::NewMacro, false));
-                v.push(("Ready-made".into(), Choice::Heading, false));
-                for (i, (name, _)) in bu_keysound::macros::templates().into_iter().enumerate() {
-                    v.push((name.to_string(), Choice::Template(i), false));
-                }
-            }
-            Pop::Templates => {
-                for (i, (name, _)) in bu_keysound::macros::templates().into_iter().enumerate() {
-                    v.push((name.to_string(), Choice::Template(i), false));
-                }
-            }
-            Pop::StepAdd => {
-                for (i, l) in ["Press a key", "Type a text", "Wait", "Open an app, file or website"].iter().enumerate() {
-                    v.push((l.to_string(), Choice::Step(i as u8), false));
-                }
-            }
         }
         v
     }
@@ -390,7 +439,11 @@ impl Keyboard {
     fn choose(&mut self, c: Choice, cx: &mut Cx) {
         let sel = self.sel;
         match c.clone() {
-            Choice::Heading => {}
+            Choice::Heading | Choice::Sep => {}
+            Choice::MakePack => {
+                self.pop = None;
+                self.open_make(cx.now);
+            }
             Choice::Pack(p) => match self.pop.map(|(q, _)| q) {
                 Some(Pop::RulePack(i)) => {
                     if let Some(r) = self.prefs.s.rules.get_mut(i) {
@@ -418,20 +471,7 @@ impl Keyboard {
                 self.pop = None;
                 self.import_pack(cx);
             }
-            Choice::Template(i) => {
-                self.pop = None;
-                if let Some((name, steps)) = bu_keysound::macros::templates().into_iter().nth(i) {
-                    match self.model.new_macro_from(name, steps) {
-                        Ok(id) => {
-                            if let Some(s) = sel {
-                                let _ = self.model.set_macro(s, &id);
-                            }
-                            self.open_editor(&id, cx.now);
-                        }
-                        Err(e) => self.err = Some(e),
-                    }
-                }
-            }
+
             Choice::Target(code) => {
                 if let Some(s) = sel {
                     match self.model.set_remap(s, code) {
@@ -453,41 +493,6 @@ impl Keyboard {
                 if let Some(s) = sel {
                     self.bind_app_action(s, &id);
                 }
-            }
-            Choice::Macro(id) => {
-                if let Some(s) = sel {
-                    match self.model.set_macro(s, &id) {
-                        Ok(()) => {
-                            self.err = None;
-                            self.save();
-                        }
-                        Err(e) => self.err = Some(e),
-                    }
-                }
-            }
-            Choice::NewMacro => {
-                self.pop = None;
-                if let Some(id) = self.new_macro() {
-                    if let Some(s) = sel {
-                        let _ = self.model.set_macro(s, &id);
-                        self.save();
-                    }
-                    self.open_editor(&id, cx.now);
-                }
-            }
-            Choice::Step(k) => {
-                if let Some(m) = self.edit.clone().and_then(|id| self.model.macros.iter_mut().find(|x| x.id == id)) {
-                    m.steps.push(match k {
-                        0 => Step::Keys(Vec::new()),
-                        1 => Step::Type(String::new()),
-                        2 => Step::Wait(200),
-                        _ => Step::Open(String::new()),
-                    });
-                    if let Step::Keys(_) = m.steps.last().unwrap() {
-                        self.listen_step = Some(m.steps.len() - 1);
-                    }
-                }
-                self.save();
             }
         }
         self.pop = None;
@@ -536,21 +541,40 @@ impl Keyboard {
         }
     }
 
+    /// Plays pack `p` as the A key would (press + release as "Play on" says - E21: the preview follows Play on). Works with
+    /// the sounds off; an imported / made pack is read first when the engine doesn't hold it yet.
     fn preview(&self, p: &Pack) {
-        if !self.prefs.on || self.test {
+        if self.test {
             return;
         }
-        let (p, play_on) = (p.clone(), self.prefs.s.play_on);
-        // the key-up sound a moment after the key-down (a short-lived thread, only for this click)
-        std::thread::spawn(move || {
-            if play_on.plays(true) {
-                glue::engine().preview(&p, Kind::Down);
+        self.load_pack(p);
+        let none = bu_keysound::Layers::new();
+        let mouse = |_: u16| None;
+        let pad = |_: u16| None;
+        let h = crate::pages::btnwin::HearOf { dev: bu_keysound::Dev::Keys, pack: Some(p), volume: self.prefs.s.volume, play_on: self.prefs.s.play_on, mouse: &mouse, pad: &pad };
+        crate::pages::btnwin::hear(&h, &none, &[0x1E]);
+    }
+
+    /// Makes sure the engine holds pack `p`'s sounds (an imported / made one is read safely from its cache).
+    fn load_pack(&self, p: &Pack) {
+        if self.test {
+            return;
+        }
+        let Some(dir) = crate::services::with(|s| glue::packs_dir(s.store.folder())) else { return };
+        let e = glue::engine();
+        match p {
+            Pack::Imported(n) if e.pack_sound(bu_keysound::Dev::Keys, p, 0x1E, true, None, None).is_none() => {
+                if let Ok(x) = bu_keysound::safe::read_installed(&dir, n) {
+                    e.set_imported(n, Some(x.set));
+                }
             }
-            std::thread::sleep(std::time::Duration::from_millis(90));
-            if play_on.plays(false) {
-                glue::engine().preview(&p, Kind::Up);
+            Pack::Made(n) if e.pack_sound(bu_keysound::Dev::Keys, p, 0x1E, true, None, None).is_none() => {
+                if let Ok(m) = glue::read_made(&dir, n) {
+                    e.set_made(n, Some(m));
+                }
             }
-        });
+            _ => {}
+        }
     }
 
     /// "Import a pack…": ONE picker for the .zip as the site hands it out or a pack folder (a folder is picked by the
@@ -560,7 +584,8 @@ impl Keyboard {
         let Some(src) = picked else { return };
         let dir = crate::services::with(|s| glue::packs_dir(s.store.folder()));
         let Some(dir) = dir else { return };
-        match bu_keysound::import::install_any(std::path::Path::new(&src), &dir) {
+        // Order 090 (E21): read through the helper copy - a broken pack says why and never crashes the app
+        match bu_keysound::safe::install_any(std::path::Path::new(&src), &dir) {
             Ok(p) => {
                 self.import_msg = None;
                 self.prefs.s.pack = Pack::Imported(p.name.clone());
@@ -582,8 +607,8 @@ impl Keyboard {
         for i in 0..64 {
             if k == idx(K_MENU, i) {
                 if let Some(p) = self.pop.map(|(p, _)| p) {
-                    if let Some((_, Choice::Pack(Pack::Imported(n)), _)) = self.list(p).get(i).cloned() {
-                        self.ask_del = Some((n, (x, y)));
+                    if let Some((_, Choice::Pack(pk @ (Pack::Imported(_) | Pack::Made(_))), _)) = self.list(p).get(i).cloned() {
+                        self.ask_del = Some((pk, (x, y)));
                     }
                 }
                 return;
@@ -593,8 +618,8 @@ impl Keyboard {
 
     /// The pack is gone from the PC: the settings that used it go back to a sound that exists (the general sound to Linear,
     /// a program's own sound to Off) and the engine lets its sounds go. Pure state; the files are `remove_pack`.
-    fn forget_pack(&mut self, name: &str) -> bool {
-        let gone = Pack::Imported(name.to_string());
+    fn forget_pack(&mut self, gone: &Pack) -> bool {
+        let gone = gone.clone();
         let was_in_use = self.prefs.s.pack == gone;
         if was_in_use {
             self.prefs.s.pack = Pack::Builtin(bu_keysound::PackId::Linear);
@@ -602,50 +627,36 @@ impl Keyboard {
         for r in self.prefs.s.rules.iter_mut().filter(|r| r.pack.as_ref() == Some(&gone)) {
             r.pack = None;
         }
+        if self.prefs.s.pad_pack.as_ref() == Some(&gone) {
+            self.prefs.s.pad_pack = None;
+        }
         was_in_use
     }
 
     /// "Remove" was confirmed: the pack's folder is deleted, the settings that used it fall back.
-    fn remove_pack(&mut self, name: &str, cx: &mut Cx) {
+    fn remove_pack(&mut self, pack: &Pack, cx: &mut Cx) {
         let dir = crate::services::with(|s| glue::packs_dir(s.store.folder()));
+        let name = self.pack_name(pack);
         if !self.test {
             let Some(dir) = dir else { return };
-            if let Err(e) = bu_keysound::import::remove(&dir, name) {
+            let r = match pack {
+                Pack::Made(n) => glue::remove_made(&dir, n),
+                _ => bu_keysound::import::remove(&dir, &name),
+            };
+            if let Err(e) = r {
                 cx.toast(&format!("Not removed: {e}"));
                 return;
             }
-            glue::engine().set_imported(name, None);
+            match pack {
+                Pack::Made(n) => glue::engine().set_made(n, None),
+                _ => glue::engine().set_imported(&name, None),
+            }
+        } else {
+            self.made_list.retain(|n| *n != name);
         }
-        let was_in_use = self.forget_pack(name);
+        let was_in_use = self.forget_pack(pack);
         self.save();
         cx.toast(&if was_in_use { format!("{name} removed · the sound is Linear again") } else { format!("{name} removed") });
-    }
-
-    fn new_macro(&mut self) -> Option<String> {
-        self.model.new_macro().ok()
-    }
-
-    fn open_editor(&mut self, id: &str, now: f64) {
-        self.edit = Some(id.to_string());
-        self.rec = false;
-        self.rec_at = None;
-        self.listen_step = None;
-        self.opened_at = now;
-        self.pop = None;
-        self.save();
-    }
-
-    fn close_editor(&mut self) {
-        self.edit = None;
-        self.rec = false;
-        self.listen_step = None;
-        self.pop = None;
-        self.save();
-    }
-
-    fn macro_mut(&mut self) -> Option<&mut Macro> {
-        let id = self.edit.clone()?;
-        self.model.macros.iter_mut().find(|m| m.id == id)
     }
 
     fn select(&mut self, code: Option<Code>) {
@@ -654,6 +665,8 @@ impl Keyboard {
         self.choosing = false;
         self.err = None;
         self.pop = None;
+        self.snd.reset();
+        self.med.reset();
     }
 
     fn set_mode(&mut self, code: Code, m: Mode) {
@@ -694,14 +707,6 @@ impl Keyboard {
         }
     }
 
-    /// A key was clicked on the picture.
-    fn key_clicked(&mut self, n: usize, cx: &mut Cx) {
-        let Some(k) = self.keys.get(n % ISO_LOWER).cloned() else { return };
-        // the key's own window opens (a click on the open one's key can't happen: its dim covers the picture)
-        self.select(Some(k.code));
-        self.key_at = cx.now;
-    }
-
     /// The key pressed on the remap field: its scancode is the new key.
     fn target_pressed(&mut self, vk: u16) {
         let Some(from) = self.sel else { return };
@@ -737,6 +742,22 @@ impl Keyboard {
         });
         if let Err(e) = r {
             cx.toast(&format!("Not applied: {e:?}"));
+        }
+    }
+
+    /// The keyboard detection ended: a known keyboard sets the picture size (a size picked by hand is never touched).
+    fn follow_detect(&mut self) {
+        let Some(v) = crate::services::with(|s| s.job(JOB_DETECT)).flatten() else { return };
+        let Some(crate::jobs::End::Done(text)) = v.end.clone() else { return };
+        if !first_end(JOB_DETECT, v.id) || self.prefs.size_manual || text.is_empty() {
+            return;
+        }
+        let size = Size::from_key(&text);
+        if size != self.prefs.size {
+            self.prefs.size = size;
+            self.select(None);
+            self.rebuild_keys();
+            crate::services::with(|s| self.prefs.save(&mut s.store));
         }
     }
 
@@ -779,6 +800,7 @@ impl Keyboard {
 
     fn change_size(&mut self, s: Size) {
         self.prefs.size = s;
+        self.prefs.size_manual = true;
         self.select(None);
         self.rebuild_keys();
         self.save();
@@ -799,6 +821,10 @@ impl Page for Keyboard {
         *self = Keyboard::default();
         self.opened_at = now;
         self.load(env);
+        // Order 096: which keyboard is plugged in (read-only, off the UI thread) picks the picture size, unless it was picked by hand
+        if !env.fake() && !self.prefs.size_manual {
+            crate::services::with(|s| s.start_job(JOB_DETECT, |_| Ok(detect::detect_text())).ok());
+        }
     }
     fn close(&mut self) {
         gallery::OPEN.store(false, std::sync::atomic::Ordering::SeqCst);
@@ -810,6 +836,7 @@ impl Page for Keyboard {
             self.load(&Env { test: true, ..Env::default() });
         }
         self.follow_job(cx);
+        self.follow_detect();
         self.follow_get(cx);
         self.follow_preview(cx);
         self.view(cx)
@@ -831,8 +858,14 @@ impl Page for Keyboard {
             });
         } else if self.pop.is_some() {
             self.pop = None;
-        } else if self.edit.is_some() {
-            self.close_editor();
+        } else if self.snd.menu_open() || self.med.menu_open() {
+            self.snd.escape();
+            self.med.escape();
+        } else if self.make.is_some() {
+            self.make = None;
+        } else if self.many {
+            self.many = false;
+            self.snd.reset();
         } else if self.sel.is_some() {
             self.select(None);
         }
@@ -848,8 +881,12 @@ impl Page for Keyboard {
     }
     fn describe(&self) -> String {
         format!(
-            "on={} pack={} vol={} size={} sel={:?} remaps={} binds={} macros={} dirty={}",
+            "on={} card={} pick={} many={} layers={} pack={} vol={} size={} sel={:?} remaps={} binds={} macros={} dirty={}",
             self.prefs.on,
+            self.card_open,
+            self.pick.len(),
+            self.many,
+            self.prefs.keys.len(),
             self.prefs.s.pack.to_key(),
             self.prefs.s.volume,
             self.prefs.size.key(),

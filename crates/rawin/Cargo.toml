@@ -11,6 +11,7 @@ name = "bu_rawin"
 [target.'cfg(windows)'.dependencies.windows]
 version = "0.62"
 features = [
+    "Win32_Devices_HumanInterfaceDevice",
     "Win32_Foundation",
     "Win32_Graphics_Gdi",
     "Win32_System_LibraryLoader",
@@ -26,3 +27,8 @@ path = "examples/bench.rs"
 [target.'cfg(windows)'.dev-dependencies.windows]
 version = "0.62"
 features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_System_LibraryLoader", "Win32_System_Threading", "Win32_System_WindowsProgramming", "Win32_UI_WindowsAndMessaging"]
+
+# Order 081's check: can the app see a controller's presses (read-only listener, counts only)
+[[example]]
+name = "rawin-padcheck"
+path = "examples/padcheck.rs"

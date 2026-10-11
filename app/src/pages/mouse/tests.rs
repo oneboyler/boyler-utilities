@@ -347,10 +347,10 @@ fn acceleration_card_switch_curve_presets_per_app() {
     assert_eq!(m.panel.curve, Curve::Linear);
     assert_eq!(m.vals().get(Field::Acceleration), 2.8);
     assert_eq!(toast(&m), Some("Loaded Valorant"));
-    // a slider (sent when let go): Acceleration to the far left = 0.05 (Raw Accel refuses 0)
+    // a slider (sent when let go): Acceleration to the far left = 0.001 (Raw Accel refuses 0; Order 090 E19: its real range)
     drag(&mut m, idx(K_ASL, field_ix(Field::Acceleration)), (174.0, 489.0, 116.0, 20.0), 0.0);
-    assert_eq!(m.vals().get(Field::Acceleration), 0.05);
-    assert_eq!(m.v.panel.current_values().get(Field::Acceleration), 0.05, "the worker got it");
+    assert_eq!(m.vals().get(Field::Acceleration), 0.001);
+    assert_eq!(m.v.panel.current_values().get(Field::Acceleration), 0.001, "the worker got it");
     // Save as preset: "Preset 3", renamed inline to "Fast"
     click(&mut m, K_SAVE);
     assert_eq!(m.rename.as_ref().map(|r| r.1.as_str()), Some("Preset 3"));
@@ -477,9 +477,11 @@ fn boxes_match_the_drawing_card_open() {
     let mut m = opened();
     m.panel.expanded = true;
     let laid = render_page(&mut m, None);
+    // Order 094 (mouse-v9): the Your mouse card changed on purpose (two columns, no sub-lines), so what is below it sits elsewhere
+    // than in the old drawing's dump: the boxes are checked against the drawing relative to the accel switch
+    let top = laid.rect_of(K_ACT).expect("accel switch").1 + 56.0 - 356.625;
     let row0 = idx(K_ROW, 0);
     let want: Vec<(&str, Key, [f32; 4])> = vec![
-        ("web link", K_WEB, [427.812, 152.844, 134.188, 16.0]),
         ("accel switch", K_ACT, [486.0, 356.625, 44.0, 24.0]),
         ("chip Valorant", idx(K_CHIP, 0), [129.156, 408.625, 64.812, 26.0]),
         ("chip Default", idx(K_CHIP, 1), [199.969, 408.625, 57.781, 26.0]),
@@ -509,14 +511,12 @@ fn boxes_match_the_drawing_card_open() {
         ("swap", K_SWAP, [518.0, 1081.094, 44.0, 24.0]),
         ("import", K_IMP, [258.234, 1136.094, 85.828, 16.0]),
         ("size", K_SIZE, [402.0, 1134.094, 132.0, 20.0]),
-        ("back to how it was", sub(K_RS, "pc"), [220.922, 1267.188, 132.344, 16.0]),
-        ("windows defaults", sub(K_RS, "win"), [372.266, 1267.188, 94.125, 16.0]),
     ];
     let bubbles = [48.281, 124.844, 201.422, 277.984, 354.562, 431.125, 507.703];
     let mut bad = Vec::new();
     let mut check = |name: &str, k: Key, w: [f32; 4]| match laid.rect_of(k) {
         Some(r) => {
-            let r = [r.0, r.1 + 56.0, r.2, r.3];
+            let r = [r.0, r.1 + 56.0 - top, r.2, r.3];
             if r.iter().zip(w.iter()).any(|(a, b)| (a - b).abs() > 0.02) {
                 bad.push(format!("{name}: app {r:?} drawing {w:?}"));
             }
@@ -530,6 +530,10 @@ fn boxes_match_the_drawing_card_open() {
         check(&format!("bubble {i}"), idx(K_ROLE, i), [*x, 1173.094, 44.0, 62.0]);
     }
     assert!(bad.is_empty(), "\n{}", bad.join("\n"));
+    // Order 090: the Click sounds card sits between the cursors and the reset line
+    let cs = text_rect(&laid, "Click sounds");
+    let rs = laid.rect_of(sub(K_RS, "pc")).unwrap();
+    assert!(cs.1 > laid.rect_of(K_SIZE).unwrap().1 && rs.1 > cs.1);
 }
 
 fn popup_laid(m: &mut Mouse) -> crate::ui::lay::Laid {
@@ -596,14 +600,15 @@ fn unsupported_mouse_and_no_raw_accel_boxes() {
     let mut m = opened_with(svc::Sample { unsupported_mouse: true, no_raw_accel: true });
     assert!(!m.supported());
     let l = render_page(&mut m, None);
-    let w = |s: &str| {
-        let r = text_rect(&l, s);
-        (r.0, r.1 + 56.0, r.2, r.3)
-    };
-    assert!(near(w("Lamzu Maya X"), [80.0, 144.14, 84.73, 17.55]), "{:?}", w("Lamzu Maya X"));
-    assert!(near(w("\u{2014}"), [171.73, 144.14, 12.94, 17.55]), "{:?}", w("\u{2014}"));
-    assert!(near(w("open its web settings"), [191.67, 144.91, 115.77, 16.0]), "{:?}", w("open its web settings"));
-    assert!(near(w(bu_mouse::accel::service::INSTALL_TITLE), [96.0, 217.84, 379.66, 18.0]), "{:?}", w(bu_mouse::accel::service::INSTALL_TITLE));
+    // Order 094 (mouse-v9): the card is the right column now, so the name line is checked relative to the name (the drawing's
+    // offsets: the dash 91.73 right of it on the same line, the link 111.67 right of it and 0.77 lower)
+    let name = text_rect(&l, "Lamzu Maya X");
+    let (dash, link) = (text_rect(&l, "\u{2014}"), text_rect(&l, "open its web settings"));
+    assert!(near((dash.0 - name.0, dash.1 - name.1, dash.2, dash.3), [91.73, 0.0, 12.94, 17.55]), "{dash:?} {name:?}");
+    assert!(near((link.0 - name.0, link.1 - name.1, link.2, link.3), [111.67, 0.77, 115.77, 16.0]), "{link:?} {name:?}");
+    assert!(name.0 > 120.0, "the name stands right of the mouse's column");
+    let t = text_rect(&l, bu_mouse::accel::service::INSTALL_TITLE);
+    assert!(near((t.0, 0.0, t.2, t.3), [96.0, 0.0, 379.66, 18.0]), "{t:?}");
 }
 
 /// The `rename` test state (pixel proof of the chip being renamed): the first chip shows its name field, focused.
@@ -708,20 +713,65 @@ fn proof_042_cursor_picker_with_windows_schemes() {
     crate::ui::lay::proof_png(root, crate::ui::WIN_W, crate::ui::WIN_H, 1.5, "cursor_picker.png");
 }
 
-/// Order 042 (test feedback: the polling rate showed but not the DPI, 2400, which was not in the list):
-/// the mouse's own DPI - e.g. 2400 read from a real mouse (measured with mouse-read) - is a lit chip of its own, in its place.
+/// Order 042 / 094 (mouse-v9): the DPI is four boxes 400 / 800 / 1600 / Custom; the mouse's own DPI - e.g. 2400 read from a
+/// real mouse - lights Custom, which shows the number; a click on a fixed box sets it and Custom is "Custom" again.
 #[test]
-fn the_mouses_own_dpi_is_a_lit_chip_whatever_it_is() {
+fn the_mouses_own_dpi_lights_the_custom_box_and_shows_the_number() {
     let mut m = opened();
+    let words = |m: &mut Mouse| -> Vec<String> {
+        let l = render_page(m, None);
+        [0, 1, 2, 3].map(|i| l.rect_of(idx(K_DPI, i))).iter().map(|r| format!("{:?}", r.is_some())).collect()
+    };
+    assert_eq!(words(&mut m).len(), 4);
+    let has = |m: &mut Mouse, w: &str| render_page(m, None).nodes.iter().any(|n| matches!(&n.el.content, crate::ui::el::Content::Text(t) if t.s == w));
+    assert!(has(&mut m, "Custom"), "1600 is a fixed box: Custom says Custom");
+    // a click on Custom opens the typing box; Enter applies it to the mouse
+    with_cx(|cx| {
+        m.event(&Ev::Click(idx(K_DPI, 3)), cx);
+        assert!(cx.focused(K_DPIN));
+    });
     typed(&mut m, K_DPIN, "2400", 0x0D);
     assert_eq!(m.mouse_dpi(), Some(2400));
-    assert_eq!(m.dpi_chips(), vec![400, 800, 1600, 2400, 3200]);
-    let l = render_page(&mut m, None);
-    assert!(l.nodes.iter().any(|n| matches!(&n.el.content, crate::ui::el::Content::Text(t) if t.s == "2400")), "a 2400 chip");
-    // a click on 400 sets it; the 2400 chip goes (it was only the mouse's own)
+    assert!(has(&mut m, "2400") && !has(&mut m, "Custom"), "the box shows the mouse's number");
+    // Esc cancels what is typed
+    with_cx(|cx| m.event(&Ev::Click(idx(K_DPI, 3)), cx));
+    typed(&mut m, K_DPIN, "999", 0x1B);
+    assert_eq!(m.mouse_dpi(), Some(2400));
+    // a click on 400 sets it; Custom is Custom again
     click(&mut m, idx(K_DPI, 0));
     assert_eq!(m.mouse_dpi(), Some(400));
-    assert_eq!(m.dpi_chips(), DPI_CHIPS.to_vec());
+    assert!(has(&mut m, "Custom"));
+}
+
+/// Order 094 (mouse-v9): the mouse picture is exactly as tall as the card and centred to it; the DPI boxes, the polling buttons
+/// and the lift-off buttons stand in the same 58 px columns, right edge on right edge.
+#[test]
+fn the_mouse_is_the_cards_height_and_the_buttons_line_up_in_columns() {
+    let mut m = opened();
+    let l = render_page(&mut m, None);
+    let card = l.rect_of(K_CARD).expect("card");
+    let wheel = l.rect_of(idx(btns::K_MB, 2)).expect("wheel");
+    assert!((card.3 - btns::PIC_H).abs() < 0.5, "the card is {} px tall, the picture {}", card.3, btns::PIC_H);
+    assert!(wheel.1 > card.1 && wheel.1 < card.1 + card.3, "the wheel is beside the card");
+    let col = |k: Key, i: usize| l.rect_of(idx(k, i)).unwrap_or_else(|| panic!("box {i}"));
+    for i in 0..4 {
+        let (d, h) = (col(K_DPI, i), col(K_HZ, i));
+        assert!((d.0 - h.0).abs() < 0.5 && (d.2 - 58.0).abs() < 0.5 && (h.2 - 58.0).abs() < 0.5, "column {i}: dpi {d:?} polling {h:?}");
+    }
+    let (lo, d2) = (col(K_LOD, 1), col(K_DPI, 3));
+    assert!((lo.0 - d2.0).abs() < 0.5 && (lo.2 - 58.0).abs() < 0.5, "lift-off {lo:?} vs {d2:?}");
+}
+
+/// Order 097 (mouse-v9: `margin-top:30px` on the next card): 30 px between the Your mouse card and Mouse acceleration, the
+/// "Click a button to change it" hint sits in it without touching either.
+#[test]
+fn thirty_px_between_the_your_mouse_card_and_mouse_acceleration() {
+    let mut m = opened();
+    let l = render_page(&mut m, None);
+    let card = l.rect_of(K_CARD).expect("card");
+    let ac = l.rect_of(K_ACH).expect("acceleration card header (the card starts with it)");
+    let gap = ac.1 - (card.1 + card.3);
+    assert!((gap - 30.0).abs() < 0.5, "{gap} px between the cards");
 }
 
 /// Order 042 proof picture (`BU_PIC_OUT=<folder> cargo test -p bu-app proof_042 -- --ignored`): "Your mouse" with the mouse at 2400 DPI.

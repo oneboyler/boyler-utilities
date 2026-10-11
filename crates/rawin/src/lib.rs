@@ -25,8 +25,12 @@
 
 pub mod hub;
 #[cfg(windows)]
+pub mod pad;
+#[cfg(windows)]
 mod win;
 
-pub use hub::{MouseButtonClass, MouseSoundEvent, RawPacket, SoundClass, SoundEvent, Stats, Target, MAX_CHATTER_MS, QUEUE_CAP};
+pub use hub::pad as padbtn;
+pub use hub::{MOUSE_LEFT, MOUSE_MIDDLE, MOUSE_RIGHT, MOUSE_X1, MOUSE_X2};
+pub use hub::{MouseButtonClass, MouseSoundEvent, PadSoundClass, PadSoundEvent, PadStats, RawPacket, SoundClass, SoundEvent, Stats, Target, MAX_CHATTER_MS, QUEUE_CAP};
 #[cfg(windows)]
-pub use win::{notify_on_input, set_key_sound, set_keys, set_mouse_sound, set_sound_chatter, stats, take_packets, MouseSink, SoundSink};
+pub use win::{list_pads, notify_on_input, pad_stats, set_key_sound, set_keys, set_mouse_sound, set_pad_sound, set_sound_chatter, stats, take_packets, MouseSink, PadSink, SoundSink};

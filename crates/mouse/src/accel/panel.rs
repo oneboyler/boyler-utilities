@@ -118,47 +118,51 @@ const fn r(field: Field, label: &'static str, min: f64, max: f64, step: f64, dec
 pub fn rows(c: Curve) -> Vec<RowSpec> {
     use Field::*;
     match c {
+        // Order 090 (E19): every range reaches Raw Accel's real values (its own text boxes take any value its validation
+        // accepts: rates and caps > 0, motivity / limit > 1, smooth 0-1). The ends below cover what its GUI and the
+        // community's shared curves use (e.g. a Linear acceleration of 0.005 or a cap under 1×); steps fine enough to hold
+        // a value read from Raw Accel exactly. Defaults unchanged.
         Curve::Linear => vec![
-            r(Acceleration, "Acceleration", 0.05, 5.0, 0.05, 2, false, 2.6),
+            r(Acceleration, "Acceleration", 0.001, 10.0, 0.001, 3, false, 2.6),
             r(InputOffset, "Input offset", 0.0, 120.0, 1.0, 0, false, 55.0),
-            r(CapInput, "Cap: input", 1.0, 120.0, 1.0, 0, false, 15.0),
-            r(CapOutput, "Cap: output", 1.0, 5.0, 0.05, 2, true, 2.0),
+            r(CapInput, "Cap: input", 0.1, 120.0, 0.1, 1, false, 15.0),
+            r(CapOutput, "Cap: output", 0.1, 10.0, 0.01, 2, true, 2.0),
         ],
         Curve::Classic => vec![
-            r(Acceleration, "Acceleration", 0.001, 0.1, 0.001, 3, false, 0.020),
-            r(Exponent, "Exponent", 1.1, 5.0, 0.05, 2, false, 2.5),
+            r(Acceleration, "Acceleration", 0.0001, 1.0, 0.0001, 4, false, 0.020),
+            r(Exponent, "Exponent", 1.01, 10.0, 0.01, 2, false, 2.5),
             r(InputOffset, "Input offset", 0.0, 120.0, 1.0, 0, false, 20.0),
-            r(CapInput, "Cap: input", 1.0, 120.0, 1.0, 0, false, 60.0),
-            r(CapOutput, "Cap: output", 1.0, 5.0, 0.05, 2, true, 2.4),
+            r(CapInput, "Cap: input", 0.1, 120.0, 0.1, 1, false, 60.0),
+            r(CapOutput, "Cap: output", 0.1, 10.0, 0.01, 2, true, 2.4),
         ],
         Curve::Natural => vec![
-            r(DecayRate, "Decay rate", 0.01, 1.0, 0.01, 2, false, 0.10),
-            r(Limit, "Limit", 1.0, 5.0, 0.05, 2, true, 1.5),
+            r(DecayRate, "Decay rate", 0.001, 5.0, 0.001, 3, false, 0.10),
+            r(Limit, "Limit", 1.01, 10.0, 0.01, 2, true, 1.5),
             r(InputOffset, "Input offset", 0.0, 120.0, 1.0, 0, false, 0.0),
         ],
         Curve::Jump => vec![
-            r(JumpInput, "Jump: input", 1.0, 120.0, 1.0, 0, false, 15.0),
-            r(JumpOutput, "Jump: output", 1.0, 5.0, 0.05, 2, true, 2.6),
-            r(Smooth, "Smooth", 0.0, 1.0, 0.05, 2, false, 0.50),
+            r(JumpInput, "Jump: input", 0.1, 120.0, 0.1, 1, false, 15.0),
+            r(JumpOutput, "Jump: output", 0.1, 10.0, 0.01, 2, true, 2.6),
+            r(Smooth, "Smooth", 0.0, 1.0, 0.01, 2, false, 0.50),
         ],
         Curve::Synchronous => vec![
-            r(SyncSpeed, "Sync speed", 1.0, 100.0, 1.0, 0, false, 5.0),
-            r(Motivity, "Motivity", 1.05, 5.0, 0.05, 2, false, 1.50),
-            r(Gamma, "Gamma", 0.1, 3.0, 0.05, 2, false, 1.00),
-            r(Smooth, "Smooth", 0.0, 1.0, 0.05, 2, false, 0.50),
+            r(SyncSpeed, "Sync speed", 0.1, 100.0, 0.1, 1, false, 5.0),
+            r(Motivity, "Motivity", 1.01, 10.0, 0.01, 2, false, 1.50),
+            r(Gamma, "Gamma", 0.01, 10.0, 0.01, 2, false, 1.00),
+            r(Smooth, "Smooth", 0.0, 1.0, 0.01, 2, false, 0.50),
         ],
         Curve::Power => vec![
-            r(Scale, "Scale", 0.1, 5.0, 0.05, 2, false, 1.00),
-            r(Exponent, "Exponent", 0.01, 1.0, 0.01, 2, false, 0.05),
-            r(OutputOffset, "Output offset", 0.0, 1.0, 0.05, 2, false, 0.00),
-            r(CapInput, "Cap: input", 1.0, 120.0, 1.0, 0, false, 15.0),
-            r(CapOutput, "Cap: output", 1.0, 5.0, 0.05, 2, true, 2.6),
+            r(Scale, "Scale", 0.01, 10.0, 0.01, 2, false, 1.00),
+            r(Exponent, "Exponent", 0.001, 5.0, 0.001, 3, false, 0.05),
+            r(OutputOffset, "Output offset", 0.0, 1.0, 0.01, 2, false, 0.00),
+            r(CapInput, "Cap: input", 0.1, 120.0, 0.1, 1, false, 15.0),
+            r(CapOutput, "Cap: output", 0.1, 10.0, 0.01, 2, true, 2.6),
         ],
     }
 }
 
-/// Sens multiplier row (always last): 0.1–3, step .05, default 1.00×.
-pub const SENS: RowSpec = r(Field::Scale, "Sens multiplier", 0.1, 3.0, 0.05, 2, true, 1.0);
+/// Sens multiplier row (always last): 0.01–10 (Order 090, E19: Raw Accel's sens), step .01, default 1.00×.
+pub const SENS: RowSpec = r(Field::Scale, "Sens multiplier", 0.01, 10.0, 0.01, 2, true, 1.0);
 
 /// One curve's values (Gain and Cap type included).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

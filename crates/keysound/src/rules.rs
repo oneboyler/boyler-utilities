@@ -1,6 +1,9 @@
 //! What plays, and how loud: the settings and the decision for one key press (pure, no Windows).
 
-use crate::synth::PackId;
+use crate::synth::{ClickStyle, PackId};
+
+/// The longest "Ignore repeats within" (ms, Order 090: his friend's bouncing keyboard needs "up to 400ms or something").
+pub const MAX_REPEAT_MS: u16 = 400;
 
 /// The volume a fresh install starts at (the owner, Oct 8: "like 5%" — the app's sound rule).
 pub const DEFAULT_VOLUME: u8 = 5;
@@ -65,19 +68,22 @@ impl PlayOn {
     }
 }
 
-/// A sound pack: one of ours, or one the user imported (its folder name under the app's pack folder).
+/// A sound pack: one of ours, one the user imported or downloaded (its folder name under the app's pack folder), or one the
+/// user made from one sound (Order 090, its folder under `made\`).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Pack {
     Builtin(PackId),
     Imported(String),
+    Made(String),
 }
 
 impl Pack {
-    /// The text kept in the settings file: `linear`, `glass-tap`, … or `imported:<name>`.
+    /// The text kept in the settings file: `linear`, `glass-tap`, … `imported:<name>` or `made:<name>`.
     pub fn to_key(&self) -> String {
         match self {
             Pack::Builtin(p) => p.key().to_string(),
             Pack::Imported(n) => format!("imported:{n}"),
+            Pack::Made(n) => format!("made:{n}"),
         }
     }
 
@@ -85,8 +91,29 @@ impl Pack {
         if let Some(n) = s.strip_prefix("imported:") {
             return (!n.is_empty()).then(|| Pack::Imported(n.to_string()));
         }
+        if let Some(n) = s.strip_prefix("made:") {
+            return (!n.is_empty()).then(|| Pack::Made(n.to_string()));
+        }
         PackId::from_key(s).map(Pack::Builtin)
     }
+}
+
+/// The click styles the Mouse tab's Click sounds › Sound offers besides "Same as keyboard" (Order 090).
+pub const CLICK_STYLES: [ClickStyle; 4] = [ClickStyle::Silent, ClickStyle::Optical, ClickStyle::Micro, ClickStyle::Deep];
+
+/// The settings text of a click style (`silent`, `optical`, `micro`, `deep`); None for a pack's tick.
+pub fn click_key(c: ClickStyle) -> Option<&'static str> {
+    match c {
+        ClickStyle::Silent => Some("silent"),
+        ClickStyle::Optical => Some("optical"),
+        ClickStyle::Micro => Some("micro"),
+        ClickStyle::Deep => Some("deep"),
+        ClickStyle::Tick(_) => None,
+    }
+}
+
+pub fn click_from_key(s: &str) -> Option<ClickStyle> {
+    CLICK_STYLES.into_iter().find(|c| click_key(*c) == Some(s))
 }
 
 /// "In this app, play THIS pack" (or none at all). `exe` is the program's file name, lower case (`discord.exe`).
@@ -99,25 +126,38 @@ pub struct Rule {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Settings {
+    /// The Keyboard tab's "Keyboard sounds" switch (Order 090: the mouse and controller sounds have switches of their own and
+    /// play without it). The app sets it from its switch; while false no key is listened to.
+    pub keys_on: bool,
     pub pack: Pack,
     pub volume: u8,
     /// Silent while a full-screen app / game is in front.
     pub off_in_game: bool,
-    /// "Ignore repeats within __ ms" (0-80; 0 = off): a key that comes down twice inside the window plays one sound.
-    pub repeat_ms: u8,
+    /// "Ignore repeats within __ ms" (0-[`MAX_REPEAT_MS`]; 0 = off): a key that comes down twice inside the window plays one sound.
+    pub repeat_ms: u16,
     pub rules: Vec<Rule>,
-    /// "Mouse clicks too" (Order 064, off by default): the mouse buttons make sounds as well. The side buttons play the chosen
-    /// pack's key sound, the others a click of our own made to suit that pack. Needs the key sounds to be on.
+    /// Mouse › "Click sounds" (Order 064 / 090, off by default): the mouse buttons make sounds. The side buttons play the
+    /// keyboard pack's key sound, the others a click (`mouse_click`, or the one that suits the keyboard pack).
     pub mouse_on: bool,
     /// The mouse sounds' own volume (0-100, default [`DEFAULT_VOLUME`]).
     pub mouse_volume: u8,
-    /// "Play on" (Order 076): press + release (default), press only or release only - for the keys and the mouse.
+    /// Click sounds › Sound: None = "Same as keyboard" (the click that suits the keyboard pack), else that click.
+    pub mouse_click: Option<ClickStyle>,
+    /// Controller settings › "Button sounds" (Order 081 / 090, off by default): face buttons, bumpers, D-pad and stick clicks play
+    /// the pack's key sound, the triggers a click.
+    pub pad_on: bool,
+    /// Button sounds' own volume (Order 090; 0-100, default [`DEFAULT_VOLUME`]).
+    pub pad_volume: u8,
+    /// Button sounds › Sound: None = "Same as keyboard", else that pack.
+    pub pad_pack: Option<Pack>,
+    /// "Play on" (Order 076): press + release (default), press only or release only - for keys, mouse and controller.
     pub play_on: PlayOn,
 }
 
 impl Default for Settings {
     fn default() -> Self {
         Settings {
+            keys_on: true,
             pack: Pack::Builtin(PackId::Linear),
             volume: DEFAULT_VOLUME,
             off_in_game: false,
@@ -125,8 +165,35 @@ impl Default for Settings {
             rules: Vec::new(),
             mouse_on: false,
             mouse_volume: DEFAULT_VOLUME,
+            mouse_click: None,
+            pad_on: false,
+            pad_volume: DEFAULT_VOLUME,
+            pad_pack: None,
             play_on: PlayOn::Both,
         }
+    }
+}
+
+impl Settings {
+    /// Anything to listen to at all (keys, mouse or controller).
+    pub fn any_on(&self) -> bool {
+        self.keys_on || self.mouse_on || self.pad_on
+    }
+
+    /// Every pack these settings can play (the keyboard's, the per-app rules', the controller's).
+    pub fn packs(&self) -> Vec<Pack> {
+        let mut v = vec![self.pack.clone()];
+        v.extend(self.rules.iter().filter_map(|r| r.pack.clone()));
+        if let Some(p) = &self.pad_pack {
+            v.push(p.clone());
+        }
+        let mut out: Vec<Pack> = Vec::new();
+        for p in v {
+            if !out.contains(&p) {
+                out.push(p);
+            }
+        }
+        out
     }
 }
 
@@ -159,6 +226,17 @@ pub fn choose_mouse<'a>(s: &'a Settings, exe: &str, game_in_front: bool) -> Opti
         return None;
     }
     pick(s, exe, game_in_front)
+}
+
+/// The same for a controller button or trigger (Order 081 / 090): the controller sounds follow the same game switch and per-app
+/// rules as the keys (an app that is Off is silent), play their own Sound (or the keys' pack there) at their own volume and have
+/// their own switch. None = silent.
+pub fn choose_pad<'a>(s: &'a Settings, exe: &str, game_in_front: bool) -> Option<&'a Pack> {
+    if !s.pad_on || s.pad_volume == 0 {
+        return None;
+    }
+    let p = pick(s, exe, game_in_front)?;
+    Some(s.pad_pack.as_ref().unwrap_or(p))
 }
 
 #[cfg(test)]
@@ -197,6 +275,34 @@ mod tests {
         assert_eq!(choose(&s, "Discord.EXE", false), None, "Off in Discord (names compare without case)");
         assert_eq!(choose(&s, "notepad.exe", false), Some(&Pack::Builtin(PackId::Typewriter)));
         assert_eq!(choose(&s, "chrome.exe", false), Some(&Pack::Builtin(PackId::Linear)));
+    }
+
+    #[test]
+    fn controller_sounds_are_off_by_default_and_follow_the_games_switch_and_the_app_rules() {
+        let mut s = Settings::default();
+        assert!(!s.pad_on, "off by default");
+        assert_eq!(choose_pad(&s, "a.exe", false), None, "the switch is off");
+        s.pad_on = true;
+        assert_eq!(choose_pad(&s, "a.exe", false), Some(&Pack::Builtin(PackId::Linear)));
+        s.off_in_game = true;
+        assert_eq!(choose_pad(&s, "game.exe", true), None, "a game in front: silent");
+        assert!(choose_pad(&s, "a.exe", false).is_some());
+        s.off_in_game = false;
+        s.rules.push(Rule { exe: "discord.exe".into(), pack: None });
+        assert_eq!(choose_pad(&s, "discord.exe", false), None, "Off in that app");
+        // Order 090: their own volume, neither the keys' nor the mouse's
+        s.mouse_volume = 0;
+        s.volume = 0;
+        assert!(choose_pad(&s, "a.exe", false).is_some());
+        s.pad_volume = 0;
+        assert_eq!(choose_pad(&s, "a.exe", false), None);
+        // their own Sound, or the keys' pack ("Same as keyboard")
+        s.pad_volume = 5;
+        s.pad_pack = Some(Pack::Builtin(PackId::Bubble));
+        assert_eq!(choose_pad(&s, "a.exe", false), Some(&Pack::Builtin(PackId::Bubble)));
+        s.rules.push(Rule { exe: "x.exe".into(), pack: Some(Pack::Builtin(PackId::Clicky)) });
+        assert_eq!(choose_pad(&s, "x.exe", false), Some(&Pack::Builtin(PackId::Bubble)), "a picked controller sound wins over an app's pack");
+        assert_eq!(choose_pad(&s, "discord.exe", false), None, "but an app that is Off stays silent");
     }
 
     #[test]
@@ -256,6 +362,12 @@ mod tests {
         assert_eq!(imp.to_key(), "imported:Holy Panda");
         assert_eq!(Pack::from_key("imported:Holy Panda"), Some(imp));
         assert_eq!(Pack::from_key("imported:"), None);
+        let made = Pack::Made("My thock".into());
+        assert_eq!(Pack::from_key(&made.to_key()), Some(made));
+        assert_eq!(Pack::from_key("made:"), None);
+        for c in CLICK_STYLES {
+            assert_eq!(click_from_key(click_key(c).unwrap()), Some(c));
+        }
         assert_eq!(Pack::from_key("nope"), None);
     }
 }

@@ -230,6 +230,10 @@ pub enum Bind {
     App(String),
     /// A macro, by its id.
     Macro(String),
+    /// Order 090, a MOUSE button's "Also press": it keeps its own job and also presses this key / combo (virtual keys) ...
+    Also(Vec<u16>),
+    /// ... or this mouse button (`macros::CLICK_LEFT` ..).
+    AlsoClick(u8),
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -292,6 +296,8 @@ impl Binds {
                 Bind::Preset(p) => format!("{c:X}|p|{}|{}", p.id(), p.target().unwrap_or("")),
                 Bind::App(a) => format!("{c:X}|a|{a}"),
                 Bind::Macro(m) => format!("{c:X}|m|{m}"),
+                Bind::Also(k) => format!("{c:X}|k|{}", k.iter().map(|v| format!("{v:X}")).collect::<Vec<_>>().join(",")),
+                Bind::AlsoClick(b) => format!("{c:X}|c|{b}"),
             })
             .collect()
     }
@@ -311,6 +317,11 @@ impl Binds {
                 "p" => Preset::from_parts(id, rest).map(Bind::Preset),
                 "a" => Some(Bind::App(id.to_string())),
                 "m" => Some(Bind::Macro(id.to_string())),
+                "k" => {
+                    let v: Vec<u16> = id.split(',').filter_map(|h| u16::from_str_radix(h, 16).ok()).filter(|v| *v > 0 && *v < 0xFF).take(crate::macros::MAX_KEYS_IN_STEP).collect();
+                    (!v.is_empty()).then_some(Bind::Also(v))
+                }
+                "c" => id.parse::<u8>().ok().filter(|b| *b <= crate::macros::CLICK_X2).map(Bind::AlsoClick),
                 _ => None,
             };
             if let Some(bind) = bind {
@@ -329,7 +340,8 @@ pub fn presses_own_key(bind: &Bind, macros: &[crate::macros::Macro], vk: u16) ->
     match bind {
         Bind::Preset(p) => p.combo() == Some(&[vk][..]),
         Bind::Macro(id) => macros.iter().find(|m| &m.id == id).is_some_and(|m| m.steps.iter().any(|s| matches!(s, crate::macros::Step::Keys(k) if k.as_slice() == [vk]))),
-        Bind::App(_) => false,
+        Bind::App(_) | Bind::AlsoClick(_) => false,
+        Bind::Also(k) => k.as_slice() == [vk],
     }
 }
 
@@ -359,6 +371,8 @@ mod tests {
         b.set(0xE038, Bind::Preset(Preset::OpenWeb("https://example.com/a?b=1|2".into()))).unwrap();
         b.set(0x57, Bind::Macro("m1".into())).unwrap();
         b.set(0x58, Bind::App("micmute.toggle".into())).unwrap();
+        b.set(0x3, Bind::Also(vec![0x11, 0x43])).unwrap();
+        b.set(0x4, Bind::AlsoClick(1)).unwrap();
         b.set(0x3B, Bind::Preset(Preset::OpenApp(r"C:\Program Files\App\app.exe".into()))).unwrap();
         let lines = b.to_lines();
         assert_eq!(Binds::from_lines(&lines), b);

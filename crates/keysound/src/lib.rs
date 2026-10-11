@@ -1,10 +1,13 @@
 //! `bu-keysound` — the Keyboard tab's engine (Order 058). No UI.
 //!
 //! **Key sounds** (off by default; while off nothing listens): a soft sound on every key down / up.
-//! * The key is used ONLY to pick the sound (Space / Enter / Backspace / any other) and is FORGOTTEN at once: it is never
-//!   stored, logged, sent or kept in a buffer. The only listener is the process's one Raw Input owner (`bu-rawin`), which
-//!   hands this crate a [`bu_rawin::SoundEvent`] — a class and up / down, two bytes, no key — straight from its own
-//!   thread. This crate never sees a key code at all (`tests::the_engine_never_sees_a_key`).
+//! * The key is used ONLY to pick the sound and is FORGOTTEN at once: it is never stored, logged, sent or kept in a buffer.
+//!   The only listener is the process's one Raw Input owner (`bu-rawin`), which hands this crate a [`bu_rawin::SoundEvent`]
+//!   — a class (Space / Enter / Backspace / other), up / down and (Order 090) the key's scan code, so a key's own sound and a
+//!   pack made from one sound can play — straight from its own thread. No text, no time, no window ever reaches it.
+//! * Order 090: every key / mouse button / controller button plays two LAYERS ([`layers`]): the pack's sound (switchable per
+//!   button) and "your sound" on top (a file of your own, pitch + loudness). Packs can be made from one sound
+//!   ([`layers::Made`]). A file someone else made is decoded in a helper process ([`safe`]): a broken one can't crash the app.
 //! * The sounds are OUR OWN, made by a small synth ([`synth`]) when the stream opens — no recordings, no licences. Nine
 //!   packs: Linear, Tactile, Clicky, Typewriter (clean keyboard) and Bubble, Glass tap, Water drop, Wood block, Marble
 //!   (satisfying); each with key down, key up and Space / Enter / Backspace variants. A pack the user imports (a Mechvibes
@@ -21,6 +24,10 @@
 //! wheel click play a click of our own synth ([`synth::ClickStyle`]: silent switch, optical, micro-switch, deep click, or a tick of
 //! a satisfying pack) that suits the pack. While the switch is off the mouse is not even registered with Windows.
 //!
+//! **Controller too** (Order 081, off by default, at the keys' volume): `bu-rawin` hands over a [`bu_rawin::PadSoundEvent`] (button /
+//! left trigger / right trigger + up or down; no button number, no device). A button (face, bumper, D-pad, stick click) plays the
+//! chosen pack's key sound, a trigger the left / right click. While the switch is off no controller is registered with Windows.
+//!
 //! **Key remap** ([`remap`]): Windows' own Scancode Map (HKLM, one admin Yes, a restart), listed + "Reset all".
 //!
 //! The pure parts (synth, mixer, rules, the scancode map codec) are unit-tested; `engine` / `front` / `stream` /
@@ -30,17 +37,21 @@ pub mod binds;
 pub mod gallery;
 pub mod import;
 pub mod kind;
+pub mod layers;
 pub mod layout;
 pub mod macros;
 pub mod mixer;
 pub mod remap;
 pub mod rules;
+pub mod safe;
 pub mod synth;
 
 #[cfg(windows)]
 pub mod engine;
 #[cfg(windows)]
 mod front;
+#[cfg(windows)]
+mod mf;
 #[cfg(windows)]
 pub mod guard;
 #[cfg(windows)]
@@ -51,8 +62,9 @@ mod stream;
 pub mod watch;
 
 pub use kind::{kind_of, Kind, KINDS};
-pub use rules::{choose, choose_mouse, gain, Pack, PlayOn, Rule, Settings, DEFAULT_VOLUME};
+pub use layers::{Layer, Layers, Made, Release, Vary};
+pub use rules::{choose, choose_mouse, choose_pad, click_from_key, click_key, gain, Pack, PlayOn, Rule, Settings, CLICK_STYLES, DEFAULT_VOLUME, MAX_REPEAT_MS};
 pub use synth::{render_clicks, ClickSet, ClickStyle, PackId, SoundSet};
 
 #[cfg(windows)]
-pub use engine::{KeySounds, Status};
+pub use engine::{Dev, Hear, KeySounds, MadeSet, Status};

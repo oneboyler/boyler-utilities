@@ -64,3 +64,47 @@ pub fn seg(cx: &mut Cx, key: Key, labels: &[&str], on: usize, fit: bool) -> El {
     }
     g
 }
+
+/// Order 097 (pack-noise-v1 `.seg{justify-content:space-between}` in a fixed column): a `.seg.fit` that is exactly `w` wide - every
+/// segment is its word's width plus an equal share of what is left over (or minus an equal share of what is missing), the pill
+/// glides to the chosen one. Segment i = `Ev::Click(idx(key, i))`.
+pub fn seg_w(cx: &mut Cx, key: Key, labels: &[&str], on: usize, w: f32) -> El {
+    let n = labels.len().max(1);
+    let words: Vec<f32> = labels.iter().map(|l| cx.g.text_width(l, btn_font(13.0, 400)) + 22.0).collect();
+    let share = (w - 4.0 - words.iter().sum::<f32>()) / n as f32;
+    let ws: Vec<f32> = words.iter().map(|x| (x + share).max(24.0)).collect();
+    let on = on.min(n - 1);
+    let px = cx.tr(key, 1, ws[..on].iter().sum::<f32>(), 260.0, GLIDE);
+    let pw = cx.tr(key, 2, ws[on], 260.0, GLIDE);
+    let pill = El::block()
+        .abs(2.0, 2.0, f32::NAN, 2.0)
+        .w(pw)
+        .radius(6.0)
+        .bg(PILL())
+        .shadow(&[sh(0.0, 1.0, 3.0, 0.0, Rgba(0.0, 0.0, 0.0, 0.2))])
+        .inset(&[sh(0.0, 0.0, 0.0, 0.5, Rgba(1.0, 1.0, 1.0, 0.14))])
+        .translate(px, 0.0)
+        .no_hit();
+    let tracks: Vec<_> = ws.iter().map(|x| length(*x)).collect();
+    let mut g = El::grid().pad_all(2.0).radius(8.0).bg(CTL()).none().w(w).child(pill).style(move |s| {
+        s.grid_auto_flow = GridAutoFlow::Column;
+        s.grid_auto_columns = tracks.clone();
+    });
+    for (i, l) in labels.iter().enumerate() {
+        let k = idx(key, i);
+        let hv = cx.hover_t(k, 150.0, EASE);
+        let pr = cx.active_t(k, 120.0, EASE);
+        let op = if i == on { 1.0 } else { 0.78 + (0.95 - 0.78) * hv };
+        let b = El::row()
+            .center()
+            .justify(JustifyContent::CENTER)
+            .h(24.0)
+            .opacity(op)
+            .scale(1.0 - 0.04 * pr)
+            .on_click(k)
+            .cursor(Cursor::Hand)
+            .child(El::text(*l, btn_font(13.0, 400), FG(), lh(13.0, 1.35)));
+        g = g.child(b);
+    }
+    g
+}

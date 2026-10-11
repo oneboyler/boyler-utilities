@@ -261,6 +261,18 @@ pub struct Look {
     pub sel: bool,
     /// Changed: remapped or carrying an action / macro (it glows).
     pub changed: bool,
+    /// Order 090: picked for "Change N keys" (a solid blue, like files picked on the desktop).
+    pub pick: bool,
+    /// Order 090: the key has its own sound (or its pack sound off): a small dot in its corner.
+    pub dot: bool,
+    /// Order 090, "Make a pack from one sound": the key's pitch, -1 (lowest, blue) .. +1 (highest, teal).
+    pub tint: Option<f32>,
+}
+
+/// The scan code of every key of the full keyboard, for making a pack from one sound (Order 090).
+pub fn codes() -> Vec<u16> {
+    let (ks, _, _) = keys(Size::Full);
+    ks.iter().filter(|k| !k.dead).map(|k| k.code).collect()
 }
 
 /// The picture's height in px for a width.
@@ -305,6 +317,15 @@ pub fn paint(g: &Gfx, keys: &[KeyBox], texts: &[String], looks: &[Look], descr: 
             stroke = ACC();
             sw = 1.6 * s;
         }
+        if let Some(t) = lk.tint {
+            // lower = blue, higher = teal (the drawing's tint), stronger the further from the middle
+            let hue = if t < 0.0 { Rgba(0.23, 0.51, 0.96, 1.0) } else { Rgba(0.18, 0.83, 0.75, 1.0) };
+            fill = cmix(base, hue, (0.25 + 0.55 * t.abs()).min(0.8));
+        }
+        if lk.pick {
+            fill = ACC();
+            stroke = ACC();
+        }
         let a = if k.dead { 0.55 } else { 1.0 };
         let (kx, ky) = (x + (k.x * U + GAP / 2.0) * s, y + (k.y * U + GAP / 2.0) * s);
         let (kw, kh) = ((k.w * U - GAP) * s, (k.h * U - GAP) * s);
@@ -329,16 +350,19 @@ pub fn paint(g: &Gfx, keys: &[KeyBox], texts: &[String], looks: &[Look], descr: 
             }
         }
         let text = texts.get(i).map(String::as_str).unwrap_or(k.label);
-        let wide_desc = if lk.changed && k.w >= 1.5 { descr(i) } else { None };
+        let wide_desc = if (lk.changed || lk.tint.is_some()) && k.w >= 1.5 { descr(i) } else { None };
         let fs = if k.small || text.chars().count() > 2 { 7.0 * s } else { 8.6 * s };
-        let (font, col) = (key_font(fs, 500), if lk.changed { FG() } else { FG2() });
+        let (font, col) = (key_font(fs, 500), if lk.pick { crate::ui::WHITE } else if lk.changed || lk.tint.is_some() { FG() } else { FG2() });
         let lh = (fs * 1.3).round().max(8.0);
         let ty = if k.shape == Shape::Iso { ky + (U * s - lh) / 2.0 + 2.0 * s } else if wide_desc.is_some() { ky + kh / 2.0 - lh + 1.0 * s } else { ky + (kh - lh) / 2.0 };
         g.text(text, font, kx + kw / 2.0, ty, lh, col.mul_a(a), Align::Center, kw);
         if let Some(d) = wide_desc {
             let df = key_font(6.4 * s, 600);
             let dl = (6.4 * s * 1.3).round().max(8.0);
-            g.text(&d, df, kx + kw / 2.0, ky + kh - dl - 1.5 * s, dl, ACC(), Align::Center, kw);
+            g.text(&d, df, kx + kw / 2.0, ky + kh - dl - 1.5 * s, dl, if lk.pick || lk.tint.is_some() { FG() } else { ACC() }, Align::Center, kw);
+        }
+        if lk.dot {
+            g.fill_circle(kx + kw - 4.4 * s, ky + 4.4 * s, 1.9 * s, if lk.pick { crate::ui::WHITE } else { FG() });
         }
     }
 }

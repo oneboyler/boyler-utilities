@@ -4,8 +4,9 @@
 //!   write any setting the page shows ([`settings::Change`]) keeping every other byte of the file identical
 //!   ([`vdf::Doc`]); a backup of the original before the first write, one undo step per write, "Steam's setting for this",
 //!   "Steam's layout" and "Back to how your PC was" ([`ControllerService`]). Steam re-reads a game's layout when the game
-//!   window gets focus (measured live Oct 8), so no Steam restart is needed — and the app never starts, closes or
-//!   restarts Steam.
+//!   window gets focus (measured live Oct 8), so no Steam restart is needed. The light colour of "This controller" is
+//!   different: Steam keeps it in memory while it runs, so it needs the "Restart Steam to apply" click (Order 085) -
+//!   the only place the app closes / starts Steam.
 //! - **This controller · all games**: Steam's `preferences_<serial>.vdf` ([`prefs`]).
 //! - **Controllers**: the connected ones, their type and battery ([`os::PadOs`]).
 //! - **Live view**: sticks, buttons, triggers of the selected controller while the page is open ([`live::LiveView`]).

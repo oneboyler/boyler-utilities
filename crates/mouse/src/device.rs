@@ -157,6 +157,8 @@ pub fn find_mice(hid: &[HidInfo]) -> Vec<YourMouse> {
     let mut ids: Vec<(u16, u16)> = hid.iter().filter(|h| h.usage_page == 0x01 && h.usage == 0x02).map(|h| (h.vid, h.pid)).collect();
     ids.sort();
     ids.dedup();
+    // Order 090: real mice only - a keyboard's extra mouse interface (Wooting 80HE's "mouse" for its analog keys) is no mouse
+    ids.retain(|(vid, pid)| !is_keyboard(hid, *vid, *pid));
     // a mouse with no USB id (touchpad, PS/2, remote session) is only listed when no mouse with an id is there (it would
     // otherwise be a second row for the same hardware or a virtual device)
     if ids.iter().any(|i| i.0 != 0) {
@@ -185,6 +187,16 @@ pub fn find_mice(hid: &[HidInfo]) -> Vec<YourMouse> {
     // supported first, then mice the tables know by model, then the rest; no-id mice last
     out.sort_by_key(|m| (m.protocol.is_none(), m.vid == 0, crate::models::model(m.vid, m.pid).is_none(), m.wireless == Some(true)));
     out
+}
+
+/// Makers that make keyboards only: a mouse collection of theirs is a keyboard's extra interface (Wooting, Keychron).
+const KEYBOARD_VENDORS: [u16; 2] = [0x31E3, 0x3434];
+
+/// Is the device `vid:pid` a KEYBOARD that also shows a mouse collection (Order 090: the owner's Mouse tab listed "Wooting 80HE ·
+/// Also connected · 31E3:1402")? Only by maker: the interfaces can't tell - his real Pulsar X2 MOUSE has its keyboard
+/// collection on interface 0 and the mouse on interface 2, exactly like a keyboard with a mouse interface.
+pub fn is_keyboard(_hid: &[HidInfo], vid: u16, _pid: u16) -> bool {
+    KEYBOARD_VENDORS.contains(&vid)
 }
 
 /// The vendor collection the cMouse protocol uses: vendor usage page 0xFF02 with output AND input reports of ≥ 17 bytes

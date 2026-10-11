@@ -289,10 +289,17 @@ impl Open {
         let act = |p: Press| v.presses.iter().find(|(q, _)| *q == p).map(|(_, a)| a.clone()).unwrap_or(Action::Nothing);
         let st_act = |p: Press| steam.as_ref().and_then(|s| s.presses.iter().find(|(q, _)| *q == p).map(|(_, a)| a.clone()));
         let n = format!("{b:?}").to_lowercase();
-        let does = self.r_act(cx, &format!("{n}.full"), "Does", &act(Press::Full), AW::Btn(b, Press::Full), st_act(Press::Full).as_ref());
+        // Order 090 (v8): a button running a macro says "Macro" in Does, its steps right under it (Steam plays them)
+        let mac = self.button_macro(b).is_some();
+        let full = if mac { Action::Other("Macro".into()) } else { act(Press::Full) };
+        let does = self.r_act(cx, &format!("{n}.full"), "Does", &full, AW::Btn(b, Press::Full), st_act(Press::Full).as_ref());
+        let steps = self.macro_rows(cx, b);
         let long = self.r_act(cx, &format!("{n}.long"), "Long press", &act(Press::Long), AW::Btn(b, Press::Long), None);
         let dbl = self.r_act(cx, &format!("{n}.double"), "Double press", &act(Press::Double), AW::Btn(b, Press::Double), None);
-        let press = look::psec_first("Press", vec![does, long, dbl]);
+        let mut rows = vec![does];
+        rows.extend(steps);
+        rows.extend([long, dbl]);
+        let press = look::psec_first("Press", rows);
         // "More ways to press": start, release, together with
         let start = self.r_act(cx, &format!("{n}.start"), "Start press", &act(Press::Start), AW::Btn(b, Press::Start), None);
         let rel = self.r_act(cx, &format!("{n}.release"), "Release press", &act(Press::Release), AW::Btn(b, Press::Release), None);
@@ -324,7 +331,8 @@ impl Open {
         };
         let tail = self.tail(cx, ck, back);
         let together = look::prw("Together with", PANEL.lw, vec![dropdown::dropdown(cx, ck, &shown, Some(110.0)), look::ach(cx, cak, &show(&chord_a, self.xbox()), false, false)], false, Some(tail));
-        let more = Self::r_sec("More ways to press", vec![start, rel, together]);
+        // (a macro is Steam's start presses: its own "Start press" row would show one step of it)
+        let more = Self::r_sec("More ways to press", if mac { vec![rel, together] } else { vec![start, rel, together] });
         // "Press settings" (Steam's Regular Press Settings)
         let s = |p: PressSetting| sv(&v.settings, p);
         let turbo = on_nz(s(PressSetting::HoldToRepeat));
@@ -573,8 +581,28 @@ pub(super) fn prefs_rows(o: &mut Open, cx: &mut Cx) -> Vec<El> {
         rows.push(look::prw("Light bar", DLG.lw, vec![look::lsw(cx, k, on)], dead, Some(tail)));
         let bri = get(PrefSetting::LedBrightness).and_then(|v| v.trim().parse::<f64>().ok()).map(|v| (v * 100.0).round() as i64);
         rows.push(o.r_slider(cx, DLG, "pf.bri", "Brightness", (0.0, 100.0, 5.0), 100.0, Conv::Unit, Fmt::Pct, W::Pref(PrefSetting::LedBrightness), bri, dead));
+        rows.extend(restart_row(o, cx));
     }
     rows
+}
+
+/// The line under "Brightness" (Order 085): Steam sets the light only when it starts, so a new colour / brightness waits
+/// for a Steam restart. Shown from the first light change until Steam has been restarted by this link; asks first.
+fn restart_row(o: &Open, cx: &mut Cx) -> Option<El> {
+    use super::{Rs, K_RESTART, LIGHT_PENDING};
+    let pending = o.keep.get::<bool>(LIGHT_PENDING).unwrap_or(false);
+    let (text, links): (&str, Vec<(&str, &str)>) = match o.rs {
+        Rs::Idle if pending => ("Steam sets the light only when it starts.", vec![("ask", "Restart Steam to apply")]),
+        Rs::Idle => return None,
+        Rs::Ask => ("Steam closes for a few seconds and starts again in the tray.", vec![("go", "Restart Steam"), ("no", "Cancel")]),
+        Rs::Busy => ("Restarting Steam\u{2026}", vec![]),
+    };
+    let said = El::text(text, Font::new(11.5, 400), FG3(), lh(11.5, 1.35)).wrapping();
+    let mut line = El::row().center().gap(12.0).none();
+    for (part, label) in links {
+        line = line.child(link::link(cx, sub(K_RESTART, part), label, 12.0));
+    }
+    Some(look::prw("", DLG.lw, vec![El::col().gap(2.0).w(DLG.w - DLG.lw - 10.0).child(said).child(line)], false, None))
 }
 
 /// The two wells of a stick (`stickWells`): the dead zone circle (live dot = the stick) and the response curve.

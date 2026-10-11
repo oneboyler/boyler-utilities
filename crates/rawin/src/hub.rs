@@ -12,7 +12,7 @@ pub const USAGE_MOUSE: u16 = 2;
 pub const USAGE_KEYBOARD: u16 = 6;
 
 /// The longest "ignore repeats" window the sounds accept (ms).
-pub const MAX_CHATTER_MS: u32 = 80;
+pub const MAX_CHATTER_MS: u32 = 400;
 
 /// The most packets kept for the keys client between two reads (the oldest go first when it is full).
 pub const QUEUE_CAP: usize = 256;
@@ -32,8 +32,8 @@ pub const RI_KEY_BREAK: u16 = 1;
 pub const RI_KEY_E0: u16 = 2;
 pub const RI_KEY_E1: u16 = 4;
 
-/// What the key SOUNDS may hear of a key (Order 058): one of four classes, never the key itself. Space, Enter and
-/// Backspace sound different from the rest; every other key is `Other`.
+/// The class of a key for the key SOUNDS (Order 058): Space, Enter and Backspace sound different from the rest of a pack;
+/// every other key is `Other`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SoundClass {
     Other,
@@ -58,10 +58,22 @@ pub enum MouseButtonClass {
 pub struct MouseSoundEvent {
     pub button: MouseButtonClass,
     pub down: bool,
+    /// Which of the five buttons (Order 090: a button's own sound): [`MOUSE_LEFT`] .. [`MOUSE_X2`].
+    pub index: u8,
 }
+
+/// The mouse buttons' numbers in [`MouseSoundEvent::index`] (Order 090).
+pub const MOUSE_LEFT: u8 = 0;
+pub const MOUSE_RIGHT: u8 = 1;
+pub const MOUSE_MIDDLE: u8 = 2;
+/// Back (side).
+pub const MOUSE_X1: u8 = 3;
+/// Forward (side).
+pub const MOUSE_X2: u8 = 4;
 
 /// RAWMOUSE.usButtonFlags of the five buttons: (down flag, up flag, chatter code, class). The wheels (0x0400 / 0x0800) are
 /// not here on purpose.
+/// The chatter code is also the button's number ([`MOUSE_LEFT`] .. [`MOUSE_X2`]).
 const MOUSE_BUTTONS: [(u16, u16, u8, MouseButtonClass); 5] = [
     (0x0001, 0x0002, 0, MouseButtonClass::Left),
     (0x0004, 0x0008, 1, MouseButtonClass::Right),
@@ -70,12 +82,132 @@ const MOUSE_BUTTONS: [(u16, u16, u8, MouseButtonClass); 5] = [
     (0x0100, 0x0200, 4, MouseButtonClass::Side),
 ];
 
-/// One key going down or up, as the sounds hear it. By design this holds NO key identity (no VKey, no scan code): the
-/// key is used to pick the class and forgotten at once.
+/// HID usages (page "generic desktop") of the two kinds of game controller Windows lists.
+pub const USAGE_JOYSTICK: u16 = 4;
+pub const USAGE_GAMEPAD: u16 = 5;
+
+/// What a controller sound is for (Order 081): any button (face, bumpers, D-pad, stick clicks, the rest) or one of the two
+/// triggers. Never which button.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PadSoundClass {
+    Button,
+    TriggerLeft,
+    TriggerRight,
+}
+
+/// One controller button / trigger going down or up, as the controller sounds hear it: the class and up / down - nothing else
+/// (no button number, no device, no time).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PadSoundEvent {
+    pub class: PadSoundClass,
+    pub down: bool,
+    /// Which button (Order 090: a button's own sound), one of the [`pad`] numbers; [`pad::UNKNOWN`] on a controller whose layout
+    /// is not known.
+    pub button: u8,
+}
+
+/// The controller buttons' numbers in [`PadSoundEvent::button`] (Order 090), by place on the pad - the same on a PlayStation and
+/// an Xbox controller (Cross = A).
+pub mod pad {
+    pub const SOUTH: u8 = 0;
+    pub const EAST: u8 = 1;
+    pub const WEST: u8 = 2;
+    pub const NORTH: u8 = 3;
+    pub const LB: u8 = 4;
+    pub const RB: u8 = 5;
+    pub const LT: u8 = 6;
+    pub const RT: u8 = 7;
+    /// Share / Create / View.
+    pub const BACK: u8 = 8;
+    /// Options / Menu.
+    pub const START: u8 = 9;
+    pub const LS: u8 = 10;
+    pub const RS: u8 = 11;
+    /// PS / Xbox button.
+    pub const HOME: u8 = 12;
+    pub const TOUCHPAD: u8 = 13;
+    pub const DPAD_UP: u8 = 14;
+    pub const DPAD_RIGHT: u8 = 15;
+    pub const DPAD_DOWN: u8 = 16;
+    pub const DPAD_LEFT: u8 = 17;
+    /// The DualSense mic button.
+    pub const MIC: u8 = 18;
+    pub const UNKNOWN: u8 = 255;
+    pub const VID_SONY: u16 = 0x054C;
+    pub const VID_MICROSOFT: u16 = 0x045E;
+
+    /// The button number of HID button bit `bit` (0 = HID button 1; 56..=59 = the D-pad) on a pad made by `vendor`.
+    pub fn of(vendor: u16, bit: u32) -> u8 {
+        match bit {
+            56 => return DPAD_UP,
+            57 => return DPAD_RIGHT,
+            58 => return DPAD_DOWN,
+            59 => return DPAD_LEFT,
+            _ => {}
+        }
+        let table: &[u8] = match vendor {
+            // DualShock 4 / DualSense / DualSense Edge (DirectInput order)
+            VID_SONY => &[WEST, SOUTH, EAST, NORTH, LB, RB, LT, RT, BACK, START, LS, RS, HOME, TOUCHPAD, MIC],
+            // Xbox controllers over Bluetooth / HID
+            VID_MICROSOFT => &[SOUTH, EAST, WEST, NORTH, LB, RB, BACK, START, LS, RS, HOME],
+            _ => &[],
+        };
+        table.get(bit as usize).copied().unwrap_or(UNKNOWN)
+    }
+}
+
+/// One decoded input report of one controller (made by the Windows shell from the HID report; this part is pure).
+/// `keys`: bit n = button n+1 is held (bits 0..=55), bits 56..=59 = D-pad up / right / down / left. `trig`: bit 0 = left
+/// trigger, bit 1 = right trigger held, for pads whose triggers are buttons. `analog`: the two triggers as 0..=255 for pads
+/// whose triggers are axes (then `trig` is unused).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PadFrame {
+    /// The device (its raw-input handle; never 0).
+    pub dev: usize,
+    /// Its maker's USB vendor id (which button is which: [`pad::of`]).
+    pub vendor: u16,
+    pub keys: u64,
+    pub trig: u8,
+    pub analog: Option<(u8, u8)>,
+}
+
+/// A trigger axis counts as pressed from this value up and as released below the lower one (so a trigger resting on the
+/// threshold can't chatter).
+pub const TRIGGER_DOWN: u8 = 96;
+pub const TRIGGER_UP: u8 = 64;
+/// How many controllers are told apart at once (a fifth takes the place of the one seen longest ago).
+pub const MAX_PADS: usize = 4;
+
+/// What the controller sounds know about one pad: which buttons are held right now (a state, never a history).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct PadHeld {
+    dev: usize,
+    vendor: u16,
+    keys: u64,
+    trig: u8,
+}
+
+/// Counters for the check "can the app see the controller's presses" (nothing about WHICH button).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PadStats {
+    /// Controller reports read since the sounds listen.
+    pub packets: u64,
+    /// ... of which the shell could decode (a report it does not know is counted in `packets` only).
+    pub decoded: u64,
+    /// Different controllers that sent a report since the sounds listen.
+    pub devices: u32,
+    /// Button / trigger events handed out.
+    pub events: u64,
+}
+
+/// One key going down or up, as the sounds hear it: its class, up / down and (Order 090: a key's own sound, a pack made from
+/// one sound) its place on the keyboard - the scan code as the remap writes it (0xE000 added for an extended key). The sound
+/// engine uses it at once to pick the sound; it is never stored, logged or sent anywhere.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SoundEvent {
     pub class: SoundClass,
     pub down: bool,
+    pub key: u16,
 }
 
 /// The one thing the sound client's repeat filter keeps: WHICH of the 256 scan codes are held down right now (a 32-byte
@@ -194,6 +326,8 @@ pub struct Posts {
     pub sounds: Vec<SoundEvent>,
     /// Mouse button sounds to play (Order 064), same rules as `sounds`.
     pub mouse_sounds: Vec<MouseSoundEvent>,
+    /// Controller sounds to play (Order 081), same rules as `sounds`.
+    pub pad_sounds: Vec<PadSoundEvent>,
 }
 
 /// What the keys client asked for last (put back if Windows refuses the new one).
@@ -222,6 +356,15 @@ pub struct Hub {
     mchatter: Chatter,
     /// What is registered with Windows now (keyboard, mouse).
     pub registered: (bool, bool),
+    /// The controller-sound client listens (Order 081): controller reports become [`PadSoundEvent`]s.
+    psound: bool,
+    /// What is registered with Windows for the controllers now (joystick + gamepad usage).
+    pub registered_pad: bool,
+    /// Which buttons each known controller holds right now (empty while nobody listens).
+    pads: [PadHeld; MAX_PADS],
+    /// Next slot a new controller takes when all are in use.
+    pad_next: usize,
+    pad_stats: PadStats,
     queue: VecDeque<RawPacket>,
     /// A wake-up was posted to the keys client and it hasn't taken the packets since.
     posted: bool,
@@ -245,6 +388,11 @@ impl Hub {
             msound: false,
             mchatter: Chatter::new(),
             registered: (false, false),
+            psound: false,
+            registered_pad: false,
+            pads: [PadHeld { dev: 0, vendor: 0, keys: 0, trig: 0 }; MAX_PADS],
+            pad_next: 0,
+            pad_stats: PadStats { packets: 0, decoded: 0, devices: 0, events: 0 },
             queue: VecDeque::new(),
             posted: false,
             stats: Stats { packets_seen: 0, packets_forwarded: 0, wakes_posted: 0, batches: 0 },
@@ -267,7 +415,103 @@ impl Hub {
                 out.push((usage, w));
             }
         }
+        if self.psound != self.registered_pad {
+            out.push((USAGE_GAMEPAD, self.psound));
+            out.push((USAGE_JOYSTICK, self.psound));
+        }
         out
+    }
+
+    /// The controller-sound client listens (true) or lets go (false). Returns the old setting. Either way what is known
+    /// about the pads' buttons starts empty: nothing about them survives a change.
+    pub fn set_pad_sound(&mut self, on: bool) -> bool {
+        self.pads = [PadHeld::default(); MAX_PADS];
+        self.pad_next = 0;
+        self.pad_stats = PadStats::default();
+        std::mem::replace(&mut self.psound, on)
+    }
+
+    /// The controller sounds listen right now.
+    pub fn pad_listening(&self) -> bool {
+        self.psound
+    }
+
+    pub fn pad_stats(&self) -> PadStats {
+        self.pad_stats
+    }
+
+    /// A controller report that was read but could not be decoded (counted, nothing else).
+    pub fn pad_undecoded(&mut self, _dev: usize) {
+        // (no slot is taken: a device nobody can read must not push a real pad out)
+        self.pad_stats.packets += 1;
+    }
+
+    fn pad_slot(&mut self, dev: usize, vendor: u16) -> usize {
+        if let Some(i) = self.pads.iter().position(|p| p.dev == dev) {
+            return i;
+        }
+        let i = self.pads.iter().position(|p| p.dev == 0).unwrap_or_else(|| {
+            let i = self.pad_next;
+            self.pad_next = (i + 1) % MAX_PADS;
+            i
+        });
+        self.pads[i] = PadHeld { dev, vendor, keys: 0, trig: 0 };
+        self.pad_stats.devices += 1;
+        i
+    }
+
+    /// One decoded report: the buttons / triggers that changed since this pad's last report become events (a release
+    /// before a press, in button order). Reports that change nothing - a pad streams them all the time - add nothing.
+    #[inline]
+    pub fn feed_pad(&mut self, f: PadFrame, out: &mut Posts) {
+        if !self.psound || f.dev == 0 {
+            return;
+        }
+        self.pad_stats.packets += 1;
+        self.pad_stats.decoded += 1;
+        let i = self.pad_slot(f.dev, f.vendor);
+        let was = self.pads[i];
+        let trig = match f.analog {
+            Some((l, r)) => {
+                let mut t = was.trig;
+                for (bit, v) in [(1u8, l), (2u8, r)] {
+                    if v >= TRIGGER_DOWN {
+                        t |= bit;
+                    } else if v <= TRIGGER_UP {
+                        t &= !bit;
+                    }
+                }
+                t
+            }
+            None => f.trig & 3,
+        };
+        if f.keys == was.keys && trig == was.trig {
+            return;
+        }
+        self.pads[i].keys = f.keys;
+        self.pads[i].trig = trig;
+        let before = out.pad_sounds.len();
+        let (up, down) = (was.keys & !f.keys, f.keys & !was.keys);
+        let vendor = self.pads[i].vendor;
+        let bits = |m: u64| (0..64u32).filter(move |b| m & (1u64 << b) != 0);
+        for b in bits(up) {
+            out.pad_sounds.push(PadSoundEvent { class: PadSoundClass::Button, down: false, button: pad::of(vendor, b) });
+        }
+        const TRIGS: [(u8, PadSoundClass, u8); 2] = [(1, PadSoundClass::TriggerLeft, pad::LT), (2, PadSoundClass::TriggerRight, pad::RT)];
+        for (bit, class, button) in TRIGS {
+            if was.trig & bit != 0 && trig & bit == 0 {
+                out.pad_sounds.push(PadSoundEvent { class, down: false, button });
+            }
+        }
+        for (bit, class, button) in TRIGS {
+            if was.trig & bit == 0 && trig & bit != 0 {
+                out.pad_sounds.push(PadSoundEvent { class, down: true, button });
+            }
+        }
+        for b in bits(down) {
+            out.pad_sounds.push(PadSoundEvent { class: PadSoundClass::Button, down: true, button: pad::of(vendor, b) });
+        }
+        self.pad_stats.events += (out.pad_sounds.len() - before) as u64;
     }
 
     /// The keys client's needs (a target to wake, or None). Returns the old ones. Nothing needed any more: its queue
@@ -324,10 +568,10 @@ impl Hub {
     fn mouse_sounds_of(&mut self, buttons: u16, now: u32, out: &mut Vec<MouseSoundEvent>) {
         for (down, up, code, button) in MOUSE_BUTTONS {
             if buttons & down != 0 && (self.mchatter.ms == 0 || self.mchatter.down(code, now)) {
-                out.push(MouseSoundEvent { button, down: true });
+                out.push(MouseSoundEvent { button, down: true, index: code });
             }
             if buttons & up != 0 && (self.mchatter.ms == 0 || self.mchatter.up(code)) {
-                out.push(MouseSoundEvent { button, down: false });
+                out.push(MouseSoundEvent { button, down: false, index: code });
             }
         }
     }
@@ -343,24 +587,25 @@ impl Hub {
     }
 
     /// A key packet for the sound client: the sound event, or None (a repeat of a held key, a fake key, the Pause key's
-    /// E1 sequence). The key is looked at here and forgotten: only the class and up / down leave.
+    /// E1 sequence). Only the class, up / down and the key's scan code leave (for the key's own sound).
     #[inline]
     fn sound_of(&mut self, vk: u16, make: u16, flags: u16, now: u32) -> Option<SoundEvent> {
         if vk == 0 || vk >= 0xFF || flags & RI_KEY_E1 != 0 {
             return None;
         }
         let code = (make & 0x7F) as u8 | if flags & RI_KEY_E0 != 0 { 0x80 } else { 0 };
+        let key = (make & 0x7F) | if flags & RI_KEY_E0 != 0 { 0xE000 } else { 0 };
         if flags & RI_KEY_BREAK != 0 {
             self.held.release(code);
             if self.chatter.ms > 0 && !self.chatter.up(code) {
                 return None;
             }
-            Some(SoundEvent { class: sound_class(vk), down: false })
+            Some(SoundEvent { class: sound_class(vk), down: false, key })
         } else if self.held.press(code) {
             if self.chatter.ms > 0 && !self.chatter.down(code, now) {
                 return None;
             }
-            Some(SoundEvent { class: sound_class(vk), down: true })
+            Some(SoundEvent { class: sound_class(vk), down: true, key })
         } else {
             None
         }
@@ -529,7 +774,7 @@ mod tests {
         h.set_activity(Some(ACT));
         h.registered = h.wanted();
         let out = batch(&mut h, &[mouse(0), mouse(0), key(0x41)]);
-        assert_eq!(out, Posts { keys: None, activity: Some(ACT), sounds: vec![], mouse_sounds: vec![] }, "a move is enough; the key isn't the keys' device");
+        assert_eq!(out, Posts { keys: None, activity: Some(ACT), ..Posts::default() }, "a move is enough; the key isn't the keys' device");
         assert_eq!(batch(&mut h, &[mouse(0)]).activity, None, "once only");
         // the keyboard is dropped again, the keys' mouse stays
         assert_eq!(h.changes(), vec![(USAGE_KEYBOARD, false)]);
@@ -553,27 +798,35 @@ mod tests {
     fn kup(vk: u16, make: u16) -> RawPacket {
         RawPacket::Key { vk, make, flags: RI_KEY_BREAK }
     }
+    /// A key's event with its scan code (`make` as the test packets give it, no E0).
+    fn evk(class: SoundClass, down: bool, key: u16) -> SoundEvent {
+        SoundEvent { class, down, key }
+    }
     fn ev(class: SoundClass, down: bool) -> SoundEvent {
-        SoundEvent { class, down }
+        evk(class, down, 0x1E)
     }
 
+    /// Order 090: class, direction and the key's place (its scan code, 0xE000 for an extended key) - for the key's own sound.
     #[test]
-    fn sounds_hear_class_and_direction_only() {
+    fn sounds_hear_class_direction_and_the_keys_place() {
         let mut h = Hub::new();
         h.set_sound(true);
         let out = batch(&mut h, &[kdown(0x41, 0x1E), kup(0x41, 0x1E), kdown(0x20, 0x39), kup(0x20, 0x39), kdown(0x0D, 0x1C), kdown(0x08, 0x0E)]);
         assert_eq!(
             out.sounds,
             vec![
-                ev(SoundClass::Other, true),
-                ev(SoundClass::Other, false),
-                ev(SoundClass::Space, true),
-                ev(SoundClass::Space, false),
-                ev(SoundClass::Enter, true),
-                ev(SoundClass::Backspace, true)
+                evk(SoundClass::Other, true, 0x1E),
+                evk(SoundClass::Other, false, 0x1E),
+                evk(SoundClass::Space, true, 0x39),
+                evk(SoundClass::Space, false, 0x39),
+                evk(SoundClass::Enter, true, 0x1C),
+                evk(SoundClass::Backspace, true, 0x0E)
             ]
         );
         assert_eq!(out.keys, None, "the sounds never wake the keys client");
+        // numpad Enter (E0 1C) is told apart from Enter
+        let out = batch(&mut h, &[RawPacket::Key { vk: 0x0D, make: 0x1C, flags: RI_KEY_E0 }]);
+        assert_eq!(out.sounds, vec![evk(SoundClass::Enter, true, 0xE01C)]);
     }
 
     #[test]
@@ -624,8 +877,8 @@ mod tests {
         let out = batch(&mut h, &[kdown(0x41, 0x1E)]);
         assert!(out.sounds.is_empty(), "off = nothing is heard");
         assert_eq!(h.held_count(), 0, "off = nothing is kept");
-        // the event is exactly (class, down): two bytes of information and no key
-        assert_eq!(std::mem::size_of::<SoundEvent>(), 2);
+        // the event is (class, down, scan code): nothing more of the key, and nothing of the text it typed
+        assert_eq!(std::mem::size_of::<SoundEvent>(), 4);
     }
 
     #[test]
@@ -673,16 +926,30 @@ mod tests {
         assert_eq!(h.held_count(), 0);
     }
 
+    /// A mouse event without its button number (the class tests); [`mouse_index_batch`] keeps it.
     fn me(button: MouseButtonClass, down: bool) -> MouseSoundEvent {
-        MouseSoundEvent { button, down }
+        MouseSoundEvent { button, down, index: 0 }
     }
-    fn mouse_batch(h: &mut Hub, packets: &[(u16, u32)]) -> Vec<MouseSoundEvent> {
+    fn mouse_index_batch(h: &mut Hub, packets: &[(u16, u32)]) -> Vec<MouseSoundEvent> {
         let mut out = Posts::default();
         for (b, t) in packets {
             h.feed_at(mouse(*b), &mut out, *t);
         }
         assert!(out.sounds.is_empty(), "a mouse packet is never a key sound");
         out.mouse_sounds
+    }
+    fn mouse_batch(h: &mut Hub, packets: &[(u16, u32)]) -> Vec<MouseSoundEvent> {
+        mouse_index_batch(h, packets).into_iter().map(|e| MouseSoundEvent { index: 0, ..e }).collect()
+    }
+
+    /// Order 090: every mouse event says which of the five buttons it is (Back and Forward told apart).
+    #[test]
+    fn mouse_sounds_say_which_button() {
+        let mut h = Hub::new();
+        h.set_mouse_sound(true);
+        let s = mouse_index_batch(&mut h, &[(0x0001, 0), (0x0004, 0), (0x0010, 0), (0x0040, 0), (0x0100, 0)]);
+        let idx: Vec<u8> = s.iter().map(|e| e.index).collect();
+        assert_eq!(idx, vec![MOUSE_LEFT, MOUSE_RIGHT, MOUSE_MIDDLE, MOUSE_X1, MOUSE_X2]);
     }
 
     /// Order 064: the mouse sounds hear which class of button went down / up and nothing else; moves and wheel turns are silent.
@@ -765,5 +1032,124 @@ mod tests {
         assert_eq!(s.len(), 2, "what was kept is gone when the sounds were switched off and on");
         h.set_chatter(1000);
         assert_eq!(h.chatter.ms, MAX_CHATTER_MS);
+    }
+
+    /// A pad event without its button number (the class tests); [`pad_ids`] keeps it.
+    fn pe(class: PadSoundClass, down: bool) -> PadSoundEvent {
+        PadSoundEvent { class, down, button: 0 }
+    }
+    fn frame(dev: usize, keys: u64, trig: u8) -> PadFrame {
+        PadFrame { dev, vendor: 0, keys, trig, analog: None }
+    }
+    fn analog(dev: usize, keys: u64, l: u8, r: u8) -> PadFrame {
+        PadFrame { dev, vendor: 0, keys, trig: 0, analog: Some((l, r)) }
+    }
+    fn pad_ids(h: &mut Hub, frames: &[PadFrame]) -> Vec<PadSoundEvent> {
+        let mut out = Posts::default();
+        for f in frames {
+            h.feed_pad(*f, &mut out);
+        }
+        assert!(out.sounds.is_empty() && out.mouse_sounds.is_empty() && out.keys.is_none(), "a pad is never a key or a mouse");
+        out.pad_sounds
+    }
+    fn pad(h: &mut Hub, frames: &[PadFrame]) -> Vec<PadSoundEvent> {
+        pad_ids(h, frames).into_iter().map(|e| PadSoundEvent { button: 0, ..e }).collect()
+    }
+
+    /// Order 090: a known pad's buttons are named by their place (Sony Cross = Xbox A = SOUTH); an unknown maker's are UNKNOWN.
+    #[test]
+    fn pad_events_say_which_button_on_known_pads() {
+        let mut h = Hub::new();
+        h.set_pad_sound(true);
+        let sony = |keys, trig| PadFrame { dev: 5, vendor: pad::VID_SONY, keys, trig, analog: None };
+        // HID button 2 = Cross, then the right trigger (Sony: buttons 7 / 8 arrive as trig bits), then D-pad left
+        let s = pad_ids(&mut h, &[sony(0b10, 0), sony(0b10, 2), sony((1 << 59) | 0b10, 2)]);
+        let ids: Vec<u8> = s.iter().map(|e| e.button).collect();
+        assert_eq!(ids, vec![pad::SOUTH, pad::RT, pad::DPAD_LEFT]);
+        let xbox = |keys| PadFrame { dev: 6, vendor: pad::VID_MICROSOFT, keys, trig: 0, analog: None };
+        let s = pad_ids(&mut h, &[xbox(0b1), xbox(0b1001)]);
+        assert_eq!(s.iter().map(|e| e.button).collect::<Vec<_>>(), vec![pad::SOUTH, pad::NORTH]);
+        let other = |keys| PadFrame { dev: 7, vendor: 0x1234, keys, trig: 0, analog: None };
+        assert_eq!(pad_ids(&mut h, &[other(0b1)])[0].button, pad::UNKNOWN);
+    }
+
+    /// Order 081: the controller sounds hear buttons and triggers going down / up, by class only; a pad streams a report all
+    /// the time and only a change makes a sound.
+    #[test]
+    fn pad_sounds_hear_changes_only() {
+        use PadSoundClass::*;
+        let mut h = Hub::new();
+        assert!(pad(&mut h, &[frame(7, 1, 0)]).is_empty(), "off: nothing is heard");
+        assert_eq!(h.changes(), vec![], "and nothing is registered");
+        h.set_pad_sound(true);
+        assert_eq!(h.changes(), vec![(USAGE_GAMEPAD, true), (USAGE_JOYSTICK, true)]);
+        assert_eq!(h.wanted(), (false, false), "the keyboard and the mouse are not touched");
+        // 500 idle reports: silence
+        let idle: Vec<PadFrame> = (0..500).map(|_| frame(7, 0, 0)).collect();
+        assert!(pad(&mut h, &idle).is_empty());
+        // a face button, held over many reports, down once and up once
+        let s = pad(&mut h, &[frame(7, 0b10, 0), frame(7, 0b10, 0), frame(7, 0b10, 0), frame(7, 0, 0)]);
+        assert_eq!(s, vec![pe(Button, true), pe(Button, false)]);
+        // the D-pad (bits 56..) and a stick click are buttons too; two at once = two sounds
+        let s = pad(&mut h, &[frame(7, (1 << 56) | (1 << 10), 0), frame(7, 1 << 10, 0), frame(7, 0, 0)]);
+        assert_eq!(s, vec![pe(Button, true), pe(Button, true), pe(Button, false), pe(Button, false)]);
+        // digital triggers: left, then right, each its own class; a release comes before a press in one report
+        let s = pad(&mut h, &[frame(7, 0, 1), frame(7, 0, 3), frame(7, 0b1, 2)]);
+        assert_eq!(s, vec![pe(TriggerLeft, true), pe(TriggerRight, true), pe(TriggerLeft, false), pe(Button, true)]);
+        let s = pad(&mut h, &[frame(7, 0, 0)]);
+        assert_eq!(s, vec![pe(Button, false), pe(TriggerRight, false)]);
+        let st = h.pad_stats();
+        assert_eq!((st.packets, st.decoded, st.devices), (511, 511, 1));
+        assert_eq!(st.events, 2 + 4 + 4 + 2);
+    }
+
+    #[test]
+    fn analog_triggers_have_a_gap_between_down_and_up() {
+        use PadSoundClass::*;
+        let mut h = Hub::new();
+        h.set_pad_sound(true);
+        let s = pad(&mut h, &[analog(3, 0, 0, 0), analog(3, 0, 50, 0), analog(3, 0, 95, 0), analog(3, 0, 96, 10), analog(3, 0, 255, 0)]);
+        assert_eq!(s, vec![pe(TriggerLeft, true)], "down once at 96, a harder pull is the same press");
+        // coming back through the gap (65..95) is still held; at 64 it is released
+        let s = pad(&mut h, &[analog(3, 0, 80, 0), analog(3, 0, 96, 0), analog(3, 0, 70, 0), analog(3, 0, 64, 0)]);
+        assert_eq!(s, vec![pe(TriggerLeft, false)]);
+        let s = pad(&mut h, &[analog(3, 0, 0, 200), analog(3, 0, 0, 0)]);
+        assert_eq!(s, vec![pe(TriggerRight, true), pe(TriggerRight, false)]);
+    }
+
+    #[test]
+    fn two_pads_are_two_states_and_off_forgets_everything() {
+        use PadSoundClass::*;
+        let mut h = Hub::new();
+        h.set_pad_sound(true);
+        // pad 1 holds a button; pad 2 pressing its own is a press, not a change of pad 1's
+        assert_eq!(pad(&mut h, &[frame(1, 1, 0)]), vec![pe(Button, true)]);
+        assert_eq!(pad(&mut h, &[frame(2, 1, 0)]), vec![pe(Button, true)]);
+        assert!(pad(&mut h, &[frame(1, 1, 0), frame(2, 1, 0)]).is_empty());
+        assert_eq!(pad(&mut h, &[frame(1, 0, 0)]), vec![pe(Button, false)]);
+        assert_eq!(h.pad_stats().devices, 2);
+        // five pads: the oldest slot is reused, nothing panics
+        for d in 3..=8 {
+            pad(&mut h, &[frame(d, 0, 0)]);
+        }
+        // off: the held state is wiped, the registration goes, nothing is heard
+        assert!(h.set_pad_sound(false));
+        h.registered_pad = true;
+        assert_eq!(h.changes(), vec![(USAGE_GAMEPAD, false), (USAGE_JOYSTICK, false)]);
+        assert!(pad(&mut h, &[frame(2, 1, 0)]).is_empty());
+        assert_eq!(h.pad_stats(), PadStats::default());
+        // on again: a pad that held a button before shows it as a fresh press (nothing was remembered)
+        h.set_pad_sound(true);
+        assert_eq!(pad(&mut h, &[frame(2, 1, 0)]), vec![pe(Button, true)]);
+        // a report the shell could not decode is only counted
+        h.pad_undecoded(2);
+        assert_eq!(h.pad_stats().packets, 2);
+        assert_eq!(h.pad_stats().decoded, 1);
+    }
+
+    /// The event carries the class, the direction and (Order 090) which button by place - no device and no time.
+    #[test]
+    fn the_pad_event_is_class_direction_and_button_only() {
+        assert_eq!(std::mem::size_of::<PadSoundEvent>(), 3);
     }
 }

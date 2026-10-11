@@ -96,6 +96,8 @@ pub enum Job {
     Live { pad: Option<PadInfo>, old: Option<LiveView> },
     /// "Open in Steam": the link (needs Steam's process list), opened through the shell
     OpenInSteam { game: Game, test: bool },
+    /// "Restart Steam to apply" (Order 085): close Steam cleanly, write the light values again, start it minimised
+    RestartSteam { serial: String },
 }
 
 impl Job {
@@ -115,6 +117,8 @@ pub enum Done {
     Live(Option<LiveView>),
     /// a toast for the page (None = nothing to say)
     Said(Option<String>),
+    /// the restart ended: Ok(what to say) or the words of why not
+    Restarted(Result<String, String>),
 }
 
 impl Done {
@@ -179,6 +183,7 @@ impl Worker {
                 Done::Live(pad.and_then(|p| self.live(&p)))
             }
             Job::OpenInSteam { game, test } => Done::Said(self.open_in_steam(&game, test)),
+            Job::RestartSteam { serial } => Done::Restarted(self.restart_steam(&serial)),
         }
     }
 
@@ -256,6 +261,60 @@ impl Worker {
             Err(bu_controller::Error::SteamClosed) => Some("Steam is closed \u{b7} start Steam first".into()),
             Err(e) => Some(e.to_string()),
         }
+    }
+}
+
+/// How long Steam gets to close by itself (a clean shutdown saves its files and the cloud; it is never killed).
+pub const CLOSE_WAIT_MS: u64 = 45_000;
+/// How often the closing Steam's process is looked at.
+const CLOSE_POLL_MS: u64 = 300;
+
+impl Worker {
+    /// "Restart Steam to apply" (Order 085): refuse while a game runs, remember the light values, close Steam cleanly and
+    /// wait for it, write the values again (a closing Steam may write its own copy back), start Steam minimised. The
+    /// service is locked only for each step, never while waiting.
+    fn restart_steam(&self, serial: &str) -> Result<String, String> {
+        let svc = |f: &mut dyn FnMut(&mut Svc) -> Result<(), String>| -> Result<(), String> {
+            let mut g = self.svc.lock().unwrap_or_else(|p| p.into_inner());
+            match &mut *g {
+                Some(Ok(s)) => f(s),
+                Some(Err(e)) => Err(e.clone()),
+                None => Err("Steam is not read yet".into()),
+            }
+        };
+        let words = |e: bu_controller::Error| match e {
+            bu_controller::Error::GameRunning => "A game is running through Steam \u{b7} close it first, then restart Steam".to_string(),
+            bu_controller::Error::SteamClosed => "Steam is closed \u{b7} nothing to restart".to_string(),
+            e => e.to_string(),
+        };
+        let mut wanted = Vec::new();
+        svc(&mut |s| {
+            s.restart_check().map_err(words)?;
+            wanted = s.light_values(serial).map_err(words)?;
+            s.steam_shutdown().map_err(words)
+        })?;
+        let mut waited = 0;
+        loop {
+            let mut closed = false;
+            svc(&mut |s| {
+                closed = s.steam_closed();
+                Ok(())
+            })?;
+            if closed {
+                break;
+            }
+            if waited >= CLOSE_WAIT_MS {
+                return Err("Steam didn\u{2019}t close by itself \u{b7} it was left running, nothing was forced".into());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(CLOSE_POLL_MS));
+            waited += CLOSE_POLL_MS;
+        }
+        // Steam is gone: the values go into the file again if its closing wrote an older copy over them, then it starts
+        let kept = svc(&mut |s| s.keep_light(serial, &wanted).map(|_| ()).map_err(words));
+        let started = svc(&mut |s| s.steam_start_minimised().map_err(words));
+        started?;
+        kept?;
+        Ok("Steam restarted \u{b7} it sets the light to your colour when the controller connects".into())
     }
 }
 

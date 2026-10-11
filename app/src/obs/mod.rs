@@ -54,6 +54,7 @@ const MORE_CLIP: [&str; 3] = ["obs.clip2", "obs.clip3", "obs.clip4"];
 
 enum Cmd {
     Popup(PopMsg, Option<usize>),
+    RetractClipFailed,
     Publish(View),
     Dialog(String),
     Keys(KeysView),
@@ -76,6 +77,10 @@ struct UiQ;
 impl bu_obs::Ui for UiQ {
     fn popup(&mut self, m: &PopMsg, c: Option<usize>) {
         Q.lock().unwrap().push_back(Cmd::Popup(m.clone(), c));
+        post();
+    }
+    fn retract_clip_failed(&mut self) {
+        Q.lock().unwrap().push_back(Cmd::RetractClipFailed);
         post();
     }
     fn publish(&mut self, v: &View) {
@@ -392,6 +397,7 @@ fn drain() {
                     popups::show(&m, clipped, &set, &mons, false);
                 }
             }
+            Cmd::RetractClipFailed => popups::retract_clip_failed(),
             Cmd::Publish(v) => {
                 let st = with(|f| {
                     // the engine made the default scene list: the page shows it (not saved until changed)
@@ -410,6 +416,9 @@ fn drain() {
                     }
                     status::update(&set, &mons, v.connected, v.replay, v.recording, v.clipped, test);
                     crate::tray::set_tip_extra(Some(&v.tip));
+                    // Order 091: the tray icon's number tile = the monitor OBS records (replay buffer or recording on)
+                    let recorded = if v.connected && (v.replay || v.recording) { v.clipped.and_then(|i| mons.get(i)).map(|m| m.num) } else { None };
+                    crate::tray::set_obs_monitor(recorded);
                 }
                 crate::services::Waker.wake();
             }
@@ -518,6 +527,7 @@ pub fn stop() {
         }
         Q.lock().unwrap().clear();
         crate::tray::set_tip_extra(None);
+        crate::tray::set_obs_monitor(None);
     }
 }
 

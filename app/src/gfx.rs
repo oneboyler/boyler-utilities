@@ -918,6 +918,17 @@ impl Gfx {
         }
         self.cv().draw_path(g, &p);
     }
+    /// Order 097: a path filled with a shader (a gradient), anti-aliased and dithered; `alpha` multiplies it.
+    pub fn fill_path_shader(&self, path: &Path, sh: &sk::Shader, alpha: f32) {
+        if self.off() {
+            return;
+        }
+        let mut p = Paint::new(Color4f::new(0.0, 0.0, 0.0, alpha.clamp(0.0, 1.0)), None);
+        p.set_anti_alias(true);
+        p.set_dither(true);
+        p.set_shader(sh.clone());
+        self.cv().draw_path(path, &p);
+    }
     /// A stroked rounded rect (centred on the outline).
     pub fn stroke_rr(&self, x: f32, y: f32, w: f32, h: f32, r: f32, lw: f32, c: Rgba) {
         if self.off() {

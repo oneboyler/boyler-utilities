@@ -919,3 +919,82 @@ fn the_game_names_are_read_once_per_change() {
     let _ = s.games(EDGE).unwrap();
     assert_eq!(reads(&s) - r2, full);
 }
+
+// ------------------------------------------------------------------------------------------------ Restart Steam to apply (Order 085)
+
+fn running_service() -> ControllerService<FakeSteam> {
+    let mut f = fake();
+    f.active = Some(ACCOUNT.parse().unwrap());
+    f.running = true;
+    ControllerService::new(f, BACKUPS).expect("fake Steam found")
+}
+
+#[test]
+fn the_restart_is_refused_while_steam_is_closed_or_a_game_runs() {
+    let s = service();
+    assert!(matches!(s.restart_check(), Err(Error::SteamClosed)));
+    let s = running_service();
+    s.restart_check().unwrap();
+    s.os().game.store(true, Ordering::Relaxed);
+    assert!(matches!(s.restart_check(), Err(Error::GameRunning)));
+    assert!(matches!(s.steam_shutdown(), Err(Error::GameRunning)), "a game started after the check: still refused");
+    assert!(s.os().procs.lock().unwrap().is_empty(), "nothing was closed");
+}
+
+#[test]
+fn a_read_only_layer_never_closes_or_starts_steam() {
+    let mut f = fake();
+    f.active = Some(ACCOUNT.parse().unwrap());
+    f.running = true;
+    f.read_only = true;
+    let s = ControllerService::new(f, BACKUPS).unwrap();
+    assert!(matches!(s.steam_shutdown(), Err(Error::ReadOnly(_))));
+    assert!(matches!(s.steam_start_minimised(), Err(Error::ReadOnly(_))));
+    assert!(s.os().procs.lock().unwrap().is_empty());
+}
+
+/// Theory (a): Steam writes its own copy back when it closes. The colour written while Steam ran must come out the
+/// other side of the restart: written again after Steam has closed, before it starts.
+#[test]
+fn the_colour_survives_a_steam_that_writes_its_old_copy_back_on_exit() {
+    let mut s = running_service();
+    s.set_light_bar(SERIAL, (164, 99, 255)).unwrap();
+    s.set_preference(SERIAL, PrefSetting::LedBrightness, Some("0.8")).unwrap();
+    // Steam's memory still holds the colour from before
+    s.os().write_on_exit.lock().unwrap().replace((prefs_path(), PREFS.as_bytes().to_vec()));
+    s.restart_check().unwrap();
+    let wanted = s.light_values(SERIAL).unwrap();
+    assert_eq!(wanted[0], (PrefSetting::LedRed, Some("164".into())));
+    assert_eq!(wanted[3], (PrefSetting::LedBrightness, Some("0.8".into())));
+    s.steam_shutdown().unwrap();
+    assert!(s.steam_closed());
+    assert_eq!(s.light_bar(SERIAL).unwrap(), Some((10, 20, 30)), "Steam wrote its old copy back while closing");
+    assert!(s.keep_light(SERIAL, &wanted).unwrap(), "so it is written again");
+    s.steam_start_minimised().unwrap();
+    assert!(!s.steam_closed());
+    assert_eq!(s.light_bar(SERIAL).unwrap(), Some((164, 99, 255)));
+    assert_eq!(s.preferences().unwrap()[0].get(PrefSetting::LedBrightness), Some("0.8"));
+    assert_eq!(*s.os().procs.lock().unwrap(), ["-shutdown", "-silent"]);
+    // the other lines of the file are untouched
+    let (rem, add) = line_diff(PREFS, &text(&s, &prefs_path()));
+    assert_eq!((rem.len(), add.len()), (4, 4), "the three colour values + the brightness only");
+}
+
+#[test]
+fn a_steam_that_keeps_the_colour_needs_no_second_write() {
+    let mut s = running_service();
+    s.set_light_bar(SERIAL, (1, 2, 3)).unwrap();
+    let wanted = s.light_values(SERIAL).unwrap();
+    s.steam_shutdown().unwrap();
+    let writes = s.os().writes().len();
+    assert!(!s.keep_light(SERIAL, &wanted).unwrap());
+    assert_eq!(s.os().writes().len(), writes, "nothing written");
+}
+
+#[test]
+fn a_steam_that_will_not_close_is_left_alone() {
+    let s = running_service();
+    s.os().stuck.store(true, Ordering::Relaxed);
+    s.steam_shutdown().unwrap();
+    assert!(!s.steam_closed(), "still running; the caller gives up after its time and forces nothing");
+}

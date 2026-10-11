@@ -6,6 +6,7 @@
 //! CSS; rules are quoted where a part is not a shared piece.
 
 mod art;
+mod btns;
 mod pic;
 mod store;
 #[cfg(windows)]
@@ -22,7 +23,7 @@ use bu_mouse::accel::panel::{rows, value_text, visible_rows, CapType, Curve, Fie
 use bu_mouse::accel::service::{header_line, RawAccelStatus, INSTALL_TEXT, INSTALL_TITLE};
 use bu_mouse::accel::switch::{PerApp, PresetId, RowId, Target};
 use bu_mouse::cursors::{Role, SetId};
-use bu_mouse::device::{DPI_CHIPS, LIFT_OFF_CHIPS, POLLING_CHIPS};
+use bu_mouse::device::{LIFT_OFF_CHIPS, POLLING_CHIPS};
 use bu_mouse::settings::{double_click_ms_for_step, double_click_step_for_ms, ScrollLines};
 
 use crate::anim::EASE;
@@ -31,6 +32,7 @@ use crate::pages::{Env, Page};
 use crate::ui::cx::{Cx, Ev};
 use crate::ui::el::{idx, key, lh, sub, Cursor, El, Key, RADIUS_PILL};
 use crate::ui::pieces::mitems::{self, It, Lead, Place, Row};
+use crate::ui::pieces::segx::Label;
 use crate::ui::pieces::{self, bits, button, card, dropdown, fold, group, link, nbox, reset, rowbits, seg, segx, slider, toast, toggle};
 use crate::ui::{cmix, ACC, ACC_S, AMBER, CTL, CTL_H, DASH, FG, FG2, FG3, HAIR, HL_V19, HOV, ICO_ON, POP, SEL, WELL, WHITE};
 
@@ -45,6 +47,8 @@ enum MItem {
 
 // ---- keys ("cur.<name>")
 const K_WEB: Key = key("cur.web");
+/// the Your mouse card (the mouse picture is as tall as it)
+const K_CARD: Key = key("cur.card");
 const K_DPI: Key = key("cur.dpi");
 const K_DPIN: Key = key("cur.dpin");
 const K_HZ: Key = key("cur.hz");
@@ -88,6 +92,13 @@ const K_RSC: Key = key("cur.rsc");
 const K_RSG: Key = key("cur.rsg");
 const K_MENU: Key = key("cur.menu");
 const K_TOAST: Key = key("cur.toast");
+
+/// The DPI boxes (mouse-v9): 400 / 800 / 1600, then Custom.
+const DPI_BOXES: [u32; 3] = [400, 800, 1600];
+/// One box of the DPI / Polling / Lift-off buttons: 58 px wide, so their columns line up row under row.
+const BOX_W: f32 = 58.0;
+const BOX4: segx::SegOpts = segx::SegOpts { px: 4.0, min_w: 4.0 * BOX_W + 4.0, ..segx::BASE };
+const BOX2: segx::SegOpts = segx::SegOpts { px: 4.0, min_w: 2.0 * BOX_W + 4.0, ..segx::BASE };
 
 /// The drawing's AMODES (the curve popup).
 const CURVES: [Curve; 6] = Curve::ALL;
@@ -209,6 +220,8 @@ pub struct Mouse {
     store_done: Option<crate::jobs::JobId>,
     /// the pack being downloaded (its name), for the install after the download job
     store_getting: Option<String>,
+    /// Order 090: the big mouse picture + the button window + Click sounds
+    btns: btns::Btns,
 }
 
 impl Mouse {
@@ -262,16 +275,6 @@ impl Mouse {
         self.v.on_mouse.as_ref().and_then(|o| o.dpi).map(|d| d.0)
     }
 
-    /// The DPI chips: the drawing's four, plus the mouse's own DPI in its place when it is none of them (Order 042:
-    /// a mouse at 2400 - read from the mouse, measured - showed only in the Custom box, "not in the list").
-    fn dpi_chips(&self) -> Vec<u32> {
-        let mut v = DPI_CHIPS.to_vec();
-        if let Some(d) = self.mouse_dpi().filter(|d| !v.contains(d)) {
-            v.push(d);
-            v.sort_unstable();
-        }
-        v
-    }
 
     fn ra_installed(&self) -> bool {
         !matches!(self.v.ra, Some(RawAccelStatus::NotInstalled))
@@ -321,7 +324,12 @@ impl Mouse {
         let mut rows = Vec::new();
         if sup {
             // .ymrow{min-height:58px}: the mouse's icon tile, name, line + its web settings link
-            let sub_line = y.as_ref().map(|y| format!("{} · {}", y.sub_line(), y.ids())).unwrap_or_else(|| "Wireless · saved on the mouse itself".to_string());
+            // mouse-v9: the line under the name is just "Wireless" (the mouse saves its settings itself - no need to say so)
+            let sub_line = match y.as_ref().map(|y| y.wireless) {
+                Some(Some(false)) => "Wired",
+                Some(None) => "",
+                _ => "Wireless",
+            };
             let lnk = y.as_ref().and_then(|y| y.link()).map(|(t, _)| t);
             let mut head = group::row(
                 true,
@@ -333,7 +341,7 @@ impl Mouse {
                     .child(
                         El::col()
                             .child(El::text(name.clone(), Font::new(13.0, 600), FG(), lh(13.0, 1.35)).ellipsis())
-                            .child(El::text(sub_line, Font::new(11.0, 400), FG2(), lh(11.0, 1.35)).margin(1.0, 0.0, 0.0, 0.0)),
+                            .child_if(!sub_line.is_empty(), || El::text(sub_line, Font::new(11.0, 400), FG2(), lh(11.0, 1.35)).margin(1.0, 0.0, 0.0, 0.0)),
                     )],
             )
             .min_h(58.0);
@@ -341,41 +349,39 @@ impl Mouse {
                 head = head.child(group::ctl(vec![link::link(cx, K_WEB, &t, 12.0)]));
             }
             rows.push(head);
-            // DPI: the chips (the mouse's own DPI always among them, `dpi_chips`) + the Custom field to type any other one
-            // (`.seg.nopick` = no pill while the DPI isn't read yet)
+            // DPI (mouse-v9): four equal boxes 400 / 800 / 1600 / Custom. The mouse's own DPI lights its box; any other DPI
+            // lights Custom, which then shows the number; a click on Custom = type one (Enter applies, Esc cancels)
             let dpi = self.mouse_dpi();
-            let dchips = self.dpi_chips();
-            let chips: Vec<String> = dchips.iter().map(|d| d.to_string()).collect();
-            let labels: Vec<&str> = chips.iter().map(|s| s.as_str()).collect();
-            let lit = dpi.and_then(|d| dchips.iter().position(|c| *c == d));
-            let mut s = seg::seg(cx, K_DPI, &labels, lit.unwrap_or(0), false);
-            if lit.is_none() {
-                nopick(&mut s, 0);
+            let editing = cx.focused(K_DPIN);
+            let custom = dpi.filter(|d| !DPI_BOXES.contains(d));
+            // while it is typed in, the field takes the box's place (no word under it, no pill)
+            let last = match custom {
+                _ if editing => String::new(),
+                Some(d) => d.to_string(),
+                None => "Custom".to_string(),
+            };
+            let lit = dpi.map(|d| DPI_BOXES.iter().position(|c| *c == d).unwrap_or(3)).filter(|i| !(editing && *i == 3));
+            let mut labels: Vec<String> = DPI_BOXES.iter().map(|d| d.to_string()).collect();
+            labels.push(last);
+            let labs: Vec<Label> = labels.iter().map(|s| Label::Text(s.as_str())).collect();
+            let mut s = segx::seg_ex(cx, K_DPI, &labs, lit, &BOX4);
+            if editing {
+                s = s.child(self.dpi_input(cx));
             }
-            let txt = if cx.focused(K_DPIN) { self.dpi_text.clone() } else { String::new() };
-            // Order 045: `h('div',{class:'nbox sm',title:'Type any DPI, 50 – 26000'})` - the mouse's real range (Order 042)
-            let (dlo, dhi) = bu_mouse::device::DPI_RANGE;
-            let field = nbox::nbox(cx, K_DPIN, &txt, "Custom", &nbox::SM, &nbox::Cue::NONE).wheel_steps().title(&format!("Type any DPI, {dlo} \u{2013} {dhi}"));
-            rows.push(group::row(false, vec![group::lbl("DPI", None), group::ctl(vec![s, field])]));
-            // Polling rate (+ the unit) and Lift-off distance
+            rows.push(group::row(false, vec![group::lbl("DPI", None), group::ctl(vec![s])]));
+            // Polling rate: "Hz" left of the buttons, whose columns are the DPI boxes' columns; no sub-lines (Lift-off too)
             let hz = self.v.on_mouse.as_ref().and_then(|o| o.polling_hz);
             let hl: Vec<String> = POLLING_CHIPS.iter().map(|d| d.to_string()).collect();
-            let hlab: Vec<&str> = hl.iter().map(|s| s.as_str()).collect();
+            let hlab: Vec<Label> = hl.iter().map(|s| Label::Text(s.as_str())).collect();
             let hi = hz.and_then(|h| POLLING_CHIPS.iter().position(|c| *c == h));
-            let mut hs = seg::seg(cx, K_HZ, &hlab, hi.unwrap_or(0), false);
-            if hi.is_none() {
-                nopick(&mut hs, 0);
-            }
-            // .unit{font-size:12px;color:var(--fg3);margin-left:-2px}
-            let unit = El::text("Hz", Font::new(12.0, 400), FG3(), lh(12.0, 1.35)).none().margin(0.0, 0.0, 0.0, -2.0);
-            rows.push(group::row(false, vec![group::lbl("Polling rate", Some("Higher is smoother · uses more battery")), group::ctl(vec![hs, unit])]));
+            let hs = segx::seg_ex(cx, K_HZ, &hlab, hi, &BOX4);
+            // .unit{font-size:12px;color:var(--fg3)}
+            let unit = El::text("Hz", Font::new(12.0, 400), FG3(), lh(12.0, 1.35)).none();
+            rows.push(group::row(false, vec![group::lbl("Polling rate", None), group::ctl(vec![unit, hs])]));
             let lo = self.v.on_mouse.as_ref().and_then(|o| o.lift_off);
             let li = lo.and_then(|l| LIFT_OFF_CHIPS.iter().position(|c| *c == l));
-            let mut ls = seg::seg(cx, K_LOD, &["1 mm", "2 mm"], li.unwrap_or(0), false);
-            if li.is_none() {
-                nopick(&mut ls, 0);
-            }
-            rows.push(group::row(false, vec![group::lbl("Lift-off distance", Some("How high you lift it before it stops")), group::ctl(vec![ls])]));
+            let ls = segx::seg_ex(cx, K_LOD, &[Label::Text("1 mm"), Label::Text("2 mm")], li, &BOX2);
+            rows.push(group::row(false, vec![group::lbl("Lift-off distance", None), group::ctl(vec![ls])]));
         } else {
             // a mouse the app can't talk to yet: `.ci.dim{background:var(--ctl);box-shadow:inset 0 0 0 .5px var(--hair)}`
             // `.ci.dim svg{stroke:var(--fg2)}`; `.ct{gap:7px}` name · `.ymd{color:var(--fg3);font-weight:400}` "—" · the link
@@ -398,11 +404,54 @@ impl Mouse {
                 .min_h(58.0),
             );
         }
+        // mouse-v9: two columns - the mouse (left, no panel) and the card (right); the mouse is as tall as the card, centred to it
+        let test = self.test || self.fake;
+        let split = El::row().center().gap(4.0).child(self.btns.picture(cx, test)).child(group::grp(rows).flex1().min_w(0.0).key(K_CARD));
+        // the drawing leaves 30 px under the columns (the hint sits in it) before the next card
+        let mut out = El::block().child(gh).child(split).margin(0.0, 0.0, 30.0, 0.0);
         // Order 061: every other mouse Windows lists, named, with its VID:PID (so an unknown mouse can be reported)
-        for o in self.v.mice.as_ref().map(|m| m.iter().skip(1)).into_iter().flatten() {
-            rows.push(group::row(false, vec![group::lbl(&o.name, Some(&format!("Also connected \u{b7} {}", o.ids())))]));
+        let others: Vec<El> = self
+            .v
+            .mice
+            .as_ref()
+            .map(|m| m.iter().skip(1))
+            .into_iter()
+            .flatten()
+            .map(|o| group::row(false, vec![group::lbl(&o.name, Some(&format!("Also connected \u{b7} {}", o.ids())))]))
+            .collect();
+        if !others.is_empty() {
+            out = out.child(group::grp(others).margin(24.0, 0.0, 0.0, 0.0));
         }
-        El::block().child(gh).child(group::grp(rows))
+        out
+    }
+
+    /// The Custom DPI box while it is being typed in (mouse-v9 `.seg input`): the fourth box's place, a blue ring on a faint blue
+    /// well, the digits centred; Enter applies, Esc cancels (`key`), a click elsewhere applies what is typed (`Ev::Blur`).
+    fn dpi_input(&self, cx: &mut Cx) -> El {
+        let t = &self.dpi_text;
+        let f = Font::new(12.0, 600);
+        let mut b = El::row()
+            .abs(f32::NAN, 2.0, 2.0, 2.0)
+            .w(BOX_W)
+            .center()
+            .justify(JustifyContent::CENTER)
+            .radius(5.0)
+            .bg(ACC().mul_a(0.12))
+            .inset(&[sh(0.0, 0.0, 0.0, 1.0, ACC())])
+            .key(K_DPIN)
+            .cursor(Cursor::Text)
+            .wheel_steps()
+            .title(&format!("Type any DPI, {} \u{2013} {}", bu_mouse::device::DPI_RANGE.0, bu_mouse::device::DPI_RANGE.1));
+        if t.is_empty() {
+            b = b.child(El::text("DPI", Font::new(12.0, 400), FG3(), lh(12.0, 1.35)).none());
+        } else {
+            b = b.child(El::text(t.clone(), f, WHITE, lh(12.0, 1.35)).none());
+        }
+        // the caret, blinking like the other fields (530 ms)
+        cx.wake_every(530.0, 0.0);
+        let on = ((cx.now / 530.0) as i64) % 2 == 0;
+        let x = BOX_W / 2.0 + cx.g.text_width(t, f) / 2.0;
+        b.child(El::block().abs(x.round(), 5.0, f32::NAN, f32::NAN).size(1.0, 14.0).bg(if on { FG() } else { Rgba(0.0, 0.0, 0.0, 0.0) }).no_hit())
     }
 
     // ================================================================== ACCELERATION
@@ -1460,16 +1509,6 @@ fn small_link(cx: &mut Cx, k: Key, t: &str, size: f32) -> El {
     El::text(t, Font::new(size, 400).ls(0), ACC(), 15.0).underline(hv).none().on_click(k).cursor(Cursor::Hand)
 }
 
-/// `.seg.nopick .pill{opacity:0}` (and no segment is `.on`): the DPI is your own.
-fn nopick(s: &mut El, on: usize) {
-    if let Some(p) = s.children.get_mut(0) {
-        p.opacity = 0.0;
-    }
-    if let Some(b) = s.children.get_mut(on + 1) {
-        b.opacity = 0.78;
-    }
-}
-
 /// One accel row (`.asr{display:flex;align-items:center;gap:8px;height:27px}` `>span:first-child{width:84px;flex:none;
 /// font-size:12px;color:var(--fg2)}` `.rng{flex:1}` `.sv{min-width:36px}`; `.sens` = 32 px, margin-top 4, padding-top 4,
 /// the hairline above, its label in --fg).
@@ -1579,10 +1618,12 @@ impl Page for Mouse {
         }
         self.follow_store(cx);
         let mut kids = vec![pieces::header(self.name(), None)];
+        let test = self.test || self.fake;
         kids.push(self.your_mouse(cx));
         kids.push(self.accel(cx));
         kids.push(self.settings(cx));
         kids.push(self.cursors(cx));
+        kids.extend(self.btns.click_card(cx, test));
         kids.push(reset::reset_line(cx, K_RS, Some("Windows defaults")));
         kids
     }
@@ -1601,6 +1642,10 @@ impl Page for Mouse {
         if let Some(d) = self.store_window(cx) {
             any = true;
             layer = layer.child(d);
+        }
+        if let Some(w) = self.btns.window(cx) {
+            any = true;
+            layer = layer.child(w);
         }
         if let Some((win, ticks)) = self.reset.clone() {
             any = true;
@@ -1621,6 +1666,9 @@ impl Page for Mouse {
         }
     }
     fn popup_dismiss(&mut self) {
+        if self.btns.dismiss() {
+            return;
+        }
         if self.store_open {
             // (no job to stop here: the window's own Done / close does that; a press beside it just closes the list)
             self.store_open = false;
@@ -1633,6 +1681,11 @@ impl Page for Mouse {
         self.reset = None;
     }
     fn event(&mut self, ev: &Ev, cx: &mut Cx) {
+        // Order 090: the buttons' part (its window takes every event while it is open)
+        let open = self.btns.open();
+        if self.btns.event(ev, cx) || (open && !matches!(ev, Ev::Wheel(..))) {
+            return;
+        }
         let now = cx.now;
         match ev {
             Ev::Press(k, x, _, r) => {
@@ -1647,9 +1700,6 @@ impl Page for Mouse {
                 if [K_SPEED, K_LINES, K_DBL, K_SIZE].contains(&k) || (0..100).any(|i| k == idx(K_ASL, i)) {
                     self.drag = Some(k);
                     self.slider_event(k, *x, *r, false);
-                }
-                if k == K_DPIN {
-                    self.dpi_text = String::new();
                 }
                 if k == K_ACDPI {
                     self.acdpi_text = String::new();
@@ -1722,7 +1772,8 @@ impl Page for Mouse {
     fn describe(&self) -> String {
         let w = self.v.win;
         format!(
-            "speed={} epp={} dpi={} accel_on={} open={} curve={} presets={} menu={:?} toast={:?} rename={:?}",
+            "{} speed={} epp={} dpi={} accel_on={} open={} curve={} presets={} menu={:?} toast={:?} rename={:?}",
+            self.btns.describe(),
             w.map(|w| w.pointer_speed).unwrap_or(0),
             w.map(|w| w.precision).unwrap_or(false),
             self.mouse_dpi().unwrap_or(0),
@@ -2179,11 +2230,16 @@ impl Mouse {
                     open_url(url, fake);
                 }
             }
-            _ if (0..self.dpi_chips().len()).any(|i| k == idx(K_DPI, i)) => {
-                let chips = self.dpi_chips();
-                let i = (0..chips.len()).find(|i| k == idx(K_DPI, *i)).unwrap_or(0);
-                if self.mouse_dpi() != Some(chips[i]) {
-                    self.send(Cmd::Dpi(chips[i]));
+            _ if (0..=DPI_BOXES.len()).any(|i| k == idx(K_DPI, i)) => {
+                let i = (0..=DPI_BOXES.len()).find(|i| k == idx(K_DPI, *i)).unwrap_or(0);
+                if let Some(d) = DPI_BOXES.get(i).copied() {
+                    if self.mouse_dpi() != Some(d) {
+                        self.send(Cmd::Dpi(d));
+                    }
+                } else {
+                    // Custom: type a DPI (the box turns into the field)
+                    self.dpi_text.clear();
+                    cx.focus(Some(K_DPIN));
                 }
             }
             _ if (0..4).any(|i| k == idx(K_HZ, i)) => {

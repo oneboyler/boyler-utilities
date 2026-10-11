@@ -49,7 +49,7 @@ const MAX: usize = 100;
 /// The part a layout change belongs to.
 pub fn part_of(c: &Change) -> Part {
     match c {
-        Change::ButtonAction { button, .. } | Change::ButtonSetting { button, .. } => Part::Button(*button),
+        Change::ButtonAction { button, .. } | Change::ButtonSetting { button, .. } | Change::ButtonMacro { button, .. } => Part::Button(*button),
         Change::StickMode { side, .. } | Change::StickSetting { side, .. } | Change::StickRing { side, .. } => Part::Stick(*side),
         Change::TriggerAnalog { side, .. } | Change::TriggerSetting { side, .. } | Change::TriggerAction { side, .. } => Part::Trigger(*side),
         Change::GyroMode { .. } | Change::GyroSetting { .. } => Part::Gyro,
@@ -143,6 +143,8 @@ impl Open {
     /// Order 047: written on the tab's worker like any change (shown at once when it is on screen); the step moves to the
     /// other list with the answer ("Undone · …"), or back to its own when the write did not go through.
     pub(super) fn undo(&mut self, redo: bool, now: f64) {
+        // (Order 090: the macro being edited is read from the layout again)
+        self.pad_mac = None;
         // a change still being written keeps its step until its answer: wait for it (else the older change is undone)
         if self.out_state > 0 {
             self.undo_q.push(redo);

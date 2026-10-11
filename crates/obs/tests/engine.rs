@@ -24,6 +24,7 @@ struct TH {
     sent: Vec<Value>,
     answered: HashSet<String>,
     popups: Vec<PopMsg>,
+    retracts: usize,
     sounds: Vec<Sound>,
     dialogs: Vec<String>,
     view: View,
@@ -61,6 +62,9 @@ impl Host for TH {
     }
     fn popup(&mut self, m: &PopMsg, _clipped: Option<usize>) {
         self.popups.push(m.clone());
+    }
+    fn retract_clip_failed(&mut self) {
+        self.retracts += 1;
     }
     fn sound(&mut self, ev: Sound, _set: &Settings) {
         self.sounds.push(ev);
@@ -115,6 +119,7 @@ impl T {
             sent: vec![],
             answered: HashSet::new(),
             popups: vec![],
+            retracts: 0,
             sounds: vec![],
             dialogs: vec![],
             view: View::default(),
@@ -261,12 +266,68 @@ fn save_clip_says_clipped_last_n_seconds() {
     let p = t.last_popup().clone();
     assert_eq!((p.color, p.main.as_str(), p.top.as_str(), p.detail.as_str()), (Color::Green, "Clipped last 12 seconds", "Monitor 1", "12 s"));
     assert_eq!(*t.h.sounds.last().unwrap(), Sound::Saved);
-    // no save within 2 s of a press: "Clip failed" (a press right after a save is OBS's own announcement: skipped)
+    // no save at all after a press: "Clip failed" only after the long wait (a press right after a save is OBS's own announcement: skipped)
     t.wait(500);
     t.input(Input::Key { which: KeyWhich::Clip, down: true, mouse: false });
     t.wait(2100);
+    assert_eq!(t.last_popup().main, "Clipped last 12 seconds", "a slow save is not a failure");
+    t.wait(27_000);
+    assert_eq!(t.last_popup().main, "Clipped last 12 seconds");
+    t.wait(1_000);
     assert_eq!(t.last_popup().main, "Clip failed");
     assert_eq!(t.last_popup().top, "OBS couldn't save the file");
+}
+
+/// Order 091: a save that takes longer than 2 s is not a failure (no "Clip failed" before the "Clipped").
+#[test]
+fn a_slow_save_shows_only_clipped() {
+    let mut t = T::new("slowclip", no_keep());
+    t.connect(true);
+    t.event("ReplayBufferStateChanged", json!({"outputActive": true, "outputState": "OBS_WEBSOCKET_OUTPUT_STARTED"}));
+    t.wait(12_000);
+    let clip = t.dir.join("slow.mp4");
+    std::fs::write(&clip, b"x").unwrap();
+    t.h.os.with(|s| {
+        s.exists.insert(clip.clone());
+    });
+    let n = t.h.popups.len();
+    t.input(Input::Key { which: KeyWhich::Clip, down: true, mouse: false });
+    t.input(Input::Key { which: KeyWhich::Clip, down: false, mouse: false });
+    t.wait(5_000);
+    t.event("ReplayBufferSaved", json!({"savedReplayPath": clip.to_string_lossy()}));
+    let got = t.popups_since(n);
+    assert!(got.len() == 1 && got[0].0.starts_with("Clipped last") && got[0].1 == "Monitor 1", "{got:?}");
+    assert_eq!(t.h.retracts, 0);
+    t.wait(40_000);
+    assert_eq!(t.popups_since(n).len(), 1, "no failure popup later");
+}
+
+/// Order 091: when "Clip failed" was already shown, a late "saved" takes it away and shows "Clipped".
+#[test]
+fn a_late_saved_replaces_a_shown_clip_failed() {
+    let mut t = T::new("lateclip", no_keep());
+    t.connect(true);
+    t.event("ReplayBufferStateChanged", json!({"outputActive": true, "outputState": "OBS_WEBSOCKET_OUTPUT_STARTED"}));
+    t.wait(12_000);
+    let clip = t.dir.join("late.mp4");
+    std::fs::write(&clip, b"x").unwrap();
+    t.h.os.with(|s| {
+        s.exists.insert(clip.clone());
+    });
+    t.input(Input::Key { which: KeyWhich::Clip, down: true, mouse: false });
+    t.input(Input::Key { which: KeyWhich::Clip, down: false, mouse: false });
+    t.wait(31_000);
+    assert_eq!(t.last_popup().main, "Clip failed");
+    assert_eq!(t.h.retracts, 0);
+    t.event("ReplayBufferSaved", json!({"savedReplayPath": clip.to_string_lossy()}));
+    assert_eq!(t.h.retracts, 1, "the red popup is taken away");
+    assert!(t.last_popup().main.starts_with("Clipped last"));
+    // a later, normal save does not retract anything
+    t.wait(5_000);
+    t.input(Input::Key { which: KeyWhich::Clip, down: true, mouse: false });
+    t.input(Input::Key { which: KeyWhich::Clip, down: false, mouse: false });
+    t.event("ReplayBufferSaved", json!({"savedReplayPath": clip.to_string_lossy()}));
+    assert_eq!(t.h.retracts, 1);
 }
 
 #[test]

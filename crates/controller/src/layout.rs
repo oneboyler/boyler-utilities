@@ -549,4 +549,242 @@ impl Layout {
     pub fn is_value(&self, addr: &[usize]) -> bool {
         matches!(self.doc.get(addr).map(|n| &n.kind), Some(Kind::Value { .. }))
     }
+
+    // ---------------------------------------------------------------- Order 090: a button's macro, played by Steam
+
+    fn activators(&self, set: u32, source: &str, input: &str) -> Option<Addr> {
+        let g = self.group(set, source)?;
+        let i = self.doc.find(&g, "inputs")?;
+        let inp = self.doc.find(&i, input)?;
+        self.doc.find(&inp, "activators")
+    }
+
+    /// The input's Regular / Start activator blocks in file order, as written: (press, bindings, settings).
+    fn raw_cmds(&self, set: u32, source: &str, input: &str) -> Vec<RawCmd> {
+        let Some(a) = self.activators(set, source, input) else { return vec![] };
+        let Some(n) = self.doc.get(&a) else { return vec![] };
+        n.children()
+            .iter()
+            .filter_map(|c| {
+                let press = if c.key.eq_ignore_ascii_case(Press::Full.steam()) {
+                    Press::Full
+                } else if c.key.eq_ignore_ascii_case(Press::Start.steam()) {
+                    Press::Start
+                } else {
+                    return None;
+                };
+                let bindings = c.child("bindings").map(|b| b.children_named("binding").filter_map(|x| x.value().map(str::to_string)).collect()).unwrap_or_default();
+                let settings = c.child("settings").map(|s| s.children().iter().filter_map(|x| x.value().map(|v| (x.key.clone(), v.to_string()))).collect()).unwrap_or_default();
+                Some(RawCmd { press, bindings, settings })
+            })
+            .collect()
+    }
+
+    /// The input's Regular / Start commands in file order (Steam's "extra commands"): what each presses, when. A block that
+    /// presses nothing (the Regular press only holding its settings, the app's macro marker) is no command.
+    pub fn macro_cmds(&self, set: u32, source: &str, input: &str) -> Vec<MacroCmd> {
+        self.raw_cmds(set, source, input)
+            .into_iter()
+            .filter(|r| !r.bindings.is_empty())
+            .map(|r| MacroCmd { press: r.press, actions: r.bindings.iter().map(|b| Action::parse(b)).collect(), delay_ms: r.delay() })
+            .collect()
+    }
+
+    /// Is the input a macro? The app's marker (a Start press that presses nothing, fired 1 ms in), or what only Steam's "Add
+    /// extra command" makes: several Regular commands or several Start commands. (One Regular + one Start press, with or
+    /// without a fire start delay, is a plain button with a Start press.)
+    pub fn is_macro(&self, set: u32, source: &str, input: &str) -> bool {
+        let r = self.raw_cmds(set, source, input);
+        let n = |p: Press| r.iter().filter(|c| c.press == p && !c.bindings.is_empty()).count();
+        r.iter().any(RawCmd::is_marker) || n(Press::Full) > 1 || n(Press::Start) > 1
+    }
+
+    /// Writes `cmds` as the input's commands (Long / Double / Release / chord stay): every Regular / Start block goes, then
+    /// one block per command in order - `"Start_Press" { "bindings" { "binding" "…" } "settings" { "delay_start" "200" } }`,
+    /// the shape Steam writes for "Add extra command" + "Fire start delay" - and the marker. The Regular press's own settings
+    /// (long press time, turbo, toggle, haptics…) stay on the first Regular block (one that presses nothing when the macro
+    /// has no Regular command); a command kept from before keeps its binding's text and its own settings. No commands = the
+    /// macro ends: the Regular press is Nothing, its settings kept.
+    pub fn set_macro(&mut self, set: u32, source: &str, default_mode: &str, input: &str, cmds: &[MacroCmd]) -> LResult<()> {
+        let olds: Vec<RawCmd> = self.raw_cmds(set, source, input).into_iter().filter(|r| !r.is_marker()).collect();
+        let regular: Vec<(String, String)> = olds.iter().find(|r| r.press == Press::Full).map(|r| r.settings.iter().filter(|(k, _)| !k.eq_ignore_ascii_case("delay_start")).cloned().collect()).unwrap_or_default();
+        while let Some(a) = self.activators(set, source, input) {
+            let first = self.doc.get(&a).and_then(|n| n.children().iter().position(|c| c.key.eq_ignore_ascii_case(Press::Full.steam()) || c.key.eq_ignore_ascii_case(Press::Start.steam())));
+            let Some(i) = first else { break };
+            let mut addr = a.clone();
+            addr.push(i);
+            self.doc.remove(&addr)?;
+        }
+        if cmds.is_empty() && regular.is_empty() {
+            return self.drop_empty_input(set, source, input);
+        }
+        let g = self.ensure_group(set, source, default_mode)?;
+        let i = self.doc.ensure_block(&g, "inputs")?;
+        let inp = self.doc.ensure_block(&i, input)?;
+        let acts = self.doc.ensure_block(&inp, "activators")?;
+        let mut full_done = false;
+        if !regular.is_empty() && !cmds.iter().any(|c| c.press == Press::Full) {
+            self.write_cmd(&acts, source, Press::Full, &[], &regular)?;
+            full_done = true;
+        }
+        let mut used = vec![false; olds.len()];
+        for c in cmds {
+            let old = (0..olds.len()).find(|j| !used[*j] && olds[*j].press == c.press && olds[*j].bindings.iter().map(|b| Action::parse(b)).collect::<Vec<_>>() == c.actions);
+            let bindings: Vec<String> = match old {
+                Some(j) => {
+                    used[j] = true;
+                    olds[j].bindings.clone()
+                }
+                None => c.actions.iter().filter_map(|a| a.binding_value(None)).collect(),
+            };
+            let mut settings: Vec<(String, String)> = old.map(|j| olds[j].settings.iter().filter(|(k, _)| !k.eq_ignore_ascii_case("delay_start")).cloned().collect()).unwrap_or_default();
+            if c.press == Press::Full && !full_done {
+                full_done = true;
+                for (k, v) in &regular {
+                    if !settings.iter().any(|(x, _)| x.eq_ignore_ascii_case(k)) {
+                        settings.push((k.clone(), v.clone()));
+                    }
+                }
+            }
+            if c.delay_ms > 0 {
+                settings.push(("delay_start".into(), c.delay_ms.to_string()));
+            }
+            self.write_cmd(&acts, source, c.press, &bindings, &settings)?;
+        }
+        if !cmds.is_empty() {
+            self.write_cmd(&acts, source, Press::Start, &[], &[("delay_start".into(), MARKER_MS.into())])?;
+        }
+        Ok(())
+    }
+
+    /// One activator block at the end of `acts`.
+    fn write_cmd(&mut self, acts: &[usize], source: &str, press: Press, bindings: &[String], settings: &[(String, String)]) -> LResult<()> {
+        let name = press.steam();
+        self.doc.insert_block(acts, name)?;
+        let a = self.doc.find_last(acts, name).ok_or(LayoutError::NoGroup(source.into()))?;
+        self.doc.insert_block(&a, "bindings")?;
+        let b = self.doc.find_last(&a, "bindings").ok_or(LayoutError::NoGroup(source.into()))?;
+        for v in bindings {
+            self.doc.insert_value(&b, "binding", v)?;
+        }
+        if !settings.is_empty() {
+            self.doc.insert_block(&a, "settings")?;
+            let s = self.doc.find_last(&a, "settings").ok_or(LayoutError::NoGroup(source.into()))?;
+            for (k, v) in settings {
+                self.doc.insert_value(&s, k, v)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The app's mark on a macro it wrote: a Start press that presses nothing, fired this long after the press (Steam does
+/// nothing for it; Steam's own screen never makes this shape).
+const MARKER_MS: &str = "1";
+
+/// One Regular / Start activator block as written.
+struct RawCmd {
+    press: Press,
+    bindings: Vec<String>,
+    settings: Vec<(String, String)>,
+}
+
+impl RawCmd {
+    fn delay(&self) -> u32 {
+        self.settings.iter().find(|(k, _)| k.eq_ignore_ascii_case("delay_start")).and_then(|(_, v)| v.trim().parse::<u32>().ok()).unwrap_or(0)
+    }
+    fn is_marker(&self) -> bool {
+        self.press == Press::Start && self.bindings.is_empty() && self.settings.len() == 1 && self.settings.iter().any(|(k, v)| k.eq_ignore_ascii_case("delay_start") && v.trim() == MARKER_MS)
+    }
+}
+
+/// Order 090 (boss A_090_01: a controller button's macro is played by Steam, so it works in games): one command of it - an
+/// extra command on the button with Steam's "Fire start delay".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MacroCmd {
+    /// [`Press::Start`] = a tap when the button goes down; [`Press::Full`] = held while the button is held.
+    pub press: Press,
+    /// What it presses (a key combo has several).
+    pub actions: Vec<Action>,
+    /// How long after the press it fires (ms).
+    pub delay_ms: u32,
+}
+
+/// The longest wait a controller macro step may add (Steam's field takes any number; a quick helper, as the app's macros).
+pub const MAX_MACRO_MS: u32 = 30_000;
+
+#[cfg(test)]
+mod macro_tests {
+    use super::*;
+    use crate::binding::MouseButton;
+
+    const RL: &str = include_str!("../tests/fixtures/rl_ps5.vdf");
+
+    #[test]
+    fn a_macro_is_written_as_steams_extra_commands_and_read_back() {
+        let mut l = Layout::parse(RL).unwrap();
+        let (src, mode, input) = ("button_diamond", "four_buttons", "button_a");
+        let before = l.action(0, src, input, Press::Full);
+        assert!(!l.is_macro(0, src, input), "one plain command: no macro ({before:?})");
+        // a Start press next to the Regular one is a plain button, not a macro
+        l.set_action(0, src, mode, input, Press::Start, &Action::Key("G".into())).unwrap();
+        assert!(!l.is_macro(0, src, input));
+        assert_eq!(l.action(0, src, input, Press::Full), before, "the Regular press stays");
+        l.set_action(0, src, mode, input, Press::Start, &Action::Nothing).unwrap();
+        let cmds = vec![
+            MacroCmd { press: Press::Start, actions: vec![Action::Key("LEFT_CONTROL".into()), Action::Key("C".into())], delay_ms: 0 },
+            MacroCmd { press: Press::Start, actions: vec![Action::Mouse(MouseButton::Left)], delay_ms: 150 },
+            MacroCmd { press: Press::Full, actions: vec![Action::Key("SPACE".into())], delay_ms: 300 },
+        ];
+        l.set_macro(0, src, mode, input, &cmds).unwrap();
+        assert_eq!(l.macro_cmds(0, src, input), cmds);
+        assert!(l.is_macro(0, src, input));
+        // still a layout Steam reads, and only that input changed
+        let text = l.text().to_string();
+        assert!(Layout::parse(text.clone()).is_ok());
+        assert!(text.contains("\"delay_start\"\t\t\"150\"") || text.contains("\"delay_start\" \"150\"") || text.contains("delay_start"), "{text}");
+        // the Regular press's own setting (the fixture's "delay_end" 14) stays on the first Regular command
+        assert_eq!(l.activator_setting(0, src, input, Press::Full, "delay_end").as_deref(), Some("14"));
+        // ending it: no extra command is left, the setting still there
+        l.set_macro(0, src, mode, input, &[]).unwrap();
+        l.set_action(0, src, mode, input, Press::Full, &before).unwrap();
+        assert!(!l.is_macro(0, src, input));
+        assert_eq!(l.action(0, src, input, Press::Full), before);
+        assert_eq!(l.macro_cmds(0, src, input).len(), 1);
+        assert_eq!(l.activator_setting(0, src, input, Press::Full, "delay_end").as_deref(), Some("14"));
+    }
+
+    /// Review (Order 090): one-command macros are still macros, a press setting on an all-Start macro keeps it editable,
+    /// a plain Start press with its own fire start delay is no macro, and a kept command keeps its binding's text.
+    #[test]
+    fn macro_marker_settings_and_binding_text() {
+        let mut l = Layout::parse(RL).unwrap();
+        let (src, mode, input) = ("button_diamond", "four_buttons", "button_a");
+        // one Regular command that waits (a "Key down" macro): still a macro, and the setting holder is no command
+        let one = vec![MacroCmd { press: Press::Full, actions: vec![Action::Key("A".into())], delay_ms: 100 }];
+        l.set_macro(0, src, mode, input, &one).unwrap();
+        assert!(l.is_macro(0, src, input));
+        assert_eq!(l.macro_cmds(0, src, input), one);
+        // all Start: the Regular settings sit on a Regular block that presses nothing; turbo set on it keeps the macro
+        let starts = vec![MacroCmd { press: Press::Start, actions: vec![Action::Key("B".into())], delay_ms: 0 }];
+        l.set_macro(0, src, mode, input, &starts).unwrap();
+        assert_eq!(l.activator_setting(0, src, input, Press::Full, "delay_end").as_deref(), Some("14"));
+        l.set_activator_setting(0, src, mode, input, Press::Full, "hold_repeats", Some("1")).unwrap();
+        assert!(l.is_macro(0, src, input));
+        assert_eq!(l.macro_cmds(0, src, input), starts);
+        l.set_macro(0, src, mode, input, &starts).unwrap();
+        assert_eq!(l.activator_setting(0, src, input, Press::Full, "hold_repeats").as_deref(), Some("1"), "kept on a rewrite");
+        // a kept command keeps its binding's text (label) when the macro is written again
+        let t = l.text().replace("key_press B, , ", "key_press B, Boost, ");
+        let mut l = Layout::parse(t).unwrap();
+        let more = vec![starts[0].clone(), MacroCmd { press: Press::Start, actions: vec![Action::Key("C".into())], delay_ms: 50 }];
+        l.set_macro(0, src, mode, input, &more).unwrap();
+        assert!(l.text().contains("key_press B, Boost, "), "{}", l.text());
+        assert_eq!(l.macro_cmds(0, src, input), more);
+        // a plain button with a Start press that has its own fire start delay is no macro
+        let mut p = Layout::parse(RL).unwrap();
+        p.set_action(0, src, mode, input, Press::Start, &Action::Key("G".into())).unwrap();
+        p.set_activator_setting(0, src, mode, input, Press::Start, "delay_start", Some("100")).unwrap();
+        assert!(!p.is_macro(0, src, input));
+    }
 }

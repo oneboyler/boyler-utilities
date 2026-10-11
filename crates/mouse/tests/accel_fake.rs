@@ -277,15 +277,15 @@ fn every_slider_extreme_is_valid_for_raw_accel() {
 #[test]
 fn sliders_snap_curves_keep_their_values_cap_rule() {
     let mut p = Panel::default();
-    assert_eq!(p.set_value(Field::Acceleration, 2.83), Some(2.85));
-    assert_eq!(p.set_value(Field::Acceleration, 99.0), Some(5.0));
+    assert_eq!(p.set_value(Field::Acceleration, 2.8333), Some(2.833), "Order 090: steps of 0.001");
+    assert_eq!(p.set_value(Field::Acceleration, 99.0), Some(10.0));
     assert_eq!(p.set_value(Field::Gamma, 1.0), None, "not a Linear row");
-    assert_eq!(p.set_sens(0.27), 0.25);
+    assert_eq!(p.set_sens(0.274), 0.27);
     p.set_curve(Curve::Natural);
     p.set_value(Field::Limit, 2.0);
     p.set_gain(false);
     p.set_curve(Curve::Linear);
-    assert_eq!(p.current_values().get(Field::Acceleration), 5.0, "switching curves resets nothing");
+    assert_eq!(p.current_values().get(Field::Acceleration), 10.0, "switching curves resets nothing");
     assert!(p.current_values().gain, "each curve keeps its own Gain");
     assert!(!p.values[&Curve::Natural].gain);
     // Cap type Input with Cap: input (15) ≤ offset (55) → moves to min(120, 55 + 30) = 85
@@ -365,6 +365,51 @@ fn first_run_mirrors_raw_accel_and_writes_nothing() {
     assert_eq!(m.os().rawaccel_byte_writes, 0);
     assert!(!m.mirror_rawaccel().unwrap(), "only on the first run");
     assert_eq!(m.accel().panel.presets.len(), 1);
+}
+
+/// Order 090 (E19): a new card starts from the user's Raw Accel curve - the driver's when it runs one (mirror), else the one
+/// in Raw Accel's settings.json (the card stays off and the driver is not touched).
+#[test]
+fn a_new_card_starts_from_raw_accels_curve_even_when_the_driver_runs_none() {
+    // the driver runs his curve: the mirror (switch on, preset)
+    let mut m = with_driver((1, 7, 0), Some(SETTINGS));
+    assert!(m.start_from_rawaccel().unwrap());
+    assert!(m.accel().panel.on);
+    // the driver runs nothing (after a restart), settings.json still holds the curve
+    let mut m = with_driver((1, 7, 0), Some(SETTINGS));
+    m.os_mut().rawaccel_driver = Vec::new();
+    let want = from_args(&DriverConfig::from_json(SETTINGS).unwrap().profiles[0].accel_x).unwrap();
+    assert!(m.start_from_rawaccel().unwrap());
+    let a = m.accel();
+    assert!(!a.panel.on, "off: the driver is not touched");
+    assert!(a.panel.presets.is_empty());
+    assert_eq!(a.panel.curve, want.0);
+    assert_eq!(a.panel.values.get(&want.0), Some(&want.1), "the card shows his curve, as Copy its curve does");
+    assert_eq!(m.os().rawaccel_byte_writes, 0);
+    // a card that is the user's already (presets) is never replaced
+    let mut m = with_driver((1, 7, 0), Some(SETTINGS));
+    m.os_mut().rawaccel_driver = Vec::new();
+    m.accel_mut().panel.save_as_preset();
+    assert!(!m.start_from_rawaccel().unwrap());
+    // no Raw Accel settings at all: nothing changes
+    let mut m = with_driver((1, 7, 0), None);
+    assert!(!m.start_from_rawaccel().unwrap());
+}
+
+/// Order 090 (E19): every row reaches Raw Accel's real values (e.g. acceleration 0.005 is below the old 0.05 minimum).
+#[test]
+fn slider_ranges_cover_raw_accels_real_ranges() {
+    let row = |c: Curve, f: Field| rows(c).into_iter().find(|r| r.field == f).unwrap();
+    assert!(row(Curve::Linear, Field::Acceleration).min <= 0.005);
+    assert!(row(Curve::Classic, Field::Acceleration).min <= 0.0005);
+    assert!(row(Curve::Linear, Field::CapOutput).min < 1.0, "a cap below 1 (slower) is a Raw Accel value too");
+    assert!(row(Curve::Natural, Field::DecayRate).min <= 0.005);
+    assert!(row(Curve::Synchronous, Field::Motivity).max >= 10.0);
+    // his real curve (Linear 2.6 / cap 2.0 / offset 55) sits inside, as the defaults
+    let a = row(Curve::Linear, Field::Acceleration);
+    assert!(a.min <= 2.6 && 2.6 <= a.max && a.default == 2.6);
+    // a value Raw Accel holds snaps onto a step without moving (no 0.005 -> 0.05)
+    assert!((bu_mouse::accel::panel::snap(&a, 0.005) - 0.005).abs() < 1e-9);
 }
 
 #[test]

@@ -56,7 +56,7 @@ impl Model {
             match self.binds.get(c) {
                 Some(Bind::Preset(_)) => Mode::Action,
                 Some(Bind::Macro(_)) => Mode::Macro,
-                Some(Bind::App(_)) => Mode::Action,
+                Some(Bind::App(_) | Bind::Also(_) | Bind::AlsoClick(_)) => Mode::Action,
                 None if app_action => Mode::Action,
                 None => Mode::Normal,
             }

@@ -20,6 +20,7 @@ use crate::undo::{DefaultItem, Val};
 pub type Shared = std::sync::Arc<std::sync::Mutex<Option<std::result::Result<Svc, String>>>>;
 
 /// The service over the real or the fake Steam.
+#[allow(clippy::large_enum_variant)] // the fake Steam holds the test switches (Order 085); one value per tab
 pub enum Svc {
     Fake(ControllerService<FakeSteam>),
     Real(ControllerService<RealSteam>),
@@ -191,6 +192,25 @@ impl Svc {
     pub fn steam_running(&self) -> bool {
         with!(self, s => s.steam_running())
     }
+    // ---- "Restart Steam to apply" (Order 085), in the order the worker runs them
+    pub fn restart_check(&self) -> Result<()> {
+        with!(self, s => s.restart_check())
+    }
+    pub fn light_values(&self, serial: &str) -> Result<Vec<(PrefSetting, Option<String>)>> {
+        with!(self, s => s.light_values(serial))
+    }
+    pub fn steam_shutdown(&self) -> Result<()> {
+        with!(self, s => s.steam_shutdown())
+    }
+    pub fn steam_closed(&self) -> bool {
+        with!(self, s => s.steam_closed())
+    }
+    pub fn keep_light(&mut self, serial: &str, wanted: &[(PrefSetting, Option<String>)]) -> Result<bool> {
+        with!(self, s => s.keep_light(serial, wanted))
+    }
+    pub fn steam_start_minimised(&self) -> Result<()> {
+        with!(self, s => s.steam_start_minimised())
+    }
     /// Steam's install folder (where `steam.exe` is).
     pub fn steam_dir(&self) -> PathBuf {
         with!(self, s => s.steam().dir.clone())
@@ -200,6 +220,25 @@ impl Svc {
         match self {
             Svc::Fake(s) => s.os().writes(),
             Svc::Real(_) => vec![],
+        }
+    }
+    /// The fake's `steam.exe` calls ("-shutdown" / "-silent"), in order (tests).
+    pub fn fake_procs(&self) -> Vec<String> {
+        match self {
+            Svc::Fake(s) => s.os().procs.lock().unwrap().clone(),
+            Svc::Real(_) => vec![],
+        }
+    }
+    /// A game runs through the fake Steam (tests).
+    pub fn fake_game(&self, on: bool) {
+        if let Svc::Fake(s) = self {
+            s.os().game.store(on, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+    /// The fake Steam writes this over a file while it closes (tests: Steam keeps its own copy and writes it back).
+    pub fn fake_write_on_exit(&self, path: PathBuf, bytes: Vec<u8>) {
+        if let Svc::Fake(s) = self {
+            *s.os().write_on_exit.lock().unwrap() = Some((path, bytes));
         }
     }
     pub fn fake_text(&self, path: &std::path::Path) -> Option<String> {

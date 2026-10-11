@@ -25,6 +25,7 @@ pub fn source(name: &str) -> Option<&'static str> {
         "micS" => r##"<svg viewBox="0 0 20 20"><rect x="7.25" y="2.5" width="5.5" height="9.5" rx="2.75"/><path d="M4.5 9.5a5.5 5.5 0 0 0 11 0M10 15v2.5"/><path class="sl" d="M3.5 3l13 14"/></svg>"##,
         "mon" => r##"<svg viewBox="0 0 20 20"><rect x="2.5" y="3.5" width="15" height="10.5" rx="2"/><path d="M7.5 17h5M10 14v3"/></svg>"##,
         "spk" => r##"<svg viewBox="0 0 20 20"><path d="M3.5 8h2.8L10 5v10l-3.7-3H3.5z"/><path d="M13 7.6a3.4 3.4 0 0 1 0 4.8M15.2 5.4a6.5 6.5 0 0 1 0 9.2"/></svg>"##,
+        "spkS" => r##"<svg viewBox="0 0 20 20"><path d="M3.5 8h2.8L10 5v10l-3.7-3H3.5z"/><path d="M13 7.6a3.4 3.4 0 0 1 0 4.8M15.2 5.4a6.5 6.5 0 0 1 0 9.2"/><path class="sl" d="M3.5 3l13 14"/></svg>"##,
         "bell" => r##"<svg viewBox="0 0 20 20"><path d="M10 3a4.5 4.5 0 0 0-4.5 4.5v3L4 13h12l-1.5-2.5v-3A4.5 4.5 0 0 0 10 3zM8 15.5a2 2 0 0 0 4 0"/></svg>"##,
         "tool" => r##"<svg viewBox="0 0 20 20"><g transform="scale(.83333)" style="stroke-width:1.8"><path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"/></g></svg>"##,
         "chevR" => r##"<svg viewBox="0 0 7 12"><path d="M1.5 1.5L6 6l-4.5 4.5"/></svg>"##,

@@ -159,6 +159,8 @@ pub trait Host {
     fn ws_abort(&mut self);
     /// show a popup (the monitor being clipped, for "Other monitor")
     fn popup(&mut self, m: &PopMsg, clipped: Option<usize>);
+    /// take the shown "Clip failed" popup away (the save did happen, only later than thought)
+    fn retract_clip_failed(&mut self) {}
     fn sound(&mut self, ev: Sound, set: &Settings);
     /// the view changed
     fn publish(&mut self, v: &View);
@@ -279,6 +281,10 @@ struct St {
     amber: bool,
     last_saved: u64,
     clip_pending: bool,
+    /// when the Save clip press was seen (the wait for OBS's "saved" runs from here)
+    clip_t0: u64,
+    /// a "Clip failed" popup was shown and a late "saved" may still replace it
+    clip_failed_shown: bool,
     low_warned: bool,
     meas_kbps: i32,
     quiet_stop: bool,
@@ -378,6 +384,10 @@ const RA_AGAIN_MS: u64 = 5000;
 const RA_RELEASE_MS: u64 = 300;
 const RA_HOLD_CAP_MS: u64 = 5000;
 const RA_GUARD_MS: u64 = 2000;
+/// this long after the press a low-storage cause is reported (a real failure shows early)
+const CLIP_STORAGE_CHECK_MS: u64 = 2000;
+/// no "saved" event this long after the press = the save really failed (a slow save takes seconds)
+const CLIP_GIVE_UP_MS: u64 = 30_000;
 const MAX_REQ: usize = 96;
 
 pub struct Engine {
@@ -1159,8 +1169,13 @@ impl Engine {
         self.kill(T::Clip);
         let ok = !path.is_empty() && h.os().file_exists(Path::new(path));
         if !ok {
-            self.pop(h, Color::Red, Icon::Bang, "OBS couldn't save the file", "Clip failed", "Clip failed", "");
+            self.clip_failed(h, "OBS couldn't save the file");
             return;
+        }
+        if self.s.clip_failed_shown {
+            // the save was only slow: the "Clip failed" on screen is wrong, the "Clipped" takes its place
+            self.s.clip_failed_shown = false;
+            h.retract_clip_failed();
         }
         let n = self.clip_real_sec(h);
         let lab = self.mon_label();
@@ -2043,7 +2058,15 @@ impl Engine {
             return; // OBS already announced this save
         }
         self.s.clip_pending = true;
-        self.set_timer(h, T::Clip, 2000);
+        self.s.clip_t0 = h.now_ms();
+        self.set_timer(h, T::Clip, CLIP_STORAGE_CHECK_MS);
+    }
+
+    /// the red "Clip failed" popup (remembered so a late "saved" can take it away)
+    fn clip_failed(&mut self, h: &mut dyn Host, top: &str) {
+        self.s.clip_failed_shown = true;
+        let detail = if top == "Your storage is low" { "storage low" } else { "" };
+        self.pop(h, Color::Red, Icon::Bang, top, "Clip failed", "Clip failed", detail);
     }
 
     fn la_start(&mut self, h: &mut dyn Host, p: &Path) {
@@ -2208,11 +2231,16 @@ impl Engine {
                 if !self.s.clip_pending {
                     return;
                 }
-                self.s.clip_pending = false;
                 if self.storage_low(h) {
-                    self.pop(h, Color::Red, Icon::Bang, "Your storage is low", "Clip failed", "Clip failed", "storage low");
+                    self.s.clip_pending = false;
+                    self.clip_failed(h, "Your storage is low");
+                } else if h.now_ms() - self.s.clip_t0 < CLIP_GIVE_UP_MS {
+                    // no real failure seen: OBS may only be slow, keep waiting for its "saved"
+                    let left = CLIP_GIVE_UP_MS - (h.now_ms() - self.s.clip_t0);
+                    self.set_timer(h, T::Clip, left);
                 } else {
-                    self.pop(h, Color::Red, Icon::Bang, "OBS couldn't save the file", "Clip failed", "Clip failed", "");
+                    self.s.clip_pending = false;
+                    self.clip_failed(h, "OBS couldn't save the file");
                 }
             }
         }

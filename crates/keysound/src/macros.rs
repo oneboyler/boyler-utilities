@@ -24,12 +24,40 @@ const VK_TAB: u16 = 0x09;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Step {
-    /// A key or combo: modifiers first, the main key last (virtual-key codes), pressed together.
+    /// "Press": a key or combo - modifiers first, the main key last (virtual-key codes), pressed together.
     Keys(Vec<u16>),
     Type(String),
     Wait(u32),
     /// An app / file path or a web address.
     Open(String),
+    /// Order 090 (his "hold in hold out on keys"): one key goes down and stays down ...
+    Down(u16),
+    /// ... until this lets it go (a macro that ends with a key still held lets go of it at the end).
+    Up(u16),
+    /// A mouse click: [`CLICK_LEFT`] .. [`CLICK_X2`].
+    Click(u8),
+    /// A controller button (`bu_rawin::padbtn` numbers): only in a controller button's macro, which Steam plays; a keyboard /
+    /// mouse macro never offers it and its runner skips it.
+    Pad(u8),
+}
+
+/// The mouse buttons a Click step can press.
+pub const CLICK_LEFT: u8 = 0;
+pub const CLICK_RIGHT: u8 = 1;
+pub const CLICK_MIDDLE: u8 = 2;
+pub const CLICK_X1: u8 = 3;
+pub const CLICK_X2: u8 = 4;
+
+/// A Click step's name.
+pub fn click_name(b: u8) -> &'static str {
+    match b {
+        CLICK_LEFT => "Left click",
+        CLICK_RIGHT => "Right click",
+        CLICK_MIDDLE => "Wheel click",
+        CLICK_X1 => "Back (side)",
+        CLICK_X2 => "Forward (side)",
+        _ => "Click",
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -37,11 +65,71 @@ pub struct Macro {
     pub id: String,
     pub name: String,
     pub steps: Vec<Step>,
+    /// Order 090: how often a press runs it (the editor's "Repeat").
+    pub rep: Repeat,
 }
+
+/// The editor's "Repeat": once, a few times, while the key is held, or until it is pressed again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Repeat {
+    #[default]
+    Once,
+    Times(u8),
+    /// Runs again and again while the key / button stays down; letting go stops it.
+    Held,
+    /// Runs again and again until the key / button is pressed a second time.
+    Toggle,
+}
+
+impl Repeat {
+    /// The choices in the editor's list, in order.
+    pub const ALL: [Repeat; 7] = [Repeat::Once, Repeat::Times(2), Repeat::Times(3), Repeat::Times(5), Repeat::Times(10), Repeat::Held, Repeat::Toggle];
+
+    pub fn label(self) -> String {
+        match self {
+            Repeat::Once | Repeat::Times(0 | 1) => "Once".into(),
+            Repeat::Times(n) => format!("{n} times"),
+            Repeat::Held => "While the key is held".into(),
+            Repeat::Toggle => "Until pressed again".into(),
+        }
+    }
+
+    fn key(self) -> String {
+        match self {
+            Repeat::Once | Repeat::Times(0 | 1) => "1".into(),
+            Repeat::Times(n) => n.to_string(),
+            Repeat::Held => "held".into(),
+            Repeat::Toggle => "toggle".into(),
+        }
+    }
+
+    fn from_key(s: &str) -> Repeat {
+        match s {
+            "held" => Repeat::Held,
+            "toggle" => Repeat::Toggle,
+            n => match n.parse::<u8>() {
+                Ok(0 | 1) | Err(_) => Repeat::Once,
+                Ok(n) => Repeat::Times(n.min(MAX_TIMES)),
+            },
+        }
+    }
+
+    /// How many times one press plays the steps (None = until stopped: held / toggle).
+    pub fn times(self) -> Option<u32> {
+        match self {
+            Repeat::Once => Some(1),
+            Repeat::Times(n) => Some(u32::from(n.clamp(1, MAX_TIMES))),
+            Repeat::Held | Repeat::Toggle => None,
+        }
+    }
+}
+
+/// The most a "N times" macro repeats.
+pub const MAX_TIMES: u8 = 10;
 
 impl Macro {
     pub fn new(id: &str, name: &str) -> Macro {
-        Macro { id: id.into(), name: name.into(), steps: Vec::new() }
+        Macro { id: id.into(), name: name.into(), steps: Vec::new(), rep: Repeat::Once }
     }
 
     /// Fine to save and run?
@@ -82,6 +170,21 @@ impl Macro {
                         return Err("a website must start with http:// or https://".into());
                     }
                 }
+                Step::Down(vk) | Step::Up(vk) => {
+                    if *vk == 0 || *vk >= 0xFF {
+                        return Err("a key down / up step needs a key".into());
+                    }
+                }
+                Step::Click(b) => {
+                    if *b > CLICK_X2 {
+                        return Err("a click step needs a mouse button".into());
+                    }
+                }
+                Step::Pad(b) => {
+                    if *b > 18 {
+                        return Err("a button step needs a controller button".into());
+                    }
+                }
             }
         }
         if waits > MAX_TOTAL_WAIT_MS {
@@ -100,9 +203,17 @@ impl Macro {
                 Step::Type(t) => json!({ "t": t }),
                 Step::Wait(w) => json!({ "w": w }),
                 Step::Open(o) => json!({ "o": o }),
+                Step::Down(k) => json!({ "d": k }),
+                Step::Up(k) => json!({ "u": k }),
+                Step::Click(b) => json!({ "c": b }),
+                Step::Pad(b) => json!({ "p": b }),
             })
             .collect();
-        json!({ "id": self.id, "name": self.name, "steps": steps }).to_string()
+        if self.rep == Repeat::Once {
+            json!({ "id": self.id, "name": self.name, "steps": steps }).to_string()
+        } else {
+            json!({ "id": self.id, "name": self.name, "steps": steps, "r": self.rep.key() }).to_string()
+        }
     }
 
     pub fn from_json(s: &str) -> Result<Macro, String> {
@@ -119,12 +230,21 @@ impl Macro {
                 Step::Wait(u32::try_from(w).unwrap_or(u32::MAX))
             } else if let Some(o) = st.get("o").and_then(Value::as_str) {
                 Step::Open(o.to_string())
+            } else if let Some(k) = st.get("d").and_then(Value::as_u64) {
+                Step::Down(u16::try_from(k).unwrap_or(0))
+            } else if let Some(k) = st.get("u").and_then(Value::as_u64) {
+                Step::Up(u16::try_from(k).unwrap_or(0))
+            } else if let Some(b) = st.get("c").and_then(Value::as_u64) {
+                Step::Click(u8::try_from(b).unwrap_or(u8::MAX))
+            } else if let Some(b) = st.get("p").and_then(Value::as_u64) {
+                Step::Pad(u8::try_from(b).unwrap_or(u8::MAX))
             } else {
                 return Err("an unknown step".into());
             };
             steps.push(step);
         }
-        let m = Macro { id, name, steps };
+        let rep = v.get("r").and_then(Value::as_str).map(Repeat::from_key).unwrap_or_default();
+        let m = Macro { id, name, steps, rep };
         m.check()?;
         Ok(m)
     }
@@ -179,6 +299,8 @@ pub fn to_lines(ms: &[Macro]) -> Vec<String> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Ev {
     Key { vk: u16, down: bool },
+    /// A mouse button ([`CLICK_LEFT`] ..).
+    Mouse { button: u8, down: bool },
     /// One UTF-16 unit typed as a character (KEYEVENTF_UNICODE), so any text works on any keyboard layout.
     Char { unit: u16, down: bool },
     Sleep(u32),
@@ -223,6 +345,16 @@ pub fn plan(m: &Macro) -> Vec<Ev> {
             }
             Step::Wait(ms) => v.push(Ev::Sleep(*ms)),
             Step::Open(t) => v.push(Ev::Open(t.clone())),
+            Step::Down(vk) => v.push(Ev::Key { vk: *vk, down: true }),
+            Step::Up(vk) => v.push(Ev::Key { vk: *vk, down: false }),
+            Step::Click(b) => {
+                v.push(Ev::Mouse { button: *b, down: true });
+                v.push(Ev::Sleep(CHAR_GAP_MS));
+                v.push(Ev::Mouse { button: *b, down: false });
+                v.push(Ev::Sleep(CHAR_GAP_MS));
+            }
+            // Steam plays a controller macro; nothing here can press a controller button
+            Step::Pad(_) => {}
         }
     }
     v
@@ -231,6 +363,7 @@ pub fn plan(m: &Macro) -> Vec<Ev> {
 /// Where the events go (the real one is SendInput + ShellExecute; tests record them).
 pub trait Out {
     fn key(&mut self, vk: u16, down: bool);
+    fn mouse(&mut self, button: u8, down: bool);
     fn unit(&mut self, unit: u16, down: bool);
     fn open(&mut self, target: &str) -> Result<(), String>;
     /// Sleep up to `ms`; the real one returns early when asked to stop.
@@ -253,7 +386,13 @@ pub enum Outcome {
 /// key the macro still holds. Sleeps are cut in slices of 25 ms so a "no" or a cancel is noticed quickly.
 pub fn run(events: &[Ev], out: &mut dyn Out, safety: &mut dyn Safety, cancel: &AtomicBool) -> Outcome {
     let mut held: Vec<u16> = Vec::new();
-    let stop = |held: &mut Vec<u16>, out: &mut dyn Out, why: String| {
+    let mut held_mouse: Vec<u8> = Vec::new();
+    // every way out lets go of what the macro holds: keys AND mouse buttons (a cancel inside a Click's down / up must
+    // never leave the button down - Order 090 review)
+    let stop = |held: &mut Vec<u16>, held_mouse: &mut Vec<u8>, out: &mut dyn Out, why: String| {
+        for b in held_mouse.drain(..) {
+            out.mouse(b, false);
+        }
         for vk in held.drain(..).rev() {
             out.key(vk, false);
         }
@@ -261,7 +400,7 @@ pub fn run(events: &[Ev], out: &mut dyn Out, safety: &mut dyn Safety, cancel: &A
     };
     for e in events {
         if cancel.load(Ordering::SeqCst) {
-            return stop(&mut held, out, "stopped".into());
+            return stop(&mut held, &mut held_mouse, out, "stopped".into());
         }
         match e {
             Ev::Sleep(ms) => {
@@ -271,18 +410,18 @@ pub fn run(events: &[Ev], out: &mut dyn Out, safety: &mut dyn Safety, cancel: &A
                     out.sleep(slice);
                     left -= slice;
                     if cancel.load(Ordering::SeqCst) {
-                        return stop(&mut held, out, "stopped".into());
+                        return stop(&mut held, &mut held_mouse, out, "stopped".into());
                     }
                     if *ms > 100 {
                         if let Some(why) = safety.blocked() {
-                            return stop(&mut held, out, why);
+                            return stop(&mut held, &mut held_mouse, out, why);
                         }
                     }
                 }
             }
             Ev::Key { vk, down } => {
                 if let Some(why) = safety.blocked() {
-                    return stop(&mut held, out, why);
+                    return stop(&mut held, &mut held_mouse, out, why);
                 }
                 out.key(*vk, *down);
                 if *down {
@@ -293,19 +432,37 @@ pub fn run(events: &[Ev], out: &mut dyn Out, safety: &mut dyn Safety, cancel: &A
             }
             Ev::Char { unit, down } => {
                 if let Some(why) = safety.blocked() {
-                    return stop(&mut held, out, why);
+                    return stop(&mut held, &mut held_mouse, out, why);
                 }
                 out.unit(*unit, *down);
             }
+            Ev::Mouse { button, down } => {
+                if let Some(why) = safety.blocked() {
+                    return stop(&mut held, &mut held_mouse, out, why);
+                }
+                out.mouse(*button, *down);
+                if *down {
+                    held_mouse.push(*button);
+                } else {
+                    held_mouse.retain(|b| b != button);
+                }
+            }
             Ev::Open(t) => {
                 if let Some(why) = safety.blocked() {
-                    return stop(&mut held, out, why);
+                    return stop(&mut held, &mut held_mouse, out, why);
                 }
                 if let Err(e) = out.open(t) {
-                    return stop(&mut held, out, e);
+                    return stop(&mut held, &mut held_mouse, out, e);
                 }
             }
         }
+    }
+    // a key put down by a Key down step and never let go: let go of it now (nothing stays stuck after a macro)
+    for b in held_mouse.drain(..) {
+        out.mouse(b, false);
+    }
+    for vk in held.drain(..).rev() {
+        out.key(vk, false);
     }
     Outcome::Done
 }
@@ -315,7 +472,7 @@ mod tests {
     use super::*;
 
     fn mac(steps: Vec<Step>) -> Macro {
-        Macro { id: "m1".into(), name: "Test".into(), steps }
+        Macro { id: "m1".into(), name: "Test".into(), steps, rep: Repeat::Once }
     }
 
     #[derive(Default)]
@@ -325,6 +482,9 @@ mod tests {
     impl Out for Rec {
         fn key(&mut self, vk: u16, down: bool) {
             self.log.push(format!("{}{vk:X}", if down { "v" } else { "^" }));
+        }
+        fn mouse(&mut self, b: u8, down: bool) {
+            self.log.push(format!("{}M{b}", if down { "v" } else { "^" }));
         }
         fn unit(&mut self, unit: u16, down: bool) {
             self.log.push(format!("{}'{}'", if down { "v" } else { "^" }, char::from_u32(unit as u32).unwrap_or('?')));
@@ -431,6 +591,9 @@ mod tests {
                     self.0.store(true, Ordering::SeqCst);
                 }
             }
+            fn mouse(&mut self, b: u8, d: bool) {
+                self.1.mouse(b, d)
+            }
             fn unit(&mut self, u: u16, d: bool) {
                 self.1.unit(u, d)
             }
@@ -470,6 +633,7 @@ mod tests {
             id: "m7".into(),
             name: "Open my notes".into(),
             steps: vec![Step::Keys(vec![0x5B, 0x52]), Step::Wait(300), Step::Type("notepad \"x\"\n".into()), Step::Open("https://example.com".into())],
+            rep: Repeat::Once,
         };
         let j = m.to_json();
         assert_eq!(Macro::from_json(&j), Ok(m.clone()));
@@ -484,6 +648,32 @@ mod tests {
         assert_eq!(new_id(&[]), "m1");
     }
 
+    /// Order 090: Key down / Key up / Click / a controller button - saved, planned and run; a key left down is let go at the end.
+    #[test]
+    fn hold_release_click_and_button_steps() {
+        let m = Macro {
+            id: "m3".into(),
+            name: "Hold".into(),
+            steps: vec![Step::Down(0x10), Step::Click(CLICK_RIGHT), Step::Keys(vec![0x41]), Step::Up(0x10), Step::Down(0x11), Step::Pad(3)],
+            rep: Repeat::Times(3),
+        };
+        assert_eq!(Repeat::from_key(&Repeat::Held.key()), Repeat::Held);
+        assert_eq!(Repeat::from_key("99"), Repeat::Times(MAX_TIMES));
+        assert_eq!(Repeat::Times(3).times(), Some(3));
+        assert_eq!(Repeat::Toggle.times(), None);
+        assert!(m.check().is_ok());
+        assert_eq!(Macro::from_json(&m.to_json()), Ok(m.clone()));
+        let mut out = Rec::default();
+        let cancel = AtomicBool::new(false);
+        assert_eq!(run(&plan(&m), &mut out, &mut Always, &cancel), Outcome::Done);
+        out.log.retain(|l| !l.starts_with("zz"));
+        assert_eq!(out.log, vec!["v10", "vM1", "^M1", "v41", "^41", "^10", "v11", "^11"], "shift held over the click and A; Ctrl let go at the end; the button step is Steam's");
+        assert!(mac(vec![Step::Down(0)]).check().is_err());
+        assert!(mac(vec![Step::Click(9)]).check().is_err());
+        assert!(mac(vec![Step::Pad(200)]).check().is_err());
+        assert_eq!(click_name(CLICK_X2), "Forward (side)");
+    }
+
     #[test]
     fn the_ready_made_macros_are_valid_and_named() {
         let t = templates();
@@ -495,5 +685,44 @@ mod tests {
             assert!(!m.steps.is_empty());
             assert!(!plan(&m).is_empty(), "{name} plans some input");
         }
+    }
+}
+
+#[cfg(test)]
+mod stop_tests {
+    use super::*;
+
+    /// Order 090 review: a cancel that lands between a Click's down and up lets go of the button.
+    #[test]
+    fn a_cancel_inside_a_click_lets_go_of_the_button() {
+        struct CancelOnDown<'a>(&'a AtomicBool, Vec<String>);
+        impl Out for CancelOnDown<'_> {
+            fn key(&mut self, vk: u16, down: bool) {
+                self.1.push(format!("{}{vk:X}", if down { "v" } else { "^" }));
+            }
+            fn mouse(&mut self, b: u8, down: bool) {
+                self.1.push(format!("{}M{b}", if down { "v" } else { "^" }));
+                if down {
+                    self.0.store(true, Ordering::SeqCst);
+                }
+            }
+            fn unit(&mut self, _: u16, _: bool) {}
+            fn open(&mut self, _: &str) -> Result<(), String> {
+                Ok(())
+            }
+            fn sleep(&mut self, _: u32) {}
+        }
+        struct Ok_;
+        impl Safety for Ok_ {
+            fn blocked(&mut self) -> Option<String> {
+                None
+            }
+        }
+        let cancel = AtomicBool::new(false);
+        let mut m = Macro::new("m1", "Click");
+        m.steps = vec![Step::Down(0x10), Step::Click(CLICK_LEFT)];
+        let mut out = CancelOnDown(&cancel, Vec::new());
+        assert_eq!(run(&plan(&m), &mut out, &mut Ok_, &cancel), Outcome::Stopped("stopped".into()));
+        assert_eq!(out.1, vec!["v10", "vM0", "^M0", "^10"], "the button and the key are both let go");
     }
 }

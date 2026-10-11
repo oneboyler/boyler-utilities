@@ -379,3 +379,36 @@ fn a_mouse_without_a_usb_id_is_listed_only_when_no_mouse_has_one() {
     assert_eq!(all.len(), 1);
     assert_eq!(all[0].name, "USB Receiver");
 }
+
+/// Order 090 (the owner's real list: "Wooting 80HE · Also connected · 31E3:1402"): a keyboard's extra mouse interface is not a
+/// mouse; a wireless receiver (keyboard + mouse on purpose) and a mouse with macro keys still are.
+#[test]
+fn a_keyboards_mouse_interface_is_not_listed_as_a_mouse() {
+    let named = |mut h: HidInfo, n: &str| {
+        h.product = Some(n.into());
+        h
+    };
+    let list = vec![
+        // Wooting 80HE: keyboard on mi_00, its analog "mouse" on mi_02
+        named(hid(r"\?\hid#vid_31e3&pid_1402&mi_00#k", 0x31E3, 0x1402, 0x01, 0x06, 8, 1), "Wooting 80HE"),
+        named(hid(r"\?\hid#vid_31e3&pid_1402&mi_02#m", 0x31E3, 0x1402, 0x01, 0x02, 8, 0), "Wooting 80HE"),
+        // Keychron: keyboards only
+        named(hid(r"\?\hid#vid_3434&pid_0001&mi_00#k", 0x3434, 0x0001, 0x01, 0x06, 8, 1), "Keychron Q1"),
+        named(hid(r"\?\hid#vid_3434&pid_0001&mi_01#m", 0x3434, 0x0001, 0x01, 0x02, 8, 0), "Keychron Q1"),
+        // a mouse the app doesn't know, laid out like his real Pulsar X2 (keyboard on mi_00, the mouse on mi_02) - kept
+        named(hid(r"\?\hid#vid_1234&pid_0001&mi_00#k", 0x1234, 0x0001, 0x01, 0x06, 9, 2), "Some X2"),
+        named(hid(r"\?\hid#vid_1234&pid_0001&mi_02#m", 0x1234, 0x0001, 0x01, 0x02, 8, 0), "Some X2"),
+        // a wireless receiver: keyboard first, mouse second - kept
+        named(hid(r"\?\hid#vid_046d&pid_c52b&mi_00#k", 0x046D, 0xC52B, 0x01, 0x06, 8, 1), "USB Receiver"),
+        named(hid(r"\?\hid#vid_046d&pid_c52b&mi_01#m", 0x046D, 0xC52B, 0x01, 0x02, 8, 0), "USB Receiver"),
+        // a mouse with a keyboard collection for its macro keys (mouse first) - kept
+        named(hid(r"\?\hid#vid_2222&pid_0002&mi_00#m", 0x2222, 0x0002, 0x01, 0x02, 8, 0), "Gaming Mouse"),
+        named(hid(r"\?\hid#vid_2222&pid_0002&mi_01#k", 0x2222, 0x0002, 0x01, 0x06, 8, 1), "Gaming Mouse"),
+    ];
+    let mice = find_mice(&list);
+    let ids: Vec<String> = mice.iter().map(|m| m.ids()).collect();
+    assert!(!ids.iter().any(|i| i.contains("31E3") || i.contains("3434")), "{ids:?}");
+    assert!(ids.iter().any(|i| i.contains("1234")), "a mouse laid out like a keyboard stays: {ids:?}");
+    assert!(ids.iter().any(|i| i.contains("046D")) && ids.iter().any(|i| i.contains("2222")), "{ids:?}");
+    assert!(is_keyboard(&list, 0x31E3, 0x1402));
+}

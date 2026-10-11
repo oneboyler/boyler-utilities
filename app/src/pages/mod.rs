@@ -16,6 +16,7 @@ pub mod activity;
 pub mod addons;
 pub mod apps;
 pub mod audio;
+pub mod btnwin;
 pub mod controller;
 pub mod display;
 pub mod keyboard;

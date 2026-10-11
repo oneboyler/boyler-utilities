@@ -234,7 +234,8 @@ pub fn get_job(
                 say(&t);
             })?;
             say("Importing…");
-            let imported = bu_keysound::import::install_zip(&bytes, &p.name, &packs_dir)?;
+            // Order 090 (E21): decoded in the helper copy - a broken download can't crash the app
+            let imported = bu_keysound::safe::install_zip(&bytes, &p.name, &packs_dir)?;
             Ok(imported.name)
         })();
         update(|g| g.getting = None);
@@ -291,24 +292,29 @@ pub fn preview_job(
         job.status("Loading the sound…");
         let r = (|| -> Result<(), String> {
             let bytes = gallery::download(&*fetch, &p, &mut |_, _| {})?;
-            let heard = bu_keysound::import::preview_zip(&bytes, &p.name)?;
+            let heard = bu_keysound::safe::preview_zip(&bytes, &p.name)?;
             if job.stopped() || !OPEN.load(std::sync::atomic::Ordering::SeqCst) {
                 return Ok(());
             }
+            let play_on = settings.play_on;
             let e = super::glue::engine();
             let was_on = e.status().enabled;
             if !was_on {
                 settings.mouse_on = false;
+                settings.pad_on = false;
                 e.enable_without_keys(settings)?;
             }
             e.set_imported(PREVIEW_NAME, Some(heard.set));
             let pack = bu_keysound::Pack::Imported(PREVIEW_NAME.to_string());
+            // Order 090 (E21): the hear-first follows "Play on" (press only = no release sounds, release only = no press sounds)
             for (kind, wait) in PREVIEW_KEYS {
                 if job.stopped() {
                     break;
                 }
                 std::thread::sleep(std::time::Duration::from_millis(wait));
-                e.preview(&pack, kind);
+                if play_on.plays(kind != bu_keysound::Kind::Up) {
+                    e.preview(&pack, kind);
+                }
             }
             // let the last sound ring out, then let the pack go
             std::thread::sleep(std::time::Duration::from_millis(1200));

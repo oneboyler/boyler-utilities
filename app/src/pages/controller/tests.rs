@@ -214,13 +214,13 @@ fn the_action_picker_searches_and_writes() {
     for c in "f6".chars() {
         t.ev(Ev::Char(K_ASRCH, c));
     }
-    let items = t.o().act_items("f6");
+    let items = t.o().act_items(Open::k("square.full"), "f6");
     assert_eq!(items[0].1, Action::Key("F6".into()), "{items:?}");
     t.ev(Ev::Key(K_ASRCH, 0x0D));
     assert!(t.o().pop.is_none());
     assert!(t.rl().contains("key_press F6"), "Square does F6 now");
     // nothing matches
-    assert!(t.o().act_items("zzzz").is_empty());
+    assert!(t.o().act_items(Open::k("square.full"), "zzzz").is_empty());
 }
 
 #[test]
@@ -1558,4 +1558,261 @@ fn ctrl_z_during_a_write_undoes_the_newest_change() {
     assert_eq!(t.left_stick(), orig, "B undone");
     assert!(t.rl().contains("\"hold_repeats\"\t\t\"1\""), "A kept");
     assert_eq!(t.toast(), "Undone \u{b7} Left stick \u{b7} Dead zone");
+}
+
+// ------------------------------------------------------------------------------------------------ Order 085 (light colour)
+
+/// the owner (Oct 10): "changing color of led in my app doesn't change the controllers real color". Steam keeps the controller's
+/// preferences in memory while it runs: after a light change the popup offers ONE "Restart Steam to apply" link; it asks
+/// first, never runs while a game does, and the colour comes out of the restart even when the closing Steam writes its old
+/// copy back.
+#[test]
+fn a_light_change_offers_the_steam_restart_and_it_keeps_the_colour() {
+    let mut t = T::new();
+    t.click(K_CTLSET);
+    let gone = |t: &mut T, id: &str| t.popup_laid().rect_of(sub(K_RESTART, id)).is_none();
+    assert!(gone(&mut t, "ask"), "nothing changed yet: no link");
+    t.click(idx(Open::k("pf.lc"), 3));
+    assert!(!gone(&mut t, "ask"), "the light changed: the link is there");
+    let old = t.prefs();
+    // the closing Steam writes its old copy back (theory: Steam keeps the file in memory)
+    let path = data::config().join(format!("preferences_{}.vdf", data::SERIAL));
+    t.o().svc_do(|s| s.fake_write_on_exit(path.clone(), old.replace("\"color_red\"\t\t\"164\"", "\"color_red\"\t\t\"1\"").into_bytes())).unwrap();
+    // asks first: the click on the link only opens the question, nothing is closed
+    t.click(sub(K_RESTART, "ask"));
+    assert_eq!(t.o().rs, Rs::Ask);
+    assert!(t.o().svc_do(|s| s.fake_procs()).unwrap().is_empty());
+    t.click(sub(K_RESTART, "no"));
+    assert_eq!(t.o().rs, Rs::Idle);
+    assert!(!gone(&mut t, "ask"), "Cancel keeps the link");
+    t.click(sub(K_RESTART, "ask"));
+    t.click(sub(K_RESTART, "go"));
+    assert_eq!(t.o().rs, Rs::Idle, "the worker's answer is in");
+    assert_eq!(t.o().svc_do(|s| s.fake_procs()).unwrap(), ["-shutdown", "-silent"]);
+    assert!(t.prefs().contains("\"color_red\"\t\t\"164\""), "written again after Steam had closed: {}", t.prefs());
+    assert!(t.toast().contains("Steam restarted"), "{}", t.toast());
+    assert!(gone(&mut t, "ask"), "restarted: the link is gone");
+}
+
+#[test]
+fn the_steam_restart_never_runs_while_a_game_runs() {
+    let mut t = T::new();
+    t.click(K_CTLSET);
+    t.click(idx(Open::k("pf.lc"), 3));
+    t.o().svc_do(|s| s.fake_game(true)).unwrap();
+    t.click(sub(K_RESTART, "ask"));
+    t.click(sub(K_RESTART, "go"));
+    assert!(t.toast().contains("A game is running"), "{}", t.toast());
+    assert!(t.o().svc_do(|s| s.fake_procs()).unwrap().is_empty(), "Steam was not touched");
+    assert_eq!(t.o().rs, Rs::Idle);
+    assert!(t.popup_laid().rect_of(sub(K_RESTART, "ask")).is_some(), "the link stays");
+}
+
+/// Order 085 proof pictures (`BU_PIC_OUT=<folder> cargo test -p bu-app proof_085 -- --ignored --test-threads=1`): the
+/// Controller settings with the "Restart Steam to apply" line - offered, asked, restarting.
+#[test]
+#[ignore]
+fn proof_085_restart_row() {
+    if std::env::var("BU_PIC_OUT").is_err() {
+        return;
+    }
+    for (light, theme) in [(false, "dark"), (true, "light")] {
+        crate::ui::set_light(light);
+        for step in ["offered", "asked", "restarting"] {
+            let mut t = T::new();
+            t.click(K_CTLSET);
+            t.click(idx(Open::k("pf.lc"), 3));
+            match step {
+                "asked" => t.click(sub(K_RESTART, "ask")),
+                "restarting" => t.o().rs = Rs::Busy,
+                _ => {}
+            }
+            t.now += 2000.0;
+            let mut cx = Cx::new(t.now, false, &t.g, &mut t.st).for_page("pad");
+            let kids = t.p.build(&mut cx);
+            let pop = t.p.popup(&mut cx);
+            let page = El::block().abs(0.0, crate::ui::PAGE_TOP, f32::NAN, f32::NAN).w(WIN_W).pad(2.0, 26.0, 18.0, 26.0).children(kids);
+            let root = El::block().w(WIN_W).h(crate::ui::WIN_H).child(page).children(pop);
+            crate::ui::lay::proof_png(root, WIN_W, crate::ui::WIN_H, 1.5, &format!("085_restart_{step}_{theme}.png"));
+        }
+    }
+    crate::ui::set_light(false);
+}
+
+/// Order 090: the tab painted (page + popups) for the pictures and the "no scroll" measure (run: cargo test -p bu-app
+/// controller::tests::pad_090 -- --ignored).
+fn shot_090(t: &mut T, name: &str) -> f32 {
+    let dir = r"C:\BoylerUtilities-scratch/P098";
+    let _ = std::fs::create_dir_all(dir);
+    unsafe {
+        let _ = windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_MULTITHREADED);
+    }
+    let icons = crate::icons::Icons::new();
+    t.now += 2000.0;
+    let mut cx = Cx::new(t.now, false, &t.g, &mut t.st).for_page("pad");
+    let kids = t.p.build(&mut cx);
+    let pop = t.p.popup(&mut cx);
+    drop(cx);
+    let page = crate::ui::lay::Laid::new(&t.g, El::block().w(WIN_W).pad(2.0, 26.0, 18.0, 26.0).children(kids), WIN_W, None);
+    let (w, h) = (WIN_W, crate::ui::WIN_H);
+    let mut s = crate::gfx::new_surface(w as i32, h as i32).unwrap();
+    t.g.begin(s.canvas());
+    t.g.fill_rect(0.0, 0.0, w, h, crate::gfx::Rgba::rgb(28, 30, 38));
+    page.paint(&t.g, &icons, 0.0, crate::ui::PAGE_TOP, None);
+    if let Some(p) = pop {
+        let l = crate::ui::lay::Laid::new(&t.g, El::block().w(w).h(h).child(p), w, Some(h));
+        l.paint(&t.g, &icons, 0.0, 0.0, None);
+    }
+    t.g.end();
+    let px = crate::png::from_surface(&mut s);
+    crate::png::save_png(&px, &format!("{dir}/{name}.png")).expect("save");
+    page.height
+}
+
+#[test]
+#[ignore]
+fn pad_090() {
+    let mut t = T::new();
+    let h = shot_090(&mut t, "pad_page");
+    eprintln!("page height {h} (room {})", crate::ui::PAGE_H);
+}
+
+/// Order 090: a button's window has the shared Sound part (with the note while Button sounds are off); Controller settings has
+/// Button sounds (switch, Sound, its own volume).
+#[test]
+fn a_buttons_window_has_its_sound_and_controller_settings_has_button_sounds() {
+    use super::snd::keys::*;
+    let mut t = T::new();
+    t.click_part(Pid::B(ButtonId::Cross));
+    assert_eq!(snd::slot_of(Pid::B(ButtonId::Cross)), Some(u16::from(bu_rawin::padbtn::SOUTH)));
+    // the pack's sound off for Cross only
+    t.click(sub(K_PSND, "pack"));
+    assert!(!t.o().snd.prefs().pad.of(u16::from(bu_rawin::padbtn::SOUTH)).pack_on);
+    // your sound dropped on Press
+    t.ev(Ev::Drop(sub(K_PSND, "press"), vec![r"C:\x\pop.wav".into()]));
+    assert_eq!(t.o().snd.prefs().pad.of(u16::from(bu_rawin::padbtn::SOUTH)).press.as_deref(), Some("pop.wav"));
+    assert!(t.writes().is_empty(), "a sound never writes Steam's layout");
+    // the sticks have no sound part
+    assert_eq!(snd::slot_of(Pid::Stick(Side::Left)), None);
+    // Controller settings: Button sounds (off by default), its Sound list and its own volume
+    t.click(sub(K_PANEL, "x"));
+    t.click(K_CTLSET);
+    assert!(t.o().dlg.is_some());
+    assert!(!t.o().snd.prefs().s.pad_on, "off by default");
+    t.click(K_BSON);
+    assert!(t.o().snd.prefs().s.pad_on);
+    t.click(K_BSPACK);
+    t.click(idx(K_BSMENU, 3));
+    assert!(t.o().snd.prefs().s.pad_pack.is_some(), "a pack of its own");
+    t.click(K_BSPACK);
+    t.click(idx(K_BSMENU, 0));
+    assert_eq!(t.o().snd.prefs().s.pad_pack, None, "Same as keyboard");
+    t.ev(Ev::Press(K_BSVOL, 108.0, 10.0, (0.0, 0.0, 216.0, 20.0)));
+    t.ev(Ev::Release(K_BSVOL));
+    assert_eq!(t.o().snd.prefs().s.pad_volume, 50);
+    assert!(t.writes().is_empty());
+}
+
+#[test]
+#[ignore]
+fn pad_090_windows() {
+    let mut t = T::new();
+    t.click_part(Pid::B(ButtonId::Cross));
+    t.st.scroll_y.insert(K_PANEL, 400.0);
+    shot_090(&mut t, "pad_cross_window");
+    t.click(sub(K_PANEL, "x"));
+    t.click(K_CTLSET);
+    shot_090(&mut t, "pad_settings");
+}
+
+/// Order 090 (A_090_01): a button's Does can run a macro made on keys - written into the game's Steam layout as extra
+/// commands with fire start delays (Steam plays it); a step added in the window is written at once; a plain action ends it.
+#[test]
+fn a_button_runs_a_macro_steam_plays() {
+    use bu_keysound::macros::{Macro, Step};
+    let mut m = Macro::new("m1", "Combo");
+    m.steps = vec![Step::Keys(vec![0x41]), Step::Wait(150), Step::Keys(vec![0x42]), Step::Type("not steam".into())];
+    crate::services::init_headless(true);
+    crate::services::with(|s| {
+        let mut p = crate::pages::keyboard::prefs::Prefs::load(&s.store);
+        p.macros = vec![m];
+        p.save(&mut s.store);
+    })
+    .unwrap();
+    let mut t = T::new();
+    t.click_part(Pid::B(ButtonId::Cross));
+    let at = Open::k("cross.full");
+    t.click(at);
+    let items = t.o().act_items(at, "");
+    let names: Vec<String> = items.iter().filter(|(_, a)| mac::item_id(a).is_some()).map(|(_, a)| t.p.o.as_ref().unwrap().act_text(a, false)).collect();
+    assert_eq!(names, vec!["New macro\u{2026}", "Combo"]);
+    assert!(t.o().act_items(Open::k("cross.long"), "").iter().all(|(_, a)| mac::item_id(a).is_none()), "only Does runs a macro");
+    let i = items.iter().position(|(_, a)| mac::item_id(a) == Some("m1")).unwrap();
+    t.click(idx(K_ACT, i));
+    let rl = t.rl();
+    assert!(rl.contains("key_press A") && rl.contains("key_press B") && rl.contains("Start_Press") && rl.contains("\"150\""), "{rl}");
+    let shown = t.o().button_macro(ButtonId::Cross).unwrap().unwrap();
+    assert_eq!(shown.steps, vec![Step::Keys(vec![0x41]), Step::Wait(150), Step::Keys(vec![0x42])]);
+    // the window: Does says Macro, the steps under it, no Start press row
+    let els = t.build();
+    let _ = els;
+    assert!(matches!(t.o().ctl.get(&at), Some(Ctl::Act { cur: Action::Other(s), .. }) if s == "Macro"));
+    // a Click step added in the window is written at once
+    t.click(idx(sub(mac::K_PMAC, "add"), 5));
+    assert!(t.rl().contains("mouse_button LEFT"), "{}", t.rl());
+    assert_eq!(t.o().button_macro(ButtonId::Cross).unwrap().unwrap().steps.len(), 4);
+    // a plain action ends the macro
+    t.click(at);
+    t.click(idx(K_ACT, 0));
+    assert_eq!(t.o().button_macro(ButtonId::Cross), None);
+    let v = t.o().view.clone().unwrap();
+    assert!(v.buttons.iter().find(|b| b.id == ButtonId::Cross).unwrap().macro_cmds.is_empty());
+    // New macro: nothing written until it has a step Steam plays
+    let before = t.writes().len();
+    t.click(at);
+    let items = t.o().act_items(at, "");
+    let i = items.iter().position(|(_, a)| mac::item_id(a) == Some("new")).unwrap();
+    t.click(idx(K_ACT, i));
+    assert_eq!(t.writes().len(), before);
+    assert_eq!(t.o().button_macro(ButtonId::Cross), Some(Some(mac::as_macro(vec![]))));
+    // Delete on a macro never written writes nothing
+    t.click(sub(mac::K_PMAC, "del"));
+    assert_eq!(t.writes().len(), before);
+    assert_eq!(t.o().button_macro(ButtonId::Cross), None);
+    t.click(at);
+    t.click(idx(K_ACT, i));
+    t.click(idx(sub(mac::K_PMAC, "add"), 7));
+    assert!(t.writes().len() > before);
+    let v = t.o().view.clone().unwrap();
+    assert_eq!(v.buttons.iter().find(|b| b.id == ButtonId::Cross).unwrap().macro_cmds.len(), 1, "the Button step is in the layout");
+    assert_eq!(t.o().button_macro(ButtonId::Cross).unwrap().unwrap().steps, vec![Step::Pad(bu_rawin::padbtn::SOUTH)]);
+    // Delete macro: the button does nothing
+    t.click(sub(mac::K_PMAC, "del"));
+    assert_eq!(t.o().button_macro(ButtonId::Cross), None);
+    crate::services::shutdown();
+}
+
+#[test]
+#[ignore]
+fn pad_090_macro() {
+    use bu_keysound::macros::{Macro, Step};
+    crate::services::init_headless(true);
+    let mut m = Macro::new("m1", "Combo");
+    m.steps = vec![Step::Down(0x10), Step::Keys(vec![0x41]), Step::Wait(150), Step::Click(0), Step::Pad(bu_rawin::padbtn::SOUTH)];
+    crate::services::with(|s| {
+        let mut p = crate::pages::keyboard::prefs::Prefs::load(&s.store);
+        p.macros = vec![m];
+        p.save(&mut s.store);
+    })
+    .unwrap();
+    let mut t = T::new();
+    t.click_part(Pid::B(ButtonId::Cross));
+    let at = Open::k("cross.full");
+    t.click(at);
+    shot_090(&mut t, "pad_does_list");
+    let items = t.o().act_items(at, "");
+    let i = items.iter().position(|(_, a)| mac::item_id(a) == Some("m1")).unwrap();
+    t.click(idx(K_ACT, i));
+    shot_090(&mut t, "pad_cross_macro");
+    crate::services::shutdown();
 }

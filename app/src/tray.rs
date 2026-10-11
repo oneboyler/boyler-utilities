@@ -297,6 +297,21 @@ pub fn set_muted(muted: bool) {
     }
 }
 
+/// Order 091: the monitor OBS records (replay buffer or recording on), 0 = none: a white number tile top-right on the icon.
+static OBS_MON: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+/// OBS now records monitor `n` (None = nothing is recorded). The icon is redrawn only when this changes - no timer.
+pub fn set_obs_monitor(n: Option<i32>) {
+    let n = n.filter(|n| *n > 0).unwrap_or(0);
+    if OBS_MON.swap(n, std::sync::atomic::Ordering::AcqRel) == n {
+        return;
+    }
+    // (while the mute badge animates, its thread repaints with the new number anyway)
+    if !BADGE_RUNNING.load(std::sync::atomic::Ordering::Acquire) {
+        badge_show();
+    }
+}
+
 /// Order 050: the badge's animation thread runs.
 static BADGE_RUNNING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -322,11 +337,12 @@ fn badge_show() {
             b.anim = None;
         }
     }
-    if b.cur <= 0.0 && !b.shown {
+    let mon = OBS_MON.load(std::sync::atomic::Ordering::Acquire);
+    if b.cur <= 0.0 && mon == 0 && !b.shown {
         return;
     }
     let base = load_icon(hwnd);
-    let icon = if b.cur > 0.0 { badged(base, b.cur) } else { None };
+    let icon = if b.cur > 0.0 || mon > 0 { badged(base, b.cur, mon) } else { None };
     let t = Tray { hwnd, icon: icon.unwrap_or(base), added: true, open: MENU_OPEN.load(std::sync::atomic::Ordering::Relaxed), enabled: true };
     let mut d = t.data();
     d.uFlags = NIF_ICON;
@@ -341,7 +357,7 @@ fn badge_show() {
         }
         let _ = DestroyIcon(base);
     }
-    b.shown = b.cur > 0.0;
+    b.shown = b.cur > 0.0 || mon > 0;
 }
 
 /// An icon's straight-alpha BGRA pixels (top-down), width, height.
@@ -367,11 +383,14 @@ fn icon_pixels(icon: HICON) -> Option<(Vec<u8>, i32, i32)> {
     }
 }
 
-/// The icon `base` with the badge at scale `s` (a new icon; `base` stays).
-fn badged(base: HICON, s: f32) -> Option<HICON> {
+/// The icon `base` with the monitor tile (`mon` > 0) and the mute badge at scale `s` (a new icon; `base` stays).
+fn badged(base: HICON, s: f32, mon: i32) -> Option<HICON> {
     use windows::Win32::Graphics::Gdi::*;
     let (mut px, w, h) = icon_pixels(base)?;
-    paint_badge(&mut px, w as usize, h as usize, s);
+    paint_monitor(&mut px, w as usize, h as usize, mon);
+    if s > 0.0 {
+        paint_badge(&mut px, w as usize, h as usize, s);
+    }
     unsafe {
         let bi = BITMAPINFO {
             bmiHeader: BITMAPINFOHEADER { biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32, biWidth: w, biHeight: -h, biPlanes: 1, biBitCount: 32, ..Default::default() },
@@ -394,13 +413,12 @@ fn badged(base: HICON, s: f32) -> Option<HICON> {
 }
 
 /// The badge into straight-alpha BGRA pixels `w` x `h` (top-down) at scale `s`: the 1.5 px ring cut out of the icon, then
-/// the 7 px #ff453a dot (16 px icon units, scaled to the pixel size), both scaled about the dot's centre; edges
-/// anti-aliased by 4 x 4 sampling.
+/// the 5 px #ff453a dot (16 px icon units, scaled to the pixel size; Order 091: was 7 px), both scaled about the dot's
+/// centre in the icon's bottom-right corner; edges anti-aliased by 4 x 4 sampling.
 fn paint_badge(px: &mut [u8], w: usize, h: usize, s: f32) {
     let u = w as f32 / 16.0;
-    let (r_dot, r_cut) = (3.5 * u * s, 5.0 * u * s);
-    // at full size the ring touches the icon's right and bottom edges
-    let (cx, cy) = (w as f32 - 5.0 * u, h as f32 - 5.0 * u);
+    let (r_dot, r_cut) = (2.5 * u * s, 4.0 * u * s);
+    let (cx, cy) = (w as f32 - 2.5 * u, h as f32 - 2.5 * u);
     let cover = |x: usize, y: usize, r: f32| -> f32 {
         let mut n = 0;
         for j in 0..4 {
@@ -434,9 +452,152 @@ fn paint_badge(px: &mut [u8], w: usize, h: usize, s: f32) {
     }
 }
 
+/// Is the pixel-centre sample (x, y) inside the rounded rectangle (rx, ry, rw, rh) with corner radius r?
+fn in_round_rect(x: f32, y: f32, rx: f32, ry: f32, rw: f32, rh: f32, r: f32) -> bool {
+    if x < rx || y < ry || x > rx + rw || y > ry + rh {
+        return false;
+    }
+    let dx = (rx + r - x).max(x - (rx + rw - r)).max(0.0);
+    let dy = (ry + r - y).max(y - (ry + rh - r)).max(0.0);
+    dx * dx + dy * dy <= r * r
+}
+
+/// Coverage 0..1 of the rounded rectangle at pixel (x, y), 4 x 4 sampling.
+fn rr_cover(x: usize, y: usize, rx: f32, ry: f32, rw: f32, rh: f32, r: f32) -> f32 {
+    let mut n = 0;
+    for j in 0..4 {
+        for i in 0..4 {
+            if in_round_rect(x as f32 + (i as f32 + 0.5) / 4.0, y as f32 + (j as f32 + 0.5) / 4.0, rx, ry, rw, rh, r) {
+                n += 1;
+            }
+        }
+    }
+    n as f32 / 16.0
+}
+
+/// `text` as white-on-black GDI text (Segoe UI ExtraBold, `em` px, grey anti-aliasing) in a `tw` x `th` box: one coverage byte
+/// per pixel. Drawn 4 x as large and the ink's bounding box (not the font's line box, whose ascent / descent push a digit up or
+/// down) centred in the box before it is scaled down, so the digit sits exactly in the middle of the tile (Order 093).
+fn text_mask(text: &str, tw: i32, th: i32, em: f32) -> Vec<u8> {
+    use windows::Win32::Graphics::Gdi::*;
+    const SS: i32 = 1;
+    let mut out = vec![0u8; (tw.max(0) * th.max(0)) as usize];
+    if out.is_empty() {
+        return out;
+    }
+    let (bw, bh) = (tw * SS, th * SS);
+    let mut big = vec![0u8; (bw * bh) as usize];
+    unsafe {
+        let dc = CreateCompatibleDC(None);
+        let bi = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER { biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32, biWidth: bw, biHeight: -bh, biPlanes: 1, biBitCount: 32, ..Default::default() },
+            ..Default::default()
+        };
+        let mut bits: *mut std::ffi::c_void = std::ptr::null_mut();
+        let Ok(bmp) = CreateDIBSection(Some(dc), &bi, DIB_RGB_COLORS, &mut bits, None, 0) else {
+            let _ = DeleteDC(dc);
+            return out;
+        };
+        let old = SelectObject(dc, bmp.into());
+        let mut face: Vec<u16> = "Segoe UI".encode_utf16().collect();
+        face.push(0);
+        let font = CreateFontW(-((em * SS as f32).round() as i32).max(1), 0, 0, 0, 800, 0, 0, 0, DEFAULT_CHARSET, OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY, DEFAULT_PITCH.0 as u32, PCWSTR(face.as_ptr()));
+        let of = SelectObject(dc, font.into());
+        SetBkMode(dc, TRANSPARENT);
+        SetTextColor(dc, COLORREF(0xFF_FFFF));
+        let mut rc = RECT { left: 0, top: 0, right: bw, bottom: bh };
+        let mut t: Vec<u16> = text.encode_utf16().collect();
+        DrawTextW(dc, &mut t, &mut rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        let _ = GdiFlush();
+        if !bits.is_null() {
+            let src = std::slice::from_raw_parts(bits as *const u8, big.len() * 4);
+            for (i, o) in big.iter_mut().enumerate() {
+                *o = src[i * 4 + 1];
+            }
+        }
+        SelectObject(dc, of);
+        SelectObject(dc, old);
+        let _ = DeleteObject(font.into());
+        let _ = DeleteObject(bmp.into());
+        let _ = DeleteDC(dc);
+    }
+    // the ink's bounding box (coverage over a quarter) -> how far to move it so its middle is the box's middle
+    let (mut x0, mut y0, mut x1, mut y1) = (bw, bh, -1, -1);
+    for y in 0..bh {
+        for x in 0..bw {
+            if big[(y * bw + x) as usize] > 64 {
+                x0 = x0.min(x);
+                x1 = x1.max(x);
+                y0 = y0.min(y);
+                y1 = y1.max(y);
+            }
+        }
+    }
+    if x1 < 0 {
+        return out;
+    }
+    let sx = (bw - (x0 + x1 + 1)) / 2;
+    let sy = (bh - (y0 + y1 + 1)) / 2;
+    for y in 0..th {
+        for x in 0..tw {
+            let mut sum = 0u32;
+            for j in 0..SS {
+                for i in 0..SS {
+                    let (px, py) = (x * SS + i - sx, y * SS + j - sy);
+                    if px >= 0 && py >= 0 && px < bw && py < bh {
+                        sum += big[(py * bw + px) as usize] as u32;
+                    }
+                }
+            }
+            out[(y * tw + x) as usize] = (sum / (SS * SS) as u32) as u8;
+        }
+    }
+    out
+}
+
+/// The monitor tile (Order 091, drawing `tray-obs-v1.html` option 1) into straight-alpha BGRA pixels `w` x `h` (top-down):
+/// an 8 px white tile (16 px icon units) with the number in #111418, top-right; a 1 px ring round it is cut out of the icon
+/// so the real taskbar shows through on a dark and a light taskbar alike.
+fn paint_monitor(px: &mut [u8], w: usize, h: usize, mon: i32) {
+    if mon <= 0 {
+        return;
+    }
+    let k = w as f32 / 16.0;
+    let side = 8.0 * k;
+    let (tx, ty) = (w as f32 - side, 0.0);
+    // the number: the drawing's 7.2 px em, a touch smaller for two digits
+    let s = mon.to_string();
+    let em = if s.len() > 1 { 5.4 * k } else { 7.2 * k };
+    let (tw, th) = (side.round() as i32, side.round() as i32);
+    let mask = text_mask(&s, tw, th, em);
+    let (ox, oy) = (w as i32 - tw, 0);
+    for y in 0..h {
+        for x in 0..w {
+            let cut = rr_cover(x, y, tx - k, ty - k, side + 2.0 * k, side + 2.0 * k, 3.0 * k);
+            if cut <= 0.0 {
+                continue;
+            }
+            let o = (y * w + x) * 4;
+            let tile = rr_cover(x, y, tx, ty, side, side, 2.0 * k);
+            // what is left of the icon, then the white tile over it
+            let a = px[o + 3] as f32 / 255.0 * (1.0 - cut);
+            let out_a = tile + a * (1.0 - tile);
+            // the number's colour over the white tile
+            let (mx, my) = (x as i32 - ox, y as i32 - oy);
+            let m = if mx >= 0 && my >= 0 && mx < tw && my < th { mask[(my * tw + mx) as usize] as f32 / 255.0 } else { 0.0 };
+            for (c, (white, ink)) in [(0usize, (255.0f32, 0x18 as f32)), (1, (255.0, 0x14 as f32)), (2, (255.0, 0x11 as f32))] {
+                let tile_c = white * (1.0 - m) + ink * m;
+                let v = if out_a > 0.0 { (tile_c * tile + px[o + c] as f32 * a * (1.0 - tile)) / out_a } else { 0.0 };
+                px[o + c] = v.round().clamp(0.0, 255.0) as u8;
+            }
+            px[o + 3] = (out_a * 255.0).round().clamp(0.0, 255.0) as u8;
+        }
+    }
+}
+
 #[cfg(test)]
 mod badge_tests {
-    use super::{badge_scale, paint_badge};
+    use super::{badge_scale, paint_badge, paint_monitor};
     use windows::Win32::UI::WindowsAndMessaging::{DestroyIcon, LoadImageW, HICON, IMAGE_ICON, LR_LOADFROMFILE};
 
     #[test]
@@ -453,65 +614,109 @@ mod badge_tests {
         let mut px = vec![0x80u8; 16 * 16 * 4];
         paint_badge(&mut px, 16, 16, 1.0);
         let at = |x: usize, y: usize| px[(y * 16 + x) * 4..(y * 16 + x) * 4 + 4].to_vec();
-        // the dot's centre (11, 11): #ff453a, opaque
-        assert_eq!(at(11, 11), vec![0x3a, 0x45, 0xff, 0xff]);
-        // in the ring (4.5 px left of the centre): cut out
-        assert_eq!(at(6, 11)[3], 0);
+        // the dot (5 px, Order 091) sits in the corner: its centre pixel (13, 13) is #ff453a, opaque
+        assert_eq!(at(13, 13), vec![0x3a, 0x45, 0xff, 0xff]);
+        // in the ring (3 px left of the centre): cut out
+        assert_eq!(at(10, 13)[3], 0);
         // far from the badge: the tile, untouched
         assert_eq!(at(2, 2), vec![0x80, 0x80, 0x80, 0x80]);
     }
 
-    /// Order 045 proof picture (`BU_PIC_OUT=<folder> cargo test -p bu-app proof_045 -- --ignored`): the real tray icons
-    /// (dark / light taskbar) at 16 / 24 / 32 px, plain and with the badge, on their taskbar's colour, 8 x enlarged.
+    #[test]
+    fn the_monitor_tile_is_white_with_a_dark_number_and_a_cut_out_ring() {
+        let mut px = vec![0x80u8; 16 * 16 * 4];
+        paint_monitor(&mut px, 16, 16, 2);
+        let at = |x: usize, y: usize| px[(y * 16 + x) * 4..(y * 16 + x) * 4 + 4].to_vec();
+        // the tile (x 8..16, y 0..8): the dark number's ink and white tile pixels
+        let tile: Vec<Vec<u8>> = (0..8).flat_map(|y| (8..16).map(move |x| (x, y))).map(|(x, y)| at(x, y)).collect();
+        assert!(tile.iter().any(|p| p[0] < 0x60 && p[3] == 255), "the number is drawn");
+        assert!(tile.iter().filter(|p| p[0] > 0xf0 && p[3] == 255).count() > 20, "the tile is white");
+        // the ring round the tile (x 7, y 4) is cut out of the icon
+        assert_eq!(at(7, 4)[3], 0);
+        // far from the tile: untouched
+        assert_eq!(at(2, 12), vec![0x80, 0x80, 0x80, 0x80]);
+        // no monitor: nothing changes
+        let mut q = vec![0x80u8; 16 * 16 * 4];
+        paint_monitor(&mut q, 16, 16, 0);
+        assert!(q.iter().all(|b| *b == 0x80));
+    }
+
+    #[test]
+    fn the_tile_and_the_mute_dot_work_together() {
+        let mut px = vec![0x80u8; 16 * 16 * 4];
+        paint_monitor(&mut px, 16, 16, 1);
+        paint_badge(&mut px, 16, 16, 1.0);
+        let at = |x: usize, y: usize| px[(y * 16 + x) * 4..(y * 16 + x) * 4 + 4].to_vec();
+        assert_eq!(at(13, 13), vec![0x3a, 0x45, 0xff, 0xff], "the dot");
+        assert_eq!(at(12, 3)[3], 255, "the tile");
+    }
+
+    /// Order 093: the digit's ink sits in the middle of its tile (the gaps left / right and above / below differ by at most
+    /// one pixel - the unavoidable half pixel when the ink is odd wide in an even tile) and is whole, at every pixel size.
+    #[test]
+    fn the_digit_is_centred_and_whole_in_its_tile() {
+        for w in [16usize, 20, 24, 32] {
+            for mon in [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12] {
+                let mut px = vec![0x80u8; w * w * 4];
+                paint_monitor(&mut px, w, w, mon);
+                let side = w / 2;
+                let (mut x0, mut x1, mut y0, mut y1) = (usize::MAX, 0, usize::MAX, 0);
+                for y in 0..side {
+                    for x in w - side..w {
+                        if px[(y * w + x) * 4] < 0xa0 && px[(y * w + x) * 4 + 3] == 255 {
+                            x0 = x0.min(x - (w - side));
+                            x1 = x1.max(x - (w - side));
+                            y0 = y0.min(y);
+                            y1 = y1.max(y);
+                        }
+                    }
+                }
+                assert!(x0 != usize::MAX, "w {w} mon {mon}: a digit is drawn");
+                let (l, r, t, b) = (x0 as i32, (side - 1 - x1) as i32, y0 as i32, (side - 1 - y1) as i32);
+                assert!(l >= 1 && r >= 1 && t >= 1 && b >= 1, "w {w} mon {mon}: whole, inside the tile ({l} {r} {t} {b})");
+                assert!((l - r).abs() <= 1 && (t - b).abs() <= 1, "w {w} mon {mon}: centred ({l} {r} {t} {b})");
+            }
+        }
+    }
+
+    /// Order 045 / 091 / 093 proof pictures (`BU_PIC_OUT=<folder> cargo test -p bu-app proof_045 -- --ignored`): the real tray
+    /// icons (dark / light taskbar, #202020 / #f3f3f3) at 16 / 20 / 24 / 32 px in every state, one 1:1 PNG each
+    /// (`<dark|light>_<size>_<state>.png`).
     #[test]
     #[ignore]
     fn proof_045_tray_badge() {
         use windows::core::HSTRING;
         let Ok(dir) = std::env::var("BU_PIC_OUT") else { return };
-        let mut rows: Vec<Vec<u8>> = Vec::new();
-        let (z, gap) = (8usize, 16usize);
-        let width = (16 + 24 + 32) * 2 * z + 7 * gap;
-        for (file, bg) in [("pane_dark.ico", [0x2d, 0x25, 0x23]), ("pane_light.ico", [0xf3, 0xf3, 0xf3])] {
+        let _ = std::fs::create_dir_all(&dir);
+        unsafe {
+            let _ = windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_APARTMENTTHREADED);
+        }
+        for (theme, file, bg) in [("dark", "pane_dark.ico", [0x20u8, 0x20, 0x20]), ("light", "pane_light.ico", [0xf3, 0xf3, 0xf3])] {
             let path = format!("{}/assets/{file}", env!("CARGO_MANIFEST_DIR"));
-            let hgt = 32 * z + 2 * gap;
-            let mut img = vec![0u8; width * hgt * 4];
-            for p in img.chunks_mut(4) {
-                p.copy_from_slice(&[bg[0], bg[1], bg[2], 255]);
-            }
-            let mut x0 = gap;
-            for size in [16i32, 24, 32] {
+            for size in [16i32, 20, 24, 32] {
                 let h = unsafe { LoadImageW(None, &HSTRING::from(path.as_str()), IMAGE_ICON, size, size, LR_LOADFROMFILE) }.expect("icon");
                 let (px, w, hh) = super::icon_pixels(HICON(h.0)).expect("pixels");
-                for badge in [false, true] {
+                for (name, mon, badge) in [("none", 0, false), ("m1", 1, false), ("m2", 2, false), ("m2mute", 2, true), ("mute", 0, true)] {
                     let mut p = px.clone();
+                    paint_monitor(&mut p, w as usize, hh as usize, mon);
                     if badge {
                         paint_badge(&mut p, w as usize, hh as usize, 1.0);
                     }
-                    for y in 0..hh as usize * z {
-                        for x in 0..w as usize * z {
-                            let s = &p[((y / z) * w as usize + x / z) * 4..][..4];
-                            let a = s[3] as u32;
-                            let o = ((gap + y) * width + x0 + x) * 4;
-                            for c in 0..3 {
-                                img[o + c] = ((s[c] as u32 * a + img[o + c] as u32 * (255 - a)) / 255) as u8;
-                            }
+                    // over the taskbar's colour (straight-alpha BGRA in, opaque out)
+                    for q in p.chunks_mut(4) {
+                        let a = q[3] as u32;
+                        for c in 0..3 {
+                            q[c] = ((q[c] as u32 * a + bg[2 - c] as u32 * (255 - a)) / 255) as u8;
                         }
+                        q[3] = 255;
                     }
-                    x0 += w as usize * z + gap;
+                    let img = crate::png::Pixels { w: w as u32, h: hh as u32, data: p };
+                    crate::png::save_png(&img, &format!("{dir}/{theme}_{size}_{name}.png")).expect("png");
                 }
                 unsafe {
                     let _ = DestroyIcon(HICON(h.0));
                 }
             }
-            rows.push(img);
         }
-        let data: Vec<u8> = rows.concat();
-        let h = data.len() / 4 / width;
-        let _ = std::fs::create_dir_all(&dir);
-        unsafe {
-            let _ = windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_APARTMENTTHREADED);
-        }
-        let px = crate::png::Pixels { w: width as u32, h: h as u32, data };
-        crate::png::save_png(&px, &format!("{dir}/07_tray_badge.png")).expect("png");
     }
 }

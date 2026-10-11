@@ -17,6 +17,7 @@ features = [
     "Win32_System_Com",
     "Win32_System_Com_StructuredStorage",
     "Win32_System_ProcessStatus",
+    "Win32_System_SystemInformation",
     "Win32_System_Threading",
     "Win32_System_Variant",
     "Win32_System_WindowsProgramming",
@@ -31,3 +32,8 @@ path = "examples/proof.rs"
 [[example]]
 name = "noise-proof-mix"
 path = "examples/proof_mix.rs"
+
+# Order 092: the listening tracker fed by the real engine, MUTED, ledger in a scratch folder
+[[example]]
+name = "noise-proof-listen"
+path = "examples/listen_proof.rs"

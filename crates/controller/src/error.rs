@@ -36,6 +36,10 @@ pub enum Error {
     BackupMismatch(PathBuf),
     #[error("Steam is closed — open Steam yourself first (the app never starts Steam)")]
     SteamClosed,
+    #[error("a game is running through Steam — close it first, then restart Steam")]
+    GameRunning,
+    #[error("Steam did not close by itself within the time given — it was left running, nothing was forced")]
+    SteamWontClose,
     #[error("controller not found (unplugged?): {0}")]
     PadGone(String),
     #[error("Steam file {path}: {err}")]

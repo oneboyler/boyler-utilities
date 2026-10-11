@@ -29,6 +29,8 @@ pub enum Cmd {
     /// a device picked in the list = Windows' default (all three roles)
     Default(Flow, String),
     DeviceVolume(String, f32),
+    /// Order 081: a device's own mute (the Output row's speaker icon)
+    DeviceMute(String, bool),
     /// a device's own switch in the list
     DeviceOn(Flow, String, bool),
     /// (output device, app group, volume) - unmutes a muted app, as in Windows
@@ -40,6 +42,7 @@ fn apply<O: AudioOs>(s: &mut AudioService<O>, c: Cmd) -> Result<Option<Change>> 
     match c {
         Cmd::Default(f, id) => s.select_default(f, &id).map(Some),
         Cmd::DeviceVolume(id, v) => s.set_device_volume(&id, v).map(Some),
+        Cmd::DeviceMute(id, m) => s.set_device_mute(&id, m).map(Some),
         Cmd::DeviceOn(f, id, on) => s.set_device_on(f, &id, on).map(Some),
         Cmd::AppVolume(out, g, v) => s.set_app_volume(&out, &g, v).map(Some),
         Cmd::AppMute(out, g, m) => s.set_app_mute(&out, &g, m).map(Some),

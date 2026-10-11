@@ -358,6 +358,18 @@ pub fn show(m: &PopMsg, clipped: Option<usize>, set: &Settings, mons: &[Mon], te
     });
 }
 
+/// A save that looked failed finished after all (Order 091): the red "Clip failed" popups go, the "Clipped" shows in their place.
+pub fn retract_clip_failed() {
+    S.with(|s| {
+        let Ok(mut st) = s.try_borrow_mut() else { return };
+        st.shown.retain(|l| !l.starts_with("Clip failed |"));
+        while let Some(i) = st.pops.iter().position(|p| p.msg.color == bu_obs::Color::Red && p.msg.main == "Clip failed") {
+            free(&mut st, i);
+        }
+        restack(&mut st);
+    });
+}
+
 /// Every popup gone (settings changed, feature off).
 pub fn clear() {
     S.with(|s| {

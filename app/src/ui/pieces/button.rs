@@ -6,7 +6,7 @@ use taffy::style::JustifyContent;
 use crate::anim::EASE;
 use crate::gfx::{sh, Rgba};
 use crate::ui::cx::Cx;
-use crate::ui::el::{lh, Cursor, El, Key};
+use crate::ui::el::{lh, Cursor, El, IconPaint, Key};
 use crate::ui::{cmix, ACC, CTL, CTL_H, FG, FG2, HAIR, RED, WHITE};
 
 use super::btn_font;
@@ -109,6 +109,15 @@ pub fn btn(cx: &mut Cx, key: Key, icon: &str, label: &str, on: bool) -> El {
     }
     // `#sw button{font:inherit}` (an id rule) wins over `.btn{font-size:12.5px}`: 13 px (Chromium's computed style)
     b.child(El::text(label, btn_font(13.0, 400), fg, lh(13.0, 1.35)))
+}
+
+/// Order 098 (the owner: "This icon is ugly"): every play button. A small FILLED triangle in the text colour (white on the dark
+/// glass), no circle at rest, centred optically (a triangle's weight sits left of its box, so it is nudged 1 px right); on hover
+/// the same soft highlight as the window's × (28 x 28, radius 7, `--ctl-h`).
+pub fn play_icon_btn(cx: &mut Cx, key: Key) -> El {
+    let hv = cx.hover_t(key, 120.0, EASE);
+    let tri = El::icon("play", 9.0, 1.0, FG()).h(10.0).icon_paint(IconPaint { fill_all: true, classes: vec![] }).translate(1.0, 0.0);
+    El::block().size(28.0, 28.0).none().radius(7.0).bg(CTL_H().mul_a(hv)).place_center().on_click(key).cursor(Cursor::Hand).child(tri.no_hit())
 }
 
 /// The icon-only button: `#sw .dlx{width:28px;height:28px;border-radius:7px;background:transparent;color:var(--fg2);

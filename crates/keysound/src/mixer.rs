@@ -47,7 +47,10 @@ impl Mixer {
         self.voices[slot] = Voice { data: Some(sound.clone()), pos: 0.0, step: step.clamp(0.25, 4.0), gain, age: self.clock };
     }
 
-    /// How many voices are still playing.
+    /// The speed of the sound started last (tests: the pitch a press got).
+    pub fn last_step(&self) -> f32 {
+        self.voices.iter().filter(|v| v.data.is_some()).max_by_key(|v| v.age).map(|v| v.step).unwrap_or(0.0)
+    }
     pub fn active(&self) -> usize {
         self.voices.iter().filter(|v| v.data.is_some()).count()
     }

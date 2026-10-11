@@ -1473,6 +1473,7 @@ fn run(opts: Opts) -> Result<()> {
         }
         let mut msgbuf = MSG::default();
         loop {
+            ui::COVERED.store(app.back, std::sync::atomic::Ordering::Relaxed);
             // pick how to wait: frames while the menu moves, otherwise only messages (zero CPU)
             let want = app.menu.as_ref().map(|m| m.ui.dirty || m.backdrop_dirty || m.ui.animating(timing::now())).unwrap_or(false);
             // Order 051: the capture overlay's GPU windows that wait for their monitor's next refresh
@@ -1645,6 +1646,12 @@ fn main() {
     if let Some(code) = bu_addons::helper::run_if_requested(&args) {
         std::process::exit(code);
     }
+    // started as the sound decoder (Order 090, E21): a pack or sound file someone else made is decoded in this short-lived
+    // copy, so a broken one can't end the app; nothing opens
+    if let Some(code) = bu_keysound::safe::run_if_requested(&args) {
+        std::process::exit(code);
+    }
+    bu_keysound::safe::use_helper(std::env::current_exe().ok());
     // started with the admin prompt to set up Search's own Everything (Order 049): voidtools' file checked, our manual
     // service, v1.0.0's Everything tidied up when asked; nothing opens
     if let Some(code) = bu_search::real::ours::run_if_requested(&args) {

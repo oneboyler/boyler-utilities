@@ -422,6 +422,15 @@ fn mic_icon_and_mute_settings() {
     assert!(a.describe().contains("sound=false") && a.describe().contains("vol=5"), "{}", a.describe());
     click(&mut a, key("aud.mm.snd"), &g, &mut st);
     assert!(a.describe().contains("sound=true"));
+    // Order 092: the Volume slider works with the sound on and "Change" never opened (it sits right under the switch):
+    // a press at the middle of its 150 px track = 50 %, and letting go keeps it
+    {
+        let mut cx = Cx::new(1000.0, false, &g, &mut st).for_page("aud");
+        let r = (300.0, 200.0, 150.0, 20.0);
+        a.event(&Ev::Press(key("aud.mm.vol"), r.0 + 8.0 + 0.5 * (r.2 - 16.0), 210.0, r), &mut cx);
+        a.event(&Ev::Release(key("aud.mm.vol")), &mut cx);
+    }
+    assert!(a.describe().contains("vol=50"), "{}", a.describe());
     click(&mut a, key("aud.mm.snd"), &g, &mut st);
     assert!(a.describe().contains("sound=false"));
     click(&mut a, sub(mute::K_MM, "x"), &g, &mut st);
@@ -824,4 +833,103 @@ fn meters_step_every_33_ms_and_the_ticks_between_ask_for_no_frame() {
     assert!(a.live_only(), "the live pass repaints the meters; nothing is built");
     assert_eq!(a.st.as_ref().unwrap().last, 40.0 + STEP_MS);
     assert_eq!(a.wake_at(80.0), Some(40.0 + 2.0 * STEP_MS));
+}
+
+/// Order 081: the Output row's speaker icon mutes / unmutes the default output device - on the page's FAKE worker only
+/// (a test never touches the PC's device); the icon follows what the device really says, and the meter pill dims.
+#[test]
+fn speaker_icon_mutes_the_default_output() {
+    let g = Gfx::new(1.0);
+    let mut st = State::default();
+    let mut a = page();
+    let out_muted = |a: &Audio| {
+        let id = a.st.as_ref().unwrap().out.as_ref().map(|o| o.0.clone()).unwrap();
+        a.st.as_ref().unwrap().svc.with_fake(|f| f.volumes[&id].muted).unwrap()
+    };
+    assert!(!out_muted(&a) && a.describe().contains("outmuted=false"));
+    let vol0 = a.st.as_ref().unwrap().out.as_ref().unwrap().1;
+    click(&mut a, K_SPK, &g, &mut st);
+    assert!(a.describe().contains("outmuted=true"), "the icon flips at once");
+    let t0 = std::time::Instant::now();
+    while !out_muted(&a) && t0.elapsed().as_secs() < 5 {
+        wait(&mut a, 20);
+    }
+    assert!(out_muted(&a), "the worker muted the fake device");
+    wait(&mut a, 700);
+    assert!(a.describe().contains("outmuted=true"), "the icon follows the device: {}", a.describe());
+    assert_eq!(a.st.as_ref().unwrap().out.as_ref().unwrap().1, vol0, "the volume is left alone");
+    // the mic is a different device: untouched
+    assert!(a.describe().contains("micmuted=false"));
+    click(&mut a, K_SPK, &g, &mut st);
+    let t0 = std::time::Instant::now();
+    while out_muted(&a) && t0.elapsed().as_secs() < 5 {
+        wait(&mut a, 20);
+    }
+    assert!(!out_muted(&a), "unmuted again");
+    wait(&mut a, 700);
+    assert!(a.describe().contains("outmuted=false"));
+    // a mute made elsewhere (Windows' own mixer) shows on the icon too
+    let id = a.st.as_ref().unwrap().out.as_ref().unwrap().0.clone();
+    a.st.as_ref().unwrap().svc.with_fake(|f| f.volumes.get_mut(&id).unwrap().muted = true);
+    let t0 = std::time::Instant::now();
+    while !a.describe().contains("outmuted=true") && t0.elapsed().as_secs() < 5 {
+        wait(&mut a, 100);
+    }
+    assert!(a.describe().contains("outmuted=true"), "{}", a.describe());
+    // the tooltip / icon of the built page
+    let l = lay(&mut a, &g, &mut st, 0.0);
+    assert!(l.rect_of(K_SPK).is_some());
+}
+
+/// Order 081 picture (`BU_PIC_OUT=<folder> cargo test -p bu-app speaker_muted_picture -- --ignored`): the Audio page with the
+/// Output speaker muted (red icon with the slash, the level pill dimmed) beside the unmuted Input row.
+#[test]
+#[ignore]
+fn speaker_muted_picture() {
+    if std::env::var("BU_PIC_OUT").is_err() {
+        return;
+    }
+    let mut a = page();
+    let g = Gfx::new(1.0);
+    let mut st = State::default();
+    let _ = lay(&mut a, &g, &mut st, 0.0);
+    click(&mut a, K_SPK, &g, &mut st);
+    let _ = lay(&mut a, &g, &mut st, 1000.0);
+    let mut cx = Cx::new(2000.0, false, &g, &mut st);
+    let kids = a.build(&mut cx);
+    let root = El::block().w(600.0).h(300.0).pad(2.0, 26.0, 18.0, 26.0).children(kids);
+    crate::ui::lay::proof_png(root, 600.0, 300.0, 2.0, "audio_speaker_muted.png");
+}
+
+/// Order 092 picture (`BU_PIC_OUT=<folder> cargo test -p bu-app proof_092 -- --ignored`): Mute settings with the mute sound
+/// switched on - the Volume slider sits right under the switch, "Change" still closed.
+#[test]
+#[ignore]
+fn proof_092_volume_under_the_switch() {
+    if std::env::var("BU_PIC_OUT").is_err() {
+        return;
+    }
+    crate::services::init(windows::Win32::Foundation::HWND::default(), true);
+    crate::services::with(mute::register);
+    let g = Gfx::new(1.0);
+    let mut st = State::default();
+    let mut a = page();
+    click(&mut a, K_MML, &g, &mut st);
+    click(&mut a, key("aud.mm.on"), &g, &mut st);
+    {
+        let mut cx = Cx::new(1000.0, false, &g, &mut st).for_page("aud");
+        let _ = a.popup(&mut cx);
+    }
+    click(&mut a, key("aud.mm.snd"), &g, &mut st);
+    let mut cx = Cx::new(3000.0, false, &g, &mut st).for_page("aud");
+    let _ = a.popup(&mut cx);
+    let mut cx = Cx::new(4000.0, false, &g, &mut st).for_page("aud");
+    let kids = a.build(&mut cx);
+    let pop = a.popup(&mut cx);
+    let pg = El::block().abs(0.0, crate::ui::PAGE_TOP, f32::NAN, f32::NAN).w(600.0).pad(2.0, 26.0, 18.0, 26.0).children(kids);
+    let root = El::block().w(600.0).h(crate::ui::WIN_H).child(pg).children(pop);
+    crate::ui::lay::proof_png(root, 600.0, crate::ui::WIN_H, 1.5, "092_mute_volume.png");
+    drop(cx);
+    mute::reset_for_test();
+    crate::services::shutdown();
 }

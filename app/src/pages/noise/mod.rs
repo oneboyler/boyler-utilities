@@ -10,17 +10,22 @@
 //! "Save as my sound" names the mix and puts it in the list under "My sounds" (Remove takes it out again).
 
 use crate::pages::{Background, Env, Page};
+use crate::anim::EASE;
+use crate::gfx::{Font, Rgba};
 use crate::ui::cx::{Cx, Ev};
-use crate::ui::el::{idx, key, El, Key};
+use crate::ui::el::{idx, key, lh, El, Key};
 use crate::ui::pieces::button::{self, Kind as BKind};
 use crate::ui::pieces::mitems::{self, It, Place, Row};
 use crate::ui::pieces::nbox::{self, Filter};
 use crate::ui::pieces::{self, dropdown, group, seg, slider, tinput};
-use crate::ui::{WIN_H, WIN_W};
+use crate::ui::{PAGE_H, WIN_H, WIN_W};
+use bu_noise::listen::{self, Totals, Tracker};
 use bu_noise::{Kind, Mix, Sound, Status, SLEEP_CHOICES};
+use taffy::style::AlignItems;
 
 pub mod glue;
 pub mod prefs;
+mod tide;
 #[cfg(test)]
 mod tests;
 
@@ -39,9 +44,13 @@ const K_NAME: Key = key("nse.name");
 const K_NSAVE: Key = key("nse.nsave");
 const K_NCANCEL: Key = key("nse.ncancel");
 const K_REMOVE: Key = key("nse.remove");
+const K_LISTEN: Key = key("nse.listen");
 
 /// The name given when Save is pressed with nothing typed.
 const DEFAULT_NAME: &str = "My sound";
+
+/// The Soft tide moves every 50 ms (about 20 frames a second).
+const TIDE_MS: f64 = 50.0;
 
 /// The three sliders of the Custom mix.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -119,6 +128,18 @@ pub struct Noise {
     press_dismissed: bool,
     /// "Save as my sound" was pressed: the name being typed.
     naming: Option<String>,
+    /// The "Time listened" figures: summed when the tab opens and when Stop is pressed - never on a timer.
+    listened: Totals,
+    /// A test copy keeps its own tracker, clock (local seconds) and "seconds the player wrote" (nothing real is touched).
+    tracker: Tracker,
+    clock: i64,
+    wrote: f64,
+    /// Order 097: how far the Soft tide has faded in (0..1), and when it was last moved (it moves ~20 times a second, only while noise
+    /// plays AND this tab is on screen).
+    level: f32,
+    anim_at: Option<f64>,
+    /// Reduced motion is on: no tide.
+    rm: bool,
 }
 
 /// "Stops in 27 min" for a running sleep timer.
@@ -133,6 +154,33 @@ fn sleep_line(st: &Status) -> Option<String> {
     Some(if s < 60 { "Stops in under a minute".into() } else { format!("Stops in {} min", s.div_ceil(60)) })
 }
 
+/// pack-noise-v1 `.tl1`: the five totals as ONE small grey line under the card (no box of big numbers): "1h 35m today · 7h 20m this
+/// week · 26h 05m this month · 211h this year · 340h in all"; the pointer over it brightens it.
+fn listened_line(cx: &mut Cx, t: Totals) -> El {
+    let hv = cx.hover_t(K_LISTEN, 150.0, EASE);
+    let col = Rgba(235.0 / 255.0, 238.0 / 255.0, 248.0 / 255.0, 0.30 + 0.30 * hv);
+    let f = Font::new(11.0, 400).tnum();
+    let cells = [(t.today, "today"), (t.week, "this week"), (t.month, "this month"), (t.year, "this year"), (t.all, "in all")];
+    let mut r = El::row().center().margin(14.0, 2.0, 0.0, 2.0).key(K_LISTEN);
+    for (i, (secs, name)) in cells.into_iter().enumerate() {
+        if i > 0 {
+            r = r.child(El::text("\u{b7}", f, col.mul_a(0.6), lh(11.0, 1.35)).none().margin(0.0, 7.0, 0.0, 7.0));
+        }
+        r = r.child(El::text(format!("{} {name}", listen::format(secs)), f, col, lh(11.0, 1.35)).none());
+    }
+    r
+}
+
+/// When the sleep line next changes (ms): the seconds left cross a whole minute (or reach 0). None = no running timer.
+fn sleep_wake(st: &Status, now: f64) -> Option<f64> {
+    if !st.playing || st.stopping {
+        return None;
+    }
+    let s = st.sleep_left?;
+    let to_edge = if s == 60 { 1 } else if s < 60 { s } else { s - (s.div_ceil(60) - 1) * 60 };
+    Some(now + f64::from(to_edge) * 1000.0 + 150.0)
+}
+
 /// "Tone 35 · Rumble 30 · Waves 0".
 fn mix_line(m: Mix) -> String {
     format!("Tone {} · Rumble {} · Waves {}", m.tone, m.rumble, m.waves)
@@ -141,8 +189,25 @@ fn mix_line(m: Mix) -> String {
 impl Noise {
     fn load(&mut self, env: &Env) {
         self.test = env.fake();
+        self.rm = env.rm;
         self.prefs = crate::services::with(|s| Prefs::load(&s.store)).unwrap_or_default();
         self.loaded = true;
+        self.listened = self.listened_now();
+    }
+
+    /// The five figures as of now (a running stretch counts up to now).
+    fn listened_now(&self) -> Totals {
+        if self.test {
+            self.tracker.totals(self.clock, self.wrote)
+        } else {
+            glue::listened()
+        }
+    }
+
+    /// Drops what the page held when the tab closes / opens; the test copy's stand-ins stay.
+    fn reset(&mut self) {
+        let (fake, tracker, clock, wrote) = (std::mem::take(&mut self.fake), std::mem::take(&mut self.tracker), self.clock, self.wrote);
+        *self = Noise { fake, tracker, clock, wrote, ..Noise::default() };
     }
 
     fn save(&mut self) {
@@ -162,18 +227,21 @@ impl Noise {
     fn play(&mut self) {
         let sound = self.prefs.sound();
         if self.test {
+            self.tracker.begin(self.clock, self.wrote);
             self.fake = Status { playing: true, sound: Some(sound), volume: self.prefs.volume, sleep_left: self.prefs.sleep.map(|m| m * 60), ..Status::default() };
         } else {
-            glue::engine().play(sound, self.prefs.volume, self.prefs.sleep);
+            glue::play(sound, self.prefs.volume, self.prefs.sleep);
         }
     }
 
     fn stop(&mut self) {
         if self.test {
+            self.tracker.end(self.clock, self.wrote);
             self.fake = Status::default();
         } else {
-            glue::engine().stop();
+            glue::stop();
         }
+        self.listened = self.listened_now();
     }
 
     /// What is playing / will play is now `prefs.sound()`.
@@ -305,6 +373,12 @@ impl Noise {
         if let Some(e) = &st.error {
             out.push(group::gf(&format!("The sound couldn't start: {e}")));
         }
+        out.push(listened_line(cx, self.listened));
+        // the Soft tide sits under the cards (first = painted first), only while it has faded in
+        if self.level > 0.0 {
+            let (t, level) = (cx.now / 1000.0, self.level);
+            out.insert(0, El::paint(move |g, r| tide::paint(g, r, t, level)).sig((t.to_bits(), level.to_bits())).abs(0.0, PAGE_H - tide::H, f32::NAN, f32::NAN).size(tide::W, tide::H).no_hit());
+        }
         out
     }
 
@@ -331,6 +405,11 @@ impl Noise {
         rows
     }
 
+    /// Nothing animates: the menu is behind a full-screen game, or reduced motion is on.
+    fn still(&self) -> bool {
+        self.rm || covered()
+    }
+
     fn slider_at(&mut self, k: Key, x: f32, r: (f32, f32, f32, f32)) {
         if k == K_VOL {
             self.set_volume(slider::value_at(r, x));
@@ -351,9 +430,7 @@ impl Page for Noise {
         "noise"
     }
     fn open(&mut self, env: &Env, _now: f64) {
-        let fake = std::mem::take(&mut self.fake);
-        *self = Noise::default();
-        self.fake = fake;
+        self.reset();
         self.load(env);
     }
     fn close(&mut self) {
@@ -361,9 +438,7 @@ impl Page for Noise {
             self.save();
         }
         // the player goes on (it is the switch's, not the tab's); only what the page held is dropped
-        let fake = std::mem::take(&mut self.fake);
-        *self = Noise::default();
-        self.fake = fake;
+        self.reset();
     }
     fn build(&mut self, cx: &mut Cx) -> Vec<El> {
         if !self.loaded {
@@ -479,24 +554,47 @@ impl Page for Noise {
         }
     }
     /// The sleep line counts down: ask again when its minute changes (nothing playing = None: no frames, no wake-ups).
-    fn tick(&mut self, _now: f64) -> bool {
-        sleep_line(&self.status()) != self.shown
+    /// Order 097: and the Soft tide moves (about 20 times a second) while noise plays - this runs only while the tab is on
+    /// screen, so a closed menu, another tab or stopped noise costs no frame and no timer at all.
+    fn tick(&mut self, now: f64) -> bool {
+        let st = self.status();
+        let changed = sleep_line(&st) != self.shown;
+        if self.still() {
+            self.anim_at = None;
+            return std::mem::take(&mut self.level) > 0.0 || changed;
+        }
+        // no tide behind a full-screen game (nobody sees it) and none with reduced motion
+        let target = if st.playing && !st.stopping { 1.0 } else { 0.0 };
+        if target == 0.0 && self.level == 0.0 {
+            self.anim_at = None;
+            return changed;
+        }
+        if self.anim_at.is_some_and(|t| now - t < TIDE_MS - 2.0) {
+            return changed;
+        }
+        let dt = self.anim_at.map_or(TIDE_MS, |t| now - t).min(100.0) as f32 / 1000.0;
+        self.level += (target - self.level) * (dt * 1.2).min(1.0);
+        if (self.level - target).abs() < 0.01 {
+            self.level = target;
+        }
+        self.anim_at = Some(now);
+        true
     }
     fn wake_at(&self, now: f64) -> Option<f64> {
         let st = self.status();
-        if !st.playing || st.stopping {
-            return None;
+        let tide = (!self.still() && ((st.playing && !st.stopping) || self.level > 0.0)).then(|| self.anim_at.map_or(now, |t| (t + TIDE_MS).max(now)));
+        let sleep = sleep_wake(&st, now);
+        match (tide, sleep) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
         }
-        let s = st.sleep_left?;
-        // the line changes when the seconds left cross a whole minute (or reach 0)
-        let to_edge = if s == 60 { 1 } else if s < 60 { s } else { s - (s.div_ceil(60) - 1) * 60 };
-        Some(now + f64::from(to_edge) * 1000.0 + 150.0)
     }
     fn start(&self, s: &mut crate::services::Services) {
         if s.test {
             return; // test copies never start a player
         }
         glue::start();
+        glue::set_listen_file(s.store.folder());
     }
     fn background(&self, env: &Env) -> Option<Box<dyn Background>> {
         if env.test {
@@ -524,3 +622,17 @@ impl Page for Noise {
     }
 }
 
+
+/// The menu sits behind a full-screen game (a test copy has its own flag per thread: tests run side by side).
+#[cfg(not(test))]
+fn covered() -> bool {
+    crate::ui::COVERED.load(std::sync::atomic::Ordering::Relaxed)
+}
+#[cfg(test)]
+thread_local! {
+    static T_COVERED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+#[cfg(test)]
+fn covered() -> bool {
+    T_COVERED.with(|c| c.get())
+}

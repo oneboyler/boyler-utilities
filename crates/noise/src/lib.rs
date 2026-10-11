@@ -9,10 +9,13 @@
 //! * [`engine::Noise`]: one worker thread and one WASAPI shared stream that exist ONLY while the noise plays; the thread wakes
 //!   about 14 times a second to top up a 200 ms lead. Stopped: no thread, no stream, no buffer.
 //!
+//! (Order 092: [`listen`] - the listening tracker, counts only at Play / Stop.)
+//!
 //! The player starts only when asked (`Noise::play`): it is off until the user presses Play.
 
 pub mod fft;
 pub mod kind;
+pub mod listen;
 pub mod player;
 pub mod sound;
 pub mod synth;

@@ -133,15 +133,18 @@ fn the_page_asks_to_be_woken_only_while_a_timer_counts() {
     let mut p = page();
     assert_eq!(p.wake_at(1000.0), None, "nothing playing: no wake-ups, no frames");
     click(&mut p, K_PLAY);
-    assert_eq!(p.wake_at(1000.0), None, "playing without a timer: nothing changes by itself");
+    assert_eq!(sleep_wake(&p.status(), 1000.0), None, "playing without a timer: the sleep line changes by nothing");
+    assert_eq!(p.wake_at(1000.0), Some(1000.0), "...but the tide asks for its first frame");
     click(&mut p, idx(K_SLEEP, 1));
-    let at = p.wake_at(1000.0).unwrap();
+    let at = sleep_wake(&p.status(), 1000.0).unwrap();
+    assert!(p.wake_at(1000.0).unwrap() <= at);
     // 15 min = 900 s: the line changes when it reaches 14 min = 840 s, 60 s from now
     assert!((at - (1000.0 + 60_000.0 + 150.0)).abs() < 1.0, "{at}");
     // a build paints the line; the tick then has nothing new to say
     with_cx(|cx| {
         p.build(cx);
     });
+    p.tick(1000.0); // (the tide's first frame)
     assert!(!p.tick(1000.0));
     p.fake.sleep_left = Some(14 * 60);
     assert!(p.tick(1000.0), "the minute changed: repaint");
@@ -288,7 +291,7 @@ fn the_wake_for_the_last_minute_is_one_second_after_one_minute_left() {
     click(&mut p, K_PLAY);
     for (left, wait_ms) in [(60u32, 1000.0), (45, 45_000.0), (61, 1000.0), (120, 60_000.0)] {
         p.fake.sleep_left = Some(left);
-        let at = p.wake_at(0.0).unwrap();
+        let at = sleep_wake(&p.status(), 0.0).unwrap();
         assert!((at - (wait_ms + 150.0)).abs() < 1.0, "{left} s left: wake at {at}");
     }
 }
@@ -592,4 +595,197 @@ fn pictures_custom() {
     click(&mut p, K_NSAVE);
     p.pop = Some((310.0, 150.0, 130.0, 28.0));
     paint_page(&mut p, "noise_list_mine", true, 600.0);
+}
+
+// ------------------------------------------------------------------ Order 092: the listening tracker
+
+/// Local seconds of 10 Oct 2026 (a Saturday) at `h:m`.
+fn sat(h: i64, m: i64) -> i64 {
+    listen::days_from_civil(2026, 10, 10) * 86_400 + h * 3600 + m * 60
+}
+
+#[test]
+fn nothing_is_counted_until_play_and_stop_have_both_happened() {
+    let mut p = page();
+    p.clock = sat(20, 0);
+    assert_eq!(p.listened_now(), Totals::default(), "a fresh page has listened to nothing");
+    p.open(&Env { test: true, ..Env::default() }, 0.0);
+    assert_eq!(p.listened, Totals::default());
+    click(&mut p, K_PLAY);
+    // 15 min later the tab is opened again: the running stretch shows up to now, but is not kept
+    p.clock = sat(20, 15);
+    p.wrote = 900.0;
+    p.close();
+    p.open(&Env { test: true, ..Env::default() }, 0.0);
+    assert_eq!((p.listened.today, p.listened.all), (900, 900));
+    assert!(p.tracker.is_open(), "the stretch is still open: only Stop ends it");
+}
+
+#[test]
+fn stop_adds_the_stretch_to_today_this_week_this_month_this_year_and_all_time() {
+    let mut p = page();
+    p.clock = sat(20, 0);
+    click(&mut p, K_PLAY);
+    p.clock = sat(20, 45);
+    p.wrote = 2700.0;
+    click(&mut p, K_PLAY); // the button says Stop now
+    assert!(!p.status().playing);
+    let want = 45 * 60;
+    assert_eq!(p.listened, Totals { today: want, week: want, month: want, year: want, all: want });
+    // a second stretch, the next evening: today restarts, the others add up
+    p.clock = sat(20, 0) + 86_400;
+    click(&mut p, K_PLAY);
+    p.clock += 600;
+    p.wrote += 600.0;
+    click(&mut p, K_PLAY);
+    assert_eq!(p.listened, Totals { today: 600, week: want + 600, month: want + 600, year: want + 600, all: want + 600 });
+}
+
+#[test]
+fn a_sleeping_pc_or_a_missing_output_does_not_count_as_listening() {
+    let mut p = page();
+    p.clock = sat(23, 0);
+    click(&mut p, K_PLAY);
+    // 9 hours of clock (the PC slept), the player wrote 5 minutes
+    p.clock += 9 * 3600;
+    p.wrote = 300.0;
+    click(&mut p, K_PLAY);
+    assert_eq!(p.listened.all, 300);
+}
+
+#[test]
+fn the_time_listened_row_has_the_five_names_in_order_and_builds() {
+    let mut p = page();
+    with_cx(|cx| assert!(!p.build(cx).is_empty()));
+    let t = Totals { today: 90, week: 3700, month: 3700, year: 7200 + 120, all: 133 * 3600 };
+    let words: Vec<String> = [t.today, t.week, t.month, t.year, t.all].into_iter().map(listen::format).collect();
+    assert_eq!(words, ["1m", "1h 01m", "1h 01m", "2h 02m", "133h"]);
+    let line = with_cx(|cx| texts_of(listened_line(cx, t)));
+    assert_eq!(line, ["1m today", "·", "1h 01m this week", "·", "1h 01m this month", "·", "2h 02m this year", "·", "133h in all"]);
+}
+
+/// Picture of the "Time listened" row with some time in it (run: cargo test -p bu-app noise::tests::picture_listened -- --ignored).
+#[test]
+#[ignore]
+fn picture_listened() {
+    let mut p = page();
+    p.listened = Totals { today: 95 * 60, week: 7 * 3600 + 20 * 60, month: 26 * 3600 + 5 * 60, year: 211 * 3600, all: 340 * 3600 };
+    paint_page(&mut p, "noise_listened", false, 600.0);
+}
+
+// ------------------------------------------------------------------ Order 097: Soft tide + the one grey line
+
+fn texts_of(el: El) -> Vec<String> {
+    let g = Gfx::new(1.0);
+    let laid = Laid::new(&g, El::block().w(560.0).child(el), 560.0, None);
+    laid.nodes.iter().filter_map(|n| if let crate::ui::el::Content::Text(t) = &n.el.content { Some(t.s.to_string()) } else { None }).collect()
+}
+
+/// the owner, Oct 10 (pack-noise-v1 option 1): no animation, no frame and no timer unless noise plays AND the tab is on screen.
+#[test]
+fn the_tide_asks_for_nothing_while_nothing_plays() {
+    let mut p = page();
+    assert!(!p.tick(0.0), "nothing plays: no frame");
+    assert_eq!(p.wake_at(0.0), None, "nothing plays: no timer");
+    assert_eq!(p.level, 0.0);
+    let n = with_cx(|cx| p.build(cx).len());
+    click(&mut p, K_PLAY);
+    assert!(p.tick(10.0), "it starts moving");
+    assert!(with_cx(|cx| p.build(cx).len()) == n + 1, "the tide is in the page now");
+}
+
+#[test]
+fn the_tide_moves_about_twenty_times_a_second_and_settles_when_stopped() {
+    let mut p = page();
+    click(&mut p, K_PLAY);
+    let mut frames = 0;
+    let mut t = 0.0;
+    while t < 1000.0 {
+        if p.tick(t) {
+            frames += 1;
+        }
+        t += 4.0; // the loop may ask far more often than it draws
+    }
+    assert!((18..=21).contains(&frames), "{frames} frames in one second");
+    assert!(p.level > 0.5 && p.level <= 1.0, "faded in: {}", p.level);
+    assert_eq!(p.wake_at(1000.0), p.anim_at.map(|a| a + TIDE_MS), "asks again for its next step");
+    // Stop: it fades and ends; then no frame and no timer again
+    click(&mut p, K_PLAY);
+    let mut last = 0.0;
+    for i in 0..400 {
+        t = 1000.0 + i as f64 * 50.0;
+        p.tick(t);
+        last = t;
+        if p.level == 0.0 {
+            break;
+        }
+    }
+    assert_eq!(p.level, 0.0, "it faded away");
+    assert!(!p.tick(last + 100.0));
+    assert_eq!(p.wake_at(last + 100.0), None);
+    assert!(with_cx(|cx| p.build(cx).len()) == with_cx(|cx| page().build(cx).len()), "the tide left the page");
+}
+
+/// The box of big numbers is gone: ONE small line with the five totals.
+#[test]
+fn the_time_listened_is_one_small_line_under_the_card() {
+    let mut p = page();
+    p.listened = Totals { today: 95 * 60, week: 7 * 3600 + 20 * 60, month: 26 * 3600 + 5 * 60, year: 211 * 3600, all: 340 * 3600 };
+    let texts = with_cx(|cx| texts_of(El::col().children(p.build(cx))));
+    assert!(!texts.iter().any(|t| t == "Time listened"), "{texts:?}");
+    assert!(texts.iter().any(|t| t == "1h 35m today") && texts.iter().any(|t| t == "340h in all"), "{texts:?}");
+    assert!(!texts.iter().any(|t| t == "Today" || t == "All time"), "the old boxes are gone: {texts:?}");
+}
+
+/// Picture: the Noise tab in the app's 600 x 520 window (page from y 56) while playing, the tide faded in
+/// (run: cargo test -p bu-app noise::tests::picture_tide -- --ignored). `BU_PIC_OUT` = the folder.
+#[test]
+#[ignore]
+fn picture_tide() {
+    let Ok(dir) = std::env::var("BU_PIC_OUT") else { return };
+    let mut p = page();
+    p.listened = Totals { today: 95 * 60, week: 7 * 3600 + 20 * 60, month: 26 * 3600 + 5 * 60, year: 211 * 3600, all: 340 * 3600 };
+    click(&mut p, K_PLAY);
+    for i in 0..200 {
+        p.tick(i as f64 * 50.0);
+    }
+    let g = Gfx::new(1.0);
+    let icons = Icons::new();
+    let mut st = State::default();
+    let mut cx = Cx::new(10_000.0, false, &g, &mut st);
+    cx.page = "nse";
+    let kids = p.build(&mut cx);
+    let root = El::block().w(WIN_W).pad(2.0, 26.0, 18.0, 26.0).children(kids);
+    let laid = Laid::new(&g, root, WIN_W, None);
+    let Some(mut s) = crate::gfx::new_surface(600, 520) else { return };
+    g.begin(s.canvas());
+    g.fill_rect(0.0, 0.0, 600.0, 520.0, crate::gfx::Rgba::rgb(29, 32, 48));
+    g.end();
+    let base = s.image_snapshot();
+    g.begin(s.canvas());
+    laid.paint(&g, &icons, 0.0, crate::ui::PAGE_TOP, Some(&base));
+    g.end();
+    let px = crate::png::from_surface(&mut s);
+    let _ = std::fs::create_dir_all(&dir);
+    // SAFETY: COM for the WIC encoder on this test thread.
+    let _ = unsafe { windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_MULTITHREADED) };
+    crate::png::save_png(&px, &format!("{dir}/noise_playing.png")).expect("save");
+}
+
+/// Review (Order 097): behind a full-screen game, or with reduced motion, the tide neither draws nor asks for a timer.
+#[test]
+fn the_tide_stands_still_behind_a_game_and_with_reduced_motion() {
+
+    let mut p = page();
+    click(&mut p, K_PLAY);
+    assert!(p.tick(0.0) && p.level > 0.0);
+    T_COVERED.with(|c| c.set(true));
+    assert!(p.tick(100.0), "the tide goes off the page once");
+    assert_eq!((p.level, p.wake_at(100.0)), (0.0, None));
+    assert!(!p.tick(200.0));
+    T_COVERED.with(|c| c.set(false));
+    assert!(p.tick(300.0), "back in front: it starts again");
+    p.rm = true;
+    assert!(p.tick(400.0));
+    assert_eq!((p.level, p.wake_at(400.0)), (0.0, None));
 }

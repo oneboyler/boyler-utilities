@@ -68,10 +68,10 @@ impl Keyboard {
         let have = self.imported();
         let mut rows: Vec<El> = Vec::new();
         let mut shown = 0usize;
-        for (i, p) in g.list.iter().take(MAX_ROWS).enumerate() {
+        for p in g.list.iter().take(MAX_ROWS) {
             if matches(p, &self.get_q) {
                 shown += 1;
-                rows.push(self.get_row(cx, i, p, &g, &have));
+                rows.push(self.get_row(cx, p, &g, &have));
             }
         }
         if rows.is_empty() {
@@ -105,7 +105,9 @@ impl Keyboard {
         Some(dialog::dialog(cx, K_GET, 460.0, "Get more sounds", vec![top, list, foot], vec![], true, self.opened_at))
     }
 
-    fn get_row(&mut self, cx: &mut Cx, i: usize, p: &site::Listed, g: &Gal, have: &[String]) -> El {
+    /// Order 090 (E21): a row's Get / play are keyed by the PACK's id, never its place in the list - a list refreshed while
+    /// the window is open can't make a click act on another pack.
+    fn get_row(&mut self, cx: &mut Cx, p: &site::Listed, g: &Gal, have: &[String]) -> El {
         let installed = g.installed.get(&p.id).filter(|n| self.test || have.contains(n)).cloned();
         let getting = g.getting.as_ref().filter(|(id, _)| *id == p.id).map(|(_, t)| t.clone());
         let size = g.sizes.get(&p.id).map(|s| site::size_text(*s));
@@ -125,7 +127,7 @@ impl Keyboard {
         let play = if hearing {
             El::text("Loading…", Font::new(11.0, 400), FG3(), lh(11.0, 1.35)).none()
         } else {
-            let b = button::icon_btn(cx, idx(K_GPLAY, i), "play", 10.0, 1.0).title("Hear it first");
+            let b = button::play_icon_btn(cx, sub(K_GPLAY, &p.id)).title("Hear it first");
             if busy_other || g.previewing.is_some() {
                 b.opacity(0.4).no_hit()
             } else {
@@ -140,7 +142,7 @@ impl Keyboard {
         } else if installed.is_some() {
             El::text("Installed", Font::new(11.5, 600), FG2(), lh(11.5, 1.35)).none()
         } else {
-            button::cbtn(cx, idx(K_GROW, i), "Get", BKind::Ghost, true, busy_other, 0.0)
+            button::cbtn(cx, sub(K_GROW, &p.id), "Get", BKind::Ghost, true, busy_other, 0.0)
         };
         El::row().center().gap(8.0).min_h(40.0).pad(5.0, 10.0, 5.0, 12.0).child(left).child(play).child(right)
     }
@@ -161,27 +163,18 @@ impl Keyboard {
         if k == K_GSEARCH {
             return true;
         }
-        for i in 0..MAX_ROWS {
-            if k == idx(K_GROW, i) {
-                let g = gallery::snapshot();
-                if g.getting.is_some() {
-                    return true;
-                }
-                if let Some(p) = g.list.get(i).cloned() {
-                    self.start_get(p, cx);
-                }
-                return true;
+        let g = gallery::snapshot();
+        if let Some(p) = g.list.iter().find(|p| k == sub(K_GROW, &p.id)).cloned() {
+            if g.getting.is_none() {
+                self.start_get(p, cx);
             }
-            if k == idx(K_GPLAY, i) {
-                let g = gallery::snapshot();
-                if g.getting.is_some() || g.previewing.is_some() {
-                    return true;
-                }
-                if let Some(p) = g.list.get(i).cloned() {
-                    self.start_preview(p, cx);
-                }
-                return true;
+            return true;
+        }
+        if let Some(p) = g.list.iter().find(|p| k == sub(K_GPLAY, &p.id)).cloned() {
+            if g.getting.is_none() && g.previewing.is_none() {
+                self.start_preview(p, cx);
             }
+            return true;
         }
         false
     }

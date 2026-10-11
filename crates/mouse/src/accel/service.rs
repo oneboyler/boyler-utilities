@@ -203,6 +203,27 @@ impl<O: MouseOs> Mouse<O> {
         Ok(true)
     }
 
+    /// Order 090 (E19): a NEW card (nothing saved, no presets yet) starts from the user's own Raw Accel curve. What the
+    /// driver runs now wins ([`Mouse::mirror_rawaccel`]: preset "Raw Accel", switch on - nothing is written). When the driver
+    /// runs no curve (Raw Accel's settings are only in its settings.json, e.g. after a restart) the card's values start
+    /// from that curve instead - exactly "Copy its curve" - and the card stays off, so the driver is not touched.
+    pub fn start_from_rawaccel(&mut self) -> Result<bool> {
+        if self.mirror_rawaccel()? {
+            return Ok(true);
+        }
+        if !self.accel.panel.presets.is_empty() {
+            return Ok(false);
+        }
+        let Some(cfg) = self.rawaccel_settings()? else { return Ok(false) };
+        let Some(p) = cfg.profiles.first() else { return Ok(false) };
+        let Some((c, v)) = from_args(&p.accel_x) else { return Ok(false) };
+        let panel = &mut self.accel.panel;
+        panel.curve = c;
+        panel.values.insert(c, v);
+        panel.sens = p.output_dpi / super::args::NORMALIZED_DPI;
+        Ok(true)
+    }
+
     /// "Copy its curve": Raw Accel's own settings.json (profile 0) into the card — any curve (a look-up table can't be
     /// shown: error). Returns the toast.
     pub fn copy_its_curve(&mut self) -> Result<String> {

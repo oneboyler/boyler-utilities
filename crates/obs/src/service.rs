@@ -17,6 +17,7 @@ use crate::ws::{WsClient, WsEvent};
 /// What the engine shows / asks of the app (implemented by the app: popups, the page, the keys manager).
 pub trait Ui: Send {
     fn popup(&mut self, m: &PopMsg, clipped: Option<usize>);
+    fn retract_clip_failed(&mut self) {}
     fn publish(&mut self, v: &View);
     fn dialog(&mut self, text: &str);
     fn keys(&mut self, k: &KeysView);
@@ -66,6 +67,9 @@ impl Host for H {
     }
     fn popup(&mut self, m: &PopMsg, clipped: Option<usize>) {
         self.ui.popup(m, clipped);
+    }
+    fn retract_clip_failed(&mut self) {
+        self.ui.retract_clip_failed();
     }
     fn sound(&mut self, ev: Sound, set: &Settings) {
         if let Some((w, _)) = sound::build(set, ev, self.exe_dir.as_deref()) {

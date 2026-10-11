@@ -1,5 +1,17 @@
 # Boyler Utilities — What's new
 
+## 1.0.6 (2026-10-10)
+- Keyboard tab: the keyboard comes first; a folding Keyboard sounds card. Click any key: what it does (Normal / Remap / Action / Macro with real steps - key down, key up, press, type, wait, click, open) and its Sound - the pack's sound on or off for that key plus your own sound on top (press / release file, pitch, loudness).
+- Pick many keys at once (drag a box, Ctrl, Shift) and give them one sound: pitch and loudness Same or Random, while Space, Enter, Shift, Ctrl and the other big keys keep their own deeper shape.
+- "Make a pack from one sound": one file becomes a whole pack. Ignore repeats now goes up to 400 ms. Keyboards the app knows pick their size (Full / TKL / 75 % / 60 %) by themselves.
+- Mouse tab: your mouse drawn on the left - click any button to give it an action, a macro or a sound; DPI 400 / 800 / 1600 / Custom (type your own). Keyboards with a mouse function (like Wooting) no longer show up as mice.
+- Mouse acceleration: a new card starts from your Raw Accel curve, and the sliders cover Raw Accel's full range.
+- Controller tab: macros on any button (written into the game's Steam layout, so they work in games), a sound per button, Button sounds in Controller settings; the light colour really reaches the pad (Restart Steam to apply).
+- Audio: click the Output speaker to mute the PC. The mic-mute sound's Volume sits right under its switch.
+- Notifications for OBS: no more false "can't save" before a slow clip saves; the tray icon shows which monitor OBS records.
+- Noise: soft waves while it plays and a quiet line of how long you listened (today, week, month, year, all time).
+- A broken sound pack can no longer crash the app.
+
 ## 1.0.5 (2026-10-09)
 - The menu no longer blinks: switching between the GPU and CPU drawing path kept the window, glass included, instead of rebuilding it empty. Hidden Windows windows (emoji panel, clipboard) no longer count as a game in front.
 - Keyboard tab: the sound you pick stays picked (a finished download no longer takes it back). New "Play on": press + release, press only or release only, for keys and mouse.

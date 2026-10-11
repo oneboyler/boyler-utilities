@@ -11,14 +11,29 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use windows::core::{w, PCWSTR};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    MapVirtualKeyW, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, MAPVK_VK_TO_VSC,
-    VIRTUAL_KEY,
+    MapVirtualKeyW, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYBD_EVENT_FLAGS, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE,
+    MAPVK_VK_TO_VSC, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP,
+    MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, MOUSEINPUT, MOUSE_EVENT_FLAGS, VIRTUAL_KEY,
 };
 use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 
 static RUNNING: AtomicBool = AtomicBool::new(false);
 static CANCEL: AtomicBool = AtomicBool::new(false);
+/// When this app last sent a mouse button (ms since the first send, 0 = never) - Order 090: a mouse button's job must not be
+/// set off by a click the app itself sent (two buttons that "also press" each other would click for ever).
+static LAST_CLICK_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn clock_ms() -> u64 {
+    static T0: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    T0.get_or_init(Instant::now).elapsed().as_millis() as u64 + 1
+}
+
+/// Did this app send a mouse button within the last `ms`?
+pub fn sent_click_within(ms: u64) -> bool {
+    let at = LAST_CLICK_MS.load(Ordering::SeqCst);
+    at != 0 && clock_ms().saturating_sub(at) <= ms
+}
 static LAST: Mutex<Option<String>> = Mutex::new(None);
 
 const VK_MEDIA_NEXT_TRACK: u16 = 0xB0;
@@ -58,6 +73,25 @@ fn send_key(vk: u16, down: bool) {
     send(kbd(vk, scan, f));
 }
 
+/// A mouse button (Click step, Order 090) at the cursor where it is: 0 left, 1 right, 2 wheel, 3 back, 4 forward.
+fn send_mouse(button: u8, down: bool) {
+    LAST_CLICK_MS.store(clock_ms(), Ordering::SeqCst);
+    let (flags, data): (MOUSE_EVENT_FLAGS, u32) = match (button, down) {
+        (0, true) => (MOUSEEVENTF_LEFTDOWN, 0),
+        (0, false) => (MOUSEEVENTF_LEFTUP, 0),
+        (1, true) => (MOUSEEVENTF_RIGHTDOWN, 0),
+        (1, false) => (MOUSEEVENTF_RIGHTUP, 0),
+        (2, true) => (MOUSEEVENTF_MIDDLEDOWN, 0),
+        (2, false) => (MOUSEEVENTF_MIDDLEUP, 0),
+        (3, true) => (MOUSEEVENTF_XDOWN, 1),
+        (3, false) => (MOUSEEVENTF_XUP, 1),
+        (4, true) => (MOUSEEVENTF_XDOWN, 2),
+        (4, false) => (MOUSEEVENTF_XUP, 2),
+        _ => return,
+    };
+    send(INPUT { r#type: INPUT_MOUSE, Anonymous: INPUT_0 { mi: MOUSEINPUT { dx: 0, dy: 0, mouseData: data, dwFlags: flags, time: 0, dwExtraInfo: 0 } } });
+}
+
 fn send_unit(unit: u16, down: bool) {
     let mut f = KEYEVENTF_UNICODE;
     if !down {
@@ -82,6 +116,9 @@ struct SendOut;
 impl Out for SendOut {
     fn key(&mut self, vk: u16, down: bool) {
         send_key(vk, down);
+    }
+    fn mouse(&mut self, button: u8, down: bool) {
+        send_mouse(button, down);
     }
     fn unit(&mut self, unit: u16, down: bool) {
         send_unit(unit, down);
@@ -129,8 +166,21 @@ pub fn run_macro(m: &Macro) -> Result<(), String> {
     }
     CANCEL.store(false, Ordering::SeqCst);
     let events = plan(m);
+    let times = m.rep.times();
+    // a macro of instant steps repeated until stopped gets a breath between rounds (never a busy loop)
+    let breath = !events.iter().any(|e| matches!(e, crate::macros::Ev::Sleep(ms) if *ms >= 15));
     let spawned = std::thread::Builder::new().name("bu-macro".into()).spawn(move || {
-        let out = run(&events, &mut SendOut, &mut WinSafety { at: None, cached: None }, &CANCEL);
+        let mut round = 0u32;
+        let out = loop {
+            let out = run(&events, &mut SendOut, &mut WinSafety { at: None, cached: None }, &CANCEL);
+            round += 1;
+            if out != Outcome::Done || CANCEL.load(Ordering::SeqCst) || times.is_some_and(|t| round >= t) {
+                break out;
+            }
+            if breath {
+                std::thread::sleep(Duration::from_millis(15));
+            }
+        };
         set_last(match out {
             Outcome::Done => "done".to_string(),
             Outcome::Stopped(why) => format!("stopped: {why}"),
@@ -142,6 +192,24 @@ pub fn run_macro(m: &Macro) -> Result<(), String> {
         return Err("Windows couldn't start the macro".into());
     }
     Ok(())
+}
+
+/// A key / button that carries macro `m` went down (`down`) or up: Once / N times run on the press; "While the key is held"
+/// runs from the press until the release; "Until pressed again" starts on one press and stops on the next.
+pub fn press_macro(m: &Macro, down: bool) -> Result<(), String> {
+    use crate::macros::Repeat;
+    match (m.rep, down) {
+        (Repeat::Held, false) => {
+            cancel_macro();
+            Ok(())
+        }
+        (Repeat::Toggle, true) if macro_running() => {
+            cancel_macro();
+            Ok(())
+        }
+        (_, true) => run_macro(m),
+        _ => Ok(()),
+    }
 }
 
 /// Stops a running macro (it lets go of any key it holds).

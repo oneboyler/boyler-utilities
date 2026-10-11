@@ -14,6 +14,8 @@ mod hist;
 mod look;
 mod panel;
 mod pic;
+mod mac;
+mod snd;
 mod work;
 
 use std::cell::{Cell, RefCell};
@@ -70,6 +72,8 @@ const K_TOAST: Key = key("pad.toast");
 /// the "Please launch Steam" glass (it takes every click under it) and its button
 const K_GATE: Key = key("pad.gate");
 const K_LAUNCH: Key = key("pad.launch");
+/// "Restart Steam to apply" (Order 085): `.ask` / `.go` / `.no`
+const K_RESTART: Key = key("pad.restart");
 /// "Launch Steam" waits this long for Steam before it can be clicked again
 const LAUNCH_WAIT_MS: f64 = 20000.0;
 /// every panel / popup control: sub(K_C, "<id>")
@@ -177,6 +181,20 @@ enum Drift {
     Run { side: Side, at: f64, max: f32 },
     Done { side: Side, max: f32, dz: f64 },
 }
+
+/// "Restart Steam to apply" (Order 085, the owner Oct 10: "changing color of led in my app doesn't change the controllers real color"):
+/// Steam keeps the controller's preferences in memory while it runs, so a new light colour / brightness reaches the pad only
+/// after Steam restarts. The link asks first, then Steam is closed cleanly and started again minimised.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Rs {
+    Idle,
+    Ask,
+    Busy,
+}
+
+/// The light colour / brightness was changed by the app and Steam has not been restarted since (a `bool` in the app's `Keep`, so
+/// the link is still there when the tab is opened again).
+const LIGHT_PENDING: &str = "pad.light_pending";
 
 /// How long the stick is watched.
 const DRIFT_MS: f64 = 5000.0;
@@ -331,6 +349,11 @@ struct Open {
     fake: bool,
     frozen: bool,
     test: bool,
+    /// Order 090: the button windows' Sound part + "Button sounds" in Controller settings
+    snd: snd::PadSounds,
+    /// Order 090: a button's macro (Steam plays it): its steps editor and the macro being edited (button, steps)
+    pmed: crate::pages::btnwin::MacroEd,
+    pad_mac: Option<(ButtonId, bu_keysound::macros::Macro)>,
     /// the change log (Order 036): this event's changes on the PC (item, label, before, after), written by `event`
     rec_q: Vec<(String, String, crate::undo::Val, crate::undo::Val)>,
     /// the tab's undo / redo (Order 042 item 9), kept in `keep` while the tab is closed
@@ -346,6 +369,8 @@ struct Open {
     steam_up: bool,
     /// "Launch Steam" was clicked (its button waits for Steam)
     launch_at: Option<f64>,
+    /// "Restart Steam to apply" (the light colour): asked / running (Order 085)
+    rs: Rs,
     drift: Option<Drift>,
     /// the drift bar's share 0..1, read by the bar when it is painted
     drift_share: Rc<Cell<f32>>,
@@ -567,10 +592,14 @@ impl Open {
             steam_watch: None,
             steam_up: true,
             launch_at: None,
+            rs: Rs::Idle,
             drift: None,
             drift_share: Rc::new(Cell::new(0.0)),
             drift_secs: 0,
             drift_at: f64::NEG_INFINITY,
+            snd: snd::PadSounds::default(),
+            pmed: Default::default(),
+            pad_mac: None,
         };
         // the last opening's state at once; the worker's answer fills in
         if let Some(s) = env.keep.get::<Snap>(SNAP) {
@@ -749,6 +778,18 @@ impl Open {
                     self.say(t, now);
                 }
             }
+            work::Done::Restarted(r) => {
+                self.rs = Rs::Idle;
+                match r {
+                    Ok(t) => {
+                        self.keep.put(LIGHT_PENDING, false);
+                        // Steam is on its way up: the glass says so until the watch sees it
+                        self.launch_at = Some(now);
+                        self.say(t, now);
+                    }
+                    Err(e) => self.say(e, now),
+                }
+            }
         }
     }
 
@@ -758,6 +799,10 @@ impl Open {
             return; // read for a controller type no longer shown (a newer read is on its way)
         }
         self.games = l.games;
+        if (l.gi, l.set) != (self.gi, self.set) {
+            // another game / action set: the macro being edited is no longer this one's (Order 090)
+            self.pad_mac = None;
+        }
         // installed games first, the order Steam's index has them otherwise; the picked one kept
         self.gi = l.gi;
         self.set = l.set;
@@ -990,6 +1035,9 @@ impl Open {
             self.say("Steam has no settings file for this controller yet", now);
             return;
         };
+        if vals.iter().any(|(s, _)| matches!(s, PrefSetting::LedRed | PrefSetting::LedGreen | PrefSetting::LedBlue | PrefSetting::LedBrightness)) {
+            self.keep.put(LIGHT_PENDING, true);
+        }
         let serial = before.serial.clone();
         let after = After::Prefs { before, label: label.to_string(), acting: self.acting.take() };
         self.local_prefs(&serial, vals);
@@ -1120,6 +1168,11 @@ impl Open {
     fn pick(&mut self, id: Option<Pid>, now: f64) {
         let was = self.sel;
         self.pop = None;
+        self.snd.reset_window();
+        if id != was {
+            self.pmed.reset();
+            self.pad_mac = None;
+        }
         if id == Some(Pid::Light) {
             // A_015_02: the light bar's colour is per controller = the Controller settings popup (only while it is plugged in)
             if self.connected().is_some() {
@@ -1449,7 +1502,9 @@ impl Page for Controller {
     }
     fn popup_dismiss(&mut self) {
         if let Some(o) = self.o.as_mut() {
-            if o.pop.is_some() {
+            if o.snd.dismiss() || o.macro_dismiss() {
+                // (an open list of the sounds closes first)
+            } else if o.pop.is_some() {
                 o.pop = None;
             } else if o.dlg.is_some() {
                 o.dlg = None;
@@ -1620,7 +1675,13 @@ impl Open {
             cx.record(&i, &l, &old, &new);
         }
         let head = self.header(cx);
-        let rest = vec![self.pdq(cx), self.body(cx), reset::reset_line(cx, K_RESET, Some("Steam\u{2019}s layout"))];
+        // Order 090 (v8, the owner: "move this thing up so you dont have to scroll"): the reset line sits right under "Controller
+        // settings · Open in Steam" - in the empty arch between the grips - not under the whole picture
+        let s = BIG_W / pic::PIC_W;
+        let st = foot_stack(s, self.pic.h, self.kind.has_gyro());
+        let lift = BIG_W * self.pic.h / pic::PIC_W - (st.links + 16.0);
+        let reset = reset::reset_line(cx, K_RESET, Some("Steam\u{2019}s layout")).margin(6.0 - lift, 0.0, 2.0, 0.0).z(2);
+        let rest = vec![self.pdq(cx), self.body(cx), reset];
         if self.steam_up {
             let mut v = vec![head];
             v.extend(rest);
@@ -1633,9 +1694,15 @@ impl Open {
     /// "Please launch Steam" (Order 042 item 5b): a glass over the controller area that takes every click under it, with
     /// the app's popup-window card in its middle; it goes away by itself when Steam runs (`steam_tick`).
     fn steam_gate(&mut self, cx: &mut Cx) -> El {
-        let waiting = self.launch_at.is_some_and(|a| cx.now - a < LAUNCH_WAIT_MS);
-        let title = El::text("Please launch Steam", Font::display(15.0, 600).ls(-150), FG(), 20.0).none();
-        let text = El::text("The controller settings are Steam\u{2019}s own: they can be changed while Steam runs.", Font::new(12.0, 400), FG2(), 16.0)
+        let restarting = self.rs == Rs::Busy;
+        let waiting = restarting || self.launch_at.is_some_and(|a| cx.now - a < LAUNCH_WAIT_MS);
+        let title = El::text(if restarting { "Restarting Steam" } else { "Please launch Steam" }, Font::display(15.0, 600).ls(-150), FG(), 20.0).none();
+        let words = if restarting {
+            "Steam closes for a few seconds and starts again in the tray, then it sets the light."
+        } else {
+            "The controller settings are Steam\u{2019}s own: they can be changed while Steam runs."
+        };
+        let text = El::text(words, Font::new(12.0, 400), FG2(), 16.0)
             .wrapping()
             .align(crate::gfx::Align::Center)
             .margin(6.0, 0.0, 16.0, 0.0);
@@ -1960,6 +2027,11 @@ impl Open {
             kids.push(line.opacity(h_e).translate(0.0, 6.0 * (1.0 - h_e)));
         }
         kids.push(self.panel_body(cx, id).opacity(b_e).translate(0.0, 6.0 * (1.0 - b_e)));
+        // Order 090: the button's Sound part (the pack's sound + your sound on top)
+        if let Some(slot) = snd::slot_of(id) {
+            let t = self.fake || self.test;
+            kids.extend(self.snd.part(cx, slot, t).into_iter().map(|e| e.opacity(b_e)));
+        }
         // `.mdb{min-height:0;overflow-y:auto}` with the inner popups' slim glass thumb
         let body = cx.scroll_box(K_PANEL, kids).items(AlignItems::STRETCH).min_h(0.0).slim_thumb(crate::ui::el::SlimThumb::GLASS).style(|s| s.flex_shrink = 1.0);
         dialog::dialog(cx, K_PANEL, PANEL_W, &self.pname(id), vec![body], vec![], true, self.part_at)
@@ -1997,6 +2069,14 @@ impl Open {
             if matches!(ev, Ev::Click(k) if *k == K_LAUNCH) {
                 self.launch_steam(now);
             }
+            return;
+        }
+        // Order 090: the sounds' parts (a button window's Sound part, Controller settings' Button sounds) first
+        if self.macro_event(ev, cx) {
+            return;
+        }
+        let slot = self.sel.and_then(snd::slot_of);
+        if self.snd.event(ev, cx, slot, self.dlg.is_some()) {
             return;
         }
         match ev {
@@ -2152,6 +2232,15 @@ impl Open {
                 return;
             }
             K_OPENSTEAM => return self.open_in_steam(now),
+            _ if k == sub(K_RESTART, "ask") => {
+                self.rs = Rs::Ask;
+                return;
+            }
+            _ if k == sub(K_RESTART, "no") => {
+                self.rs = Rs::Idle;
+                return;
+            }
+            _ if k == sub(K_RESTART, "go") => return self.restart_steam(now),
             K_STEAMSET => return self.part_to_steam(now),
             _ => {}
         }
@@ -2224,6 +2313,21 @@ impl Open {
 
     /// "Open in Steam": the link (Steam's process list) and the shell's open on the worker (Order 047); its words come
     /// with the answer.
+    /// "Restart Steam to apply" (the asked-for click): on the worker; a test copy restarts nothing.
+    fn restart_steam(&mut self, now: f64) {
+        let Some(serial) = self.pref().map(|p| p.serial.clone()) else {
+            self.rs = Rs::Idle;
+            return;
+        };
+        if self.test && !self.fake {
+            self.rs = Rs::Idle;
+            self.say("Restarts Steam (a test copy restarts nothing)", now);
+            return;
+        }
+        self.rs = Rs::Busy;
+        self.send(Job::RestartSteam { serial });
+    }
+
     fn open_in_steam(&mut self, _now: f64) {
         let Some(g) = self.game().cloned() else { return };
         let test = self.test;
@@ -2252,6 +2356,11 @@ impl Open {
         }
         if let Some(at) = self.dlg {
             over.push(self.settings_dialog(cx, at));
+        }
+        let slot = self.sel.and_then(snd::slot_of);
+        over.extend(self.snd.popup(cx, slot));
+        if let Some(m) = self.macro_popup(cx) {
+            over.push(m.z(12));
         }
         if let Some(p) = self.pop.clone() {
             if let Some(e) = self.pop_el(cx, &p) {
@@ -2445,7 +2554,7 @@ impl Open {
     }
 
     // ---- the "does" popup (`.menu.padm`): search on top, sections below
-    fn act_items(&self, q: &str) -> Vec<(Option<&'static str>, Action)> {
+    fn act_items(&self, at: Key, q: &str) -> Vec<(Option<&'static str>, Action)> {
         let s = q.trim().to_lowercase();
         let mut out = Vec::new();
         if s.is_empty() {
@@ -2461,6 +2570,8 @@ impl Open {
                 }
             }
         }
+        // Order 090 (v8): a button's Does can run a macro (Steam plays it)
+        out.extend(self.macro_items(at, q));
         out
     }
 
@@ -2469,7 +2580,7 @@ impl Open {
             Some(Ctl::Act { cur, .. }) => cur.clone(),
             _ => Action::Nothing,
         };
-        let items = self.act_items(q);
+        let items = self.act_items(at, q);
         let xb = self.xbox();
         let mut rows: Vec<(f32, El)> = Vec::new();
         let mut cur_y = None;
@@ -2496,7 +2607,7 @@ impl Open {
                     // .mitem .pg2{width:16px;height:16px} .mitem:hover .pg2{color:#fff}
                     r.child(look::pg2(pad_glyph(*b).unwrap_or(""), 16.0, if hv { WHITE } else { FG2() })).child(El::text(a.label(false), Font::new(13.0, 400), col, lh(13.0, 1.35)))
                 }
-                _ => r.child(El::text(a.label(xb), Font::new(13.0, 400), col, lh(13.0, 1.35))),
+                _ => r.child(El::text(self.act_text(a, xb), Font::new(13.0, 400), col, lh(13.0, 1.35))),
             };
             // .mitem:hover{background:var(--acc)} .mitem.kb{background:var(--hov)}
             if hv {
@@ -2554,7 +2665,7 @@ impl Open {
         if k == K_ASRCH || k == sub(K_ACT, "box") {
             return true;
         }
-        let items = self.act_items(&q);
+        let items = self.act_items(at, &q);
         let Some(i) = (0..items.len()).find(|i| idx(K_ACT, *i) == k) else { return false };
         self.choose_act(at, items[i].1.clone(), cx.now);
         cx.focus(None);
@@ -2563,6 +2674,18 @@ impl Open {
 
     fn choose_act(&mut self, at: Key, a: Action, now: f64) {
         self.pop = None;
+        if let Some(id) = mac::item_id(&a).map(str::to_string) {
+            if let Some(Ctl::Act { w: AW::Btn(b, _), .. }) = self.ctl.get(&at).cloned() {
+                self.choose_macro(b, &id, now);
+            }
+            return;
+        }
+        if let Some(Ctl::Act { w: AW::Btn(b, Press::Full), .. }) = self.ctl.get(&at) {
+            // a plain action ends the macro (the layout loses its extra commands with it)
+            if self.pad_mac.as_ref().is_some_and(|(pb, _)| pb == b) {
+                self.pad_mac = None;
+            }
+        }
         if let Some(Ctl::Act { cur, w, .. }) = self.ctl.get(&at).cloned() {
             if cur != a {
                 self.acting = self.rows.get(&at).cloned();
@@ -2577,14 +2700,14 @@ impl Open {
         const ENTER: u16 = 0x0D;
         const UP: u16 = 0x26;
         const DOWN: u16 = 0x28;
-        let n = self.act_items(&q).len();
+        let n = self.act_items(at, &q).len();
         match vk {
             ESC => {
                 self.pop = None;
                 cx.focus(None);
             }
             ENTER => {
-                if let Some((_, a)) = self.act_items(&q).get(ki).cloned() {
+                if let Some((_, a)) = self.act_items(at, &q).get(ki).cloned() {
                     self.choose_act(at, a, cx.now);
                     cx.focus(None);
                 }
@@ -2610,7 +2733,10 @@ impl Open {
             .margin(0.0, 0.0, 12.0, 0.0);
         let rows = panel::prefs_rows(self, cx);
         let grp = pieces::group::grp(vec![El::col().items(AlignItems::STRETCH).children(rows)]).pad(2.0, 12.0, 6.0, 12.0);
-        dialog::dialog(cx, K_DLG, DLG_W, "Controller settings", vec![why, grp], vec![], true, at)
+        // Order 090 (v8): Button sounds live here, under the controller's own rows
+        let t = self.fake || self.test;
+        let bs = self.snd.settings_rows(cx, t);
+        dialog::dialog(cx, K_DLG, DLG_W, "Controller settings", vec![why, grp, bs], vec![], true, at)
     }
 
     // ============================================================================================ registry helpers (panel.rs)

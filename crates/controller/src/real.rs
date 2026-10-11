@@ -4,7 +4,8 @@
 //!   (`…\ActiveProcess\ActiveUser`), plain file reads, and writes that are ALWAYS limited to allowed folders (Steam's
 //!   `Steam Controller Configs` + the app's backup folder; a scratch folder in tests; nothing at all when read-only).
 //!   A write goes to a temp file next to the target and is renamed over it, so Steam never reads half a file.
-//!   `steam_running` only looks at the process list — the app never starts, closes or restarts Steam.
+//!   `steam_running` only looks at the process list. Steam is closed / started only by the "Restart Steam to apply" click
+//!   (`steam.exe -shutdown` / `-silent`, real mode only; never in read-only or scratch copies).
 //! - [`RealPads`]: PlayStation pads through HID (SetupDi + HidD, the device opened for READING only — never an output or
 //!   feature report), Xbox pads through XInput. Live: PlayStation = an overlapped `ReadFile` that wakes on each input
 //!   report or on the stop event (no timer); Xbox = XInput has no events, so it is polled every 8 ms ONLY while the live
@@ -180,6 +181,36 @@ impl SteamOs for RealSteam {
     }
     fn steam_running(&self) -> bool {
         process_running("steam.exe")
+    }
+    fn game_running(&self) -> bool {
+        reg_dword(HKEY_CURRENT_USER, r"Software\Valve\Steam", "RunningAppID").is_some_and(|id| id != 0)
+    }
+    fn steam_shutdown(&self) -> Result<()> {
+        self.run_steam("-shutdown")
+    }
+    fn steam_start_minimised(&self) -> Result<()> {
+        self.run_steam("-silent")
+    }
+}
+
+impl RealSteam {
+    /// `steam.exe <arg>` from Steam's own folder; only in the app's real mode (a scratch / read-only copy never starts or
+    /// closes the PC's Steam).
+    fn run_steam(&self, arg: &str) -> Result<()> {
+        use std::os::windows::process::CommandExt;
+        if self.steam_dir.is_some() || self.write_roots.is_empty() {
+            return Err(Error::ReadOnly(format!("steam.exe {arg}")));
+        }
+        let dir = Self::registry_steam_dir().ok_or(Error::NoSteam)?;
+        let exe = dir.join("steam.exe");
+        // CREATE_NO_WINDOW | DETACHED_PROCESS: nothing flashes, and Steam outlives the app
+        std::process::Command::new(&exe)
+            .arg(arg)
+            .current_dir(&dir)
+            .creation_flags(0x0800_0000 | 0x0000_0008)
+            .spawn()
+            .map(|_| ())
+            .map_err(|e| Error::io(format!("steam.exe {arg}"), e))
     }
 }
 
