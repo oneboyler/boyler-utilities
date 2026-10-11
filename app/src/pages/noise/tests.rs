@@ -134,7 +134,7 @@ fn the_page_asks_to_be_woken_only_while_a_timer_counts() {
     assert_eq!(p.wake_at(1000.0), None, "nothing playing: no wake-ups, no frames");
     click(&mut p, K_PLAY);
     assert_eq!(sleep_wake(&p.status(), 1000.0), None, "playing without a timer: the sleep line changes by nothing");
-    assert_eq!(p.wake_at(1000.0), Some(1000.0), "...but the tide asks for its first frame");
+    assert_eq!(p.wake_at(1000.0), None, "...and no frames either");
     click(&mut p, idx(K_SLEEP, 1));
     let at = sleep_wake(&p.status(), 1000.0).unwrap();
     assert!(p.wake_at(1000.0).unwrap() <= at);
@@ -144,7 +144,6 @@ fn the_page_asks_to_be_woken_only_while_a_timer_counts() {
     with_cx(|cx| {
         p.build(cx);
     });
-    p.tick(1000.0); // (the tide's first frame)
     assert!(!p.tick(1000.0));
     p.fake.sleep_left = Some(14 * 60);
     assert!(p.tick(1000.0), "the minute changed: repaint");
@@ -673,7 +672,7 @@ fn picture_listened() {
     paint_page(&mut p, "noise_listened", false, 600.0);
 }
 
-// ------------------------------------------------------------------ Order 097: Soft tide + the one grey line
+// ------------------------------------------------------------------ Order 097/099: the one grey line, no waves
 
 fn texts_of(el: El) -> Vec<String> {
     let g = Gfx::new(1.0);
@@ -681,49 +680,21 @@ fn texts_of(el: El) -> Vec<String> {
     laid.nodes.iter().filter_map(|n| if let crate::ui::el::Content::Text(t) = &n.el.content { Some(t.s.to_string()) } else { None }).collect()
 }
 
-/// the owner, Oct 10 (pack-noise-v1 option 1): no animation, no frame and no timer unless noise plays AND the tab is on screen.
+/// Order 099 (the owner: "just fuck the wave bro"): the waves are gone - noise playing on the open Noise tab asks for no frame and no
+/// timer, and the page holds nothing but its cards and the one grey line.
 #[test]
-fn the_tide_asks_for_nothing_while_nothing_plays() {
+fn noise_playing_means_no_redraw_at_all() {
     let mut p = page();
-    assert!(!p.tick(0.0), "nothing plays: no frame");
-    assert_eq!(p.wake_at(0.0), None, "nothing plays: no timer");
-    assert_eq!(p.level, 0.0);
     let n = with_cx(|cx| p.build(cx).len());
     click(&mut p, K_PLAY);
-    assert!(p.tick(10.0), "it starts moving");
-    assert!(with_cx(|cx| p.build(cx).len()) == n + 1, "the tide is in the page now");
-}
-
-#[test]
-fn the_tide_moves_about_twenty_times_a_second_and_settles_when_stopped() {
-    let mut p = page();
-    click(&mut p, K_PLAY);
-    let mut frames = 0;
+    assert!(p.status().playing);
     let mut t = 0.0;
-    while t < 1000.0 {
-        if p.tick(t) {
-            frames += 1;
-        }
-        t += 4.0; // the loop may ask far more often than it draws
+    while t < 2000.0 {
+        assert!(!p.tick(t), "no redraw while noise plays (t={t})");
+        t += 50.0;
     }
-    assert!((18..=21).contains(&frames), "{frames} frames in one second");
-    assert!(p.level > 0.5 && p.level <= 1.0, "faded in: {}", p.level);
-    assert_eq!(p.wake_at(1000.0), p.anim_at.map(|a| a + TIDE_MS), "asks again for its next step");
-    // Stop: it fades and ends; then no frame and no timer again
-    click(&mut p, K_PLAY);
-    let mut last = 0.0;
-    for i in 0..400 {
-        t = 1000.0 + i as f64 * 50.0;
-        p.tick(t);
-        last = t;
-        if p.level == 0.0 {
-            break;
-        }
-    }
-    assert_eq!(p.level, 0.0, "it faded away");
-    assert!(!p.tick(last + 100.0));
-    assert_eq!(p.wake_at(last + 100.0), None);
-    assert!(with_cx(|cx| p.build(cx).len()) == with_cx(|cx| page().build(cx).len()), "the tide left the page");
+    assert_eq!(p.wake_at(2000.0), None, "no timer while noise plays");
+    assert_eq!(with_cx(|cx| p.build(cx).len()), n, "nothing painted under the cards");
 }
 
 /// The box of big numbers is gone: ONE small line with the five totals.
@@ -737,18 +708,15 @@ fn the_time_listened_is_one_small_line_under_the_card() {
     assert!(!texts.iter().any(|t| t == "Today" || t == "All time"), "the old boxes are gone: {texts:?}");
 }
 
-/// Picture: the Noise tab in the app's 600 x 520 window (page from y 56) while playing, the tide faded in
-/// (run: cargo test -p bu-app noise::tests::picture_tide -- --ignored). `BU_PIC_OUT` = the folder.
+/// Picture: the Noise tab in the app's 600 x 520 window (page from y 56) while playing (no waves)
+/// (run: cargo test -p bu-app noise::tests::picture_noise -- --ignored). `BU_PIC_OUT` = the folder.
 #[test]
 #[ignore]
-fn picture_tide() {
+fn picture_noise() {
     let Ok(dir) = std::env::var("BU_PIC_OUT") else { return };
     let mut p = page();
     p.listened = Totals { today: 95 * 60, week: 7 * 3600 + 20 * 60, month: 26 * 3600 + 5 * 60, year: 211 * 3600, all: 340 * 3600 };
     click(&mut p, K_PLAY);
-    for i in 0..200 {
-        p.tick(i as f64 * 50.0);
-    }
     let g = Gfx::new(1.0);
     let icons = Icons::new();
     let mut st = State::default();
@@ -770,22 +738,4 @@ fn picture_tide() {
     // SAFETY: COM for the WIC encoder on this test thread.
     let _ = unsafe { windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_MULTITHREADED) };
     crate::png::save_png(&px, &format!("{dir}/noise_playing.png")).expect("save");
-}
-
-/// Review (Order 097): behind a full-screen game, or with reduced motion, the tide neither draws nor asks for a timer.
-#[test]
-fn the_tide_stands_still_behind_a_game_and_with_reduced_motion() {
-
-    let mut p = page();
-    click(&mut p, K_PLAY);
-    assert!(p.tick(0.0) && p.level > 0.0);
-    T_COVERED.with(|c| c.set(true));
-    assert!(p.tick(100.0), "the tide goes off the page once");
-    assert_eq!((p.level, p.wake_at(100.0)), (0.0, None));
-    assert!(!p.tick(200.0));
-    T_COVERED.with(|c| c.set(false));
-    assert!(p.tick(300.0), "back in front: it starts again");
-    p.rm = true;
-    assert!(p.tick(400.0));
-    assert_eq!((p.level, p.wake_at(400.0)), (0.0, None));
 }

@@ -25,7 +25,6 @@ use taffy::style::AlignItems;
 
 pub mod glue;
 pub mod prefs;
-mod tide;
 #[cfg(test)]
 mod tests;
 
@@ -48,9 +47,6 @@ const K_LISTEN: Key = key("nse.listen");
 
 /// The name given when Save is pressed with nothing typed.
 const DEFAULT_NAME: &str = "My sound";
-
-/// The Soft tide moves every 50 ms (about 20 frames a second).
-const TIDE_MS: f64 = 50.0;
 
 /// The three sliders of the Custom mix.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -134,12 +130,6 @@ pub struct Noise {
     tracker: Tracker,
     clock: i64,
     wrote: f64,
-    /// Order 097: how far the Soft tide has faded in (0..1), and when it was last moved (it moves ~20 times a second, only while noise
-    /// plays AND this tab is on screen).
-    level: f32,
-    anim_at: Option<f64>,
-    /// Reduced motion is on: no tide.
-    rm: bool,
 }
 
 /// "Stops in 27 min" for a running sleep timer.
@@ -189,7 +179,6 @@ fn mix_line(m: Mix) -> String {
 impl Noise {
     fn load(&mut self, env: &Env) {
         self.test = env.fake();
-        self.rm = env.rm;
         self.prefs = crate::services::with(|s| Prefs::load(&s.store)).unwrap_or_default();
         self.loaded = true;
         self.listened = self.listened_now();
@@ -374,11 +363,6 @@ impl Noise {
             out.push(group::gf(&format!("The sound couldn't start: {e}")));
         }
         out.push(listened_line(cx, self.listened));
-        // the Soft tide sits under the cards (first = painted first), only while it has faded in
-        if self.level > 0.0 {
-            let (t, level) = (cx.now / 1000.0, self.level);
-            out.insert(0, El::paint(move |g, r| tide::paint(g, r, t, level)).sig((t.to_bits(), level.to_bits())).abs(0.0, PAGE_H - tide::H, f32::NAN, f32::NAN).size(tide::W, tide::H).no_hit());
-        }
         out
     }
 
@@ -403,11 +387,6 @@ impl Noise {
         };
         rows.push(save_row);
         rows
-    }
-
-    /// Nothing animates: the menu is behind a full-screen game, or reduced motion is on.
-    fn still(&self) -> bool {
-        self.rm || covered()
     }
 
     fn slider_at(&mut self, k: Key, x: f32, r: (f32, f32, f32, f32)) {
@@ -554,40 +533,12 @@ impl Page for Noise {
         }
     }
     /// The sleep line counts down: ask again when its minute changes (nothing playing = None: no frames, no wake-ups).
-    /// Order 097: and the Soft tide moves (about 20 times a second) while noise plays - this runs only while the tab is on
-    /// screen, so a closed menu, another tab or stopped noise costs no frame and no timer at all.
-    fn tick(&mut self, now: f64) -> bool {
-        let st = self.status();
-        let changed = sleep_line(&st) != self.shown;
-        if self.still() {
-            self.anim_at = None;
-            return std::mem::take(&mut self.level) > 0.0 || changed;
-        }
-        // no tide behind a full-screen game (nobody sees it) and none with reduced motion
-        let target = if st.playing && !st.stopping { 1.0 } else { 0.0 };
-        if target == 0.0 && self.level == 0.0 {
-            self.anim_at = None;
-            return changed;
-        }
-        if self.anim_at.is_some_and(|t| now - t < TIDE_MS - 2.0) {
-            return changed;
-        }
-        let dt = self.anim_at.map_or(TIDE_MS, |t| now - t).min(100.0) as f32 / 1000.0;
-        self.level += (target - self.level) * (dt * 1.2).min(1.0);
-        if (self.level - target).abs() < 0.01 {
-            self.level = target;
-        }
-        self.anim_at = Some(now);
-        true
+    /// Order 099: the waves are gone - a Noise tab with noise playing redraws only when that line changes.
+    fn tick(&mut self, _now: f64) -> bool {
+        sleep_line(&self.status()) != self.shown
     }
     fn wake_at(&self, now: f64) -> Option<f64> {
-        let st = self.status();
-        let tide = (!self.still() && ((st.playing && !st.stopping) || self.level > 0.0)).then(|| self.anim_at.map_or(now, |t| (t + TIDE_MS).max(now)));
-        let sleep = sleep_wake(&st, now);
-        match (tide, sleep) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (a, b) => a.or(b),
-        }
+        sleep_wake(&self.status(), now)
     }
     fn start(&self, s: &mut crate::services::Services) {
         if s.test {
@@ -620,19 +571,4 @@ impl Page for Noise {
             self.naming.is_some()
         )
     }
-}
-
-
-/// The menu sits behind a full-screen game (a test copy has its own flag per thread: tests run side by side).
-#[cfg(not(test))]
-fn covered() -> bool {
-    crate::ui::COVERED.load(std::sync::atomic::Ordering::Relaxed)
-}
-#[cfg(test)]
-thread_local! {
-    static T_COVERED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-#[cfg(test)]
-fn covered() -> bool {
-    T_COVERED.with(|c| c.get())
 }

@@ -461,7 +461,7 @@ impl Btns {
                 if o.save {
                     self.save();
                 } else if !self.test {
-                    glue::engine().set_layers(Dev::Mouse, self.prefs.mouse.clone());
+                    glue::set_layers(Dev::Mouse, &self.prefs.mouse);
                 }
             }
             if o.play {
@@ -856,7 +856,7 @@ mod tests {
         crate::png::save_png(&px, path).expect("save");
     }
 
-    const OUT: &str = r"C:\BoylerUtilities-scratch/P098";
+    const OUT: &str = r"C:\BoylerUtilities-scratch/S099";
 
     /// Order 090: pictures of the Mouse tab (run: cargo test -p bu-app mouse::btns -- --ignored).
     #[test]

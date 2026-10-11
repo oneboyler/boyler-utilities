@@ -1473,7 +1473,6 @@ fn run(opts: Opts) -> Result<()> {
         }
         let mut msgbuf = MSG::default();
         loop {
-            ui::COVERED.store(app.back, std::sync::atomic::Ordering::Relaxed);
             // pick how to wait: frames while the menu moves, otherwise only messages (zero CPU)
             let want = app.menu.as_ref().map(|m| m.ui.dirty || m.backdrop_dirty || m.ui.animating(timing::now())).unwrap_or(false);
             // Order 051: the capture overlay's GPU windows that wait for their monitor's next refresh

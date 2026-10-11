@@ -1642,7 +1642,7 @@ fn proof_085_restart_row() {
 /// Order 090: the tab painted (page + popups) for the pictures and the "no scroll" measure (run: cargo test -p bu-app
 /// controller::tests::pad_090 -- --ignored).
 fn shot_090(t: &mut T, name: &str) -> f32 {
-    let dir = r"C:\BoylerUtilities-scratch/P098";
+    let dir = r"C:\BoylerUtilities-scratch/S099";
     let _ = std::fs::create_dir_all(dir);
     unsafe {
         let _ = windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_MULTITHREADED);

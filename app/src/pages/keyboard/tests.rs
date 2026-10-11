@@ -288,7 +288,7 @@ fn the_page_builds_in_every_state_without_panicking() {
     assert!(p.popups(&mut cx).is_some(), "the N keys window");
     p.many = false;
     p.open_make(0.0);
-    assert!(p.popups(&mut cx).is_some(), "Make a pack from one sound");
+    assert!(p.popups(&mut cx).is_some(), "Make a pack");
     p.make = None;
     p.pop = Some((Pop::Pack, (10.0, 10.0, 100.0, 24.0)));
     assert!(p.popups(&mut cx).is_some());
@@ -465,7 +465,7 @@ fn the_repeat_window_reaches_400_ms_and_the_sound_list_has_v8s_items() {
     assert_eq!(p.prefs.s.repeat_ms, 0);
     let names: Vec<String> = p.list(Pop::Pack).into_iter().map(|(l, _, _)| l).collect();
     let tail: Vec<&str> = names.iter().rev().take(3).rev().map(String::as_str).collect();
-    assert_eq!(tail, ["Get more sounds…", "Import…", "Make a pack from one sound…"], "{names:?}");
+    assert_eq!(tail, ["Get more sounds…", "Import…", "Make a pack…"], "{names:?}");
 }
 
 /// Order 059 (the owner: J -> a macro with "J" "doesnt work anymore at all, its like an infinite loop"): a key that would press
@@ -686,7 +686,7 @@ fn an_imported_sound_is_removed_after_asking_and_the_settings_fall_back() {
 
 // ------------------------------------------------------------------ pictures (run: cargo test -p bu-app keyboard::tests::pictures -- --ignored)
 
-const SCRATCH: &str = r"C:\BoylerUtilities-scratch/P098";
+const SCRATCH: &str = r"C:\BoylerUtilities-scratch/S099";
 
 /// The page painted by the app's own painter; `popup` = with its windows / lists on top, in the window's 600 x 520 at
 /// `scroll` (else the whole page).
@@ -753,6 +753,16 @@ fn pictures() {
     paint_page_to(&mut p, "kbd_key_enter", true, SCRATCH, 0.0);
     p.select(Some(0x0E));
     paint_page_to(&mut p, "kbd_key_backspace", true, SCRATCH, 0.0);
+    // Order 099: the Press list also offers the packs; a pack picked for Enter
+    p.snd.packs = Some((vec!["My thock".into()], vec!["Cream".into()]));
+    p.select(Some(0x1C));
+    press(&mut p, sub(K_SND, "press"));
+    click(&mut p, sub(K_SND, "press"));
+    paint_page_to(&mut p, "kbd_key_press_list", true, SCRATCH, 0.0);
+    let i = p.snd.list_row(true, &[p.prefs.keys.of(0x1C)], "Bubble").unwrap();
+    click(&mut p, idx(sub(K_SND, "menu"), i));
+    paint_page_to(&mut p, "kbd_key_pack_picked", true, SCRATCH, 0.0);
+    p.select(Some(0x0E));
     p.select(Some(0x57));
     paint_page_to(&mut p, "kbd_key_macro", true, SCRATCH, 0.0);
     p.select(None);

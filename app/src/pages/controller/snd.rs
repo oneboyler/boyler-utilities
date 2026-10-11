@@ -197,7 +197,7 @@ impl PadSounds {
             if o.save {
                 self.save();
             } else if o.changed && !self.test {
-                glue::engine().set_layers(Dev::Pad, self.prefs.pad.clone());
+                glue::set_layers(Dev::Pad, &self.prefs.pad);
             }
             if o.play {
                 self.hear(&ids);

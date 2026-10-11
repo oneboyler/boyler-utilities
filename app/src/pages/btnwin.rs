@@ -2,12 +2,12 @@
 //! plays and what it runs. Shared by the Keyboard, Mouse and Controller tabs; each page keeps its own model and window, and
 //! builds these parts into it:
 //! * [`SoundEd`] - the Sound part: "Pack's sound" (a switch: off = silent for this button only) and "Your sound" on top
-//!   (Press: none / your file · Release: same as press / none / your file · Pitch · Loudness; drop an .mp3 / .wav / .ogg on
-//!   Press or Release; ▶ plays both layers). For several buttons at once ("N keys") Pitch and Loudness are each Same / Random
+//!   (Press: none / your file / a pack's sound (Order 099) Â· Release: same as press / none / your file Â· Pitch Â· Loudness; drop an .mp3 / .wav / .ogg on
+//!   Press or Release; â¶ plays both layers). For several buttons at once ("N keys") Pitch and Loudness are each Same / Random
 //!   with their own slider (a keyboard's special keys - Space, Enter ... - keep their built-in shape).
-//! * [`MacroEd`] - a macro's steps right in the window: Repeat, Record, the steps (Key down · Key up · Press · Type · Wait ·
-//!   Click · Open, + Button in a controller's macro), Add.
-//! * the "your sounds" folder ([`take_file`], [`load_clips`]) and the ▶ ([`hear`]).
+//! * [`MacroEd`] - a macro's steps right in the window: Repeat, Record, the steps (Key down Â· Key up Â· Press Â· Type Â· Wait Â·
+//!   Click Â· Open, + Button in a controller's macro), Add.
+//! * the "your sounds" folder ([`take_file`], [`load_clips`]) and the â¶ ([`hear`]).
 //!
 //! Stateless builders + small state structs: a page calls `view` while it builds its window and `event` with every event,
 //! and gets back what changed (it saves, tells the engine, plays).
@@ -32,12 +32,12 @@ use crate::ui::{cmix, ACC, CTL, FG, FG2, FG3};
 
 // ================================================================== small shared pieces
 
-/// The ▶ button of a window ("Play it · both sounds"): a small filled triangle, a soft highlight on hover (Order 098).
+/// The â¶ button of a window ("Play it Â· both sounds"): a small filled triangle, a soft highlight on hover (Order 098).
 pub fn play_btn(cx: &mut Cx, k: Key, tip: &str) -> El {
     button::play_icon_btn(cx, k).title(tip)
 }
 
-/// A window's small bold heading with things on its right ("Sound ▶", "Your sound · on top … Remove your sound").
+/// A window's small bold heading with things on its right ("Sound â¶", "Your sound Â· on top â¦ Remove your sound").
 fn heading(title: &str, small: Option<&str>, right: Vec<El>) -> El {
     let mut r = El::row().center().gap(8.0).margin(14.0, 2.0, 7.0, 2.0).min_h(28.0).child(El::text(title, Font::new(13.0, 600), FG(), lh(13.0, 1.35)).none());
     if let Some(s) = small {
@@ -101,7 +101,7 @@ pub fn take_file(path: &str) -> Result<String, String> {
     let name = src.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     let ext = src.extension().map(|e| e.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
     if !["mp3", "wav", "ogg"].contains(&ext.as_str()) {
-        return Err(format!("{name} · use an .mp3, .wav or .ogg file"));
+        return Err(format!("{name} Â· use an .mp3, .wav or .ogg file"));
     }
     let dir = yours_dir().ok_or("the settings folder isn't available")?;
     std::fs::create_dir_all(&dir).map_err(|e| format!("the sounds folder: {e}"))?;
@@ -169,7 +169,7 @@ pub fn load_clips(ids: &[String]) {
     }
 }
 
-/// What a page's ▶ plays: for each button (at most 24, one after another) its down and its up as "Play on" says - the
+/// What a page's â¶ plays: for each button (at most 24, one after another) its down and its up as "Play on" says - the
 /// pack's sound unless it is off for that button, and the button's own sound on top. `class` names what kind of mouse /
 /// controller button a slot is. Works with the sounds switched off; nothing plays in a test copy.
 pub struct HearOf<'a> {
@@ -204,7 +204,13 @@ pub fn hear(h: &HearOf, layers: &Layers, ids: &[u16]) {
                 }
             }
             if let Some(f) = l.own_file(down) {
-                if let Some(c) = e.clip(f) {
+                if let Some(pk) = layers::as_pack(f) {
+                    // Order 099: another pack's sound on top
+                    super::keyboard::glue::ensure_pack(&pk);
+                    if let Some((s, rate, loud, st)) = e.layer_sound(h.dev, &pk, slot, down, (h.mouse)(slot), (h.pad)(slot)) {
+                        list.push(Hear { sound: s, rate, gain: g * loud * f32::from(l.loud) / 100.0, pitch: l.pitch + st, at_ms });
+                    }
+                } else if let Some(c) = e.clip(f) {
                     let up = if !down && l.release == Release::SameAsPress { layers::RELEASE_UP } else { 0.0 };
                     list.push(Hear { sound: c.mono.clone(), rate: c.rate, gain: g * f32::from(l.loud) / 100.0, pitch: l.pitch + up, at_ms });
                 }
@@ -219,7 +225,7 @@ pub fn hear(h: &HearOf, layers: &Layers, ids: &[u16]) {
 /// The width of the choice + slider column of a variation row inside a button window (pack-noise-v1: 292 px).
 pub const SND_VARY_W: f32 = 292.0;
 
-/// The amount written under a variation row's name ("+1.5", "100 %", "± 10 %"): Same = the one value of every normal
+/// The amount written under a variation row's name ("+1.5", "100 %", "Â± 10 %"): Same = the one value of every normal
 /// key, Random = how much it may differ (Order 098).
 pub fn vary_label(pitch: bool, row: &layers::Row) -> String {
     let v = row.value();
@@ -297,6 +303,66 @@ pub fn vary_event(ev: &Ev, base: Key, vary: &mut Vary) -> Option<bool> {
 
 // ================================================================== the Sound part
 
+/// What a press / release id is called in the lists: a pack's name, or the page's name for a file.
+fn ref_name(id: &str, file_name: &dyn Fn(&str) -> String) -> String {
+    match layers::as_pack(id) {
+        Some(Pack::Builtin(p)) => p.name().to_string(),
+        Some(Pack::Imported(n) | Pack::Made(n)) => n,
+        None => file_name(id),
+    }
+}
+
+/// What one row of the Press / Release lists does (Order 099: the lists also offer the packs).
+#[derive(Debug, Clone, PartialEq)]
+pub enum Pick {
+    Head,
+    Sep,
+    /// Press: nothing of its own.
+    None,
+    /// Release: the press sound again.
+    Same,
+    /// A file of the user's ("Your file…").
+    File,
+    /// A pack's sound for this button.
+    Pack(Pack),
+}
+
+/// The pack rows both lists end with, in the Keyboard tab's order: Keyboard / Satisfying (built-in), Your packs, Downloaded or imported.
+/// `on` says which is ticked.
+pub fn pack_rows(made: &[String], imported: &[String], on: &dyn Fn(&Pack) -> bool) -> Vec<(String, Pick, bool)> {
+    let mut v = vec![("Keyboard".to_string(), Pick::Head, false)];
+    let add = |v: &mut Vec<(String, Pick, bool)>, name: &str, p: Pack| {
+        let t = on(&p);
+        v.push((name.to_string(), Pick::Pack(p), t));
+    };
+    for id in bu_keysound::PackId::ALL.iter().filter(|p| p.is_keyboard()) {
+        add(&mut v, id.name(), Pack::Builtin(*id));
+    }
+    v.push(("Satisfying".into(), Pick::Head, false));
+    for id in bu_keysound::PackId::ALL.iter().filter(|p| !p.is_keyboard()) {
+        add(&mut v, id.name(), Pack::Builtin(*id));
+    }
+    if !made.is_empty() {
+        v.push(("Your packs".into(), Pick::Head, false));
+        for n in made {
+            add(&mut v, n, Pack::Made(n.clone()));
+        }
+    }
+    if !imported.is_empty() {
+        v.push(("Downloaded or imported".into(), Pick::Head, false));
+        for n in imported {
+            add(&mut v, n, Pack::Imported(n.clone()));
+        }
+    }
+    v
+}
+
+/// The made and the imported packs on this PC (names), for the lists.
+fn packs_on_disk() -> (Vec<String>, Vec<String>) {
+    let Some(dir) = crate::services::with(|s| super::keyboard::glue::packs_dir(s.store.folder())) else { return (Vec::new(), Vec::new()) };
+    (super::keyboard::glue::made_list(&dir), bu_keysound::import::installed(&dir))
+}
+
 /// Which list of the Sound part is open.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SPop {
@@ -312,11 +378,13 @@ pub struct SoundEd {
     pub vary: Vary,
     /// A line under the part (a file that couldn't be taken).
     pub msg: Option<String>,
+    /// A test copy's made and imported packs (names); None = read them from this PC.
+    pub packs: Option<(Vec<String>, Vec<String>)>,
 }
 
 impl Default for SoundEd {
     fn default() -> Self {
-        SoundEd { pop: None, press: None, vary: Vary::for_keys(), msg: None }
+        SoundEd { pop: None, press: None, vary: Vary::for_keys(), msg: None, packs: None }
     }
 }
 
@@ -353,15 +421,15 @@ impl SoundEd {
     pub fn view(&self, cx: &mut Cx, base: Key, layers: &Layers, ids: &[u16], w: &Words, file_name: &dyn Fn(&str) -> String) -> El {
         let n = ids.len();
         let recs: Vec<Layer> = ids.iter().map(|s| layers.of(*s)).collect();
-        let play = play_btn(cx, sub(base, "play"), if n > 1 { "Play them one after another" } else { "Play it · both sounds" });
+        let play = play_btn(cx, sub(base, "play"), if n > 1 { "Play them one after another" } else { "Play it Â· both sounds" });
         // the pack's sound
         let offs = same(recs.iter().map(|r| !r.pack_on));
         let mine = recs.iter().any(|r| r.press.is_some());
         let one = if n > 1 { w.many } else { w.one };
         let hint = match offs {
             None => "On for some, off for others".to_string(),
-            Some(true) if mine => "Off · only your sound plays".to_string(),
-            Some(true) => format!("Off · {one} {} silent", if n > 1 { "are" } else { "is" }),
+            Some(true) if mine => "Off Â· only your sound plays".to_string(),
+            Some(true) => format!("Off Â· {one} {} silent", if n > 1 { "are" } else { "is" }),
             Some(false) => format!("Off = silent for {one} only"),
         };
         let pk = group::row(true, vec![group::lbl("Pack\u{2019}s sound", Some(&hint)), group::ctl(vec![toggle::toggle(cx, sub(base, "pack"), offs == Some(false), false)])]).min_h(50.0);
@@ -371,14 +439,14 @@ impl SoundEd {
         let press_t = match &pv {
             None => "Mixed".to_string(),
             Some(None) => "None".to_string(),
-            Some(Some(f)) => file_name(f),
+            Some(Some(f)) => ref_name(f, file_name),
         };
         let rv = same(recs.iter().map(|r| r.release.clone()));
         let rel_t = match &rv {
             None => "Mixed".to_string(),
             Some(Release::SameAsPress) => "Same as press".to_string(),
             Some(Release::None) => "None".to_string(),
-            Some(Release::File(f)) => file_name(f),
+            Some(Release::File(f)) => ref_name(f, file_name),
         };
         let press = dropdown::dropdown(cx, sub(base, "press"), &press_t, Some(190.0));
         let rel = dropdown::dropdown(cx, sub(base, "rel"), &rel_t, Some(190.0));
@@ -406,29 +474,57 @@ impl SoundEd {
         El::col().items(AlignItems::STRETCH).children(kids)
     }
 
+    /// The rows of the open list and what each does (the same for painting and for the click). Order 099: after None / Your file…
+    /// (and Same as press) come the packs - built-in, Your packs, Downloaded or imported - so a button can play a pack's sound too.
+    fn list(&self, p: SPop, recs: &[Layer]) -> Vec<(String, Pick, bool)> {
+        let (made, imported) = self.packs.clone().unwrap_or_else(packs_on_disk);
+        let mut v: Vec<(String, Pick, bool)> = Vec::new();
+        let cur = match p {
+            SPop::Press => {
+                let pv = same(recs.iter().map(|r| r.press.clone()));
+                v.push(("None".into(), Pick::None, pv == Some(None)));
+                v.push(("Your file\u{2026}".into(), Pick::File, matches!(&pv, Some(Some(f)) if layers::as_pack(f).is_none())));
+                pv.flatten().and_then(|f| layers::as_pack(&f))
+            }
+            SPop::Release => {
+                let rv = same(recs.iter().map(|r| r.release.clone()));
+                v.push(("Same as press".into(), Pick::Same, rv == Some(Release::SameAsPress)));
+                v.push(("None".into(), Pick::None, rv == Some(Release::None)));
+                v.push(("Your file\u{2026}".into(), Pick::File, matches!(&rv, Some(Release::File(f)) if layers::as_pack(f).is_none())));
+                match rv {
+                    Some(Release::File(f)) => layers::as_pack(&f),
+                    _ => None,
+                }
+            }
+        };
+        v.push((String::new(), Pick::Sep, false));
+        v.extend(pack_rows(&made, &imported, &|p| cur.as_ref() == Some(p)));
+        v
+    }
+
+    /// The index of the row called `label` in the Press (`press`) or Release list (tests, pictures).
+    #[cfg(test)]
+    pub fn list_row(&self, press: bool, recs: &[Layer], label: &str) -> Option<usize> {
+        self.list(if press { SPop::Press } else { SPop::Release }, recs).iter().position(|r| r.0 == label)
+    }
+
     /// The part's open list (the page puts it on top of everything).
     pub fn popup(&self, cx: &mut Cx, base: Key, layers: &Layers, ids: &[u16]) -> Option<El> {
         let (p, a) = self.pop?;
         let recs: Vec<Layer> = ids.iter().map(|s| layers.of(*s)).collect();
-        let rows: Vec<Row> = match p {
-            SPop::Press => {
-                let pv = same(recs.iter().map(|r| r.press.is_some()));
-                vec![Row::Item(It::tick("None", pv == Some(false))), Row::Item(It::tick("Your file\u{2026}", pv == Some(true)))]
-            }
-            SPop::Release => {
-                let rv = same(recs.iter().map(|r| match r.release {
-                    Release::SameAsPress => 0,
-                    Release::None => 1,
-                    Release::File(_) => 2,
-                }));
-                vec![
-                    Row::Item(It::tick("Same as press", rv == Some(0))),
-                    Row::Item(It::tick("None", rv == Some(1))),
-                    Row::Item(It::tick("Your file\u{2026}", rv == Some(2))),
-                ]
-            }
-        };
-        Some(mitems::menu(cx, sub(base, "menu"), &rows, Place::Under(a.0, a.1, a.2, a.3), a.2.max(170.0)).z(40))
+        let list = self.list(p, &recs);
+        let rows: Vec<Row> = list
+            .iter()
+            .map(|(label, c, on)| match c {
+                Pick::Head => Row::Section(label.as_str()),
+                Pick::Sep => Row::Sep,
+                _ => Row::Item(It::tick(label.as_str(), *on)),
+            })
+            .collect();
+        let at = Place::Under(a.0, a.1, a.2, a.3);
+        // the packs make it long: it scrolls inside its 300 px box
+        let menu = if rows.len() > 14 { mitems::menu_scroll(cx, sub(base, "menu"), &rows, at, a.2.max(170.0)) } else { mitems::menu(cx, sub(base, "menu"), &rows, at, a.2.max(170.0)) };
+        Some(menu.z(40))
     }
 
     /// Changes `ids`' layers with `f` (the i-th of n gets its place in a rise).
@@ -480,16 +576,30 @@ impl SoundEd {
             }
         };
         self.msg = None;
+        self.put_id(layers, ids, &id, release, board);
+        true
+    }
+
+    /// A pack's sound (Order 099) for the press or the release of every button in `ids`.
+    fn put_pack(&mut self, layers: &mut Layers, ids: &[u16], pack: &Pack, release: bool, board: bool) {
+        super::keyboard::glue::ensure_pack(pack);
+        self.msg = None;
+        self.put_id(layers, ids, &layers::pack_ref(pack), release, board);
+    }
+
+    /// Sets the press (or release) id - a file or a pack's ref - of every button in `ids`; a button that had no sound of its own
+    /// gets its pitch + loudness from the variation rows when several are set at once.
+    fn put_id(&mut self, layers: &mut Layers, ids: &[u16], id: &str, release: bool, board: bool) {
         let n = ids.len();
         let v = self.vary;
         Self::edit(layers, ids, |l, s, _| {
             if release {
                 if l.press.is_some() {
-                    l.release = Release::File(id.clone());
+                    l.release = Release::File(id.to_string());
                 }
             } else {
                 let had = l.press.is_some();
-                l.press = Some(id.clone());
+                l.press = Some(id.to_string());
                 if !had && n > 1 {
                     let (p, ld) = v.at(s, board);
                     l.pitch = p;
@@ -497,7 +607,6 @@ impl SoundEd {
                 }
             }
         });
-        true
     }
 
     /// One event. `test` = a test copy (no file dialog, nothing copied). `board` = the buttons are keyboard keys, so the special
@@ -544,18 +653,29 @@ impl SoundEd {
             Ev::Click(k) => {
                 let k = *k;
                 // the open list owns the next click
-                if let Some((p, _)) = self.pop {
+                if let Some((p, at)) = self.pop {
                     self.pop = None;
                     o.used = true;
-                    let pick = (0..3).find(|i| k == idx(sub(base, "menu"), *i));
+                    let recs: Vec<Layer> = ids.iter().map(|s| layers.of(*s)).collect();
+                    let pick = self.list(p, &recs).into_iter().enumerate().find(|(i, _)| k == idx(sub(base, "menu"), *i)).map(|(_, r)| r.1);
                     match (p, pick) {
-                        (SPop::Press, Some(0)) => {
+                        // a heading or a line between the groups: the list stays open
+                        (_, Some(Pick::Head | Pick::Sep)) => {
+                            self.pop = Some((p, at));
+                        }
+                        (_, Some(Pick::Pack(pk))) => {
+                            self.put_pack(layers, ids, &pk, p == SPop::Release, board);
+                            o.changed = true;
+                            o.save = true;
+                            o.play = true;
+                        }
+                        (SPop::Press, Some(Pick::None)) => {
                             Self::edit(layers, ids, |l, _, _| l.remove_own());
                             o.changed = true;
                             o.save = true;
                             o.play = true;
                         }
-                        (SPop::Press, Some(1)) | (SPop::Release, Some(2)) => {
+                        (_, Some(Pick::File)) => {
                             let release = p == SPop::Release;
                             if test {
                                 return o;
@@ -568,10 +688,10 @@ impl SoundEd {
                                 }
                             }
                         }
-                        (SPop::Release, Some(i)) => {
+                        (SPop::Release, Some(r @ (Pick::Same | Pick::None))) => {
                             Self::edit(layers, ids, |l, _, _| {
                                 if l.press.is_some() {
-                                    l.release = if i == 0 { Release::SameAsPress } else { Release::None };
+                                    l.release = if r == Pick::Same { Release::SameAsPress } else { Release::None };
                                 }
                             });
                             o.changed = true;
@@ -848,7 +968,7 @@ impl MacroEd {
     }
 
     fn editor(&mut self, cx: &mut Cx, base: Key, m: &Macro, f: MacroFor, also: &[String]) -> El {
-        // Repeat [..]  · Also on F11 · Record
+        // Repeat [..]  Â· Also on F11 Â· Record
         let mut meta = El::row().center().gap(8.0);
         if f != MacroFor::Pad {
             let rep = dropdown::dropdown(cx, sub(base, "rep"), &m.rep.label(), Some(176.0));
@@ -1334,5 +1454,106 @@ mod tests {
         assert_eq!(names, vec!["Key down", "Press", "Wait", "Click", "Button"]);
         let keys: Vec<&str> = (0..KINDS.len()).filter(|i| kind_ok(*i, MacroFor::Keys)).map(|i| KINDS[i].0).collect();
         assert_eq!(keys, vec!["Key down", "Key up", "Press", "Type", "Wait", "Click", "Open"]);
+    }
+
+    // ------------------------------------------------------------------ Order 099: the lists also offer the packs
+
+    fn with_cx<R>(f: impl FnOnce(&mut Cx) -> R) -> R {
+        let g = crate::gfx::Gfx::new(1.0);
+        let mut st = crate::ui::cx::State::default();
+        let mut cx = Cx::new(1000.0, false, &g, &mut st);
+        f(&mut cx)
+    }
+
+    const BASE: Key = crate::ui::el::key("t.snd");
+
+    /// Opens `which` ("press" / "rel") and clicks the row called `label`.
+    fn pick(ed: &mut SoundEd, layers: &mut Layers, ids: &[u16], which: &str, label: &str) -> Out {
+        let k = sub(BASE, which);
+        with_cx(|cx| ed.event(&Ev::Press(k, 5.0, 5.0, (0.0, 0.0, 190.0, 28.0)), cx, BASE, layers, ids, true, true));
+        with_cx(|cx| ed.event(&Ev::Click(k), cx, BASE, layers, ids, true, true));
+        let recs: Vec<Layer> = ids.iter().map(|s| layers.of(*s)).collect();
+        let spop = if which == "press" { SPop::Press } else { SPop::Release };
+        let i = ed.list(spop, &recs).iter().position(|r| r.0 == label).unwrap_or_else(|| panic!("no row {label}"));
+        with_cx(|cx| ed.event(&Ev::Click(idx(sub(BASE, "menu"), i)), cx, BASE, layers, ids, true, true))
+    }
+
+    fn ed() -> SoundEd {
+        SoundEd { packs: Some((vec!["My thock".into()], vec!["Cream".into()])), ..SoundEd::default() }
+    }
+
+    /// the owner: "shouldn't you here, also be able to pick from the usual pack sounds?" - the Press and Release lists end with the packs:
+    /// built-in (Keyboard, Satisfying), Your packs, Downloaded or imported.
+    #[test]
+    fn the_lists_offer_none_your_file_and_then_every_pack() {
+        let ed = ed();
+        let recs = vec![Layers::new().of(0x1C)];
+        let press: Vec<String> = ed.list(SPop::Press, &recs).into_iter().map(|r| r.0).collect();
+        assert_eq!(&press[..3], ["None", "Your file\u{2026}", ""]);
+        assert!(press.iter().any(|t| t == "Keyboard") && press.iter().any(|t| t == "Satisfying") && press.iter().any(|t| t == "Bubble"));
+        assert_eq!(&press[press.len() - 4..], ["Your packs", "My thock", "Downloaded or imported", "Cream"]);
+        let rel: Vec<String> = ed.list(SPop::Release, &recs).into_iter().map(|r| r.0).collect();
+        assert_eq!(&rel[..4], ["Same as press", "None", "Your file\u{2026}", ""]);
+        assert_eq!(&rel[4..], &press[3..], "the same packs");
+    }
+
+    /// Picking a pack: this button's extra layer plays THAT pack's sound (press, and the release = the same pack's release); the
+    /// list ticks it, the dropdown names it, the file list is untouched; None takes it away again.
+    #[test]
+    fn a_pack_picked_from_the_press_list_becomes_the_buttons_extra_sound() {
+        let (mut ed, mut ls) = (ed(), Layers::new());
+        let o = pick(&mut ed, &mut ls, &[0x1C], "press", "Bubble");
+        assert!(o.changed && o.save && o.play && o.used);
+        let bubble = Pack::Builtin(bu_keysound::PackId::Bubble);
+        let l = ls.of(0x1C);
+        assert_eq!(l.press, Some(layers::pack_ref(&bubble)));
+        assert!(l.pack_on, "the key's own pack stays under it");
+        assert_eq!((l.release.clone(), l.pitch, l.loud), (Release::SameAsPress, 0.0, 100));
+        assert_eq!(l.own_file(false), l.own_file(true), "the release plays that pack's release");
+        assert!(ls.files().is_empty(), "no file is made or kept for it");
+        // the list ticks it; "Your file…" does not
+        let rows = ed.list(SPop::Press, &[l]);
+        assert_eq!(rows.iter().filter(|r| r.2).map(|r| r.0.as_str()).collect::<Vec<_>>(), ["Bubble"]);
+        // the release gets another pack
+        pick(&mut ed, &mut ls, &[0x1C], "rel", "My thock");
+        assert_eq!(ls.of(0x1C).release, Release::File("pack:made:My thock".into()));
+        assert_eq!(ls.packs(), vec![bubble, Pack::Made("My thock".into())]);
+        // None takes the press away (and with it the rest)
+        pick(&mut ed, &mut ls, &[0x1C], "press", "None");
+        assert!(ls.get(0x1C).is_none());
+        // a heading is no choice: the list stays open
+        let k = sub(BASE, "press");
+        with_cx(|cx| ed.event(&Ev::Press(k, 5.0, 5.0, (0.0, 0.0, 190.0, 28.0)), cx, BASE, &mut ls, &[0x1C], true, true));
+        with_cx(|cx| ed.event(&Ev::Click(k), cx, BASE, &mut ls, &[0x1C], true, true));
+        let i = ed.list(SPop::Press, &[ls.of(0x1C)]).iter().position(|r| r.0 == "Satisfying").unwrap();
+        with_cx(|cx| ed.event(&Ev::Click(idx(sub(BASE, "menu"), i)), cx, BASE, &mut ls, &[0x1C], true, true));
+        assert!(ed.menu_open() && ls.get(0x1C).is_none());
+    }
+
+    /// Several buttons at once (N keys) get the same pack; each keeps the variation of the rows (the special keys their shape).
+    #[test]
+    fn n_buttons_get_the_same_pack_with_their_variation() {
+        let (mut ed, mut ls) = (ed(), Layers::new());
+        let ids = [0x1E, 0x39];
+        pick(&mut ed, &mut ls, &ids, "press", "Cream");
+        let cream = layers::pack_ref(&Pack::Imported("Cream".into()));
+        assert!(ids.iter().all(|k| ls.of(*k).press.as_deref() == Some(cream.as_str())));
+        let (a, space) = (ls.of(0x1E), ls.of(0x39));
+        assert_eq!((a.pitch, a.loud), (0.0, 100));
+        assert!(space.pitch < a.pitch && space.loud > a.loud, "Space keeps its built-in shape: {space:?}");
+        let rows = ed.list(SPop::Press, &[a, space]);
+        assert_eq!(rows.iter().filter(|r| r.2).map(|r| r.0.as_str()).collect::<Vec<_>>(), ["Cream"], "ticked when they all have it");
+    }
+
+    /// An old save (files only) loads and shows as it did: "Your file…" ticked, no pack ticked.
+    #[test]
+    fn a_file_is_still_a_file() {
+        let ed = ed();
+        let mut ls = Layers::new();
+        ls.set(0x1C, Layer { press: Some("boing.wav".into()), ..Layer::default() }).unwrap();
+        let rows = ed.list(SPop::Press, &[ls.of(0x1C)]);
+        assert_eq!(rows.iter().filter(|r| r.2).map(|r| r.0.as_str()).collect::<Vec<_>>(), ["Your file\u{2026}"]);
+        assert_eq!(ref_name("boing.wav", &|f| f.to_string()), "boing.wav");
+        assert_eq!(ref_name("pack:glass-tap", &|f| f.to_string()), "Glass tap");
     }
 }

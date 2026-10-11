@@ -1,5 +1,10 @@
 # Boyler Utilities — What's new
 
+## 1.0.7 (2026-10-11)
+- Key, mouse and controller button windows: the Press / Release lists also offer the sound packs (built-in, your own, downloaded), not only your own file.
+- "Make a pack from one sound…" is now simply "Make a pack…".
+- Noise: the waves are gone - the Noise tab no longer redraws while noise plays (0 CPU); the quiet "time listened" line stays.
+
 ## 1.0.6 (2026-10-10)
 - Keyboard tab: the keyboard comes first; a folding Keyboard sounds card. Click any key: what it does (Normal / Remap / Action / Macro with real steps - key down, key up, press, type, wait, click, open) and its Sound - the pack's sound on or off for that key plus your own sound on top (press / release file, pitch, loudness).
 - Pick many keys at once (drag a box, Ctrl, Shift) and give them one sound: pitch and loudness Same or Random, while Space, Enter, Shift, Ctrl and the other big keys keep their own deeper shape.

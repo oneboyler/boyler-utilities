@@ -61,7 +61,7 @@ mod stream;
 #[cfg(windows)]
 pub mod watch;
 
-pub use kind::{kind_of, Kind, KINDS};
+pub use kind::{key_kind, kind_of, Kind, KINDS};
 pub use layers::{Layer, Layers, Made, Release, Vary};
 pub use rules::{choose, choose_mouse, choose_pad, click_from_key, click_key, gain, Pack, PlayOn, Rule, Settings, CLICK_STYLES, DEFAULT_VOLUME, MAX_REPEAT_MS};
 pub use synth::{render_clicks, ClickSet, ClickStyle, PackId, SoundSet};

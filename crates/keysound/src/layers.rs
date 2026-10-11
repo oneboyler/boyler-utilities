@@ -10,6 +10,8 @@
 
 use std::collections::BTreeMap;
 
+use crate::rules::Pack;
+
 /// The pitch range of a key's own sound (semitones, the slider's ends).
 pub const PITCH_MIN: f32 = -12.0;
 pub const PITCH_MAX: f32 = 12.0;
@@ -19,6 +21,20 @@ pub const LOUD_MAX: u16 = 200;
 pub const MAX_LAYERS: usize = 160;
 /// The longest file name of a "your sound" file kept.
 pub const MAX_FILE_ID: usize = 120;
+/// Order 099: a button's sound can also be a PACK's sound (the Press / Release lists offer the packs): the id is then
+/// `pack:` + the pack's settings key (`pack:glass-tap`, `pack:made:Thock`, `pack:imported:Name`). A real file id can never
+/// contain `:` ([`file_id_ok`]), so the two never mix.
+pub const PACK_REF: &str = "pack:";
+
+/// The id that stands for `p`'s sound in a layer.
+pub fn pack_ref(p: &Pack) -> String {
+    format!("{PACK_REF}{}", p.to_key())
+}
+
+/// The pack an id stands for (None = it is a file id, or a pack ref that doesn't parse).
+pub fn as_pack(id: &str) -> Option<Pack> {
+    Pack::from_key(id.strip_prefix(PACK_REF)?)
+}
 
 /// What a key's own sound plays when the key comes up.
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -78,8 +94,8 @@ impl Layer {
         }
     }
 
-    /// Every file this layer uses (press, release).
-    pub fn files(&self) -> Vec<&str> {
+    /// Every ref this layer uses (press, release): files and pack refs.
+    fn refs(&self) -> Vec<&str> {
         let mut v = Vec::new();
         if let Some(p) = &self.press {
             v.push(p.as_str());
@@ -88,6 +104,16 @@ impl Layer {
             }
         }
         v
+    }
+
+    /// Every FILE this layer uses (press, release) - a pack's sound is not a file.
+    pub fn files(&self) -> Vec<&str> {
+        self.refs().into_iter().filter(|r| !r.starts_with(PACK_REF)).collect()
+    }
+
+    /// Every pack whose sound this layer uses (press, release).
+    pub fn packs(&self) -> Vec<Pack> {
+        self.refs().into_iter().filter_map(as_pack).collect()
     }
 
     fn clamp(mut self) -> Layer {
@@ -131,7 +157,7 @@ impl Layers {
         if !self.0.contains_key(&slot) && self.0.len() >= MAX_LAYERS {
             return Err(format!("at most {MAX_LAYERS} buttons can have a sound of their own"));
         }
-        if l.files().iter().any(|f| !file_id_ok(f)) {
+        if l.files().iter().any(|f| !file_id_ok(f)) || l.refs().iter().any(|r| r.starts_with(PACK_REF) && as_pack(r).is_none()) {
             return Err("not a usable sound file name".into());
         }
         self.0.insert(slot, l);
@@ -161,6 +187,17 @@ impl Layers {
     /// Buttons with a sound of their own (a file), for the picture's dots.
     pub fn with_own(&self) -> impl Iterator<Item = u16> + '_ {
         self.0.iter().filter(|(_, l)| l.press.is_some() || !l.pack_on).map(|(k, _)| *k)
+    }
+
+    /// Every pack whose sound some button uses on top (Order 099).
+    pub fn packs(&self) -> Vec<Pack> {
+        let mut v: Vec<Pack> = Vec::new();
+        for p in self.0.values().flat_map(|l| l.packs()) {
+            if !v.contains(&p) {
+                v.push(p);
+            }
+        }
+        v
     }
 
     /// Every file in use (to load them, and to tidy the folder).
@@ -436,6 +473,25 @@ mod tests {
 
     fn own(press: &str) -> Layer {
         Layer { press: Some(press.into()), ..Layer::default() }
+    }
+
+    /// Order 099: a pack's sound is kept as `pack:<key>`; it is no file, survives the settings text, and a broken ref is refused.
+    #[test]
+    fn a_pack_ref_is_no_file_and_round_trips() {
+        let r = pack_ref(&Pack::Made("My pack".into()));
+        assert_eq!(r, "pack:made:My pack");
+        assert_eq!(as_pack(&r), Some(Pack::Made("My pack".into())));
+        assert_eq!(as_pack("boing.wav"), None);
+        assert!(!file_id_ok(&r), "a file id can never be a pack ref");
+        let mut ls = Layers::new();
+        let l = Layer { press: Some(r.clone()), release: Release::File(pack_ref(&Pack::Imported("X".into()))), pitch: 2.0, ..Layer::default() };
+        ls.set(0x1E, l.clone()).unwrap();
+        ls.set(0x30, own("a.wav")).unwrap();
+        assert_eq!(ls.files(), vec!["a.wav".to_string()], "no pack ref is a file to load or keep");
+        assert_eq!(ls.packs(), vec![Pack::Made("My pack".into()), Pack::Imported("X".into())]);
+        assert_eq!(Layers::from_lines(&ls.to_lines()), ls);
+        assert!(ls.set(0x20, own("pack:")).is_err(), "a ref that names no pack is refused");
+        assert!(ls.set(0x20, own("pack:nonsense")).is_err());
     }
 
     #[test]

@@ -2,7 +2,7 @@
 //! (Normal / Remap / Action / Macro with the macro's steps right there + its Sound: the pack's sound and your own on top);
 //! drag a box, Ctrl- or Shift-click = several keys ("N keys" window: one sound for all, pitch and loudness Same / Rising /
 //! A little random). Then the "Keyboard sounds" card, folded like Mouse acceleration: Sound (the packs, yours, downloaded or
-//! imported, Get more sounds…, Import…, Make a pack from one sound…), Volume, Play on, More (Ignore repeats within 0-400 ms,
+//! imported, Get more sounds…, Import…, Make a pack…), Volume, Play on, More (Ignore repeats within 0-400 ms,
 //! Off while a game is in front, Try it, Different in some apps). Macros are made and edited only in a key's window.
 //! Engine: `crates/keysound` (bu-keysound); the always-on part is `glue.rs`, what is remembered `prefs.rs`, what the picture
 //! edits `model.rs`, the keyboard drawing `pic.rs`, the page's boxes `view.rs`, the shared window parts `pages::btnwin`.
@@ -363,7 +363,7 @@ impl Keyboard {
     /// The rows of the open list and what each means (the same for painting and for the click).
     fn list(&self, p: Pop) -> Vec<(String, Choice, bool)> {
         let mut v: Vec<(String, Choice, bool)> = Vec::new();
-        // Order 090 (v8): built-in · Your packs · Downloaded or imported · Get more sounds… · Import… · Make a pack from one sound…
+        // Order 090 (v8): built-in · Your packs · Downloaded or imported · Get more sounds… · Import… · Make a pack…
         let packs = |v: &mut Vec<(String, Choice, bool)>, cur: Option<&Pack>, with_import: bool| {
             v.push(("Keyboard".into(), Choice::Heading, false));
             for id in PackId::ALL.iter().filter(|p| p.is_keyboard()) {
@@ -393,7 +393,7 @@ impl Keyboard {
                 v.push((String::new(), Choice::Sep, false));
                 v.push(("Get more sounds\u{2026}".into(), Choice::GetMore, false));
                 v.push(("Import\u{2026}".into(), Choice::Import, false));
-                v.push(("Make a pack from one sound\u{2026}".into(), Choice::MakePack, false));
+                v.push(("Make a pack\u{2026}".into(), Choice::MakePack, false));
             }
         };
         match p {

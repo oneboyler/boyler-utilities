@@ -418,7 +418,7 @@ impl Keyboard {
             s.flex_shrink = 1.0;
             s.min_size.height = taffy::style::LengthPercentageAuto::length(0.0);
         });
-        Some(dialog::dialog(cx, K_MP, 560.0, "Make a pack from one sound", vec![body], vec![], true, mp.opened))
+        Some(dialog::dialog(cx, K_MP, 560.0, "Make a pack", vec![body], vec![], true, mp.opened))
     }
 
     /// A file for the pack maker's press (`release` false) or release: decoded at once (safely) so it can be heard.
@@ -660,7 +660,7 @@ impl Keyboard {
             if o.save {
                 self.save();
             } else if o.changed && !self.test {
-                glue::engine().set_layers(Dev::Keys, self.prefs.keys.clone());
+                glue::set_layers(Dev::Keys, &self.prefs.keys);
             }
             if o.play {
                 self.hear_keys(&ids);

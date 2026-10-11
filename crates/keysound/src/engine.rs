@@ -11,7 +11,7 @@
 
 use crate::front::Front;
 use crate::import::Clip;
-use crate::kind::{kind_of, Kind};
+use crate::kind::{key_kind, kind_of, Kind};
 use crate::layers::{speed, Layer, Layers, Made, RELEASE_UP};
 use crate::mixer::Mixer;
 use crate::rules::{choose, choose_mouse, choose_pad, gain, Pack, PlayOn, Settings};
@@ -47,6 +47,15 @@ pub enum Dev {
     Keys,
     Mouse,
     Pad,
+}
+
+/// Which button a layer plays for (Order 099: a layer may play a pack's sound, which differs per kind of button).
+#[derive(Debug, Clone, Copy)]
+enum Own {
+    /// A key: its scan code and the event's [`Kind`].
+    Key(u16, Kind),
+    Mouse(MouseButtonClass),
+    Pad(PadSoundClass),
 }
 
 /// A pack made from one sound, as the engine plays it: its five sounds (every down kind = the press file, Up = the release
@@ -133,7 +142,13 @@ fn style_of(p: &Pack) -> ClickStyle {
 impl Live {
     /// Makes the sounds of every pack the settings use (built-ins once, imported ones come from `imported`); drops the rest.
     fn ensure(&mut self) {
-        let want: Vec<Pack> = self.settings.packs();
+        let mut want: Vec<Pack> = self.settings.packs();
+        // Order 099: and every pack a button plays on top (its Press / Release list)
+        for p in self.layers.values().flat_map(Layers::packs) {
+            if !want.contains(&p) {
+                want.push(p);
+            }
+        }
         let mut styles: Vec<ClickStyle> = if self.settings.mouse_on || self.settings.pad_on { want.iter().map(style_of).collect() } else { Vec::new() };
         if let (true, Some(c)) = (self.settings.mouse_on, self.settings.mouse_click) {
             styles.push(c);
@@ -174,12 +189,36 @@ impl Live {
     }
 
     /// "Your sound" of `layer` for a press / release at `g` (the device's volume gain): (sound, rate, gain, semitones).
-    fn own(&self, layer: Option<&Layer>, down: bool, g: f32) -> Option<(Arc<[f32]>, u32, f32, f32)> {
+    /// Order 099: it may be a PACK's sound (the Press / Release lists offer the packs): that pack's sound for this button
+    /// (`ctx`), with the layer's own pitch + loudness on top.
+    fn own(&self, layer: Option<&Layer>, down: bool, g: f32, ctx: Own) -> Option<(Arc<[f32]>, u32, f32, f32)> {
         let l = layer?;
-        let c = self.clips.get(l.own_file(down)?)?;
+        let id = l.own_file(down)?;
+        if let Some(pack) = crate::layers::as_pack(id) {
+            let (s, rate, loud, st) = self.pack_layer(&pack, ctx, down)?;
+            return Some((s, rate, g * loud * f32::from(l.loud) / 100.0, l.pitch + st));
+        }
+        let c = self.clips.get(id)?;
         // "Same as press": the release plays the press file again, a touch higher (the drawing's zHit)
         let up = if !down && l.release == crate::layers::Release::SameAsPress { RELEASE_UP } else { 0.0 };
         Some((c.mono.clone(), c.rate, g * f32::from(l.loud) / 100.0, l.pitch + up))
+    }
+
+    /// `pack`'s sound for a button of `ctx`'s kind (Order 099): (sound, rate, loudness share, semitones). A key gets the pack's
+    /// down / up / Space / Enter / Backspace sound (a made pack adds the key's own pitch + loudness); a mouse button or a
+    /// controller button the pack's own click or key sound. None = the pack isn't loaded (deleted): silent.
+    fn pack_layer(&self, pack: &Pack, ctx: Own, down: bool) -> Option<(Arc<[f32]>, u32, f32, f32)> {
+        match ctx {
+            Own::Key(slot, kind) => {
+                let set = self.lib.get(pack)?;
+                // "Release only" with a pack that has no key-up sound of its own plays its key sound on the release
+                let kind = if kind == Kind::Up && self.settings.play_on == PlayOn::Release && set.get(Kind::Up).len() <= 2 { Kind::Down } else { kind };
+                let (st, loud) = self.made_mod(pack, slot, kind);
+                Some((set.get(kind).clone(), set.rate, loud, st))
+            }
+            Own::Mouse(b) => self.mouse_pack_sound_in(pack, b, down, style_of(pack)).map(|(s, r)| (s, r, 1.0, 0.0)),
+            Own::Pad(c) => self.pad_pack_sound(pack, c, down).map(|(s, r)| (s, r, 1.0, 0.0)),
+        }
     }
 
     fn jitter(&mut self) -> f32 {
@@ -196,12 +235,16 @@ impl Live {
     /// The pack layer of a mouse button: the side buttons play the pack's key sound, the others a click (Click sounds › Sound,
     /// or the one that suits the pack).
     fn mouse_pack_sound(&self, pack: &Pack, b: MouseButtonClass, down: bool) -> Option<(Arc<[f32]>, u32)> {
+        self.mouse_pack_sound_in(pack, b, down, self.settings.mouse_click.unwrap_or_else(|| style_of(pack)))
+    }
+
+    /// [`Live::mouse_pack_sound`] with the click style given (Order 099: a button's extra pack layer uses that pack's own).
+    fn mouse_pack_sound_in(&self, pack: &Pack, b: MouseButtonClass, down: bool, style: ClickStyle) -> Option<(Arc<[f32]>, u32)> {
         if b == MouseButtonClass::Side {
             let set = self.lib.get(pack)?;
             let k = if down || (self.settings.play_on == PlayOn::Release && set.get(Kind::Up).len() <= 2) { Kind::Down } else { Kind::Up };
             return Some((set.get(k).clone(), set.rate));
         }
-        let style = self.settings.mouse_click.unwrap_or_else(|| style_of(pack));
         let set = self.clicks.get(&style)?;
         Some((set.get(b, down)?.clone(), set.rate))
     }
@@ -332,7 +375,7 @@ impl Shared {
                     out[0] = Some((sound, g, self.step(rate, st) * jit));
                 }
             }
-            if let Some((s, rate, g, st)) = l.own(layer.as_ref(), e.down, g) {
+            if let Some((s, rate, g, st)) = l.own(layer.as_ref(), e.down, g, Own::Key(e.key, kind)) {
                 out[1] = Some((s, g, self.step(rate, st)));
             }
         }
@@ -367,7 +410,7 @@ impl Shared {
                     out[0] = Some((s, g, self.step(rate, 0.0) * jit));
                 }
             }
-            if let Some((s, rate, g, st)) = l.own(layer.as_ref(), e.down, g) {
+            if let Some((s, rate, g, st)) = l.own(layer.as_ref(), e.down, g, Own::Mouse(e.button)) {
                 out[1] = Some((s, g, self.step(rate, st)));
             }
         }
@@ -402,7 +445,7 @@ impl Shared {
                     out[0] = Some((s, g, self.step(rate, 0.0) * jit));
                 }
             }
-            if let Some((s, rate, g, st)) = l.own(layer.as_ref(), e.down, g) {
+            if let Some((s, rate, g, st)) = l.own(layer.as_ref(), e.down, g, Own::Pad(e.class)) {
                 out[1] = Some((s, g, self.step(rate, st)));
             }
         }
@@ -638,7 +681,9 @@ impl KeySounds {
 
     /// Order 090: the layers of one device's buttons (keys by scan code, mouse buttons, controller buttons).
     pub fn set_layers(&self, dev: Dev, layers: Layers) {
-        lock(&self.shared.live).layers.insert(dev, layers);
+        let mut l = lock(&self.shared.live);
+        l.layers.insert(dev, layers);
+        l.ensure();
     }
 
     /// Order 090: a decoded "your sound" file under its id (None removes it).
@@ -672,6 +717,36 @@ impl KeySounds {
         }
         l.lib.retain(|k, _| *k != Pack::Made(name.to_string()));
         l.ensure();
+    }
+
+    /// Order 099: what a button's extra layer sounds like when it plays `pack` (the Press / Release lists offer the packs) - the
+    /// ▶ of the button windows; the same sound a real press plays: a key gets the pack's Space / Enter / Backspace sound as fitting, a
+    /// mouse / controller button the pack's own click. (sound, rate, loudness share, semitones).
+    pub fn layer_sound(&self, dev: Dev, pack: &Pack, slot: u16, down: bool, mouse: Option<MouseButtonClass>, pad: Option<PadSoundClass>) -> Option<(Arc<[f32]>, u32, f32, f32)> {
+        let mut l = lock(&self.shared.live);
+        if !l.lib.contains_key(pack) {
+            let set = match pack {
+                Pack::Builtin(id) => render(*id, BUILTIN_RATE),
+                Pack::Imported(n) => l.imported.get(n)?.clone(),
+                Pack::Made(n) => l.made.get(n)?.set.clone(),
+            };
+            l.lib.insert(pack.clone(), set);
+        }
+        let ctx = match dev {
+            Dev::Keys => Own::Key(slot, if down { key_kind(slot) } else { Kind::Up }),
+            Dev::Mouse => Own::Mouse(mouse?),
+            Dev::Pad => Own::Pad(pad?),
+        };
+        let click = match ctx {
+            Own::Mouse(b) => b != MouseButtonClass::Side,
+            Own::Pad(c) => c != PadSoundClass::Button,
+            Own::Key(..) => false,
+        };
+        if click {
+            let style = style_of(pack);
+            l.clicks.entry(style).or_insert_with(|| render_clicks(style, BUILTIN_RATE));
+        }
+        l.pack_layer(pack, ctx, down)
     }
 
     /// The pack sound a button of `dev` makes (`slot` for a made pack's per-key pitch / loudness) - for the ▶ of the button
@@ -747,6 +822,16 @@ impl KeySounds {
         if spawned.is_err() {
             self.shared.hearing.fetch_sub(1, Ordering::SeqCst);
             self.stop_if_idle();
+        }
+    }
+
+    /// Order 099: the engine holds this pack's sounds (a built-in pack is always there; an imported or made one once read).
+    pub fn has_pack(&self, p: &Pack) -> bool {
+        let l = lock(&self.shared.live);
+        match p {
+            Pack::Builtin(_) => true,
+            Pack::Imported(n) => l.imported.contains_key(n),
+            Pack::Made(n) => l.made.contains_key(n),
         }
     }
 
@@ -1005,6 +1090,38 @@ mod tests {
         k.shared.on_event(key(true, 0x1C));
         assert_eq!(k.status().plays, 7);
         assert!(voices(&k) > 0);
+    }
+
+    /// Order 099: a button's extra layer can play another PACK's sound (from the Press / Release lists): the press and the release
+    /// (same as press = that pack's release), with the layer's own pitch; a made pack keeps its per-key pitch; a pack that is gone is silent.
+    #[test]
+    fn a_key_can_play_another_packs_sound_on_top() {
+        use crate::layers::{pack_ref, Release};
+        let k = KeySounds::new();
+        k.update(Settings::default());
+        let m = Made { name: "Thock".into(), press: "t.wav".into(), release: None, vary: crate::layers::Vary::for_pack(), keys: vec![(0x39, -12.0, 50)] };
+        k.set_made("Thock", Some(MadeSet::new(&m, &clip(4800), None)));
+        let mut ls = Layers::new();
+        let bubble = Pack::Builtin(crate::synth::PackId::Bubble);
+        ls.set(0x1C, Layer { pack_on: false, press: Some(pack_ref(&bubble)), ..Layer::default() }).unwrap();
+        ls.set(0x39, Layer { press: Some(pack_ref(&Pack::Made("Thock".into()))), release: Release::None, ..Layer::default() }).unwrap();
+        ls.set(0x0E, Layer { pack_on: false, press: Some(pack_ref(&Pack::Imported("Gone".into()))), ..Layer::default() }).unwrap();
+        k.set_layers(Dev::Keys, ls);
+        assert!(k.shared.live.lock().unwrap().lib.contains_key(&bubble), "the engine made the pack the layer plays");
+        k.shared.on_event(key(true, 0x1C));
+        assert_eq!(k.status().plays, 1, "pack off + another pack's press: that one sound");
+        k.shared.on_event(key(false, 0x1C));
+        assert_eq!(k.status().plays, 2, "...and its release (same as press)");
+        k.shared.on_event(key(true, 0x39));
+        assert_eq!(k.status().plays, 4, "Space: the pack + the made pack's layer");
+        let low = lock(&k.shared.mixer).last_step();
+        k.shared.on_event(key(true, 0x1E));
+        let plain = lock(&k.shared.mixer).last_step();
+        assert!(low < plain / 1.9, "the made pack keeps Space's own pitch (-12 st = half speed): {low} {plain}");
+        k.shared.on_event(key(false, 0x39));
+        assert_eq!(k.status().plays, 6, "release None: only the pack's own release (plain key 1 + Space release 1)");
+        k.shared.on_event(key(true, 0x0E));
+        assert_eq!(k.status().plays, 6, "a pack that is gone: silent (pack off)");
     }
 
     /// Order 090: a pack made from one sound gives every key its own pitch and loudness; the release plays the press a touch higher.

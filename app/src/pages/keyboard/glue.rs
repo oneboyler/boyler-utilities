@@ -54,7 +54,14 @@ pub fn apply(prefs: &Prefs, dir: &Path) -> Result<(), String> {
         return Ok(());
     }
     // Order 090 (E21): imported / downloaded packs are read through the safe decoder (a broken one is left out, silent)
-    for p in s.packs() {
+    let mut all = s.packs();
+    // Order 099: and the packs a button plays on top (its Press / Release list)
+    for p in [&prefs.keys, &prefs.mouse, &prefs.pad].into_iter().flat_map(|ls| ls.packs()) {
+        if !all.contains(&p) {
+            all.push(p);
+        }
+    }
+    for p in all {
         match &p {
             Pack::Imported(n) => match safe::read_installed(dir, n) {
                 Ok(p) => engine().set_imported(n, Some(p.set)),
@@ -69,6 +76,28 @@ pub fn apply(prefs: &Prefs, dir: &Path) -> Result<(), String> {
     engine().set_layers(Dev::Pad, prefs.pad.clone());
     load_clips(&yours_dir(dir), &prefs.own_files());
     engine().enable(s)
+}
+
+/// Order 099: makes sure the engine holds pack `p`'s sounds (an imported / made one is read safely from its cache; a built-in one
+/// is made by the engine itself). Nothing in a test copy.
+pub fn ensure_pack(p: &Pack) {
+    if crate::testmode::on() || engine().has_pack(p) {
+        return;
+    }
+    let Some(dir) = crate::services::with(|s| packs_dir(s.store.folder())) else { return };
+    match p {
+        Pack::Imported(n) => engine().set_imported(n, safe::read_installed(&dir, n).ok().map(|x| x.set)),
+        Pack::Made(n) => engine().set_made(n, read_made(&dir, n).ok()),
+        Pack::Builtin(_) => {}
+    }
+}
+
+/// Order 099: hands the engine a device's layers, with the packs they play (Press / Release lists) loaded first.
+pub fn set_layers(dev: Dev, layers: &bu_keysound::Layers) {
+    for p in layers.packs() {
+        ensure_pack(&p);
+    }
+    engine().set_layers(dev, layers.clone());
 }
 
 // ------------------------------------------------------------------ "your sounds" and packs made from one sound (Order 090)

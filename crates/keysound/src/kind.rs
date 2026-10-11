@@ -18,6 +18,17 @@ pub const KINDS: usize = 5;
 
 pub const ALL_KINDS: [Kind; KINDS] = [Kind::Down, Kind::Up, Kind::Space, Kind::Enter, Kind::Backspace];
 
+/// The down sound a key (by scan code) gets: Space, Enter (and the numpad's) and Backspace have their own, the rest the plain one
+/// (the same split as `bu_rawin::SoundClass`).
+pub fn key_kind(code: u16) -> Kind {
+    match code {
+        0x39 => Kind::Space,
+        0x1C | 0xE01C => Kind::Enter,
+        0x0E => Kind::Backspace,
+        _ => Kind::Down,
+    }
+}
+
 /// The sound for an event: Space / Enter / Backspace have their own down sound; every other key falls back to the plain
 /// down sound; every key coming up shares the one up sound.
 pub fn kind_of(e: SoundEvent) -> Kind {
