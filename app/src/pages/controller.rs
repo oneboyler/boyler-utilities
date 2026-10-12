@@ -26,10 +26,9 @@ use bu_controller::binding::{key_label, key_token, KEYS};
 use bu_controller::layout::{ActionSet, Layout, Press};
 use bu_controller::live::{LiveState, LiveView};
 use bu_controller::os::PadInfo;
-use bu_controller::prefs::NOISE_STEPS;
 use bu_controller::settings::{radius_to_pct, GyroView, StickView, TouchpadView, TriggerView};
 use bu_controller::{
-    Action, ButtonId, Change, Game, GyroMode, GyroSetting, MouseButton, PadButton, PadKind, PadView, Part, PrefSetting, Prefs, PressSetting, Side, SteamAction,
+    Action, ButtonId, Change, Game, GyroMode, GyroSetting, MouseButton, PadButton, PadKind, PadView, Part, Prefs, PressSetting, Side, SteamAction,
     StickMode, StickSetting, TouchMode, TouchSetting, TriggerSetting,
 };
 use taffy::style::{AlignItems, JustifyContent};
@@ -72,8 +71,6 @@ const K_TOAST: Key = key("pad.toast");
 /// the "Please launch Steam" glass (it takes every click under it) and its button
 const K_GATE: Key = key("pad.gate");
 const K_LAUNCH: Key = key("pad.launch");
-/// "Restart Steam to apply" (Order 085): `.ask` / `.go` / `.no`
-const K_RESTART: Key = key("pad.restart");
 /// "Launch Steam" waits this long for Steam before it can be clicked again
 const LAUNCH_WAIT_MS: f64 = 20000.0;
 /// every panel / popup control: sub(K_C, "<id>")
@@ -107,9 +104,6 @@ enum W {
     GyroMode,
     Touch(TouchSetting),
     TouchMode,
-    Pref(PrefSetting),
-    Noise,
-    Light,
 }
 
 /// Where an action is written.
@@ -166,12 +160,10 @@ enum Ctl {
     DriftUse(Side, f64),
 }
 
-/// What a row's reset writes: the values of Steam's layout for this game (one write), or Steam's defaults in the
-/// controller's own file (dead zones "-1", anything else taken out).
+/// What a row's reset writes: the values of Steam's layout for this game (one write).
 #[derive(Clone, Debug, PartialEq)]
 enum Back {
     Layout(Vec<Change>),
-    Pref(Vec<(PrefSetting, Option<String>)>),
 }
 
 /// "Check stick drift" (Order 042 item 11): the stick is left alone for `DRIFT_MS`, its largest distance from the centre
@@ -181,20 +173,6 @@ enum Drift {
     Run { side: Side, at: f64, max: f32 },
     Done { side: Side, max: f32, dz: f64 },
 }
-
-/// "Restart Steam to apply" (Order 085, the owner Oct 10: "changing color of led in my app doesn't change the controllers real color"):
-/// Steam keeps the controller's preferences in memory while it runs, so a new light colour / brightness reaches the pad only
-/// after Steam restarts. The link asks first, then Steam is closed cleanly and started again minimised.
-#[derive(Clone, Copy, Debug, PartialEq)]
-enum Rs {
-    Idle,
-    Ask,
-    Busy,
-}
-
-/// The light colour / brightness was changed by the app and Steam has not been restarted since (a `bool` in the app's `Keep`, so
-/// the link is still there when the tab is opened again).
-const LIGHT_PENDING: &str = "pad.light_pending";
 
 /// How long the stick is watched.
 const DRIFT_MS: f64 = 5000.0;
@@ -369,8 +347,6 @@ struct Open {
     steam_up: bool,
     /// "Launch Steam" was clicked (its button waits for Steam)
     launch_at: Option<f64>,
-    /// "Restart Steam to apply" (the light colour): asked / running (Order 085)
-    rs: Rs,
     drift: Option<Drift>,
     /// the drift bar's share 0..1, read by the bar when it is painted
     drift_share: Rc<Cell<f32>>,
@@ -592,7 +568,6 @@ impl Open {
             steam_watch: None,
             steam_up: true,
             launch_at: None,
-            rs: Rs::Idle,
             drift: None,
             drift_share: Rc::new(Cell::new(0.0)),
             drift_secs: 0,
@@ -778,18 +753,6 @@ impl Open {
                     self.say(t, now);
                 }
             }
-            work::Done::Restarted(r) => {
-                self.rs = Rs::Idle;
-                match r {
-                    Ok(t) => {
-                        self.keep.put(LIGHT_PENDING, false);
-                        // Steam is on its way up: the glass says so until the watch sees it
-                        self.launch_at = Some(now);
-                        self.say(t, now);
-                    }
-                    Err(e) => self.say(e, now),
-                }
-            }
         }
     }
 
@@ -854,15 +817,6 @@ impl Open {
                 let first = l.sets.as_ref().and_then(|s| s.first()).map(|s| s.title.clone()).unwrap_or_else(|| "Default".into());
                 self.say(format!("{title} made \u{b7} a copy of {first}"), now);
             }
-            After::Prefs { before, label, acting } => {
-                if let Some(a) = l.prefs.as_ref().and_then(|p| p.iter().find(|p| p.serial == before.serial)) {
-                    let (b, a) = hist::prefs_diff(&before, a);
-                    self.acting = acting;
-                    self.remember(hist::What::Prefs { serial: before.serial.clone(), before: b, after: a }, &format!("Controller settings \u{b7} {label}"));
-                }
-                self.acting = None;
-                self.say("Saved · this controller, every game", now);
-            }
             After::Replay { mut step, redo } => {
                 // a new action set made again gets a new id
                 if redo {
@@ -907,17 +861,6 @@ impl Open {
         self.view = Some(n.pad_view(self.set, self.kind));
         self.sets = n.action_sets();
         self.lay = Some(n);
-    }
-
-    /// The same for the controller's own file (the values as the file will hold them; None = taken out).
-    fn local_prefs(&mut self, serial: &str, vals: &[(PrefSetting, Option<String>)]) {
-        if let Some(p) = self.prefs.iter_mut().find(|p| p.serial == serial) {
-            for (s, v) in vals {
-                if let Some(slot) = p.values.iter_mut().find(|x| x.0 == *s) {
-                    slot.1 = v.clone();
-                }
-            }
-        }
     }
 
     /// A new action set shown at once: the copy of `from` made in the tab's own copy of the layout.
@@ -1028,23 +971,6 @@ impl Open {
         self.send(Job::Write { wr: Wr::Layout { key: g.key, kind, set, changes, gone: false }, want, after });
     }
 
-    /// Write values of the shown controller's own file (one write, one undo step of the crate and of the tab).
-    fn write_pref(&mut self, vals: &[(PrefSetting, Option<String>)], label: &str, now: f64) {
-        let Some(before) = self.pref().cloned() else {
-            self.acting = None;
-            self.say("Steam has no settings file for this controller yet", now);
-            return;
-        };
-        if vals.iter().any(|(s, _)| matches!(s, PrefSetting::LedRed | PrefSetting::LedGreen | PrefSetting::LedBlue | PrefSetting::LedBrightness)) {
-            self.keep.put(LIGHT_PENDING, true);
-        }
-        let serial = before.serial.clone();
-        let after = After::Prefs { before, label: label.to_string(), acting: self.acting.take() };
-        self.local_prefs(&serial, vals);
-        let want = self.want();
-        self.send(Job::Write { wr: Wr::Prefs { serial, vals: vals.to_vec(), label: label.to_string() }, want, after });
-    }
-
     /// The layout change a value of a control makes (None: not a layout value, or a stick mode the list doesn't have -
     /// kept as Steam wrote it, never rewritten).
     fn layout_change(w: W, v: Option<i64>) -> Option<Change> {
@@ -1071,35 +997,14 @@ impl Open {
                     _ => TouchMode::Nothing,
                 },
             },
-            W::Pref(_) | W::Noise | W::Light => return None,
         })
     }
 
     /// One value from a control.
     fn put(&mut self, w: W, v: Option<i64>, now: f64) {
-        match w {
-            W::Pref(p) => {
-                let text = match p {
-                    PrefSetting::LeftStickDeadZone | PrefSetting::RightStickDeadZone => v.map(|r| r.to_string()).or(Some("-1".into())),
-                    PrefSetting::LedBrightness => v.map(|x| format!("{}", x as f64 / 100.0)),
-                    _ => v.map(|x| x.to_string()),
-                };
-                self.write_pref(&[(p, text)], p.label(), now);
-            }
-            W::Noise => {
-                let s = NOISE_STEPS.get(v.unwrap_or(1) as usize).map(|(_, n)| n.to_string());
-                self.write_pref(&[(PrefSetting::GyroNoiseFilter, s)], "Gyro noise filter", now);
-            }
-            W::Light => {
-                // the light colour: `color_red/green/blue` of the controller's file (what bu-controller's set_light_bar writes)
-                let (r, g, b) = look::LCOL.get(v.unwrap_or(0) as usize).and_then(|c| c.1).unwrap_or((0, 0, 0));
-                let vals = [(PrefSetting::LedRed, Some(r.to_string())), (PrefSetting::LedGreen, Some(g.to_string())), (PrefSetting::LedBlue, Some(b.to_string()))];
-                self.write_pref(&vals, "light bar colour", now);
-            }
-            _ => match Self::layout_change(w, v) {
-                Some(c) => self.write(vec![c], now),
-                None => self.acting = None,
-            },
+        match Self::layout_change(w, v) {
+            Some(c) => self.write(vec![c], now),
+            None => self.acting = None,
         }
     }
 
@@ -1117,27 +1022,14 @@ impl Open {
     }
 
     /// Steam's own value of a control, as the control reads it (`Some(None)` = not in Steam's file = its default; None =
-    /// unknown - no Steam layout here, or a value without a Steam default such as the light colour). For the controller's
-    /// own file Steam's default is "not in the file".
+    /// unknown - no Steam layout here).
     fn steam_raw(&self, w: W) -> Option<Option<i64>> {
-        match w {
-            W::Pref(_) => Some(None),
-            // nothing in the file = Steam's 0.5 = Medium, the list's item 1
-            W::Noise => Some(Some(1)),
-            W::Light => None,
-            _ => raw_in(self.steam.as_ref()?, w),
-        }
+        raw_in(self.steam.as_ref()?, w)
     }
 
     /// What a row's reset writes for Steam's value `v`.
     fn back_of(w: W, v: Option<i64>) -> Option<Back> {
-        match w {
-            W::Pref(p @ (PrefSetting::LeftStickDeadZone | PrefSetting::RightStickDeadZone)) => Some(Back::Pref(vec![(p, Some("-1".into()))])),
-            W::Pref(p) => Some(Back::Pref(vec![(p, None)])),
-            W::Noise => Some(Back::Pref(vec![(PrefSetting::GyroNoiseFilter, None)])),
-            W::Light => None,
-            _ => Self::layout_change(w, v).map(|c| Back::Layout(vec![c])),
-        }
+        Self::layout_change(w, v).map(|c| Back::Layout(vec![c]))
     }
 
     /// Steam's own action of a "does" chip (None = no Steam layout here).
@@ -1694,14 +1586,9 @@ impl Open {
     /// "Please launch Steam" (Order 042 item 5b): a glass over the controller area that takes every click under it, with
     /// the app's popup-window card in its middle; it goes away by itself when Steam runs (`steam_tick`).
     fn steam_gate(&mut self, cx: &mut Cx) -> El {
-        let restarting = self.rs == Rs::Busy;
-        let waiting = restarting || self.launch_at.is_some_and(|a| cx.now - a < LAUNCH_WAIT_MS);
-        let title = El::text(if restarting { "Restarting Steam" } else { "Please launch Steam" }, Font::display(15.0, 600).ls(-150), FG(), 20.0).none();
-        let words = if restarting {
-            "Steam closes for a few seconds and starts again in the tray, then it sets the light."
-        } else {
-            "The controller settings are Steam\u{2019}s own: they can be changed while Steam runs."
-        };
+        let waiting = self.launch_at.is_some_and(|a| cx.now - a < LAUNCH_WAIT_MS);
+        let title = El::text("Please launch Steam", Font::display(15.0, 600).ls(-150), FG(), 20.0).none();
+        let words = "The controller settings are Steam\u{2019}s own: they can be changed while Steam runs.";
         let text = El::text(words, Font::new(12.0, 400), FG2(), 16.0)
             .wrapping()
             .align(crate::gfx::Align::Center)
@@ -2232,15 +2119,6 @@ impl Open {
                 return;
             }
             K_OPENSTEAM => return self.open_in_steam(now),
-            _ if k == sub(K_RESTART, "ask") => {
-                self.rs = Rs::Ask;
-                return;
-            }
-            _ if k == sub(K_RESTART, "no") => {
-                self.rs = Rs::Idle;
-                return;
-            }
-            _ if k == sub(K_RESTART, "go") => return self.restart_steam(now),
             K_STEAMSET => return self.part_to_steam(now),
             _ => {}
         }
@@ -2278,7 +2156,6 @@ impl Open {
             Ctl::Val { on: true, .. } => self.acting = None,
             Ctl::Val { v, w, .. } => self.put(w, v, now),
             Ctl::Back(Back::Layout(c)) => self.write(c, now),
-            Ctl::Back(Back::Pref(v)) => self.write_pref(&v, "Steam\u{2019}s default", now),
             Ctl::Undo => self.undo(false, now),
             Ctl::DriftGo(side) => {
                 self.drift = Some(Drift::Run { side, at: now, max: 0.0 });
@@ -2313,21 +2190,6 @@ impl Open {
 
     /// "Open in Steam": the link (Steam's process list) and the shell's open on the worker (Order 047); its words come
     /// with the answer.
-    /// "Restart Steam to apply" (the asked-for click): on the worker; a test copy restarts nothing.
-    fn restart_steam(&mut self, now: f64) {
-        let Some(serial) = self.pref().map(|p| p.serial.clone()) else {
-            self.rs = Rs::Idle;
-            return;
-        };
-        if self.test && !self.fake {
-            self.rs = Rs::Idle;
-            self.say("Restarts Steam (a test copy restarts nothing)", now);
-            return;
-        }
-        self.rs = Rs::Busy;
-        self.send(Job::RestartSteam { serial });
-    }
-
     fn open_in_steam(&mut self, _now: f64) {
         let Some(g) = self.game().cloned() else { return };
         let test = self.test;
@@ -2725,18 +2587,12 @@ impl Open {
         }
     }
 
-    /// "Controller settings" (`miniDlg('Controller settings', ...)`, `.dlg.pdvdlg{width:420px}`): one line why it is different,
-    /// then the per-controller settings (`.grp.pdvd{padding:2px 12px 6px}`, labels 150 px) + the Light bar (A_015_02).
+    /// "Controller settings": only "Button sounds" (the app's own setting). The rows that wrote Steam's
+    /// `preferences_<serial>.vdf` are gone (Order 101): Steam ignores that file while it runs and rewrites it from the cloud.
     fn settings_dialog(&mut self, cx: &mut Cx, at: f64) -> El {
-        let why = El::text("These apply in every game \u{b7} each game\u{2019}s own settings: click the controller", Font::new(12.0, 400), FG2(), 16.0)
-            .wrapping()
-            .margin(0.0, 0.0, 12.0, 0.0);
-        let rows = panel::prefs_rows(self, cx);
-        let grp = pieces::group::grp(vec![El::col().items(AlignItems::STRETCH).children(rows)]).pad(2.0, 12.0, 6.0, 12.0);
-        // Order 090 (v8): Button sounds live here, under the controller's own rows
         let t = self.fake || self.test;
         let bs = self.snd.settings_rows(cx, t);
-        dialog::dialog(cx, K_DLG, DLG_W, "Controller settings", vec![why, grp, bs], vec![], true, at)
+        dialog::dialog(cx, K_DLG, DLG_W, "Controller settings", vec![bs], vec![], true, at)
     }
 
     // ============================================================================================ registry helpers (panel.rs)
@@ -2827,7 +2683,6 @@ fn raw_in(v: &PadView, w: W) -> Option<Option<i64>> {
         W::GyroMode => gyro_mode_v(&v.gyro.as_ref()?.mode),
         W::Touch(s) => sv(&v.touchpad.as_ref()?.settings, s),
         W::TouchMode => touch_mode_v(&v.touchpad.as_ref()?.touch),
-        W::Pref(_) | W::Noise | W::Light => return None,
     })
 }
 

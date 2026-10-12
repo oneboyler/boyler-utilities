@@ -34,14 +34,6 @@ pub struct FakeSteam {
     pub reads: AtomicU64,
     /// Tests (Order 085): a game runs through Steam.
     pub game: AtomicBool,
-    /// Tests (Order 085): `steam_shutdown` was called and `steam_start_minimised` has not been since.
-    pub closed_by_us: AtomicBool,
-    /// Tests (Order 085): Steam does not close on `-shutdown` (a stuck Steam).
-    pub stuck: AtomicBool,
-    /// Tests (Order 085): what the closing Steam writes back from its own memory (path, bytes) - theory (a).
-    pub write_on_exit: Mutex<Option<(PathBuf, Vec<u8>)>>,
-    /// Tests (Order 085): "-shutdown" / "-silent", in order.
-    pub procs: Mutex<Vec<String>>,
 }
 
 impl FakeSteam {
@@ -141,33 +133,10 @@ impl SteamOs for FakeSteam {
         Ok(())
     }
     fn steam_running(&self) -> bool {
-        self.running && !self.closed_by_us.load(Ordering::Relaxed)
+        self.running
     }
     fn game_running(&self) -> bool {
         self.game.load(Ordering::Relaxed)
-    }
-    fn steam_shutdown(&self) -> Result<()> {
-        if self.read_only {
-            return Err(Error::ReadOnly("steam.exe -shutdown".into()));
-        }
-        self.procs.lock().unwrap().push("-shutdown".into());
-        if !self.stuck.load(Ordering::Relaxed) {
-            self.closed_by_us.store(true, Ordering::Relaxed);
-            // the closing Steam writes its own copy back
-            let back = self.write_on_exit.lock().unwrap().take();
-            if let Some((p, b)) = back {
-                self.put(p, b);
-            }
-        }
-        Ok(())
-    }
-    fn steam_start_minimised(&self) -> Result<()> {
-        if self.read_only {
-            return Err(Error::ReadOnly("steam.exe -silent".into()));
-        }
-        self.procs.lock().unwrap().push("-silent".into());
-        self.closed_by_us.store(false, Ordering::Relaxed);
-        Ok(())
     }
 }
 

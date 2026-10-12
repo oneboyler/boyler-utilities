@@ -273,27 +273,7 @@ fn controls_steam_has_no_slot_for_are_not_there() {
     assert!(!gone(&mut t, "tp.req"), "the touchpad's panel is open");
     assert!(gone(&mut t, "tp.one"));
     t.click(K_CTLSET);
-    assert!(!gone(&mut t, "pf.rumble"), "Controller settings are open");
-    assert!(gone(&mut t, "pf.idle"));
-}
-
-#[test]
-fn controller_settings_write_the_controllers_file() {
-    let mut t = T::new();
-    t.click(K_CTLSET);
-    assert!(t.o().dlg.is_some());
-    t.click(Open::k("pf.anti"));
-    assert!(t.prefs().contains("\"antidrift_enabled_sw\"\t\t\"0\""));
-    // the light bar: red (A_015_02 - per controller, every game)
-    t.click(idx(Open::k("pf.lc"), 1));
-    assert!(t.prefs().contains("\"color_red\"\t\t\"255\"") && t.prefs().contains("\"color_green\"\t\t\"69\""));
-    t.slide("pf.lsdz", 0.25); // 0..40 % -> 10 %
-    let want = bu_controller::settings::pct_to_radius(10.0);
-    assert!(t.prefs().contains(&format!("\"stick_left_deadzone\"\t\t\"{want}\"")), "{}", t.prefs());
-    // the game's layout was not touched
-    assert!(!t.writes().iter().any(|w| w.contains("252950")));
-    t.click(sub(K_DLG, "x"));
-    assert!(t.o().dlg.is_none());
+    assert!(gone(&mut t, "pf.rumble"), "Controller settings hold only Button sounds");
 }
 
 #[test]
@@ -416,28 +396,6 @@ fn steams_layout_is_the_tabs_windows_defaults() {
     assert_eq!(texts(&rv), ["Rocket League \u{b7} DualSense Edge: Steam\u{2019}s layout  \u{2192}  your layout"]);
     assert!(reset(&mut t.p, &rv).iter().all(|r| r.outcome == crate::undo::Outcome::Ok));
     assert_eq!(t.rl(), original);
-}
-
-/// The controller's own settings file (this controller, every game): one entry, put back from its backup.
-#[test]
-fn controller_settings_go_into_the_change_log_and_back() {
-    let _s = Sv::start();
-    let mut t = T::live();
-    let original = t.prefs();
-    t.click(K_CTLSET);
-    t.click(Open::k("pf.anti"));
-    t.click(idx(Open::k("pf.lc"), 1));
-    assert_ne!(t.prefs(), original);
-    let item = format!("prefs:{}", data::SERIAL);
-    let r = rec(&item).expect("one entry");
-    assert_eq!(r.label, "Controller settings \u{b7} DualSense Edge Wireless Controller");
-    assert_eq!((r.was.raw.as_str(), r.now.text.as_str()), ("orig", "your settings"));
-    assert!(rec(RL_ITEM).is_none(), "the game's layout was not touched");
-    let rv = review(&t.p, crate::undo::Kind::HowItWas);
-    assert_eq!(rv.lines.len(), 1);
-    assert!(reset(&mut t.p, &rv).iter().all(|r| r.outcome == crate::undo::Outcome::Ok));
-    assert_eq!(t.prefs(), original);
-    assert!(review(&t.p, crate::undo::Kind::HowItWas).is_empty());
 }
 
 /// A tab that was never opened (Settings › Reset, the uninstaller): `resettable()` makes nothing; the first question
@@ -883,16 +841,9 @@ fn a_list_opened_in_the_part_window_is_above_it_and_changes_the_stick_mode() {
     let (x, y, w, h) = l.rect_of(idx(K_MENU, 2)).expect("the list's third item (As mouse)");
     let (_, keys) = l.hit(x + w / 2.0, y + h / 2.0).expect("something under the item");
     assert_eq!(keys.first(), Some(&idx(K_MENU, 2)), "the item itself is hit, not the window under it: {keys:?}");
-    // the same for the Controller settings' list (gyro noise filter)
     t.click(idx(K_MENU, 2));
     assert_eq!(t.o().view.as_ref().unwrap().sticks[0].mode, StickMode::Mouse);
     assert!(t.rl().contains("\"mode\"\t\t\"joystick_mouse\""), "Steam's own value in the file");
-    t.click(sub(K_PANEL, "x"));
-    t.click(K_CTLSET);
-    t.click(Open::k("pf.noise"));
-    let l = t.popup_laid();
-    let (x, y, w, h) = l.rect_of(idx(K_MENU, 0)).unwrap();
-    assert_eq!(l.hit(x + w / 2.0, y + h / 2.0).map(|h| h.1[0]), Some(idx(K_MENU, 0)));
 }
 
 /// the owner (test build 2): "outer ring, haptics, etc, are closed down menus ... rather than being open inside of left stick":
@@ -1092,19 +1043,6 @@ fn every_kind_of_change_undoes() {
     }
     assert_eq!(t.o().view.clone().unwrap(), view0, "every part as it was");
     assert!(!t.rl().contains("key_press F6"));
-    // the controller's own file: back byte for byte
-    let prefs0 = t.prefs();
-    t.click(K_CTLSET);
-    t.click(Open::k("pf.anti"));
-    t.click(Open::k("pf.rumble"));
-    t.click(idx(Open::k("pf.lc"), 1));
-    assert_ne!(t.prefs(), prefs0);
-    assert!(matches!(t.o().ctl.get(&sub(Open::k("pf.lc"), "undo")), Some(Ctl::Undo)));
-    t.undo();
-    t.undo();
-    t.undo();
-    assert_eq!(t.prefs(), prefs0);
-    t.click(sub(K_DLG, "x"));
     // a new action set: taken back by bu-controller's own exact undo, made again by redo
     let sets = t.o().sets.len();
     t.click(K_SET);
@@ -1169,14 +1107,6 @@ fn a_single_value_goes_back_to_steams() {
     let r4 = |v: &PadView| v.buttons.iter().find(|b| b.id == ButtonId::BackRightUpper).unwrap().presses[0].1.clone();
     let steam = t.o().steam.clone().unwrap();
     assert_eq!(r4(t.o().view.as_ref().unwrap()), r4(&steam));
-    // the controller's own file: Steam's default = the value taken out
-    t.click(sub(K_PANEL, "x"));
-    t.click(K_CTLSET);
-    let ak = sub(Open::k("pf.anti"), "back");
-    assert!(matches!(t.o().ctl.get(&ak), Some(Ctl::Back(_))));
-    t.click(ak);
-    assert!(!t.prefs().contains("antidrift_enabled_sw"), "{}", t.prefs());
-    assert!(!t.o().ctl.contains_key(&sub(Open::k("pf.rumble"), "back")), "rumble on = Steam's default: no reset");
 }
 
 #[test]
@@ -1342,7 +1272,6 @@ fn pad_order42_look() {
     // 6. Controller settings with a change (Undo + resets)
     let mut t = T::new();
     t.click(K_CTLSET);
-    t.click(Open::k("pf.rumble"));
     shot(&mut t, "6_controller_settings", 0.0);
     // 7. "Acts as" list open over the window
     let mut t = T::new();
@@ -1560,83 +1489,25 @@ fn ctrl_z_during_a_write_undoes_the_newest_change() {
     assert_eq!(t.toast(), "Undone \u{b7} Left stick \u{b7} Dead zone");
 }
 
-// ------------------------------------------------------------------------------------------------ Order 085 (light colour)
+// ------------------------------------------------------------------------------------------------ Order 101 (hotfix)
 
-/// the owner (Oct 10): "changing color of led in my app doesn't change the controllers real color". Steam keeps the controller's
-/// preferences in memory while it runs: after a light change the popup offers ONE "Restart Steam to apply" link; it asks
-/// first, never runs while a game does, and the colour comes out of the restart even when the closing Steam writes its old
-/// copy back.
+/// Order 101: the app never restarts Steam and never writes the controller's `preferences_<serial>.vdf` (Steam ignores it while it
+/// runs and rewrites the game's layout from the cloud when it is restarted). Controller settings holds only "Button sounds".
 #[test]
-fn a_light_change_offers_the_steam_restart_and_it_keeps_the_colour() {
+fn controller_settings_has_only_button_sounds_and_writes_no_steam_file() {
     let mut t = T::new();
+    let before = t.prefs();
+    let writes = t.o().svc_do(|s| s.fake_writes()).unwrap().len();
     t.click(K_CTLSET);
-    let gone = |t: &mut T, id: &str| t.popup_laid().rect_of(sub(K_RESTART, id)).is_none();
-    assert!(gone(&mut t, "ask"), "nothing changed yet: no link");
-    t.click(idx(Open::k("pf.lc"), 3));
-    assert!(!gone(&mut t, "ask"), "the light changed: the link is there");
-    let old = t.prefs();
-    // the closing Steam writes its old copy back (theory: Steam keeps the file in memory)
-    let path = data::config().join(format!("preferences_{}.vdf", data::SERIAL));
-    t.o().svc_do(|s| s.fake_write_on_exit(path.clone(), old.replace("\"color_red\"\t\t\"164\"", "\"color_red\"\t\t\"1\"").into_bytes())).unwrap();
-    // asks first: the click on the link only opens the question, nothing is closed
-    t.click(sub(K_RESTART, "ask"));
-    assert_eq!(t.o().rs, Rs::Ask);
-    assert!(t.o().svc_do(|s| s.fake_procs()).unwrap().is_empty());
-    t.click(sub(K_RESTART, "no"));
-    assert_eq!(t.o().rs, Rs::Idle);
-    assert!(!gone(&mut t, "ask"), "Cancel keeps the link");
-    t.click(sub(K_RESTART, "ask"));
-    t.click(sub(K_RESTART, "go"));
-    assert_eq!(t.o().rs, Rs::Idle, "the worker's answer is in");
-    assert_eq!(t.o().svc_do(|s| s.fake_procs()).unwrap(), ["-shutdown", "-silent"]);
-    assert!(t.prefs().contains("\"color_red\"\t\t\"164\""), "written again after Steam had closed: {}", t.prefs());
-    assert!(t.toast().contains("Steam restarted"), "{}", t.toast());
-    assert!(gone(&mut t, "ask"), "restarted: the link is gone");
-}
-
-#[test]
-fn the_steam_restart_never_runs_while_a_game_runs() {
-    let mut t = T::new();
-    t.click(K_CTLSET);
-    t.click(idx(Open::k("pf.lc"), 3));
-    t.o().svc_do(|s| s.fake_game(true)).unwrap();
-    t.click(sub(K_RESTART, "ask"));
-    t.click(sub(K_RESTART, "go"));
-    assert!(t.toast().contains("A game is running"), "{}", t.toast());
-    assert!(t.o().svc_do(|s| s.fake_procs()).unwrap().is_empty(), "Steam was not touched");
-    assert_eq!(t.o().rs, Rs::Idle);
-    assert!(t.popup_laid().rect_of(sub(K_RESTART, "ask")).is_some(), "the link stays");
-}
-
-/// Order 085 proof pictures (`BU_PIC_OUT=<folder> cargo test -p bu-app proof_085 -- --ignored --test-threads=1`): the
-/// Controller settings with the "Restart Steam to apply" line - offered, asked, restarting.
-#[test]
-#[ignore]
-fn proof_085_restart_row() {
-    if std::env::var("BU_PIC_OUT").is_err() {
-        return;
+    assert!(t.o().dlg.is_some(), "Controller settings are open");
+    let gone = |t: &mut T, id: &str| t.popup_laid().rect_of(Open::k(id)).is_none();
+    for id in ["pf.lsdz", "pf.rsdz", "pf.anti", "pf.noise", "pf.rumble", "pf.lc", "pf.bri"] {
+        assert!(gone(&mut t, id), "{id} is hidden");
     }
-    for (light, theme) in [(false, "dark"), (true, "light")] {
-        crate::ui::set_light(light);
-        for step in ["offered", "asked", "restarting"] {
-            let mut t = T::new();
-            t.click(K_CTLSET);
-            t.click(idx(Open::k("pf.lc"), 3));
-            match step {
-                "asked" => t.click(sub(K_RESTART, "ask")),
-                "restarting" => t.o().rs = Rs::Busy,
-                _ => {}
-            }
-            t.now += 2000.0;
-            let mut cx = Cx::new(t.now, false, &t.g, &mut t.st).for_page("pad");
-            let kids = t.p.build(&mut cx);
-            let pop = t.p.popup(&mut cx);
-            let page = El::block().abs(0.0, crate::ui::PAGE_TOP, f32::NAN, f32::NAN).w(WIN_W).pad(2.0, 26.0, 18.0, 26.0).children(kids);
-            let root = El::block().w(WIN_W).h(crate::ui::WIN_H).child(page).children(pop);
-            crate::ui::lay::proof_png(root, WIN_W, crate::ui::WIN_H, 1.5, &format!("085_restart_{step}_{theme}.png"));
-        }
-    }
-    crate::ui::set_light(false);
+    assert!(t.popup_laid().rect_of(snd::K_BSON).is_some(), "Button sounds stay");
+    t.click(snd::K_BSON);
+    assert_eq!(t.prefs(), before, "the controller's file is untouched");
+    assert_eq!(t.o().svc_do(|s| s.fake_writes()).unwrap().len(), writes, "nothing was written to Steam's files");
 }
 
 /// Order 090: the tab painted (page + popups) for the pictures and the "no scroll" measure (run: cargo test -p bu-app

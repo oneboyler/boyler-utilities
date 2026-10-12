@@ -17,7 +17,7 @@ use std::sync::mpsc::{channel, Receiver, Sender};
 use bu_controller::layout::{ActionSet, Layout};
 use bu_controller::live::LiveView;
 use bu_controller::os::{PadInfo, PadOs};
-use bu_controller::{Change, Game, PadKind, PadView, Part, PrefSetting, Prefs};
+use bu_controller::{Change, Game, PadKind, PadView, Part, Prefs};
 
 use super::data::{self, Shared, Svc};
 use super::hist::Step;
@@ -70,7 +70,6 @@ pub enum Wr {
     NewSet { key: String, kind: PadKind, from: u32, title: String },
     /// bu-controller's exact undo of a new action set, only while it is still its last write
     UndoNewSet { key: String, kind: PadKind, from: u32 },
-    Prefs { serial: String, vals: Vec<(PrefSetting, Option<String>)>, label: String },
 }
 
 /// The page's own bookkeeping of a write (its undo step, its words), handed back with the answer.
@@ -80,7 +79,6 @@ pub enum After {
     Layout { before: Option<PadView>, parts: Vec<Part>, game: String, kind: PadKind, set: u32, acting: Option<(Key, String)>, fallback: String, say: String },
     PartToSteam { before: Option<PadView>, part: Part, game: String, kind: PadKind, set: u32, name: String },
     NewSet { game: String, kind: PadKind, from: u32, title: String },
-    Prefs { before: Prefs, label: String, acting: Option<(Key, String)> },
     /// an undo (`redo` false) / redo of this step
     Replay { step: Step, redo: bool },
 }
@@ -96,8 +94,6 @@ pub enum Job {
     Live { pad: Option<PadInfo>, old: Option<LiveView> },
     /// "Open in Steam": the link (needs Steam's process list), opened through the shell
     OpenInSteam { game: Game, test: bool },
-    /// "Restart Steam to apply" (Order 085): close Steam cleanly, write the light values again, start it minimised
-    RestartSteam { serial: String },
 }
 
 impl Job {
@@ -117,8 +113,6 @@ pub enum Done {
     Live(Option<LiveView>),
     /// a toast for the page (None = nothing to say)
     Said(Option<String>),
-    /// the restart ended: Ok(what to say) or the words of why not
-    Restarted(Result<String, String>),
 }
 
 impl Done {
@@ -183,7 +177,6 @@ impl Worker {
                 Done::Live(pad.and_then(|p| self.live(&p)))
             }
             Job::OpenInSteam { game, test } => Done::Said(self.open_in_steam(&game, test)),
-            Job::RestartSteam { serial } => Done::Restarted(self.restart_steam(&serial)),
         }
     }
 
@@ -261,60 +254,6 @@ impl Worker {
             Err(bu_controller::Error::SteamClosed) => Some("Steam is closed \u{b7} start Steam first".into()),
             Err(e) => Some(e.to_string()),
         }
-    }
-}
-
-/// How long Steam gets to close by itself (a clean shutdown saves its files and the cloud; it is never killed).
-pub const CLOSE_WAIT_MS: u64 = 45_000;
-/// How often the closing Steam's process is looked at.
-const CLOSE_POLL_MS: u64 = 300;
-
-impl Worker {
-    /// "Restart Steam to apply" (Order 085): refuse while a game runs, remember the light values, close Steam cleanly and
-    /// wait for it, write the values again (a closing Steam may write its own copy back), start Steam minimised. The
-    /// service is locked only for each step, never while waiting.
-    fn restart_steam(&self, serial: &str) -> Result<String, String> {
-        let svc = |f: &mut dyn FnMut(&mut Svc) -> Result<(), String>| -> Result<(), String> {
-            let mut g = self.svc.lock().unwrap_or_else(|p| p.into_inner());
-            match &mut *g {
-                Some(Ok(s)) => f(s),
-                Some(Err(e)) => Err(e.clone()),
-                None => Err("Steam is not read yet".into()),
-            }
-        };
-        let words = |e: bu_controller::Error| match e {
-            bu_controller::Error::GameRunning => "A game is running through Steam \u{b7} close it first, then restart Steam".to_string(),
-            bu_controller::Error::SteamClosed => "Steam is closed \u{b7} nothing to restart".to_string(),
-            e => e.to_string(),
-        };
-        let mut wanted = Vec::new();
-        svc(&mut |s| {
-            s.restart_check().map_err(words)?;
-            wanted = s.light_values(serial).map_err(words)?;
-            s.steam_shutdown().map_err(words)
-        })?;
-        let mut waited = 0;
-        loop {
-            let mut closed = false;
-            svc(&mut |s| {
-                closed = s.steam_closed();
-                Ok(())
-            })?;
-            if closed {
-                break;
-            }
-            if waited >= CLOSE_WAIT_MS {
-                return Err("Steam didn\u{2019}t close by itself \u{b7} it was left running, nothing was forced".into());
-            }
-            std::thread::sleep(std::time::Duration::from_millis(CLOSE_POLL_MS));
-            waited += CLOSE_POLL_MS;
-        }
-        // Steam is gone: the values go into the file again if its closing wrote an older copy over them, then it starts
-        let kept = svc(&mut |s| s.keep_light(serial, &wanted).map(|_| ()).map_err(words));
-        let started = svc(&mut |s| s.steam_start_minimised().map_err(words));
-        started?;
-        kept?;
-        Ok("Steam restarted \u{b7} it sets the light to your colour when the controller connects".into())
     }
 }
 
@@ -413,14 +352,6 @@ fn write_in(s: &mut Svc, wr: &Wr) -> (Result<u32, String>, Vec<Rec>) {
                 Err(e) => (Err(e.to_string()), vec![]),
             }
         }
-        Wr::Prefs { serial, vals, label } => {
-            let v: Vec<(PrefSetting, Option<&str>)> = vals.iter().map(|(s, v)| (*s, v.as_deref())).collect();
-            let had = s.has_preferences_original(serial);
-            match s.set_preferences(serial, &v, label) {
-                Ok(()) => (Ok(0), log_prefs(s, serial, had)),
-                Err(e) => (Err(e.to_string()), vec![]),
-            }
-        }
     }
 }
 
@@ -434,14 +365,4 @@ fn log_layout(s: &Svc, key: &str, kind: PadKind, had: bool) -> Vec<Rec> {
     let item = data::Item::Layout(kind, key.to_string());
     let new = s.log_val(&item).unwrap_or_else(|| crate::undo::Val::new(data::EDITS, "your edits"));
     vec![(item.id(), data::layout_label(&name, kind), data::orig_val(!had), new)]
-}
-
-fn log_prefs(s: &Svc, serial: &str, had: bool) -> Vec<Rec> {
-    if !s.has_preferences_original(serial) {
-        return vec![];
-    }
-    let item = data::Item::Prefs(serial.to_string());
-    let new = s.log_val(&item).unwrap_or_else(|| crate::undo::Val::new(data::EDITS, "your settings"));
-    let name = s.preferences().ok().and_then(|p| p.into_iter().find(|p| p.serial == serial)).map(|p| p.name).unwrap_or_else(|| "this controller".into());
-    vec![(item.id(), data::prefs_label(&name), data::orig_val(!had), new)]
 }

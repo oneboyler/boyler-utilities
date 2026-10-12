@@ -1,5 +1,9 @@
 # Boyler Utilities — What's new
 
+## 1.0.8 (2026-10-12)
+- Controller: the "Restart Steam to apply" button is gone - restarting Steam could make Steam reload a game's controller layout from its cloud copy and replace your own (stick dead zones changed). The app never restarts Steam.
+- Controller settings: the rows that Steam ignores while it runs (stick dead zones, anti-drift, gyro noise filter, rumble, light colour and brightness) are hidden until they can apply live. Button sounds stays. Per-game button, stick and trigger changes work as before (live).
+
 ## 1.0.7 (2026-10-11)
 - Key, mouse and controller button windows: the Press / Release lists also offer the sound packs (built-in, your own, downloaded), not only your own file.
 - "Make a pack from one sound…" is now simply "Make a pack…".

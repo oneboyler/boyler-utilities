@@ -8,7 +8,7 @@
 //! Ctrl+Z undoes, Ctrl+Y (or Ctrl+Shift+Z) redoes; a new change clears the redo list. A small "Undo" link sits in the row
 //! of the last changed control (`Open::tail`).
 
-use bu_controller::{Change, PadKind, PadView, Part, PrefSetting};
+use bu_controller::{Change, PadKind, PadView, Part};
 
 use super::work::{After, Job, Want, Wr};
 use super::Open;
@@ -19,8 +19,6 @@ use crate::ui::el::Key;
 pub enum What {
     /// a game's layout (one controller type, one action set): the part's values before / after that differ
     Layout { game: String, kind: PadKind, set: u32, before: Vec<Change>, after: Vec<Change> },
-    /// a controller's own settings file: the values before / after that differ (None = not in the file)
-    Prefs { serial: String, before: Vec<(PrefSetting, Option<String>)>, after: Vec<(PrefSetting, Option<String>)> },
     /// "New action set…" (no way to remove a set by value: undone by bu-controller's own exact undo while it is still
     /// its last write; redone by making the set again)
     NewSet { game: String, kind: PadKind, from: u32, title: String, id: u32 },
@@ -81,19 +79,6 @@ pub fn parts_of(changes: &[Change]) -> Vec<Part> {
     out
 }
 
-/// A controller file's values that differ: (before, after).
-pub fn prefs_diff(before: &bu_controller::Prefs, after: &bu_controller::Prefs) -> (Vec<(PrefSetting, Option<String>)>, Vec<(PrefSetting, Option<String>)>) {
-    let (mut b, mut a) = (Vec::new(), Vec::new());
-    for s in PrefSetting::ALL {
-        let (x, y) = (before.get(s).map(str::to_string), after.get(s).map(str::to_string));
-        if x != y {
-            b.push((s, x));
-            a.push((s, y));
-        }
-    }
-    (b, a)
-}
-
 impl Hist {
     pub fn push(&mut self, s: Step) {
         self.undo.push(s);
@@ -109,7 +94,6 @@ impl Open {
     pub(super) fn remember(&mut self, what: What, fallback: &str) {
         let empty = match &what {
             What::Layout { before, after, .. } => before.is_empty() && after.is_empty(),
-            What::Prefs { before, .. } => before.is_empty(),
             What::NewSet { .. } => false,
         };
         let acting = self.acting.take();
@@ -129,7 +113,6 @@ impl Open {
         let s = self.hist.undo.last()?;
         let here = match &s.what {
             What::Layout { game, kind, set, .. } => self.game().is_some_and(|g| &g.key == game) && *kind == self.kind && *set == self.set,
-            What::Prefs { serial, .. } => self.pref().is_some_and(|p| &p.serial == serial),
             What::NewSet { game, kind, .. } => self.game().is_some_and(|g| &g.key == game) && *kind == self.kind,
         };
         if here {
@@ -167,13 +150,6 @@ impl Open {
                 }
                 let want = Want { kind, key: Some(game.clone()), set: Some(set), fresh: false };
                 self.send(Job::Write { wr: Wr::Layout { key: game, kind, set, changes, gone: true }, want, after: After::Replay { step, redo } });
-            }
-            What::Prefs { serial, before, after } => {
-                let vals = if redo { after } else { before };
-                self.local_prefs(&serial, &vals);
-                let want = self.want();
-                let label = step.label.clone();
-                self.send(Job::Write { wr: Wr::Prefs { serial, vals, label }, want, after: After::Replay { step, redo } });
             }
             What::NewSet { game, kind, from, title, .. } => {
                 let here = self.show_at(&game, kind, None);

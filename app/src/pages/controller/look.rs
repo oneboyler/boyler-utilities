@@ -1,5 +1,5 @@
 //! The Controller page's own boxes (classes only this page has in the drawing: `.prw`, `.asr` in `.pdx`, `.psec`,
-//! `.ach`, `.pg2`, `.pdcp`, `.cpx`, `.lsw`, `.pwl`, `.pdtr`, `.pnote`, `.pdlive`, `.pdset`), built from `El` with the
+//! `.ach`, `.pg2`, `.pdcp`, `.cpx`, `.pwl`, `.pdtr`, `.pnote`, `.pdlive`, `.pdset`), built from `El` with the
 //! drawing's CSS quoted on each.
 
 use std::cell::RefCell;
@@ -235,40 +235,6 @@ pub fn pdcp(cx: &mut Cx, key: Key, icon: &str, label: &str, small: &str, on: boo
         .child(El::icon(icon, 14.0, 1.4, cmix(FG2(), ACC(), o)).no_hit())
         .child(El::text(label, pieces::btn_font(12.0, 400), FG(), lh(12.0, 1.35)).none())
         .child(El::text(small, pieces::btn_font(12.0, 400), FG2(), lh(12.0, 1.35)).none())
-}
-
-/// The light colours (`LCOL`): Steam blue, red, green, purple, white, off.
-pub const LCOL: [(&str, Option<(u8, u8, u8)>); 6] =
-    [("Steam blue", Some((59, 130, 255))), ("Red", Some((255, 69, 58))), ("Green", Some((48, 209, 88))), ("Purple", Some((164, 99, 255))), ("White", Some((242, 242, 247))), ("Off", None)];
-
-/// The colour swatches `.lsw{display:flex;align-items:center;gap:8px}` `#sw .lsw button{width:20px;height:20px;border-radius:50%;
-/// box-shadow:inset 0 0 0 .5px rgba(0,0,0,.3);transition:transform .12s ease,box-shadow .15s ease}` `:hover{transform:scale(1.1)}`
-/// `.on{box-shadow:inset 0 0 0 .5px rgba(0,0,0,.3),0 0 0 2px rgba(0,0,0,.35),0 0 0 3.5px var(--acc)}`
-/// `.off{background:transparent;box-shadow:inset 0 0 0 1px var(--fg3)}`. Swatch i = `Ev::Click(idx(key, i))`.
-pub fn lsw(cx: &mut Cx, key: Key, on: Option<usize>) -> El {
-    let mut r = El::row().center().gap(8.0).none();
-    for (i, (name, c)) in LCOL.iter().enumerate() {
-        let k = crate::ui::el::idx(key, i);
-        let hv = cx.hover_t(k, 120.0, EASE);
-        // Order 045: `'data-tip':c[1]` (the colour's name)
-        let mut b = El::block().size(20.0, 20.0).none().radius(RADIUS_PILL).scale(1.0 + 0.1 * hv).on_click(k).tip(name).cursor(Cursor::Hand);
-        let inner = match c {
-            Some((r, g, bl)) => {
-                b = b.bg(Rgba::rgb(*r, *g, *bl));
-                sh(0.0, 0.0, 0.0, 0.5, Rgba(0.0, 0.0, 0.0, 0.3))
-            }
-            None => sh(0.0, 0.0, 0.0, 1.0, FG3()),
-        };
-        b = b.inset(&[inner]);
-        if on == Some(i) {
-            // light (Order 033): `#sw.light .lsw button.on{box-shadow:...,0 0 0 2px #fff,...}` (the "off" swatch keeps its dark ring:
-            // its own rule comes later)
-            let gap = if crate::ui::is_light() && c.is_some() { crate::ui::WHITE } else { Rgba(0.0, 0.0, 0.0, 0.35) };
-            b = b.shadow(&[sh(0.0, 0.0, 0.0, 2.0, gap), sh(0.0, 0.0, 0.0, 3.5, ACC())]);
-        }
-        r = r.child(b);
-    }
-    r
 }
 
 /// `.pdlive{margin-left:auto;display:inline-flex;align-items:center;gap:5px;height:20px;padding:0 8px;border-radius:10px;

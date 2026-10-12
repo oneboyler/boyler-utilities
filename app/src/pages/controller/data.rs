@@ -10,7 +10,7 @@ use bu_controller::layout::ActionSet;
 use bu_controller::os::{Battery, Connection, PadInfo, PadOs, PadSource};
 use bu_controller::real::{RealPads, RealSteam};
 use bu_controller::service::Opened;
-use bu_controller::{Change, ControllerService, Game, Layout, PadKind, PadView, Part, PrefSetting, Prefs, Result};
+use bu_controller::{Change, ControllerService, Game, Layout, PadKind, PadView, Part, Prefs, Result};
 
 use crate::undo::{DefaultItem, Val};
 
@@ -169,12 +169,6 @@ impl Svc {
     pub fn preferences(&self) -> Result<Vec<Prefs>> {
         with!(self, s => s.preferences())
     }
-    pub fn set_preferences(&mut self, serial: &str, v: &[(PrefSetting, Option<&str>)], label: &str) -> Result<()> {
-        with!(self, s => s.set_preferences(serial, v, label))
-    }
-    pub fn set_light_bar(&mut self, serial: &str, rgb: (u8, u8, u8)) -> Result<()> {
-        with!(self, s => s.set_light_bar(serial, rgb))
-    }
     pub fn open_in_steam_link(&self, g: &Game) -> Result<String> {
         with!(self, s => s.open_in_steam_link(g))
     }
@@ -192,25 +186,6 @@ impl Svc {
     pub fn steam_running(&self) -> bool {
         with!(self, s => s.steam_running())
     }
-    // ---- "Restart Steam to apply" (Order 085), in the order the worker runs them
-    pub fn restart_check(&self) -> Result<()> {
-        with!(self, s => s.restart_check())
-    }
-    pub fn light_values(&self, serial: &str) -> Result<Vec<(PrefSetting, Option<String>)>> {
-        with!(self, s => s.light_values(serial))
-    }
-    pub fn steam_shutdown(&self) -> Result<()> {
-        with!(self, s => s.steam_shutdown())
-    }
-    pub fn steam_closed(&self) -> bool {
-        with!(self, s => s.steam_closed())
-    }
-    pub fn keep_light(&mut self, serial: &str, wanted: &[(PrefSetting, Option<String>)]) -> Result<bool> {
-        with!(self, s => s.keep_light(serial, wanted))
-    }
-    pub fn steam_start_minimised(&self) -> Result<()> {
-        with!(self, s => s.steam_start_minimised())
-    }
     /// Steam's install folder (where `steam.exe` is).
     pub fn steam_dir(&self) -> PathBuf {
         with!(self, s => s.steam().dir.clone())
@@ -220,25 +195,6 @@ impl Svc {
         match self {
             Svc::Fake(s) => s.os().writes(),
             Svc::Real(_) => vec![],
-        }
-    }
-    /// The fake's `steam.exe` calls ("-shutdown" / "-silent"), in order (tests).
-    pub fn fake_procs(&self) -> Vec<String> {
-        match self {
-            Svc::Fake(s) => s.os().procs.lock().unwrap().clone(),
-            Svc::Real(_) => vec![],
-        }
-    }
-    /// A game runs through the fake Steam (tests).
-    pub fn fake_game(&self, on: bool) {
-        if let Svc::Fake(s) = self {
-            s.os().game.store(on, std::sync::atomic::Ordering::Relaxed);
-        }
-    }
-    /// The fake Steam writes this over a file while it closes (tests: Steam keeps its own copy and writes it back).
-    pub fn fake_write_on_exit(&self, path: PathBuf, bytes: Vec<u8>) {
-        if let Svc::Fake(s) = self {
-            *s.os().write_on_exit.lock().unwrap() = Some((path, bytes));
         }
     }
     pub fn fake_text(&self, path: &std::path::Path) -> Option<String> {

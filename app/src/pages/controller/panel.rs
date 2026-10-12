@@ -14,9 +14,8 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use bu_controller::layout::Press;
-use bu_controller::prefs::NOISE_STEPS;
 use bu_controller::settings::{radius_to_pct, CURVES, DZ_SHAPES, DZ_SOURCES, FLICK_SNAPS, GYRO_AXES, GYRO_BUTTONS, HAPTICS, HAPTICS_GROUP};
-use bu_controller::{Action, ButtonId, GyroSetting, PrefSetting, PressSetting, Side, StickMode, StickSetting, TouchMode, TouchSetting, TriggerSetting};
+use bu_controller::{Action, ButtonId, GyroSetting, PressSetting, Side, StickMode, StickSetting, TouchMode, TouchSetting, TriggerSetting};
 use taffy::style::AlignItems;
 
 use super::look::{self, ActShow};
@@ -29,19 +28,14 @@ use crate::ui::pieces::segx::{self, Label};
 use crate::ui::pieces::{button, dropdown, group, link, toggle};
 use crate::ui::{ACC, FG2, FG3, TRK};
 
-/// What the row builders need besides the page: the label column, the row's width, whose settings they are.
+/// What the row builders need besides the page: the label column and the row's width.
 #[derive(Clone, Copy)]
 struct Cols {
     lw: f32,
     w: f32,
-    /// the Controller settings popup (the controller's own file), not a part's window
-    dlg: bool,
 }
 
-const PANEL: Cols = Cols { lw: LW, w: PANEL_IN, dlg: false };
-/// `.pdvd .prw>span:first-child{width:150px}`; the dialog's content 480 - 2 x 18 (as wide as a part's window since the
-/// rows got their undo / reset slot, Order 042), the group's padding 2 x 12
-const DLG: Cols = Cols { lw: 150.0, w: super::DLG_W - 36.0 - 24.0, dlg: true };
+const PANEL: Cols = Cols { lw: LW, w: PANEL_IN };
 use super::PANEL_LEFT;
 
 /// A switch that is off when the file has no value / on when it holds anything but 0.
@@ -61,14 +55,14 @@ impl Open {
     }
 
     /// The words of a change made in this row ("Left stick · Dead zone", "Controller settings · Rumble").
-    fn row_words(&self, c: Cols, label: &str) -> String {
-        let area = if c.dlg { "Controller settings".to_string() } else { self.sel.map(|p| self.pname(p)).unwrap_or_else(|| "Controller".into()) };
+    fn row_words(&self, label: &str) -> String {
+        let area = self.sel.map(|p| self.pname(p)).unwrap_or_else(|| "Controller".into());
         format!("{area} \u{b7} {label}")
     }
 
     /// Registers a row: its controls lead to it (the undo list's "made here" and words).
-    fn row(&mut self, c: Cols, row: Key, controls: &[Key], label: &str) {
-        let words = self.row_words(c, label);
+    fn row(&mut self, row: Key, controls: &[Key], label: &str) {
+        let words = self.row_words(label);
         for k in controls {
             self.rows.insert(*k, (row, words.clone()));
         }
@@ -99,7 +93,7 @@ impl Open {
         if same(st, raw) {
             return None;
         }
-        let tip = if matches!(w, W::Pref(_) | W::Noise) { "Back to Steam\u{2019}s default".to_string() } else { format!("Back to Steam\u{2019}s setting: {}", tip(st)) };
+        let tip = format!("Back to Steam\u{2019}s setting: {}", tip(st));
         Some((Self::back_of(w, st)?, tip))
     }
 
@@ -121,7 +115,7 @@ impl Open {
         }
         let v = v.clamp(lo, hi);
         self.reg(k, if dead { Ctl::Dead } else { Ctl::Slider { lo, hi, step, def, conv, fmt: f, w, keep } });
-        self.row(c, k, &[k], label);
+        self.row(k, &[k], label);
         let back = if dead { None } else { self.steam_back(w, raw, |a, b| (shown(a) - shown(b)).abs() < step / 2.0, |s| fmt(shown(s), f)) };
         let tail = self.tail(cx, k, back);
         let v01 = ((v - lo) / (hi - lo)) as f32;
@@ -134,7 +128,7 @@ impl Open {
         let k = Self::k(id);
         let on = on_of(raw);
         self.reg(k, if dead { Ctl::Dead } else { Ctl::Toggle { on, w, on_v, off_v } });
-        self.row(c, k, &[k], label);
+        self.row(k, &[k], label);
         let back = if dead { None } else { self.steam_back(w, raw, |a, b| on_of(a) == on_of(b), |s| (if on_of(s) { "On" } else { "Off" }).into()) };
         let tail = self.tail(cx, k, back);
         look::prw(label, c.lw, vec![toggle::toggle(cx, k, on, false)], dead, Some(tail))
@@ -150,7 +144,7 @@ impl Open {
         for (i, v) in vals.iter().enumerate() {
             self.reg(keys[i], if dead { Ctl::Dead } else { Ctl::Val { v: *v, w, on: Some(i) == cur } });
         }
-        self.row(c, k, &keys, label);
+        self.row(k, &keys, label);
         let back = if dead { None } else { self.steam_back(w, raw, |a, b| cur_of(a) == cur_of(b), |s| cur_of(s).and_then(|i| labels.get(i)).map(|l| l.to_string()).unwrap_or_else(|| "its own".into())) };
         let tail = self.tail(cx, k, back);
         // `.prw .seg button{padding:0 9px}`: `segx::PRW` (fit; segment i = `Ev::Click(idx(k, i))`, as before)
@@ -172,7 +166,7 @@ impl Open {
         let name_of = |v: Option<i64>| items.iter().find(|(x, _)| *x == v).map(|(_, l)| l.clone()).unwrap_or_else(|| v.map(|v| format!("Other ({v})")).unwrap_or_else(|| "Steam\u{2019}s own".into()));
         let back = if dead { None } else { self.steam_back(w, raw, |a, b| a.or(dflt) == b.or(dflt), |s| name_of(s.or(dflt))) };
         self.reg(k, if dead { Ctl::Dead } else { Ctl::Menu { items, cur, w, width } });
-        self.row(c, k, &[k], label);
+        self.row(k, &[k], label);
         let tail = self.tail(cx, k, back);
         look::prw(label, c.lw, vec![dropdown::dropdown(cx, k, &shown, Some(width))], dead, Some(tail))
     }
@@ -181,7 +175,7 @@ impl Open {
     fn r_act(&mut self, cx: &mut Cx, id: &str, label: &str, cur: &Action, w: AW, steam: Option<&Action>) -> El {
         let k = Self::k(id);
         self.reg(k, Ctl::Act { cur: cur.clone(), w, title: label.into() });
-        self.row(PANEL, k, &[k], label);
+        self.row(k, &[k], label);
         let same = steam.map(|s| s == cur).unwrap_or(false);
         let back = self.steam_act(w).filter(|s| s != cur).map(|s| (Back::Layout(vec![Self::act_change(w, s.clone())]), format!("Back to Steam\u{2019}s setting: {}", s.label(self.xbox()))));
         let tail = self.tail(cx, k, back);
@@ -312,7 +306,7 @@ impl Open {
         let cak = Self::k(&format!("{n}.chord"));
         let chord_a = act(Press::Chord);
         self.reg(cak, Ctl::Act { cur: chord_a.clone(), w: AW::Btn(b, Press::Chord), title: "Chorded press".into() });
-        self.row(PANEL, ck, &[ck, cak], "Together with");
+        self.row(ck, &[ck, cak], "Together with");
         // its reset: both values back to Steam's (one write)
         let st_b = steam.as_ref().map(|s| sv(&s.settings, PressSetting::ChordButton));
         let st_a = st_act(Press::Chord);
@@ -537,72 +531,6 @@ impl Open {
         let more = Self::r_sec("More", more);
         vec![touch, click, more]
     }
-}
-
-/// The Controller settings popup's rows (`devIn`) + the Light bar (colour + brightness, A_015_02) for pads that have one.
-pub(super) fn prefs_rows(o: &mut Open, cx: &mut Cx) -> Vec<El> {
-    let p = o.pref().cloned();
-    let dead = p.is_none();
-    let get = |s: PrefSetting| p.as_ref().and_then(|p| p.get(s)).map(str::to_string);
-    let num = |s: PrefSetting| get(s).and_then(|v| v.trim().parse::<i64>().ok());
-    let dz = |s: PrefSetting| p.as_ref().and_then(|p| p.stick_deadzone_pct(s)).map(bu_controller::settings::pct_to_radius);
-    let mut rows = vec![
-        o.r_slider(cx, DLG, "pf.lsdz", "Left stick dead zone", (0.0, 40.0, 1.0), 8.0, Conv::Radius, Fmt::Pct, W::Pref(PrefSetting::LeftStickDeadZone), dz(PrefSetting::LeftStickDeadZone), dead),
-        o.r_slider(cx, DLG, "pf.rsdz", "Right stick dead zone", (0.0, 40.0, 1.0), 8.0, Conv::Radius, Fmt::Pct, W::Pref(PrefSetting::RightStickDeadZone), dz(PrefSetting::RightStickDeadZone), dead),
-        o.r_toggle(cx, DLG, "pf.anti", "Anti-drift", num(PrefSetting::AntiDrift), |r| r == Some(1), W::Pref(PrefSetting::AntiDrift), Some(1), Some(0), dead),
-    ];
-    if o.kind.has_gyro() {
-        // nothing in the file = Steam's default 0.5 = Medium; a value the three steps don't have = its own item (never rewritten)
-        let raw = get(PrefSetting::GyroNoiseFilter);
-        let noise = match &raw {
-            None => Some(1),
-            Some(v) => NOISE_STEPS.iter().position(|(_, n)| v.trim().parse::<f64>().ok() == n.parse::<f64>().ok()).map(|i| i as i64),
-        };
-        let mut items: Vec<(Option<i64>, String)> = NOISE_STEPS.iter().enumerate().map(|(i, (l, _))| (Some(i as i64), l.to_string())).collect();
-        if noise.is_none() {
-            items.push((None, raw.unwrap_or_default().trim().to_string()));
-        }
-        rows.push(o.r_menu(cx, DLG, "pf.noise", "Gyro noise filter", items, noise, None, W::Noise, 112.0, dead));
-    }
-    rows.push(o.r_toggle(cx, DLG, "pf.rumble", "Rumble", num(PrefSetting::Rumble), |r| r != Some(0), W::Pref(PrefSetting::Rumble), Some(1), Some(0), dead));
-    // (the drawing's "Turn off when idle" is a Steam-wide setting, not in this file - Lane L gap 4 - left out, Order 045
-    // item 13)
-    if o.kind.has_light_bar() {
-        let led = p.as_ref().and_then(|p| p.led());
-        let on = led.and_then(|c| look::LCOL.iter().position(|(_, x)| x.unwrap_or((0, 0, 0)) == c));
-        let k = Open::k("pf.lc");
-        let keys: Vec<Key> = (0..look::LCOL.len()).map(|i| idx(k, i)).collect();
-        for (i, sk) in keys.iter().enumerate() {
-            o.reg(*sk, if dead { Ctl::Dead } else { Ctl::Val { v: Some(i as i64), w: W::Light, on: on == Some(i) } });
-        }
-        o.row(DLG, k, &keys, "Light bar");
-        // no reset: Steam's own colour for a controller is not known (its file only has what was picked)
-        let tail = o.tail(cx, k, None);
-        rows.push(look::prw("Light bar", DLG.lw, vec![look::lsw(cx, k, on)], dead, Some(tail)));
-        let bri = get(PrefSetting::LedBrightness).and_then(|v| v.trim().parse::<f64>().ok()).map(|v| (v * 100.0).round() as i64);
-        rows.push(o.r_slider(cx, DLG, "pf.bri", "Brightness", (0.0, 100.0, 5.0), 100.0, Conv::Unit, Fmt::Pct, W::Pref(PrefSetting::LedBrightness), bri, dead));
-        rows.extend(restart_row(o, cx));
-    }
-    rows
-}
-
-/// The line under "Brightness" (Order 085): Steam sets the light only when it starts, so a new colour / brightness waits
-/// for a Steam restart. Shown from the first light change until Steam has been restarted by this link; asks first.
-fn restart_row(o: &Open, cx: &mut Cx) -> Option<El> {
-    use super::{Rs, K_RESTART, LIGHT_PENDING};
-    let pending = o.keep.get::<bool>(LIGHT_PENDING).unwrap_or(false);
-    let (text, links): (&str, Vec<(&str, &str)>) = match o.rs {
-        Rs::Idle if pending => ("Steam sets the light only when it starts.", vec![("ask", "Restart Steam to apply")]),
-        Rs::Idle => return None,
-        Rs::Ask => ("Steam closes for a few seconds and starts again in the tray.", vec![("go", "Restart Steam"), ("no", "Cancel")]),
-        Rs::Busy => ("Restarting Steam\u{2026}", vec![]),
-    };
-    let said = El::text(text, Font::new(11.5, 400), FG3(), lh(11.5, 1.35)).wrapping();
-    let mut line = El::row().center().gap(12.0).none();
-    for (part, label) in links {
-        line = line.child(link::link(cx, sub(K_RESTART, part), label, 12.0));
-    }
-    Some(look::prw("", DLG.lw, vec![El::col().gap(2.0).w(DLG.w - DLG.lw - 10.0).child(said).child(line)], false, None))
 }
 
 /// The two wells of a stick (`stickWells`): the dead zone circle (live dot = the stick) and the response curve.

@@ -31,11 +31,6 @@ pub trait SteamOs: Send + Sync {
     fn steam_running(&self) -> bool;
     /// Is a game running through Steam (`HKCU\Software\Valve\Steam\RunningAppID` not 0)? Read-only.
     fn game_running(&self) -> bool;
-    /// Ask Steam to close itself (`steam.exe -shutdown`: Steam's own clean shutdown, it is never killed). Only for the
-    /// "Restart Steam to apply" click; refused in read-only / scratch copies.
-    fn steam_shutdown(&self) -> Result<()>;
-    /// Start Steam again, minimised to the tray (`steam.exe -silent`). Same refusals.
-    fn steam_start_minimised(&self) -> Result<()>;
 }
 
 /// How a controller is connected.
