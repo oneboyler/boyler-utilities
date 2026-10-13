@@ -67,6 +67,9 @@
 //!   "set feature on path A, wait for the input report on path B". Held back: [`matches`] gives these ids nothing.
 //! - Battery: no ported model reports one (OP1 client: `batteryPercent: null`; OT client: `null` - its wireless block is only
 //!   meaningful on the unmapped wireless pid 0x1910, which OpenMouse leaves unsupported). The WE client has one but is held back.
+//! - Order 110 (A_110_02 scope): OP1 Motion Sync [28] / angle snapping [26] / ripple [27] (setBoolean through updateConfig);
+//!   OT angle snapping / ripple (profile flags bits 3 / 6, setProcessingFlag through updateProfile). The OT Motion Sync is two
+//!   flags (responsive / smooth) with no plain switch in OpenMouse - left out. No debounce setter in either client.
 //! - Everything else the clients can do: stages count, button mapping, filters, glass mode, sensor tuning, LEDs / RGB,
 //!   handedness, firmware version, **factory reset (0x13), firmware flash and firmware reset (OT)** - none is DPI / polling /
 //!   lift-off, and none of those commands is in this file.
@@ -78,7 +81,7 @@
 //! interface is found by that length - see [`config_interface`].
 
 use crate::error::{Error, Result};
-use crate::family::{Caps, Changed, DpiCaps, Driver, Family, Matched, OnMouse, Port, ReadOptions, Setting};
+use crate::family::{check_extra, Caps, Change, Changed, DpiCaps, Driver, Extra, ExtraRow, Family, Matched, OnMouse, Port, ReadOptions, Setting};
 use crate::os::{HidInfo, HidTransfer};
 
 pub const VENDOR_ID: u16 = 0x3367;
@@ -215,6 +218,9 @@ pub const OFF_POLLING_DIVIDER: usize = 21;
 pub const OFF_FILTER_FLAGS: usize = 22;
 pub const OFF_LOD: usize = 25;
 pub const OFF_MOTION_SYNC: usize = 28;
+/// Order 110: `EGG_OFFSET.angleSnapping` / `rippleControl` (one byte each, 0 = off).
+pub const OFF_ANGLE_SNAP: usize = 26;
+pub const OFF_RIPPLE: usize = 27;
 pub const OFF_CPI_LEVELS: usize = 30;
 pub const OFF_FIRST_CPI: usize = 51;
 pub const OFF_GLASS: usize = 127;
@@ -725,6 +731,7 @@ fn read_op1(m: &Matched, port: &mut dyn Port, opt: ReadOptions) -> Result<OnMous
     if !profile.is_neutral() {
         r.lift_off = config_lift_off(&profile, &config);
         r.caps = op1_caps(&profile, &config);
+        r.extras = op1_rows(Some(&config));
     }
     // (a neutral profile = v1 or v2 not known: no lift-off, no caps, no writes)
     Ok(r)
@@ -774,6 +781,35 @@ fn write_op1(m: &Matched, port: &mut dyn Port, s: Setting) -> Result<Changed> {
     }
 }
 
+/// Order 110 (OP1): readStatus' `motionSync` / `angleSnapping` / `rippleControl` (`config[offset] !== 0`), card order.
+fn op1_rows(config: Option<&[u8]>) -> Vec<ExtraRow> {
+    let on = |o: usize| config.and_then(|c| c.get(o)).map(|b| *b != 0);
+    vec![ExtraRow::switch(Extra::MotionSync, on(OFF_MOTION_SYNC)), ExtraRow::switch(Extra::AngleSnap, on(OFF_ANGLE_SNAP)), ExtraRow::switch(Extra::RippleControl, on(OFF_RIPPLE))]
+}
+
+/// Order 110 (OP1): `setBoolean(offset, enabled)` through `updateConfig` (read, one byte changed, store / block write, read
+/// back). setMotionSync(true) on a mouse that cannot run it at 8 kHz is refused while the mouse is at 8000 Hz.
+fn change_op1(m: &Matched, port: &mut dyn Port, c: Change) -> Result<()> {
+    let Change::Extra(e, v) = c;
+    check_extra(&op1_rows(None), e, v)?;
+    let offset = match e {
+        Extra::MotionSync => OFF_MOTION_SYNC,
+        Extra::AngleSnap => OFF_ANGLE_SNAP,
+        _ => OFF_RIPPLE,
+    };
+    let u = op1_update(port, m.variant, |p, cfg| {
+        if e == Extra::MotionSync && v == 1 && !p.motion_sync_at_8k && p.decode_polling(cfg[OFF_POLLING_DIVIDER]) == Some(8000) {
+            return Err(Error::range("Motion Sync", format!("{} cannot use Motion Sync at 8,000 Hz", p.name)));
+        }
+        cfg[offset] = v as u8;
+        Ok(())
+    })?;
+    if (u.confirmed[offset] != 0) != (v == 1) {
+        return Err(Error::BadAnswer(format!("the mouse did not confirm {}", e.label())));
+    }
+    Ok(())
+}
+
 // ================================================================================== OT platform
 
 pub const OT_PACKET_SIZE: usize = 64;
@@ -800,6 +836,10 @@ pub const OT_CPI_INDEX: usize = 16;
 pub const OT_POLLRATE_INDEX: usize = 17;
 pub const OT_POLL_RATES: usize = 18;
 pub const OT_DCU_THRESHOLD: usize = 23;
+/// Order 110: `profileFlags` (u32 LE at 12): angle snapping = bit 3, ripple control = bit 6 (`OT_PROFILE_FLAG`), both in byte 12.
+pub const OT_PROFILE_FLAGS: usize = 12;
+pub const OT_FLAG_ANGLE_SNAP: u8 = 1 << 3;
+pub const OT_FLAG_RIPPLE: u8 = 1 << 6;
 pub const OT_CPI_Y: usize = 103;
 /// the main block's length (`OT_EFFECT_SIZE - 68`)
 pub const OT_MAIN_LEN: usize = 50;
@@ -1024,7 +1064,30 @@ fn read_ot(m: &Matched, port: &mut dyn Port, opt: ReadOptions) -> Result<OnMouse
     r.dpi = ot_effect_dpi(&main);
     r.polling_hz = ot_effect_polling(&main);
     r.lift_off = ot_effect_lift_off(&main);
+    r.extras = ot_rows(Some(&main));
     Ok(r)
+}
+
+/// Order 110 (OT): `angleSnapping` / `rippleControl` from the profile flags. (Motion Sync is two separate flags there,
+/// responsive and smooth, with no plain on / off setter in OpenMouse's OT client: not a row.)
+fn ot_rows(effect: Option<&[u8]>) -> Vec<ExtraRow> {
+    let bit = |b: u8| effect.and_then(|e| e.get(OT_PROFILE_FLAGS)).map(|f| f & b != 0);
+    vec![ExtraRow::switch(Extra::AngleSnap, bit(OT_FLAG_ANGLE_SNAP)), ExtraRow::switch(Extra::RippleControl, bit(OT_FLAG_RIPPLE))]
+}
+
+/// Order 110 (OT): `setProcessingFlag(flag, enabled)` through `updateProfile` (the six packets), the flag read back.
+fn change_ot(port: &mut dyn Port, c: Change) -> Result<()> {
+    let Change::Extra(e, v) = c;
+    check_extra(&ot_rows(None), e, v)?;
+    let flag = if e == Extra::AngleSnap { OT_FLAG_ANGLE_SNAP } else { OT_FLAG_RIPPLE };
+    let (_, confirmed) = ot_update(port, |eff| {
+        eff[OT_PROFILE_FLAGS] = if v == 1 { eff[OT_PROFILE_FLAGS] | flag } else { eff[OT_PROFILE_FLAGS] & !flag };
+        Ok(())
+    })?;
+    if (confirmed[OT_PROFILE_FLAGS] & flag != 0) != (v == 1) {
+        return Err(Error::BadAnswer(format!("the mouse did not confirm {}", e.label())));
+    }
+    Ok(())
 }
 
 /// `updateProfile(0, change)`: load the profile, patch it, send the six packets, load it again. -> (before, confirmed)
@@ -1135,6 +1198,14 @@ impl Driver for Endgame {
         match the_product(m)?.client {
             Client::Op1 => write_op1(m, port, s),
             Client::Ot => write_ot(m, port, s),
+        }
+    }
+
+    /// Order 110: Motion Sync / angle snapping / ripple (OP1), angle snapping / ripple (OT), checked before anything is sent.
+    fn change(&self, m: &Matched, port: &mut dyn Port, c: Change) -> Result<()> {
+        match the_product(m)?.client {
+            Client::Op1 => change_op1(m, port, c),
+            Client::Ot => change_ot(port, c),
         }
     }
 }

@@ -18,6 +18,7 @@ use bu_mouse::accel::service::RawAccelStatus;
 use bu_mouse::accel::switch::{PerApp, Target};
 use bu_mouse::cursors::{CursorsState, Pack, Role, SetId};
 use bu_mouse::device::{OnMouse, ReadOptions, YourMouse};
+use bu_mouse::family::Change as MouseChange;
 use bu_mouse::fake::{CmouseModel, FakeOs};
 use bu_mouse::os::{DriverVersion, HidInfo, MouseOs, WinRaw, WinSetting};
 use bu_mouse::settings::WindowsMouse;
@@ -94,6 +95,9 @@ pub enum Cmd {
     Dpi(u32),
     Polling(u32),
     LiftOff(u32),
+    /// Order 110: one of the rows under Lift-off (Debounce time, Motion Sync, Angle Snap, Ripple Control, Turbo Mode) - one
+    /// write, then the mouse is read again
+    Change(MouseChange),
     /// the card's state as the page edited it (curve, values, presets, per app); handed to the driver if it changed
     Accel(Box<(Panel, PerApp)>),
     AccelOn(bool),
@@ -324,6 +328,10 @@ pub fn sample_fake_with(sample: Sample) -> Mouse<FakeOs> {
     let mut model = CmouseModel::new();
     // the drawing's mouse: stage 2 (1600 DPI) active
     model.mem[4..6].copy_from_slice(&[2, 0x55 - 2]);
+    // Order 110: the owner's X2 (the boss's notes, Oct 13): debounce 4 ms, Motion Sync / Angle Snap / Ripple / Turbo off
+    for (a, v) in [(169usize, 4u8), (171, 0), (175, 0), (177, 0), (181, 0)] {
+        model.mem[a..a + 2].copy_from_slice(&[v, 0x55u8.wrapping_sub(v)]);
+    }
     os.mice.insert(CFG.into(), Box::new(move |req| Ok(model.answer(req))));
     if sample.unsupported_mouse {
         os.hid = vec![HidInfo {
@@ -360,6 +368,8 @@ pub fn sample_fake_with(sample: Sample) -> Mouse<FakeOs> {
         os.hid = vec![base.clone(), HidInfo { path: X3.into(), usage_page: 0xFFFF, usage: 0x01, input_len: 0, feature_len: 65, interface: Some(1), ..base }];
         // the XS-1 answers (OpenMouse's offsets, +1 for the report id): DPI 1600 both axes, lift-off Medium, battery 64 %
         let mut dpi = 1600u16;
+        // Order 110: debounce 2 ms, Motion Sync on, Angle Snap / Ripple off (OpenMouse's answer byte 7 = our 8)
+        let mut flags: Vec<([u8; 2], u8)> = vec![([0x04, 0x03], 2), ([0x07, 0x05], 1), ([0x07, 0x04], 0), ([0x07, 0x03], 0)];
         os.mice.insert(
             X3.into(),
             Box::new(move |out: &[u8]| {
@@ -368,6 +378,9 @@ pub fn sample_fake_with(sample: Sample) -> Mouse<FakeOs> {
                     // a write (feature report out, no answer)
                     if cmd == [0x05, 0x02, 0x05] {
                         dpi = u16::from_le_bytes([out[8], out[9]]);
+                    }
+                    if let Some(f) = flags.iter_mut().find(|f| f.0 == [cmd[0], cmd[1]]) {
+                        f.1 = out[8];
                     }
                     return Ok(Vec::new());
                 }
@@ -381,7 +394,11 @@ pub fn sample_fake_with(sample: Sample) -> Mouse<FakeOs> {
                     }
                     [0x07, 0x82, 0x03] => a[9] = 0x0A,
                     [0x08, 0x85, 0x03] => a[8] = 30,
-                    _ => {}
+                    _ => {
+                        if let Some(f) = flags.iter().find(|f| f.0 == [cmd[0], cmd[1] & 0x7F]) {
+                            a[8] = f.1;
+                        }
+                    }
                 }
                 Ok(a)
             }),
@@ -793,6 +810,18 @@ fn apply<O: MouseOs>(m: &mut Mouse<O>, mice: &[YourMouse], on: &mut Option<OnMou
                 Err(e) => err(e),
             }
         }
+        Cmd::Change(c) => {
+            let Some(y) = mice.first() else { return Some("No mouse found".into()) };
+            match m.apply_change(y, c) {
+                Ok(()) => {
+                    if let Ok(o) = m.read_on_mouse(y, ReadOptions::default()) {
+                        *on = Some(o);
+                    }
+                    Some(change_toast(c))
+                }
+                Err(e) => err(e),
+            }
+        }
         Cmd::Accel(b) => {
             let (panel, per_app) = *b;
             let a = m.accel_mut();
@@ -857,6 +886,13 @@ fn apply<O: MouseOs>(m: &mut Mouse<O>, mice: &[YourMouse], on: &mut Option<OnMou
             None
         }
     }
+}
+
+/// The toast after an Order 110 change, like DPI's ("Motion Sync On · saved on the mouse", "Debounce time 4 ms · …").
+pub fn change_toast(c: MouseChange) -> String {
+    let MouseChange::Extra(e, v) = c;
+    let words = if e == bu_mouse::family::Extra::Debounce { format!("{v} ms") } else { (if v != 0 { "On" } else { "Off" }).to_string() };
+    format!("{} {words} \u{b7} saved on the mouse", e.label())
 }
 
 /// Is the always-on engine running (the real app)? Then it owns the driver: the tab only saves the card and asks it.

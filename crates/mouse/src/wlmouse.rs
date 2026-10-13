@@ -35,14 +35,19 @@
 //!   would flatten Y to X - this app never overwrites a value it did not show).
 //! - battery: page 0 command 0x83, `[charging (1), percent]`.
 //!
+//! - Order 110 (A_110_02 scope): debounce (device page write 0x08 `[profile, ms]` 0-15 ms, read 0x88), Motion Sync (profile
+//!   page 0x09 / 0x89), angle snapping (0x04 / 0x84), ripple (0x0a / 0x8a), turbo mode (0x13 / 0x93 - the client's
+//!   `turboMode`; the mouse only keeps it with high-speed mode on, else the read-back is off and the change is an error, as
+//!   in OpenMouse): the active profile, the write, the read-back. The five reads are optional.
+//!
 //! Left out on purpose: the Beast X 4K (0xa887, `beast-x-4k-hid.js`: another protocol, report 4 - its model is "pr", not
-//! supported), the 1K receiver (0xa882, not on the list), stage editor / stage count / active stage, sleep timeout, debounce,
-//! angle snapping, motion sync, ripple control, high-speed / turbo mode, angle tuning, button combination, firmware / serial
+//! supported), the 1K receiver (0xa882, not on the list), stage editor / stage count / active stage, sleep timeout,
+//! high-speed (hyper) mode, angle tuning, button combination, firmware / serial
 //! / paired-product reads (none is DPI / polling / lift-off / battery), the notification channel. OpenMouse sends no firmware
 //! update, DFU or reset command to a WLMouse and neither does this file. Nothing here ran on a real unit.
 
 use crate::error::{Error, Result};
-use crate::family::{Caps, Changed, DpiCaps, Driver, Family, Matched, OnMouse, Port, ReadOptions, Setting};
+use crate::family::{check_extra, Caps, Change, Changed, DpiCaps, Driver, Extra, ExtraRow, Family, Kind, Matched, OnMouse, Port, ReadOptions, Setting};
 use crate::os::{HidInfo, HidTransfer};
 
 pub const VENDOR_ID: u16 = 0x36a7;
@@ -126,6 +131,28 @@ pub fn read_polling_rate(profile: u8) -> Spec {
 /// PROFILE_READ.liftOffDistance(profile)
 pub fn read_lift_off(profile: u8) -> Spec {
     read(TARGET_MOUSE, PAGE_PROFILE, 0x88, 0x02, &[profile])
+}
+
+/// Order 110: PROFILE_READ.debounce(profile) - the DEVICE page, command 0x88, answer `[1]` = ms.
+pub fn read_debounce(profile: u8) -> Spec {
+    read(TARGET_MOUSE, PAGE_DEVICE, 0x88, 0x02, &[profile])
+}
+/// Order 110: PROFILE_READ of a profile-page flag, answer `[1]` = 1 when on.
+pub fn read_flag(profile: u8, command: u8) -> Spec {
+    read(TARGET_MOUSE, PAGE_PROFILE, command, 0x02, &[profile])
+}
+/// Order 110: the profile-page flags as (setting, WRITE command, PROFILE_READ command), card order: motionSync 0x09 / 0x89,
+/// angleSnapping 0x04 / 0x84, rippleControl 0x0a / 0x8a, turboMode 0x13 / 0x93 (the client's own "turbo mode": the sensor
+/// pinned at 20K FPS).
+pub const FLAGS: [(Extra, u8, u8); 4] = [(Extra::MotionSync, 0x09, 0x89), (Extra::AngleSnap, 0x04, 0x84), (Extra::RippleControl, 0x0a, 0x8a), (Extra::Turbo, 0x13, 0x93)];
+/// `DEBOUNCE_MAX_MS` (setDebounceTime: 0-15 ms; write = device page 0x08).
+pub const DEBOUNCE_MAX_MS: i32 = 15;
+
+/// The Order 110 rows in the card's order, values `None` = not read.
+fn extra_rows(debounce: Option<i32>, flags: [Option<bool>; 4]) -> Vec<ExtraRow> {
+    let mut v = vec![ExtraRow::new(Extra::Debounce, Kind::Range { min: 0, max: DEBOUNCE_MAX_MS, step: 1, unit: "ms" }, debounce)];
+    v.extend(FLAGS.iter().zip(flags).map(|(f, on)| ExtraRow::switch(f.0, on)));
+    v
 }
 
 /// The client's `write(page, command, profile, values)`: arguments `[profile, ...values]`, length = their count.
@@ -288,7 +315,9 @@ pub fn read_request_allowed(out: &[u8]) -> bool {
     }
     let p = &out[1..REPORT_LEN];
     let profile = if p[HEADER_LEN] == 0 { 1 } else { p[HEADER_LEN] };
-    [read_firmware(), read_battery(), read_active_profile(), read_dpi_stages(profile), read_active_stage(profile), read_polling_rate(profile), read_lift_off(profile)]
+    let mut reads = vec![read_firmware(), read_battery(), read_active_profile(), read_dpi_stages(profile), read_active_stage(profile), read_polling_rate(profile), read_lift_off(profile), read_debounce(profile)];
+    reads.extend(FLAGS.iter().map(|f| read_flag(profile, f.2)));
+    reads
         .iter()
         .any(|s| encode_request(s)[..] == *p)
 }
@@ -443,7 +472,34 @@ impl Driver for WlMouse {
         }
         r.polling_hz = optional(read_polling(port, profile))?.flatten();
         r.lift_off = optional(read_lift_off_level(port, profile))?.flatten();
+        // Order 110: debounce, then angle snapping, Motion Sync, ripple, turbo (readStatus' order), each `.catch(() => null)`
+        let debounce = optional(ask(port, &read_debounce(profile)))?.and_then(|a| a.get(1).map(|b| *b as i32));
+        let mut flags = [None; 4];
+        for i in [1usize, 0, 2, 3] {
+            flags[i] = optional(ask(port, &read_flag(profile, FLAGS[i].2)))?.and_then(|a| a.get(1).map(|b| *b == 1));
+        }
+        // a setting the mouse did not answer (unsupported on this model) gets no row, as OpenMouse hides its control
+        r.extras = extra_rows(debounce, flags).into_iter().filter(|x| x.value.is_some()).collect();
         Ok(r)
+    }
+
+    /// Order 110: setDebounceTime / setMotionSync / setAngleSnapping / setRippleControl / setTurboMode - checked first, then
+    /// the active profile, the write, the read-back (`[1]`) must hold the value.
+    fn change(&self, _m: &Matched, port: &mut dyn Port, c: Change) -> Result<()> {
+        let Change::Extra(e, v) = c;
+        check_extra(&extra_rows(None, [None; 4]), e, v)?;
+        let profile = current_profile(port)?;
+        let (write, read) = match FLAGS.iter().find(|f| f.0 == e) {
+            Some(f) => (write_spec(PAGE_PROFILE, f.1, profile, &[v as u8]), read_flag(profile, f.2)),
+            None => (write_spec(PAGE_DEVICE, 0x08, profile, &[v as u8]), read_debounce(profile)),
+        };
+        ask(port, &write)?;
+        // OpenMouse's confirm: a flag reads on when its byte === 1 (anything else = off); debounce is the byte itself
+        let now = ask(port, &read)?.get(1).copied().map(|b| if e == Extra::Debounce { b as i32 } else { (b == 1) as i32 });
+        if now != Some(v) {
+            return Err(Error::BadAnswer(format!("the mouse kept {now:?} instead of {v} ({})", e.label())));
+        }
+        Ok(())
     }
 
     /// OpenMouse's setPollingRate / setLiftOffDistance / setDpi: the active profile first, the write, the read-back that is

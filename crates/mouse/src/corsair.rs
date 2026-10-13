@@ -25,14 +25,18 @@
 //! sent): a slot with separate X / Y values - setDpi would flatten Y to X. The writes address the live profile only; the mouse
 //! forgets them when it loses power (OpenMouse's own note) - nothing stored is overwritten.
 //!
+//! Order 110 (A_110_02 scope): angle snapping - `MOUSE_SNAP` 0x04: GET `0e 13 04 00` (answer byte 4 != 0 = on), SET `07 13 04
+//! 00 | on | 05` (corsairEncode.setSnap), then the GET must answer the new value. Read only after the DPI read answered, as
+//! OpenMouse's readStatus does.
+//!
 //! Left out on purpose: polling-rate SET (OpenMouse's client marks polling read-only: the mouse re-enumerates after it),
 //! lift-off (a raw 1 - 5 byte; OpenMouse's Low / Medium / High names are "this driver's own mapping" with no millimetre
-//! figure, so a tenths-of-a-mm row would be made up), stage editor / count / colour / selection, angle snapping, the DPI-stage
+//! figure, so a tenths-of-a-mm row would be made up), stage editor / count / colour / selection, the DPI-stage
 //! mask, firmware, battery (a wired mouse). OpenMouse sends no firmware-update, DFU or reset command to a Corsair NXP mouse
 //! and neither does this file. Nothing here ran on a real unit.
 
 use crate::error::{Error, Result};
-use crate::family::{Caps, Changed, DpiCaps, Driver, Family, Matched, OnMouse, Port, ReadOptions, Setting};
+use crate::family::{check_extra, Caps, Change, Changed, DpiCaps, Driver, Extra, ExtraRow, Family, Matched, OnMouse, Port, ReadOptions, Setting};
 use crate::os::{HidInfo, HidTransfer};
 
 pub const VENDOR_ID: u16 = 0x1b1c;
@@ -91,6 +95,21 @@ pub fn set_stage_dpi(slot: u8, x: u16, y: u16, rgb: [u8; 3]) -> [u8; PACKET_LEN]
     packet(&[COMMAND_SET, FIELD_MOUSE, MOUSE_DPI_PROFILE | slot, LIVE_PROFILE, (x != y) as u8, x as u8, (x >> 8) as u8, y as u8, (y >> 8) as u8, rgb[0], rgb[1], rgb[2]])
 }
 
+/// Order 110: `CORSAIR_MOUSE.snap`
+pub const MOUSE_SNAP: u8 = 0x04;
+/// Order 110: corsairEncode.snap: `0e 13 04 00`
+pub fn get_snap() -> [u8; PACKET_LEN] {
+    packet(&[COMMAND_GET, FIELD_MOUSE, MOUSE_SNAP, LIVE_PROFILE])
+}
+/// Order 110: corsairEncode.setSnap(enabled): `07 13 04 00 | on | 05`
+pub fn set_snap(on: bool) -> [u8; PACKET_LEN] {
+    packet(&[COMMAND_SET, FIELD_MOUSE, MOUSE_SNAP, LIVE_PROFILE, on as u8, 0x05])
+}
+/// Order 110: corsairDecode.snap: answer byte 4 != 0.
+pub fn decode_snap(reply: &[u8]) -> Option<bool> {
+    reply.get(4).map(|b| *b != 0)
+}
+
 /// The packet as Windows sends it: report id 0, the packet, zeros up to the collection's feature length.
 pub fn report(p: &[u8; PACKET_LEN], feature_len: usize) -> Vec<u8> {
     let mut v = vec![0u8; feature_len.max(REPORT_LEN)];
@@ -133,7 +152,7 @@ pub fn read_request_allowed(out: &[u8]) -> bool {
         return false;
     }
     let p = &out[1..REPORT_LEN];
-    p == get_ident() || p == get_current() || (0..STAGE_COUNT).any(|slot| p == get_stage(slot))
+    p == get_ident() || p == get_current() || p == get_snap() || (0..STAGE_COUNT).any(|slot| p == get_stage(slot))
 }
 
 // ---------------------------------------------------------------- the device table
@@ -200,12 +219,29 @@ impl Driver for Corsair {
         };
         r.online = true;
         r.polling_hz = decode_polling_hz(&ident);
-        r.dpi = match get(port, &get_current()) {
-            Ok(a) => decode_current(&a).map(|c| c.1 as u32),
+        let current = match get(port, &get_current()) {
+            Ok(a) => Some(a),
             Err(Error::BadAnswer(_)) => None,
             Err(e) => return Err(e),
         };
+        r.dpi = current.as_ref().and_then(|a| decode_current(a)).map(|c| c.1 as u32);
+        // Order 110: angle snapping, asked only when the DPI read answered (readStatus: `dpi ? request(snap) : null`)
+        // best-effort as in OpenMouse: any failure only leaves the row out
+        let snap = if current.is_some() { get(port, &get_snap()).ok().and_then(|a| decode_snap(&a)) } else { None };
+        r.extras = snap.map(|s| vec![ExtraRow::switch(Extra::AngleSnap, Some(s))]).unwrap_or_default();
         Ok(r)
+    }
+
+    /// Order 110: setAngleSnapping - the SET (no answer, 20 ms), then the GET must hold the new value.
+    fn change(&self, _m: &Matched, port: &mut dyn Port, c: Change) -> Result<()> {
+        let Change::Extra(e, v) = c;
+        check_extra(&[ExtraRow::switch(Extra::AngleSnap, None)], e, v)?;
+        set(port, &set_snap(v == 1))?;
+        let now = decode_snap(&get(port, &get_snap())?);
+        if now != Some(v == 1) {
+            return Err(Error::BadAnswer(format!("the Corsair mouse kept angle snapping {now:?} instead of {}", v == 1)));
+        }
+        Ok(())
     }
 
     /// OpenMouse's setDpi: the selected slot (a GET), the slot's colour (a GET), the SET with the new DPI and that colour,

@@ -27,13 +27,18 @@
 //! Only the system block is written for a polling change and only the sensor block for a DPI change (OpenMouse writes both
 //! every time; the one it would not change is byte-identical to the stored one, as the check above proves).
 //!
+//! Order 110 (A_110_02 scope): debounce (0-30 ms: mergeEditableSettings' clamp), Motion Sync, angle snapping and ripple control:
+//! OpenMouse's setDebounceTime / setMotionSync / setAngleSnapping / setRippleControl = `apply({...})`, through the same
+//! read, rewrite check, block write, save and read-back as DPI / polling (debounce = the system block, the switches = the
+//! sensor block). Its setPerformanceMode is the sensor's maxSpeedMode, not the Pulsar turbo: left out.
+//!
 //! Left out on purpose: lift-off (OpenMouse's three levels Low / Medium / High have no millimetre figure), battery (the
 //! wired mouse has none; OpenMouse reads it for the receiver only), the receiver ids (0x080b, 0x0746), the V1 mouse
-//! (0x0747, "dms" protocol) - none of them is on OpenMouse's SUPPORTED list - profiles, sleep, debounce, angle, motion sync,
-//! ripple, performance modes, wheel reverse, lighting-colour, factory reset (`09 .. 81 FF`; never sent).
+//! (0x0747, "dms" protocol) - none of them is on OpenMouse's SUPPORTED list - profiles, sleep, angle tuning, performance
+//! modes, wheel reverse, lighting-colour, factory reset (`09 .. 81 FF`; never sent).
 
 use crate::error::{Error, Result};
-use crate::family::{Caps, Changed, DpiCaps, Driver, Family, Matched, OnMouse, Port, ReadOptions, Setting};
+use crate::family::{check_extra, not_offered, Caps, Change as FChange, Changed, DpiCaps, Driver, Extra, ExtraRow, Family, Kind, Matched, OnMouse, Port, ReadOptions, Setting};
 use crate::os::{HidInfo, HidTransfer};
 
 pub const VENDOR_ID: u16 = 0x1915;
@@ -218,6 +223,12 @@ pub enum Change {
     Dpi(u32),
     /// setPollingRate: reportRateIndex
     Rate(usize),
+    /// Order 110: setDebounceTime: debounceMs
+    Debounce(u8),
+    /// setMotionSync / setAngleSnapping / setRippleControl
+    MotionSync(bool),
+    AngleSnap(bool),
+    Ripple(bool),
 }
 
 /// mergeEditableSettings' result, as far as the two packets use it.
@@ -249,10 +260,15 @@ pub fn normalize_dpi(v: u32) -> u16 {
 pub fn merge(cur: &Settings, change: Change) -> Next {
     let mut stages = cur.stages;
     let mut rate_index = cur.rate_index;
+    let (mut debounce, mut angle_snapping, mut ripple_control, mut motion_sync) = (cur.debounce, cur.angle_snapping, cur.ripple_control, cur.motion_sync);
     match change {
         Change::None => {}
         Change::Dpi(d) => stages[cur.active_stage as usize] = (normalize_dpi(d), normalize_dpi(d)),
         Change::Rate(i) => rate_index = i,
+        Change::Debounce(v) => debounce = v,
+        Change::MotionSync(b) => motion_sync = b,
+        Change::AngleSnap(b) => angle_snapping = b,
+        Change::Ripple(b) => ripple_control = b,
     }
     for st in stages.iter_mut() {
         *st = (normalize_dpi(st.0 as u32), normalize_dpi(st.1 as u32));
@@ -264,12 +280,12 @@ pub fn merge(cur: &Settings, change: Change) -> Next {
         active_stage: cur.active_stage.min(enabled - 1),
         rate_index: rate_index.min(5),
         sleep: cur.sleep.max(1),
-        debounce: cur.debounce.min(30),
+        debounce: debounce.min(30),
         lift_off: cur.lift_off.min(2),
         angle: cur.angle.clamp(-30, 30),
-        angle_snapping: cur.angle_snapping,
-        ripple_control: cur.ripple_control,
-        motion_sync: cur.motion_sync,
+        angle_snapping,
+        ripple_control,
+        motion_sync,
         high_performance: cur.max_speed,
         overclocked: cur.full_speed,
         quick_response: cur.quick_response,
@@ -408,6 +424,16 @@ fn save_settings(port: &mut dyn Port) -> Result<()> {
     ask(port, &save(), 10, None, TIMEOUT_MS).map(|_| ())
 }
 
+/// readStatus' debounceMs and sensor switches, in the card's order (`None` = no values: the guard's rows).
+pub fn extras(s: Option<&Settings>) -> Vec<ExtraRow> {
+    vec![
+        ExtraRow::new(Extra::Debounce, Kind::Range { min: 0, max: 30, step: 1, unit: "ms" }, s.map(|s| s.debounce as i32)),
+        ExtraRow::switch(Extra::MotionSync, s.map(|s| s.motion_sync)),
+        ExtraRow::switch(Extra::AngleSnap, s.map(|s| s.angle_snapping)),
+        ExtraRow::switch(Extra::RippleControl, s.map(|s| s.ripple_control)),
+    ]
+}
+
 pub fn caps() -> Caps {
     Caps { dpi: Some(DpiCaps::uniform(DPI_MIN, DPI_MAX, DPI_STEP)), polling: RATES_HZ.to_vec(), lift_off: Vec::new(), battery: false }
 }
@@ -428,7 +454,37 @@ impl Driver for Orbital {
         let (s, _, _) = read_blocks(port)?;
         r.dpi = Some(s.dpi());
         r.polling_hz = s.polling_hz();
+        r.extras = extras(Some(&s));
         Ok(r)
+    }
+
+    /// Order 110: apply({debounceMs | motionSync | angleSnapping | rippleControl}) - checked before a byte leaves, then both
+    /// blocks read, the rewrite check of the block it changes, that block written, the save, the read-back.
+    fn change(&self, _m: &Matched, port: &mut dyn Port, c: FChange) -> Result<()> {
+        let FChange::Extra(e, v) = c;
+        check_extra(&extras(None), e, v)?;
+        let change = match e {
+            Extra::Debounce => Change::Debounce(v as u8),
+            Extra::MotionSync => Change::MotionSync(v == 1),
+            Extra::AngleSnap => Change::AngleSnap(v == 1),
+            Extra::RippleControl => Change::Ripple(v == 1),
+            Extra::Turbo => return Err(not_offered(c)),
+        };
+        let (cur, sensor, system) = read_blocks(port)?;
+        let (sensor_ok, system_ok) = rewrite_is_lossless(&cur, &sensor, &system);
+        let next = merge(&cur, change);
+        let (packet, ok) = if e == Extra::Debounce { (system_write(&next, &cur), system_ok) } else { (sensor_write(&next, &cur), sensor_ok) };
+        if !ok {
+            return Err(Error::BadAnswer("this Orbital mouse holds settings OpenMouse's way of saving would change (unknown bytes, or two different sleep times) - nothing was written".into()));
+        }
+        ask(port, &packet, 4, Some(packet[3]), TIMEOUT_MS)?;
+        save_settings(port)?;
+        let (now, _, _) = read_blocks(port)?;
+        let kept = extras(Some(&now)).into_iter().find(|r| r.extra == e).and_then(|r| r.value);
+        if kept != Some(v) {
+            return Err(Error::BadAnswer(format!("the mouse kept {kept:?} instead of {v} ({})", e.label())));
+        }
+        Ok(())
     }
 
     /// setDpi / setPollingRate: read both blocks, the rewrite check, the one block write, the save, the read-back.

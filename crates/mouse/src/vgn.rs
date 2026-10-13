@@ -14,16 +14,18 @@
 //!
 //! Differences from OpenMouse, deliberate: an unreadable DPI record or polling code is reported as unknown (OpenMouse shows
 //! 800 DPI / 1000 Hz then); a DPI change is only written when re-encoding the stored value gives back the stored four bytes
-//! (otherwise unknown flag bits would be wiped - refused, nothing written). Only the flash range `0..0x2C` is read for the
-//! profile (OpenMouse also reads `0xA8..0xB7`: debounce, motion sync, sleep, ... which this app does not show) and the
-//! firmware and key-table reads are left out.
+//! (otherwise unknown flag bits would be wiped - refused, nothing written). The profile is OpenMouse's readProfile: flash
+//! `0..0x2C` and `0xA8..0xB7`; the firmware and key-table reads are left out.
 //!
-//! Left out on purpose: lift-off (Low / Medium / High = raw 3 / 1 / 2, no millimetre figure), debounce, sleep, motion sync,
-//! angle snapping, ripple, performance mode, button mapping, firmware reads. OpenMouse sends no firmware or reset command to
-//! this family and neither does this file.
+//! Order 110 (A_110_02 scope): debounce (0-30 ms, setDebounceTime), Motion Sync, angle snapping, ripple control and the
+//! performance mode (flash 0xB5, the Pulsar cMouse's turbo address: [`Extra::Turbo`]) - each OpenMouse's writeScalar: the
+//! write, then its two bytes read back (value and parity).
+//!
+//! Left out on purpose: lift-off (Low / Medium / High = raw 3 / 1 / 2, no millimetre figure), sleep, button mapping, firmware
+//! reads. OpenMouse sends no firmware or reset command to this family and neither does this file.
 
 use crate::error::{Error, Result};
-use crate::family::{Caps, Changed, DpiCaps, Driver, Family, Matched, OnMouse, Port, ReadOptions, Setting};
+use crate::family::{check_extra, Caps, Change, Changed, DpiCaps, Driver, Extra, ExtraRow, Family, Kind, Matched, OnMouse, Port, ReadOptions, Setting};
 use crate::os::{HidInfo, HidTransfer};
 
 pub const VENDOR_ID: u16 = 0x3554;
@@ -45,15 +47,26 @@ pub const ADDR_POLLING: u16 = 0x00;
 pub const ADDR_STAGE_COUNT: u16 = 0x02;
 pub const ADDR_ACTIVE_STAGE: u16 = 0x04;
 pub const ADDR_DPI_STAGES: u16 = 0x0C;
+pub const ADDR_DEBOUNCE: u16 = 0xA9;
+pub const ADDR_MOTION_SYNC: u16 = 0xAB;
+pub const ADDR_ANGLE_SNAP: u16 = 0xAF;
+pub const ADDR_RIPPLE: u16 = 0xB1;
+/// performanceMode (the Pulsar cMouse's turbo address)
+pub const ADDR_PERFORMANCE: u16 = 0xB5;
+/// setDebounceTime: 0-30 ms.
+pub const DEBOUNCE_MAX_MS: i32 = 30;
 pub const DPI_MIN: u32 = 50;
 pub const DPI_MAX: u32 = 26000;
 pub const DPI_STEP: u32 = 50;
 /// SUPPORTED_POLLING_RATES.
 pub const RATES_HZ: [u32; 7] = [125, 250, 500, 1000, 2000, 4000, 8000];
 const TIMEOUT_MS: u32 = 700;
-/// readProfile's chunks (the part this app uses): (address, length).
-pub const PROFILE_CHUNKS: [(u16, u8); 5] = [(0x00, 10), (0x0A, 10), (0x14, 10), (0x1E, 10), (0x28, 4)];
+/// readProfile's chunks: (address, length) - `0..0x2C` and `0xA8..0xB7`.
+pub const PROFILE_CHUNKS: [(u16, u8); 7] = [(0x00, 10), (0x0A, 10), (0x14, 10), (0x1E, 10), (0x28, 4), (0xA8, 10), (0xB2, 5)];
+/// The DPI part of the profile (decode_profile needs at least this much).
 const PROFILE_LEN: usize = 0x2C;
+/// What readProfile fills (`new Uint8Array(0xb7)`).
+const PROFILE_FULL_LEN: usize = 0xB7;
 
 // ---------------------------------------------------------------- packets
 
@@ -222,6 +235,30 @@ pub fn decode_profile(profile: &[u8]) -> Option<Profile> {
     Some(Profile { active_stage: active, stage_count: count, stage_bytes, dpi: decode_dpi(&stage_bytes), polling_hz: scalar(ADDR_POLLING).and_then(decode_polling), stage_certain })
 }
 
+/// vgnDecodeProfile's debounceMs and switches (each a scalar whose parity must hold, else no value; switches `!= 0`), in
+/// the card's order.
+pub fn extras_from_profile(profile: &[u8]) -> Vec<ExtraRow> {
+    let scalar = |a: u16| profile.get(a as usize..a as usize + 2).and_then(|b| unpack_scalar(b[0], b[1]));
+    let on = |a: u16| scalar(a).map(|v| v != 0);
+    vec![
+        ExtraRow::new(Extra::Debounce, Kind::Range { min: 0, max: DEBOUNCE_MAX_MS, step: 1, unit: "ms" }, scalar(ADDR_DEBOUNCE).map(i32::from)),
+        ExtraRow::switch(Extra::MotionSync, on(ADDR_MOTION_SYNC)),
+        ExtraRow::switch(Extra::AngleSnap, on(ADDR_ANGLE_SNAP)),
+        ExtraRow::switch(Extra::RippleControl, on(ADDR_RIPPLE)),
+        ExtraRow::switch(Extra::Turbo, on(ADDR_PERFORMANCE)),
+    ]
+}
+
+fn extra_addr(e: Extra) -> u16 {
+    match e {
+        Extra::Debounce => ADDR_DEBOUNCE,
+        Extra::MotionSync => ADDR_MOTION_SYNC,
+        Extra::AngleSnap => ADDR_ANGLE_SNAP,
+        Extra::RippleControl => ADDR_RIPPLE,
+        Extra::Turbo => ADDR_PERFORMANCE,
+    }
+}
+
 // ---------------------------------------------------------------- the device table + allow-list
 
 /// OpenMouse's isSupported: Compx's vendor id, the receiver or cable id, and a collection on usage page 0xFF02 with a 16-byte
@@ -278,7 +315,7 @@ fn read_flash(port: &mut dyn Port, address: u16, length: u8) -> Result<Vec<u8>> 
 
 /// readProfile (the used range), the receiver paced 10 ms between reads like OpenMouse's readPaced.
 fn read_profile(port: &mut dyn Port, wireless: bool) -> Result<Vec<u8>> {
-    let mut profile = vec![0u8; PROFILE_LEN];
+    let mut profile = vec![0u8; PROFILE_FULL_LEN];
     for (address, length) in PROFILE_CHUNKS {
         let d = read_flash(port, address, length)?;
         profile[address as usize..address as usize + length as usize].copy_from_slice(&d);
@@ -314,10 +351,29 @@ impl Driver for Vgn {
             r.battery_percent = Some(pct);
             r.charging = Some(charging);
         }
-        let p = decode_profile(&read_profile(port, wireless)?).ok_or_else(|| Error::BadAnswer("the VGN profile was too short".into()))?;
+        let profile = read_profile(port, wireless)?;
+        let p = decode_profile(&profile).ok_or_else(|| Error::BadAnswer("the VGN profile was too short".into()))?;
         r.dpi = p.dpi;
         r.polling_hz = p.polling_hz;
+        r.extras = extras_from_profile(&profile);
         Ok(r)
+    }
+
+    /// Order 110: setDebounceTime / setMotionSync / setAngleSnapping / setRippleControl / setPerformanceMode - checked before a
+    /// byte leaves, then writeScalar: the write, its two bytes read back (value, parity).
+    fn change(&self, _m: &Matched, port: &mut dyn Port, c: Change) -> Result<()> {
+        let Change::Extra(e, v) = c;
+        check_extra(&extras_from_profile(&[]), e, v)?;
+        let addr = extra_addr(e);
+        let r = transact(port, &write_scalar_payload(addr, v as u8))?;
+        if !write_ok(&r) {
+            return Err(Error::BadAnswer(format!("VGN flash write failed at {addr:#x}")));
+        }
+        let back = read_flash(port, addr, 2)?;
+        if back[0] as i32 != v || back[0].wrapping_add(back[1]) != 0x55 {
+            return Err(Error::BadAnswer(format!("the VGN mouse did not retain the value written at {addr:#x} ({})", e.label())));
+        }
+        Ok(())
     }
 
     /// setDpi / setPollingRate: the profile read, the flash write, the read-back.

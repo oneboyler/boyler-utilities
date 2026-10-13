@@ -26,14 +26,18 @@
 //! slots beyond the stage count.
 //!
 //! Left out on purpose: lift-off (OpenMouse's levels are Low / Medium / High with no millimetre figure), polling on Sora V2 (its
-//! mouse ids offer 1000 Hz only), every other command (motion sync, sleep, system mode, HyperClick, Slam-Click, optical engine,
-//! angle tuning, lighting, firmware, DPI stage count / active stage). The "current" answers are read as OpenMouse reads them: the
+//! mouse ids offer 1000 Hz only), every other command (sleep, system mode, HyperClick, Slam-Click, optical engine, angle tuning,
+//! lighting, firmware, DPI stage count / active stage).
+//! Order 110 (A_110_02 scope): Motion Sync - the only one of debounce / Motion Sync / angle snapping / ripple / turbo OpenMouse's
+//! NinjutsoHidClient has. Current protocol: read command 14 (optional: one ask; not answered = no row, as OpenMouse hides it),
+//! `sendCurrent(13, [on])` then 14 confirms it. Sora V2: dump data[23]; report-5 command 6 `[6, 0, 0, 1, 0, profile, 22, 0, on]`
+//! between two settings dumps. The "current" answers are read as OpenMouse reads them: the
 //! report id stays in byte 0 (unclear in OpenMouse: its request payload has the arguments at byte 7 but its answers are read at
 //! byte 8, which only fits if the id is kept).
 //! Proven only against OpenMouse's bytes (tests); never run on a real unit.
 
 use crate::error::{Error, Result};
-use crate::family::{Caps, Changed, DpiCaps, Family, Matched, OnMouse, Port, ReadOptions, Setting};
+use crate::family::{check_extra, Caps, Change, Changed, DpiCaps, Extra, ExtraRow, Family, Kind as EKind, Matched, OnMouse, Port, ReadOptions, Setting};
 use crate::os::{HidInfo, HidTransfer};
 
 /// NINJUTSO_VENDOR_ID (shared with Glorious Pixart and Incott; disjoint by product id)
@@ -57,6 +61,10 @@ pub const CMD_DPI: u8 = 4;
 pub const CMD_POLLING: u8 = 6;
 pub const CMD_SET_DPI: u8 = 3;
 pub const CMD_SET_POLLING: u8 = 5;
+/// Order 110: Motion Sync read / set (current protocol); the Sora V2's report-5 command 6.
+pub const CMD_MOTION_SYNC: u8 = 14;
+pub const CMD_SET_MOTION_SYNC: u8 = 13;
+pub const LEGACY_SET_MOTION_SYNC: u8 = 6;
 
 /// NINJUTSO_POLLING_RATES
 pub const POLLING: [u32; 4] = [1000, 2000, 4000, 8000];
@@ -251,6 +259,8 @@ pub struct LegacyState {
     /// the four DPI slots, decoded
     pub stages: [u32; 4],
     pub battery: u8,
+    /// Order 110: Motion Sync (data[23] === 1)
+    pub motion_sync: bool,
 }
 
 impl LegacyState {
@@ -262,7 +272,7 @@ impl LegacyState {
         for (i, s) in stages.iter_mut().enumerate() {
             *s = legacy_decode_dpi(at(12 + i * 2), at(13 + i * 2));
         }
-        LegacyState { profile, stage_count, stage, stages, battery: at(7).min(100) }
+        LegacyState { profile, stage_count, stage, stages, battery: at(7).min(100), motion_sync: at(23) == 1 }
     }
     pub fn dpi(&self) -> u32 {
         self.stages[self.stage]
@@ -329,6 +339,7 @@ pub fn read_request_allowed(out: &[u8]) -> bool {
                 CMD_PROFILE | CMD_BATTERY_PERCENT | CMD_BATTERY_CHARGING => shaped(&[]),
                 CMD_ACTIVE_DPI_STAGE | CMD_POLLING => shaped(&[]),
                 CMD_DPI => out[8] <= 3 && shaped(&[out[8]]),
+                CMD_MOTION_SYNC => shaped(&[]),
                 _ => false,
             }
         }
@@ -409,7 +420,7 @@ fn read_legacy(port: &mut dyn Port, m: &Matched) -> Result<Option<LegacyState>> 
     Ok(Some(LegacyState::from_data(profile, &legacy_settings(&a, len)?)))
 }
 
-#[allow(dead_code)] // the Sora V2 DPI write that used it is held back (see `write`); the read flow stays tested
+/// readLegacySettings that must answer (the settings around a Sora V2 Motion Sync write).
 fn legacy_state(port: &mut dyn Port, m: &Matched) -> Result<LegacyState> {
     read_legacy(port, m)?.ok_or_else(|| Error::BadAnswer("The Sora V2 did not answer".into()))
 }
@@ -433,6 +444,10 @@ impl Ninjutso {
         r.charging = Some(charging[0] != 0);
         r.dpi = Some(decode_dpi(dpi[0], dpi.get(1).copied().unwrap_or(0), direct));
         r.polling_hz = decode_polling(polling[0]);
+        // Order 110: Motion Sync, optional (readCurrentOptional: one ask; not answered = OpenMouse hides it)
+        if let Some(v) = read_current(port, CMD_MOTION_SYNC, profile, &[], 1)? {
+            r.extras = vec![ExtraRow::switch(Extra::MotionSync, Some(v[0] == 1))];
+        }
         Ok(())
     }
 
@@ -488,6 +503,7 @@ impl crate::family::Driver for Ninjutso {
                 Some(st) => {
                     r.dpi = Some(st.dpi());
                     r.battery_percent = Some(st.battery);
+                    r.extras = vec![ExtraRow::switch(Extra::MotionSync, Some(st.motion_sync))];
                 }
                 None => r.online = false,
             }
@@ -495,6 +511,28 @@ impl crate::family::Driver for Ninjutso {
             self.read_current_status(p, port, opt, &mut r)?;
         }
         Ok(r)
+    }
+
+    /// Order 110: setMotionSync, checked before a byte leaves. Current: the profile, `sendCurrent(13, [on])`, command 14
+    /// confirms it. Sora V2: the settings (for the profile), report-5 command 6, the settings again (data[23]).
+    fn change(&self, m: &Matched, port: &mut dyn Port, c: Change) -> Result<()> {
+        let p = the_product(m)?;
+        let Change::Extra(e, v) = c;
+        check_extra(&[ExtraRow::new(Extra::MotionSync, EKind::Switch, None)], e, v)?;
+        let on = v == 1;
+        let now = if p.kind == Kind::Legacy {
+            let st = legacy_state(port, m)?;
+            port.exchange(&padded(legacy_request(LEGACY_SET_MOTION_SYNC, st.profile, Some(on as u8)), port), &HidTransfer::FeatureOut)?;
+            legacy_state(port, m)?.motion_sync
+        } else {
+            let profile = must(read_current(port, CMD_PROFILE, 0, &[], 4)?, "the profile")?[0].max(1);
+            port.exchange(&padded(current_request(CMD_SET_MOTION_SYNC, profile, &[on as u8]), port), &HidTransfer::FeatureOut)?;
+            must(read_current(port, CMD_MOTION_SYNC, profile, &[], 4)?, "Motion Sync")?[0] == 1
+        };
+        if now != on {
+            return Err(Error::BadAnswer(format!("The mouse left Motion Sync {}.", if now { "on" } else { "off" })));
+        }
+        Ok(())
     }
 
     /// OpenMouse's setDpi / setPollingRate with the read-back it confirms with (plus one read before, for undo).

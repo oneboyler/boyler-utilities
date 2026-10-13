@@ -29,13 +29,17 @@
 //! constant OpenMouse writes); only then is the table written, with just the active stage changed, and it is read back to
 //! confirm. A mouse whose table differs elsewhere is left alone with an explanation.
 //!
-//! Left out: the other DPI stages and the active stage (setActiveDpiStage), angle snapping, ripple control (setters of the
+//! Order 110 (A_110_02 scope): angle snapping and ripple control (setAngleSnapping / setRippleControl: the same table write,
+//! bytes 3 / 4) - receiver only, with the same safety check and read-back as the DPI change; on the cable they are held back
+//! like its DPI (OpenMouse would write the table from factory defaults there).
+//!
+//! Left out: the other DPI stages and the active stage (setActiveDpiStage: setters of the
 //! same table), lighting, buttons. OpenMouse sends no firmware-update, reset or pairing command to a Delux mouse and neither
 //! does this file. The Delux M600 Pro (0xfa71 wired, and a receiver that shares 0xfa60 but names itself only by a model id in
 //! its messages) is in the driver but NOT on OpenMouse's supported list: not in the table.
 
 use crate::error::{Error, Result};
-use crate::family::{Caps, Changed, DpiCaps, Family, Matched, OnMouse, Port, ReadOptions, Setting};
+use crate::family::{check_extra, Caps, Change, Changed, DpiCaps, Extra, ExtraRow, Family, Matched, OnMouse, Port, ReadOptions, Setting};
 use crate::os::{HidInfo, HidTransfer};
 
 pub const VENDOR_ID: u16 = 0x1d57;
@@ -285,6 +289,29 @@ pub fn matches(own: &[&HidInfo], vid: u16, pid: u16) -> Option<Matched> {
     Some(Matched { family: Family::Delux, model: Some(MODEL), wireless: Some(pid == PID_WIRELESS), config: (*cfg).clone(), variant: 0 })
 }
 
+/// readStatus' angleSnapping / rippleControl (the table's bytes 3 / 4 `== 1`) in the card's order (`None` = the guard's rows).
+pub fn extras(s: Option<&DpiState>) -> Vec<ExtraRow> {
+    vec![ExtraRow::switch(Extra::AngleSnap, s.map(|s| s.angle_snap)), ExtraRow::switch(Extra::RippleControl, s.map(|s| s.ripple))]
+}
+
+/// The receiver's table rewrite with one change (DPI or a switch): read, the safety check (the table must already be exactly
+/// what OpenMouse would write for this state, zero padding included), the change, the write, 300 ms, the read-back.
+fn rewrite_table(port: &mut dyn Port, change: impl FnOnce(&mut DpiState)) -> Result<(DpiState, DpiState)> {
+    let len = port.info().feature_len as usize;
+    let (cur, raw) = read_table(port)?;
+    let same = padded(&build_dpi_report(&cur, false), raw.len()).is_some_and(|want| want == raw);
+    if !same {
+        return Err(Error::range("DPI table", "this mouse's DPI table holds settings OpenMouse's write would replace - it is left alone".to_string()));
+    }
+    let mut next = cur.clone();
+    change(&mut next);
+    let out = padded(&build_dpi_report(&next, false), len).ok_or_else(|| Error::UnsupportedMouse("the Delux config report is too short".into()))?;
+    port.exchange(&out, &HidTransfer::FeatureOut)?;
+    port.pause_ms(CMD_DELAY_MS);
+    let (after, _) = read_table(port)?;
+    Ok((cur, after))
+}
+
 // ============================================================================ driver
 
 /// The Delux driver.
@@ -312,11 +339,30 @@ impl crate::family::Driver for Delux {
             return Ok(r);
         }
         match read_table(port) {
-            Ok((s, _)) => r.dpi = s.stages.get(s.active as usize - 1).copied(),
+            Ok((s, _)) => {
+                r.dpi = s.stages.get(s.active as usize - 1).copied();
+                r.extras = extras(Some(&s));
+            }
             Err(Error::BadAnswer(_) | Error::Os { .. }) => r.online = false,
             Err(e) => return Err(e),
         }
         Ok(r)
+    }
+
+    /// Order 110: setAngleSnapping / setRippleControl - checked before a byte leaves; receiver only (the cable's table is held
+    /// back); the table rewrite with the one flag changed, read back.
+    fn change(&self, m: &Matched, port: &mut dyn Port, c: Change) -> Result<()> {
+        let Change::Extra(e, v) = c;
+        check_extra(&extras(None), e, v)?;
+        if is_wired(m) {
+            return Err(Error::range(e.label(), "on the wired Delux M800 Mini OpenMouse never reads the DPI table this setting lives in, so a change would replace it with the factory defaults - use the receiver or Delux's own app".to_string()));
+        }
+        let on = v == 1;
+        let (_, after) = rewrite_table(port, |s| if e == Extra::AngleSnap { s.angle_snap = on } else { s.ripple = on })?;
+        if (if e == Extra::AngleSnap { after.angle_snap } else { after.ripple }) != on {
+            return Err(Error::BadAnswer(format!("the mouse did not confirm {}", e.label())));
+        }
+        Ok(())
     }
 
     /// Polling: OpenMouse's setPollingRate (report 0x06, 300 ms), nothing read back (the mouse can't say). DPI (receiver
@@ -343,21 +389,11 @@ impl crate::family::Driver for Delux {
                 if !dpi_is_exact(value) {
                     return Err(Error::range("DPI", format!("{value} DPI shares its hardware byte with the value 100 below, the mouse would read back a different one - not written")));
                 }
-                let (cur, raw) = read_table(port)?;
-                // the safety check: the table must already be exactly what OpenMouse would write for this state. The write is
-                // zero-padded to the whole feature-report length, so the WHOLE report read (not only its first 56 bytes) must
-                // equal that padded report - nothing stored behind byte 56 may be overwritten with zeros.
-                let same = padded(&build_dpi_report(&cur, false), raw.len()).is_some_and(|want| want == raw);
-                if !same {
-                    return Err(Error::range("DPI", "this mouse's DPI table holds settings OpenMouse's write would replace - it is left alone".to_string()));
-                }
+                // the safety check (in rewrite_table): the table must already be exactly what OpenMouse would write for this
+                // state. The write is zero-padded to the whole feature-report length, so the WHOLE report read (not only its
+                // first 56 bytes) must equal that padded report - nothing stored behind byte 56 may be overwritten with zeros.
+                let (cur, after) = rewrite_table(port, |s| s.stages[s.active as usize - 1] = value)?;
                 let at = cur.active as usize - 1;
-                let mut next = cur.clone();
-                next.stages[at] = value;
-                let out = padded(&build_dpi_report(&next, false), len).ok_or_else(|| Error::UnsupportedMouse("the Delux config report is too short".into()))?;
-                port.exchange(&out, &HidTransfer::FeatureOut)?;
-                port.pause_ms(CMD_DELAY_MS);
-                let (after, _) = read_table(port)?;
                 if after.stages[at] != value {
                     return Err(Error::BadAnswer("the mouse did not confirm the new DPI".into()));
                 }

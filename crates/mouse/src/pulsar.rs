@@ -1,5 +1,8 @@
 //! Pulsar - two protocols, both ported from OpenMouse (`crate::family`: AGPL-3.0-or-later, `drivers/pulsar/pulsar-hid.js`,
-//! `drivers/pulsar/pulsar-xs1-hid.js`, `pulsar/index.js`), DPI / polling / lift-off / battery only:
+//! `drivers/pulsar/pulsar-xs1-hid.js`, `pulsar/index.js`): DPI / polling / lift-off / battery (Order 104), and since
+//! Order 110 (the owner, A_110_02) the five settings OpenMouse's Pulsar clients also write: debounce time, Motion Sync, angle
+//! snapping, ripple control and (cMouse only) turbo = PULSAR_FLASH.performanceState; plus the 0.7 mm lift-off. Nothing else
+//! (no DPI stages, no light, no sleep): the mouse's own DPI stages are never written.
 //!
 //! **cMouse** (report 8, 17 bytes incl. the id): the X2 CrazyLight and every Pulsar-vendor (0x3710) mouse with the report-8
 //! config collection - OpenMouse's PulsarHidClient claims them all by vendor + collection, which is how the newer
@@ -15,7 +18,7 @@
 //! pulsar-battery-notifier - Order 009); since Order 104 every request is the byte sequence OpenMouse sends.
 
 use crate::error::{Error, Result};
-use crate::family::{Caps, Changed, DpiCaps, Family, Matched, OnMouse, Port, ReadOptions, Setting};
+use crate::family::{check_extra, Caps, Change, Changed, DpiCaps, Extra, ExtraRow, Family, Kind, Matched, OnMouse, Port, ReadOptions, Setting};
 use crate::os::{HidInfo, HidTransfer};
 
 pub const VENDOR_ID: u16 = 0x3710;
@@ -55,6 +58,17 @@ pub const ADDR_STAGE_COUNT: u16 = 0x0002;
 pub const ADDR_ACTIVE_STAGE: u16 = 0x0004;
 pub const ADDR_LIFT_OFF: u16 = 0x000A;
 pub const ADDR_DPI_STAGE0: u16 = 0x000C;
+/// Order 110 (PULSAR_FLASH): debounceTime, motionSync, angleSnapping, rippleControl, performanceState - each a pair.
+pub const ADDR_DEBOUNCE: u16 = 169;
+pub const ADDR_MOTION_SYNC: u16 = 171;
+pub const ADDR_ANGLE_SNAP: u16 = 175;
+pub const ADDR_RIPPLE: u16 = 177;
+pub const ADDR_PERFORMANCE: u16 = 181;
+/// The row of settings memory those five sit in (169 .. 183).
+pub const EXTRAS_FROM: u16 = ADDR_DEBOUNCE;
+pub const EXTRAS_LEN: u16 = ADDR_PERFORMANCE + 2 - ADDR_DEBOUNCE;
+/// Debounce 0-15 ms (OpenMouse's getDebounceOptions / setDebounceTime).
+pub const DEBOUNCE_MAX_MS: i32 = 15;
 
 pub fn checksum(b: &[u8]) -> u8 {
     0x55u8.wrapping_sub(b.iter().fold(0u8, |a, x| a.wrapping_add(*x)))
@@ -452,7 +466,7 @@ impl Cmouse {
     }
 
     fn caps(link: Link) -> Caps {
-        Caps { dpi: Some(dpi_caps()), polling: POLLING_RATES.iter().copied().filter(|r| *r <= link.max_polling_hz()).collect(), lift_off: vec![10, 20], battery: true }
+        Caps { dpi: Some(dpi_caps()), polling: POLLING_RATES.iter().copied().filter(|r| *r <= link.max_polling_hz()).collect(), lift_off: vec![7, 10, 20], battery: true }
     }
 
     fn read_settings(&self, port: &mut dyn Port, r: &mut OnMouse) -> Result<()> {
@@ -461,6 +475,15 @@ impl Cmouse {
             r.dpi = decode_dpi_stage(&read_mem(port, ADDR_DPI_STAGE0 + 4 * s.min(7) as u16, 4)?);
         }
         r.lift_off = scalar_from_pair(&read_mem(port, ADDR_LIFT_OFF, 2)?).and_then(lift_off_tenths);
+        // Order 110: the row OpenMouse's readStatus takes debounce / Motion Sync / angle snapping / ripple / performance
+        // from (its readFlash reads it in 10-byte pieces; a value it cannot read stays unknown, never an error)
+        let row = read_mem(port, EXTRAS_FROM, 10)
+            .and_then(|mut a| {
+                a.extend(read_mem(port, EXTRAS_FROM + 10, (EXTRAS_LEN - 10) as u8)?);
+                Ok(a)
+            })
+            .ok();
+        r.extras = extras_from_row(row.as_deref());
         Ok(())
     }
 
@@ -470,7 +493,50 @@ impl Cmouse {
     }
 }
 
+/// Order 110: the five rows from the 14 bytes at 169 (OpenMouse's readStatus: `debounceMs: flash[169]`, `motionSync:
+/// flash[171] === 1`, `angleSnapping: flash[175] === 1`, `rippleControl: flash[177] === 1`, `performanceMode: flash[181]
+/// === 1`), in the card's order. `None` = not read: the rows show, their values unknown.
+pub fn extras_from_row(row: Option<&[u8]>) -> Vec<ExtraRow> {
+    let at = |a: u16| row.and_then(|r| r.get((a - EXTRAS_FROM) as usize)).copied();
+    let on = |a: u16| at(a).map(|v| v == 1);
+    vec![
+        ExtraRow::new(Extra::Debounce, Kind::Range { min: 0, max: DEBOUNCE_MAX_MS, step: 1, unit: "ms" }, at(ADDR_DEBOUNCE).map(i32::from)),
+        ExtraRow::switch(Extra::MotionSync, on(ADDR_MOTION_SYNC)),
+        ExtraRow::switch(Extra::AngleSnap, on(ADDR_ANGLE_SNAP)),
+        ExtraRow::switch(Extra::RippleControl, on(ADDR_RIPPLE)),
+        ExtraRow::switch(Extra::Turbo, on(ADDR_PERFORMANCE)),
+    ]
+}
+
+/// Where an extra lives in settings memory.
+fn extra_addr(e: Extra) -> u16 {
+    match e {
+        Extra::Debounce => ADDR_DEBOUNCE,
+        Extra::MotionSync => ADDR_MOTION_SYNC,
+        Extra::AngleSnap => ADDR_ANGLE_SNAP,
+        Extra::RippleControl => ADDR_RIPPLE,
+        Extra::Turbo => ADDR_PERFORMANCE,
+    }
+}
+
 impl crate::family::Driver for Cmouse {
+    /// Order 110: OpenMouse's setDebounceTime / setMotionSync / setAngleSnapping / setRippleControl / setPerformanceMode =
+    /// setVerifiedByte: checked against what the mouse takes before a byte leaves, then host control, writeCheckedByte
+    /// `[v, 0x55 − v]`, read it back (the first byte must be `v`), leave.
+    fn change(&self, _m: &Matched, port: &mut dyn Port, c: Change) -> Result<()> {
+        let Change::Extra(e, v) = c;
+        check_extra(&extras_from_row(None), e, v)?;
+        let addr = extra_addr(e);
+        session(port, |p| {
+            write_mem(p, addr, &scalar_pair(v as u8))?;
+            let now = read_mem(p, addr, 2)?[0];
+            if now as i32 != v {
+                return Err(Error::BadAnswer(format!("the mouse kept {now} instead of {v} ({})", e.label())));
+            }
+            Ok(())
+        })
+    }
+
     /// identify, battery, then (if the mouse is awake) polling, active stage + its DPI, lift-off. Only READ requests:
     /// identify, battery, the online question (host control's leave form) and settings-memory reads.
     fn read(&self, _m: &Matched, port: &mut dyn Port, opt: ReadOptions) -> Result<OnMouse> {
@@ -558,7 +624,29 @@ pub const XS1_Q_STAGE: [u8; 3] = [0x05, 0x81, 0x02];
 pub const XS1_Q_LIFT_OFF: [u8; 3] = [0x07, 0x82, 0x03];
 pub const XS1_Q_POLLING: [u8; 3] = [0x08, 0x85, 0x03];
 pub const XS1_Q_VERSION: [u8; 3] = [0x01, 0x87, 0x04];
-const XS1_QUERIES: [[u8; 3]; 6] = [XS1_Q_BATTERY, XS1_Q_DPI, XS1_Q_STAGE, XS1_Q_LIFT_OFF, XS1_Q_POLLING, XS1_Q_VERSION];
+/// Order 110: OpenMouse QUERY.debounce / motionSync / angleSnapping / rippleControl.
+pub const XS1_Q_DEBOUNCE: [u8; 3] = [0x04, 0x83, 0x03];
+pub const XS1_Q_MOTION_SYNC: [u8; 3] = [0x07, 0x85, 0x02];
+pub const XS1_Q_ANGLE_SNAP: [u8; 3] = [0x07, 0x84, 0x02];
+pub const XS1_Q_RIPPLE: [u8; 3] = [0x07, 0x83, 0x02];
+const XS1_QUERIES: [[u8; 3]; 10] = [XS1_Q_BATTERY, XS1_Q_DPI, XS1_Q_STAGE, XS1_Q_LIFT_OFF, XS1_Q_POLLING, XS1_Q_VERSION, XS1_Q_DEBOUNCE, XS1_Q_MOTION_SYNC, XS1_Q_ANGLE_SNAP, XS1_Q_RIPPLE];
+
+/// A flag / debounce write (OpenMouse WRITE.debounce / motionSync / angleSnapping / rippleControl): the query with its 0x80
+/// bit cleared, `00 00 01`, the value.
+pub fn xs1_value_write(q: [u8; 3], v: u8) -> [u8; 7] {
+    [q[0], q[1] & 0x7F, q[2], 0x00, 0x00, 0x01, v]
+}
+
+/// The XS-1's Order 110 rows (no turbo: OpenMouse's XS-1 client has none), in the card's order, with their queries.
+const XS1_EXTRAS: [(Extra, [u8; 3]); 4] = [(Extra::Debounce, XS1_Q_DEBOUNCE), (Extra::MotionSync, XS1_Q_MOTION_SYNC), (Extra::AngleSnap, XS1_Q_ANGLE_SNAP), (Extra::RippleControl, XS1_Q_RIPPLE)];
+
+fn xs1_kind(e: Extra) -> Kind {
+    if e == Extra::Debounce {
+        Kind::Range { min: 0, max: DEBOUNCE_MAX_MS, step: 1, unit: "ms" }
+    } else {
+        Kind::Switch
+    }
+}
 
 /// XS-1 product ids OpenMouse knows (PULSAR_XS1_PRODUCT_IDS) whose model is on its SUPPORTED list: the X3 Medium
 /// (0x3409, 0x3410, 0x5402) and the shared 8K receiver 0x5403 (its id names no model). 0x3404 (X2A v3) is not SUPPORTED.
@@ -677,6 +765,14 @@ impl crate::family::Driver for Xs1 {
     fn read(&self, m: &Matched, port: &mut dyn Port, _opt: ReadOptions) -> Result<OnMouse> {
         let battery = xs1_query(port, &XS1_Q_BATTERY)?;
         let dpi = xs1_query(port, &XS1_Q_DPI)?;
+        // Order 110: OpenMouse's readStatus asks each of these, each optional (the packet's byte 7)
+        let extras = XS1_EXTRAS
+            .iter()
+            .map(|(e, q)| {
+                let v = xs1_query(port, q).ok().map(|a| a[7] as i32);
+                ExtraRow::new(*e, xs1_kind(*e), if *e == Extra::Debounce { v } else { v.map(|x| (x == 1) as i32) })
+            })
+            .collect();
         let lod = xs1_query(port, &XS1_Q_LIFT_OFF).ok();
         let polling = xs1_query(port, &XS1_Q_POLLING).ok();
         let rates: &[u32] = if m.variant == XS1_8K_RECEIVER { &POLLING_RATES } else { &XS1_POLLING_RATES };
@@ -690,8 +786,24 @@ impl crate::family::Driver for Xs1 {
             lift_off: lod.and_then(|l| xs1_lift_off_tenths(l[8])),
             wireless: m.wireless,
             // polling is read-only on XS-1 (OpenMouse never writes it)
-            caps: Caps { dpi: Some(DpiCaps::uniform(50, 26000, 50)), polling: Vec::new(), lift_off: vec![10, 20], battery: true },
+            caps: Caps { dpi: Some(DpiCaps::uniform(50, 26000, 50)), polling: Vec::new(), lift_off: XS1_LIFT_OFF.iter().map(|l| l.1).collect(), battery: true },
+            extras,
         })
+    }
+
+    /// Order 110: OpenMouse's setDebounceTime / setMotionSync / setAngleSnapping / setRippleControl: the write, then the
+    /// query must answer the value.
+    fn change(&self, _m: &Matched, port: &mut dyn Port, c: Change) -> Result<()> {
+        let Change::Extra(e, v) = c;
+        let rows: Vec<ExtraRow> = XS1_EXTRAS.iter().map(|(e, _)| ExtraRow::new(*e, xs1_kind(*e), None)).collect();
+        check_extra(&rows, e, v)?;
+        let q = XS1_EXTRAS.iter().find(|x| x.0 == e).map(|x| x.1).ok_or_else(|| crate::family::not_offered(c))?;
+        xs1_send(port, &xs1_value_write(q, v as u8))?;
+        let now = xs1_query(port, &q)?[7] as i32;
+        if now != v {
+            return Err(Error::BadAnswer(format!("the mouse kept {now} instead of {v} ({})", e.label())));
+        }
+        Ok(())
     }
 
     fn write(&self, _m: &Matched, port: &mut dyn Port, s: Setting) -> Result<Changed> {

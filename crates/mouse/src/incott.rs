@@ -18,14 +18,18 @@
 //! ids, so the table names no model (`model: None`); `read` names it from the identity answer (`0x8f`). The models other
 //! than G23 V2 are "likely" on OpenMouse's list, not supported - they match here only because their id is the same.
 //!
+//! Order 110 (A_110_02 scope): debounce 0-30 ms (`[05, 01, ms]`, read `[85, 01]`), Motion Sync / angle snapping / ripple
+//! (`[04, sub 4 / 3 / 2, on]`, read `[84, sub]`) - setDebounceTime / setMotionSync / setAngleSnapping / setRippleControl: the
+//! write, then the read it confirms with; a read that is not answered leaves its row out.
+//!
 //! Left out on purpose: battery (OpenMouse reads it from an UNSOLICITED input report the mouse sends only while it is being
 //! used - there is no request to send, and `HidTransfer` has no passive read: NEEDS TRANSFER, see the report), the DPI stage
-//! count / stage select / per-axis DPI, sensor toggles, debounce, sleep, performance mode, receiver LED, buttons, fire key,
+//! count / stage select / per-axis DPI, sleep, performance mode (HP / Corded / LP: not the Pulsar turbo), receiver LED, buttons, fire key,
 //! macros (none is DPI / polling / lift-off / battery). OpenMouse sends no firmware, DFU or reset command to this mouse and
 //! neither does this file.
 
 use crate::error::{Error, Result};
-use crate::family::{Caps, Changed, DpiCaps, Family, Matched, OnMouse, Port, ReadOptions, Setting};
+use crate::family::{check_extra, Caps, Change, Changed, DpiCaps, Extra, ExtraRow, Family, Kind, Matched, OnMouse, Port, ReadOptions, Setting};
 use crate::os::{HidInfo, HidTransfer};
 
 pub const VENDOR_ID: u16 = 0x093A;
@@ -53,6 +57,16 @@ pub const CMD_QUERY_SENSOR: u8 = 0x84;
 pub const CMD_QUERY_IDENTITY: u8 = 0x8F;
 /// INCOTT_SUB_LOD
 pub const SUB_LOD: u8 = 0x01;
+/// Order 110: INCOTT_SUB_RIPPLE / ANGLE_SNAP / MOTION_SYNC (the 0x04 write / 0x84 read toggles), INCOTT_CMD_SET_TIMING /
+/// QUERY_TIMING with INCOTT_SUB_DEBOUNCE.
+pub const SUB_RIPPLE: u8 = 0x02;
+pub const SUB_ANGLE_SNAP: u8 = 0x03;
+pub const SUB_MOTION_SYNC: u8 = 0x04;
+pub const CMD_SET_TIMING: u8 = 0x05;
+pub const CMD_QUERY_TIMING: u8 = 0x85;
+pub const SUB_DEBOUNCE: u8 = 0x01;
+/// INCOTT_DEBOUNCE_MIN_MS / MAX_MS.
+pub const DEBOUNCE_MAX_MS: i32 = 30;
 /// INCOTT_DPI_STAGE_COUNT
 pub const DPI_STAGE_COUNT: u8 = 6;
 pub const DPI_MIN: u32 = 50;
@@ -155,6 +169,51 @@ pub fn lift_off_wire(tenths: u32) -> Option<u8> {
 /// incottEncodeSetLiftOff: `[0x04, 0x01, wire]`.
 pub fn encode_set_lift_off(tenths: u32) -> Option<[u8; PAYLOAD_LEN]> {
     Some(payload(&[CMD_SET_SENSOR, SUB_LOD, lift_off_wire(tenths)?]))
+}
+
+/// Order 110: incottEncodeSetToggle(kind, on) = `[04, sub, on]`; incottEncodeSetDebounce(ms) = `[05, 01, ms]` (0-30).
+pub fn encode_set_extra(e: Extra, v: i32) -> Option<[u8; PAYLOAD_LEN]> {
+    let on = (v == 1) as u8;
+    Some(match e {
+        Extra::Debounce => payload(&[CMD_SET_TIMING, SUB_DEBOUNCE, u8::try_from(v).ok().filter(|v| *v as i32 <= DEBOUNCE_MAX_MS)?]),
+        Extra::MotionSync => payload(&[CMD_SET_SENSOR, SUB_MOTION_SYNC, on]),
+        Extra::AngleSnap => payload(&[CMD_SET_SENSOR, SUB_ANGLE_SNAP, on]),
+        Extra::RippleControl => payload(&[CMD_SET_SENSOR, SUB_RIPPLE, on]),
+        Extra::Turbo => return None,
+    })
+}
+
+/// The read query (cmd, sub) of an extra.
+fn extra_query(e: Extra) -> Option<(u8, u8)> {
+    Some(match e {
+        Extra::Debounce => (CMD_QUERY_TIMING, SUB_DEBOUNCE),
+        Extra::MotionSync => (CMD_QUERY_SENSOR, SUB_MOTION_SYNC),
+        Extra::AngleSnap => (CMD_QUERY_SENSOR, SUB_ANGLE_SNAP),
+        Extra::RippleControl => (CMD_QUERY_SENSOR, SUB_RIPPLE),
+        Extra::Turbo => return None,
+    })
+}
+
+/// incottDecodeToggle (`[3]` 1 = on, 0 = off, else none) / incottDecodeDebounce (`[3]` 0-30, else none) of an answer to
+/// `extra_query(e)`.
+pub fn decode_extra(f: &[u8; RESPONSE_LEN], e: Extra) -> Option<i32> {
+    let (cmd, sub) = extra_query(e)?;
+    if !frame_matches(f, cmd, Some(sub)) {
+        return None;
+    }
+    let v = f[3] as i32;
+    let max = if e == Extra::Debounce { DEBOUNCE_MAX_MS } else { 1 };
+    (0..=max).contains(&v).then_some(v)
+}
+
+/// The rows the card can have, in its order (the guard's rows; values none).
+pub fn extra_rows() -> Vec<ExtraRow> {
+    vec![
+        ExtraRow::new(Extra::Debounce, Kind::Range { min: 0, max: DEBOUNCE_MAX_MS, step: 1, unit: "ms" }, None),
+        ExtraRow::switch(Extra::MotionSync, None),
+        ExtraRow::switch(Extra::AngleSnap, None),
+        ExtraRow::switch(Extra::RippleControl, None),
+    ]
 }
 
 /// The answer as OpenMouse holds it: at most 64 bytes, zero-filled to 64 (so every `frame[i]` of the JS reads 0 past the end).
@@ -304,7 +363,8 @@ pub fn read_request_allowed(out: &[u8]) -> bool {
     match p[0] {
         CMD_QUERY_IDENTITY | CMD_QUERY_DPI_STAGE | CMD_QUERY_POLLING => p[1] == 0 && rest_zero(1),
         CMD_QUERY_DPI_STAGE_VALUE => p[1] < DPI_STAGE_COUNT && rest_zero(2),
-        CMD_QUERY_SENSOR => p[1] == SUB_LOD && rest_zero(2),
+        CMD_QUERY_SENSOR => matches!(p[1], SUB_LOD | SUB_RIPPLE | SUB_ANGLE_SNAP | SUB_MOTION_SYNC) && rest_zero(2),
+        CMD_QUERY_TIMING => p[1] == SUB_DEBOUNCE && rest_zero(2),
         _ => false,
     }
 }
@@ -378,6 +438,27 @@ fn read_lift_off(port: &mut dyn Port) -> Result<Option<u32>> {
     Ok(request(port, &query(CMD_QUERY_SENSOR, SUB_LOD), CMD_QUERY_SENSOR, Some(SUB_LOD))?.and_then(|f| decode_lift_off(&f)))
 }
 
+fn read_extra(port: &mut dyn Port, e: Extra) -> Result<Option<i32>> {
+    let Some((cmd, sub)) = extra_query(e) else { return Ok(None) };
+    Ok(request(port, &query(cmd, sub), cmd, Some(sub))?.and_then(|f| decode_extra(&f, e)))
+}
+
+/// readStatus' motionSync, rippleControl, angleSnapping, debounceMs (its order), as rows in the card's order; a read that is
+/// not answered leaves its row out.
+fn read_extras(port: &mut dyn Port) -> Result<Vec<ExtraRow>> {
+    let mut got = Vec::new();
+    for e in [Extra::MotionSync, Extra::RippleControl, Extra::AngleSnap, Extra::Debounce] {
+        got.push((e, read_extra(port, e)?));
+    }
+    Ok(extra_rows()
+        .into_iter()
+        .filter_map(|mut r| {
+            r.value = got.iter().find(|g| g.0 == r.extra).and_then(|g| g.1);
+            r.value.is_some().then_some(r)
+        })
+        .collect())
+}
+
 fn read_identity(port: &mut dyn Port) -> Result<Option<Identity>> {
     Ok(request(port, &query(CMD_QUERY_IDENTITY, 0), CMD_QUERY_IDENTITY, None)?.and_then(|f| decode_identity(&f)))
 }
@@ -409,7 +490,22 @@ impl crate::family::Driver for Incott {
         }
         r.polling_hz = read_polling(port)?;
         r.lift_off = read_lift_off(port)?;
+        r.extras = read_extras(port)?;
         Ok(r)
+    }
+
+    /// Order 110: setDebounceTime / setMotionSync / setAngleSnapping / setRippleControl - checked before a byte leaves, then the
+    /// write and the read it confirms with.
+    fn change(&self, _m: &Matched, port: &mut dyn Port, c: Change) -> Result<()> {
+        let Change::Extra(e, v) = c;
+        check_extra(&extra_rows(), e, v)?;
+        let set = encode_set_extra(e, v).ok_or_else(|| Error::range(e.label(), format!("{v}")))?;
+        write_report(port, &set)?;
+        let got = read_extra(port, e)?;
+        if got != Some(v) {
+            return Err(Error::BadAnswer(format!("the mouse kept {got:?} instead of {v} ({})", e.label())));
+        }
+        Ok(())
     }
 
     /// setDpi / setPollingRate / setLiftOffDistance the way IncottHidClient does them: the write, then the read-back it

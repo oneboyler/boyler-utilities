@@ -7,7 +7,7 @@
 //! (`receiveFeatureReport(9)`) comes WITH the id at byte 0 (the codec checks `frame[0] === 0x09`). Windows' feature buffer is
 //! the report id + the payload, zero-padded to the collection's feature length (65 here).
 
-use bu_mouse::family::{self, Driver, Family, ReadOptions, Setting};
+use bu_mouse::family::{self, Change, Driver, Extra, Family, Kind, ReadOptions, Setting};
 use bu_mouse::fake::{hid_info, ScriptPort};
 use bu_mouse::incott as inc;
 use bu_mouse::os::{HidInfo, HidTransfer};
@@ -166,7 +166,8 @@ fn only_read_queries_pass_the_allow_list() {
         assert!(!inc::read_request_allowed(&rep(&[first, 0x01, 0x02])), "{first:02x}");
     }
     // a read with something extra set is not one of OpenMouse's reads
-    assert!(!inc::read_request_allowed(&rep(&[0x84, 0x02])), "sensor query for another sub-command");
+    // (Order 110: 84 02 / 03 / 04 and 85 01 are reads now - the performance-mode query 84 05 is not one this file sends)
+    assert!(!inc::read_request_allowed(&rep(&[0x84, 0x05])), "sensor query for another sub-command");
     assert!(!inc::read_request_allowed(&rep(&[0x84, 0x01, 0x05])));
     assert!(!inc::read_request_allowed(&rep(&[0x82, 0x06])), "a stage that does not exist");
     assert!(!inc::read_request_allowed(&rep(&[0x82, 0x01, 0x02])), "an axis query");
@@ -271,6 +272,9 @@ struct Model {
     active: u8,
     polling_wire: u8,
     lod_wire: u8,
+    /// Order 110: the toggles by sub-command (2 ripple, 3 angle snap, 4 Motion Sync) and the debounce ms
+    toggles: [u8; 5],
+    debounce: u8,
     identity: Vec<u8>,
     latched: [u8; 64],
     /// ignore every write (a mouse that keeps its value)
@@ -298,6 +302,8 @@ impl Model {
             active: 1,
             polling_wire: 0,
             lod_wire: 0,
+            toggles: [0, 0, 1, 0, 1],
+            debounce: 4,
             identity: vec![0x09, 0x8F, 0x01, 0x08, 0x02, 0xF1],
             latched: [0; 64],
             refuse_writes: false,
@@ -330,9 +336,13 @@ impl Model {
                 f[4] = (wire >> 8) as u8;
             }
             0x81 => f[2] = self.polling_wire,
+            0x85 => {
+                f[2] = p[1];
+                f[3] = self.debounce;
+            }
             0x84 => {
                 f[2] = p[1];
-                f[3] = self.lod_wire;
+                f[3] = if p[1] == 0x01 { self.lod_wire } else { self.toggles[p[1] as usize] };
             }
             _ => {}
         }
@@ -347,6 +357,8 @@ impl Model {
             0x02 => self.stages[p[1] as usize] = ((p[2] as u32 | (p[3] as u32) << 8) + 1) * 50,
             0x01 => self.polling_wire = p[1],
             0x04 if p[1] == 0x01 => self.lod_wire = p[2],
+            0x04 if (2..=4).contains(&p[1]) => self.toggles[p[1] as usize] = p[2],
+            0x05 if p[1] == 0x01 => self.debounce = p[2],
             other => panic!("the driver sent command {other:02x}, which no setting needs"),
         }
     }
@@ -427,7 +439,8 @@ fn reading_asks_only_what_openmouse_asks() {
     // the requests OpenMouse sends, in order: identity, cycle, the ACTIVE stage's value, polling, lift-off - each as
     // "discard fetch, then set, then fetch after 50 ms"
     let sent: Vec<Vec<u8>> = model.borrow().log.iter().filter(|(_, h)| matches!(h, HidTransfer::FeatureOut)).map(|(o, _)| o.clone()).collect();
-    assert_eq!(sent, vec![rep(&[0x8F]), rep(&[0x83]), rep(&[0x82, 1]), rep(&[0x81]), rep(&[0x84, 1])]);
+    // (Order 110: then Motion Sync 84 04, ripple 84 02, angle snapping 84 03, debounce 85 01 - readStatus' order)
+    assert_eq!(sent, vec![rep(&[0x8F]), rep(&[0x83]), rep(&[0x82, 1]), rep(&[0x81]), rep(&[0x84, 1]), rep(&[0x84, 4]), rep(&[0x84, 2]), rep(&[0x84, 3]), rep(&[0x85, 1])]);
     let first_three: Vec<HidTransfer> = model.borrow().log.iter().take(3).map(|(_, h)| h.clone()).collect();
     assert_eq!(
         first_three,
@@ -617,4 +630,68 @@ fn the_cables_two_look_alike_collections_are_picked_the_same_way_in_any_order() 
     c.path = "0".into();
     c.interface = None;
     assert_eq!(pick(&[&c, &b, &a]), Some("a".to_string()));
+}
+
+// ---------------------------------------------------------------- Order 110: debounce, Motion Sync, angle snapping, ripple
+
+#[test]
+fn the_extras_decode_and_encode_the_openmouse_way() {
+    // incottDecodeToggle: frame [09, 84, sub, value]: 1 on, 0 off, anything else none; incottDecodeDebounce: [09, 85, 01, ms], 0-30
+    assert_eq!(inc::decode_extra(&frame(&[0x09, 0x84, 0x04, 0x01]), Extra::MotionSync), Some(1));
+    assert_eq!(inc::decode_extra(&frame(&[0x09, 0x84, 0x03, 0x00]), Extra::AngleSnap), Some(0));
+    assert_eq!(inc::decode_extra(&frame(&[0x09, 0x84, 0x02, 0x02]), Extra::RippleControl), None);
+    assert_eq!(inc::decode_extra(&frame(&[0x09, 0x84, 0x03, 0x01]), Extra::MotionSync), None, "another sub-command's answer");
+    assert_eq!(inc::decode_extra(&frame(&[0x09, 0x85, 0x01, 30]), Extra::Debounce), Some(30));
+    assert_eq!(inc::decode_extra(&frame(&[0x09, 0x85, 0x01, 31]), Extra::Debounce), None);
+    // incottEncodeSetToggle(kind, on) = payload(0x04, sub, on); incottEncodeSetDebounce(ms) = payload(0x05, 0x01, ms)
+    assert_eq!(inc::encode_set_extra(Extra::MotionSync, 0).unwrap(), [0x04, 0x04, 0x00, 0, 0, 0, 0, 0]);
+    assert_eq!(inc::encode_set_extra(Extra::AngleSnap, 1).unwrap(), [0x04, 0x03, 0x01, 0, 0, 0, 0, 0]);
+    assert_eq!(inc::encode_set_extra(Extra::RippleControl, 1).unwrap(), [0x04, 0x02, 0x01, 0, 0, 0, 0, 0]);
+    assert_eq!(inc::encode_set_extra(Extra::Debounce, 12).unwrap(), [0x05, 0x01, 0x0C, 0, 0, 0, 0, 0]);
+    assert_eq!((inc::encode_set_extra(Extra::Debounce, 31), inc::encode_set_extra(Extra::Turbo, 1)), (None, None));
+    // the new reads pass the allow-list; the writes do not
+    for q in [[0x84u8, 4], [0x84, 3], [0x84, 2], [0x85, 1]] {
+        assert!(inc::read_request_allowed(&rep(&q)), "{q:02x?}");
+    }
+    for w in [[0x04u8, 4, 1], [0x05, 1, 8], [0x85, 2, 0], [0x84, 5, 0]] {
+        assert!(!inc::read_request_allowed(&rep(&w)), "{w:02x?}");
+    }
+}
+
+#[test]
+fn the_extras_read_write_and_read_back() {
+    let (m, model, mut p) = setup(0x522C);
+    let r = inc::Incott.read(&m, &mut p, ReadOptions::default()).unwrap();
+    let got: Vec<(Extra, Option<i32>)> = r.extras.iter().map(|e| (e.extra, e.value)).collect();
+    assert_eq!(got, vec![(Extra::Debounce, Some(4)), (Extra::MotionSync, Some(1)), (Extra::AngleSnap, Some(0)), (Extra::RippleControl, Some(1))]);
+    // INCOTT_DEBOUNCE_MIN_MS 0 / MAX_MS 30
+    assert_eq!(r.extras[0].kind, Kind::Range { min: 0, max: 30, step: 1, unit: "ms" });
+    for (c, w, q) in [
+        (Change::Extra(Extra::Debounce, 30), vec![0x05u8, 0x01, 30], vec![0x85u8, 0x01]),
+        (Change::Extra(Extra::MotionSync, 0), vec![0x04, 0x04, 0x00], vec![0x84, 0x04]),
+        (Change::Extra(Extra::AngleSnap, 1), vec![0x04, 0x03, 0x01], vec![0x84, 0x03]),
+        (Change::Extra(Extra::RippleControl, 0), vec![0x04, 0x02, 0x00], vec![0x84, 0x02]),
+    ] {
+        model.borrow_mut().log.clear();
+        inc::Incott.change(&m, &mut p, c).unwrap();
+        // the write (report 9, the payload, zeros), then the confirm query
+        let sent: Vec<Vec<u8>> = model.borrow().log.iter().filter(|(_, h)| matches!(h, HidTransfer::FeatureOut)).map(|(o, _)| o.clone()).collect();
+        assert_eq!(sent, vec![rep(&w), rep(&q)], "{c:?}");
+    }
+    let r = inc::Incott.read(&m, &mut p, ReadOptions::default()).unwrap();
+    assert_eq!(r.extras.iter().map(|e| e.value).collect::<Vec<_>>(), vec![Some(30), Some(0), Some(1), Some(0)]);
+    // a mouse that keeps its value
+    model.borrow_mut().refuse_writes = true;
+    assert!(inc::Incott.change(&m, &mut p, Change::Extra(Extra::MotionSync, 1)).is_err());
+    // refused before a byte leaves
+    model.borrow_mut().log.clear();
+    for c in [Change::Extra(Extra::Debounce, 31), Change::Extra(Extra::AngleSnap, 2), Change::Extra(Extra::Turbo, 1)] {
+        assert!(inc::Incott.change(&m, &mut p, c).is_err(), "{c:?}");
+    }
+    assert!(model.borrow().log.is_empty());
+    // a mouse that does not answer the new reads: no rows (OpenMouse's null)
+    let (m, model, mut p) = setup(0x522C);
+    model.borrow_mut().toggles = [0, 0, 7, 7, 7];
+    model.borrow_mut().debounce = 99;
+    assert!(inc::Incott.read(&m, &mut p, ReadOptions::default()).unwrap().extras.is_empty());
 }

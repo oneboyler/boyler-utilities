@@ -10,7 +10,7 @@
 //! payload); the Windows buffer has the id 0x05 in front.
 
 use bu_mouse::error::Error;
-use bu_mouse::family::{self, Driver, Family, ReadOptions, Setting};
+use bu_mouse::family::{self, Change, Driver, Extra, Family, Kind, ReadOptions, Setting};
 use bu_mouse::fake::{hid_info, ScriptPort};
 use bu_mouse::finalmouse as f;
 use bu_mouse::os::{HidInfo, HidTransfer};
@@ -163,7 +163,14 @@ fn port_for(info: &HidInfo, m: Rc<RefCell<Mouse>>) -> ScriptPort {
         let mut m = m.borrow_mut();
         m.seen.push(out.to_vec());
         match how {
-            HidTransfer::OutputOnly => Ok(Vec::new()),
+            HidTransfer::OutputOnly => {
+                // Order 110: a Motion Sync write shows in the wake-all burst's command-18 answer from then on
+                if out[2] == 0x92 {
+                    m.bursts[1].retain(|r| r[2] != 18);
+                    m.bursts[1].push(input(&[0x05, 3, 18, 1, out[4]]));
+                }
+                Ok(Vec::new())
+            }
             HidTransfer::OutputThenMatch { prefixes, .. } => {
                 m.last_prefixes = prefixes.clone();
                 let i = f::read_requests(64).iter().position(|r| r == out).expect("a read request");
@@ -213,7 +220,9 @@ fn a_read_finds_the_request_that_is_answered_and_asks_the_rest_the_same_way() {
     assert_eq!(s.caps, f::caps());
     let [q0, q1, _] = f::read_requests(64);
     // DPI: the lift-off query (nothing), then wake-all; polling, state of charge, charging all with wake-all; lift-off with its own query
-    assert_eq!(mouse.borrow().seen, vec![q0.clone(), q1.clone(), q1.clone(), q1.clone(), q1.clone(), q0.clone()]);
+    // (Order 110: and Motion Sync, command 18, with wake-all too - this burst has none: no row)
+    assert_eq!(mouse.borrow().seen, vec![q0.clone(), q1.clone(), q1.clone(), q1.clone(), q1.clone(), q1.clone(), q0.clone()]);
+    assert!(s.extras.is_empty());
     assert!(port.sent.iter().all(|s| f::read_request_allowed(&s.0)));
     // the wait is for [0x05, n, command, length] for every n from 2 + length up to 62
     let prefixes = mouse.borrow().last_prefixes.clone();
@@ -332,4 +341,42 @@ fn only_the_three_read_requests_pass_the_allow_list() {
     assert!(!f::read_request_allowed(&f::request(0x04, 96, &[1], 64)));
     assert!(!f::read_request_allowed(&f::read_requests(64)[0][..10]));
     assert!(!f::read_request_allowed(&[]));
+}
+
+// ---------------------------------------------------------------- Order 110: Motion Sync (the client's only one of the order's settings)
+
+#[test]
+fn motion_sync_is_openmouses_command_18() {
+    // decodeFinalmouseReport case 18: payload.length < 1 ? null : { motionSync: payload[0] === 1 }; inner length 2 + 1 = 3
+    assert_eq!(f::decode_report(&input(&[0x05, 3, 18, 1, 1])), Some(f::Update::MotionSync(1)));
+    assert_eq!(f::decode_report(&input(&[0x05, 2, 18, 0])), None, "no payload");
+    // the burst answers it: a row, asked with the request that answered the DPI
+    let info = ulx();
+    let m = f::matches(&[&info], 0x361D, 0x0100).unwrap();
+    let mo = mouse([vec![lod_r(1), dpi_r(1600), polling_r(1000), soc_r(80), input(&[0x05, 3, 18, 1, 1])], vec![], vec![]]);
+    let mut port = port_for(&info, mo.clone());
+    let s = f::Finalmouse.read(&m, &mut port, ReadOptions::default()).unwrap();
+    assert_eq!(s.extras.iter().map(|e| (e.extra, e.value, e.kind.clone())).collect::<Vec<_>>(), vec![(Extra::MotionSync, Some(1), Kind::Switch)]);
+    assert!(port.sent.iter().all(|s| f::read_request_allowed(&s.0)));
+    // setMotionSync(false) = write(report 0x04, 18, [0]): body [2 + 1 = 3, 0x80 | 18 = 0x92, 1, 0]; true: [3, 0x92, 1, 1]
+    let mo = mouse([vec![], vec![], vec![]]);
+    let mut port = port_for(&info, mo.clone());
+    f::Finalmouse.change(&m, &mut port, Change::Extra(Extra::MotionSync, 0)).unwrap();
+    f::Finalmouse.change(&m, &mut port, Change::Extra(Extra::MotionSync, 1)).unwrap();
+    // each confirmed by asking the burst for command 18 again (the lift-off query first, then wake-all, which answers here)
+    let [q0, q1, _] = f::read_requests(64);
+    assert_eq!(mo.borrow().seen, vec![frame(&[0x04, 0x03, 0x92, 0x01, 0x00]), q0.clone(), q1.clone(), frame(&[0x04, 0x03, 0x92, 0x01, 0x01]), q0, q1]);
+    let writes: Vec<_> = port.sent.iter().filter(|s| s.1 == HidTransfer::OutputOnly).collect();
+    assert!(writes.len() == 2 && writes.iter().all(|s| !f::read_request_allowed(&s.0)));
+    // a dongle that never answers command 18: the write is not confirmed
+    let mut silent = ScriptPort::new(info.clone(), |_, how| match how {
+        HidTransfer::OutputOnly => Ok(Vec::new()),
+        _ => Err(Error::BadAnswer("no answer".into())),
+    });
+    assert!(f::Finalmouse.change(&m, &mut silent, Change::Extra(Extra::MotionSync, 1)).is_err());
+    // refused before a byte leaves
+    for c in [Change::Extra(Extra::MotionSync, 2), Change::Extra(Extra::Debounce, 4), Change::Extra(Extra::AngleSnap, 1), Change::Extra(Extra::Turbo, 1)] {
+        assert!(f::Finalmouse.change(&m, &mut port, c).is_err(), "{c:?}");
+    }
+    assert_eq!(mo.borrow().seen.len(), 6);
 }

@@ -140,6 +140,93 @@ fn cmouse_driver_sends_openmouses_sequence_for_a_dpi_change() {
     assert!(port.sent.iter().all(|s| p::read_request_allowed(&s.0)));
 }
 
+// ---------------------------------------------------------------- cMouse: Order 110, the five settings under Lift-off
+
+use bu_mouse::family::{Change, Extra, Kind};
+
+/// A scripted cMouse whose settings memory holds the values OpenMouse reads (PULSAR_FLASH), stored as the firmware stores
+/// them: `[v, 0x55 − v]` pairs.
+fn x2_with_extras() -> bu_mouse::fake::CmouseModel {
+    let mut m = bu_mouse::fake::CmouseModel::new();
+    for (a, v) in [(169usize, 4u8), (171, 1), (175, 0), (177, 1), (181, 1)] {
+        m.mem[a] = v;
+        m.mem[a + 1] = 0x55u8.wrapping_sub(v);
+    }
+    m
+}
+
+fn cmouse_port(model: bu_mouse::fake::CmouseModel) -> (std::rc::Rc<std::cell::RefCell<bu_mouse::fake::CmouseModel>>, ScriptPort, Matched) {
+    let model = std::rc::Rc::new(std::cell::RefCell::new(model));
+    let m2 = model.clone();
+    let info = hid_info("cfg", 0x3710, 0x5406, 0xFF02, 0x02, (17, 17, 0));
+    let port = ScriptPort::new(info.clone(), move |out, _| Ok(m2.borrow_mut().answer(out)));
+    let mt = Matched { family: Family::PulsarCmouse, model: None, wireless: Some(true), config: info, variant: 0 };
+    (model, port, mt)
+}
+
+#[test]
+fn cmouse_read_shows_the_five_settings_as_openmouse_reads_them() {
+    let (_, mut port, mt) = cmouse_port(x2_with_extras());
+    let r = p::Cmouse.read(&mt, &mut port, ReadOptions::default()).unwrap();
+    let got: Vec<(Extra, Option<i32>)> = r.extras.iter().map(|e| (e.extra, e.value)).collect();
+    // debounceMs = flash[169]; motionSync / angleSnapping / rippleControl / performanceMode = flash[171 / 175 / 177 / 181] === 1
+    assert_eq!(got, vec![(Extra::Debounce, Some(4)), (Extra::MotionSync, Some(1)), (Extra::AngleSnap, Some(0)), (Extra::RippleControl, Some(1)), (Extra::Turbo, Some(1))]);
+    // getDebounceOptions: 0..15 ms
+    assert_eq!(r.extras[0].kind, Kind::Range { min: 0, max: 15, step: 1, unit: "ms" });
+    assert!(r.extras[1..].iter().all(|e| e.kind == Kind::Switch));
+    // the row 169..183 that readStatus takes these from, in two reads (readFlash's 10-byte limit): 10 at 169 (0xA9), 4 at 179 (0xB3)
+    assert!(port.sent.iter().any(|s| s.0 == r8(&[0x08, 0x08, 0x00, 0x00, 0xA9, 0x0A], 0x55u8.wrapping_sub(0x08 + 0x08 + 0xA9 + 0x0A)).to_vec()));
+    assert!(port.sent.iter().any(|s| s.0 == r8(&[0x08, 0x08, 0x00, 0x00, 0xB3, 0x04], 0x55u8.wrapping_sub(0x08 + 0x08 + 0xB3 + 0x04)).to_vec()));
+    // + the 0.7 mm lift-off (OpenMouse's "Low" = 3); reading = read requests only, the DPI chips' range as before
+    assert_eq!(r.caps.lift_off, vec![7, 10, 20]);
+    assert!(port.sent.iter().all(|s| p::read_request_allowed(&s.0)));
+    assert_eq!((r.caps.dpi.as_ref().unwrap().min(), r.caps.dpi.as_ref().unwrap().max()), (50, 26000));
+}
+
+/// The write frames (0x07 writeFlash) a change sent.
+fn writes(port: &ScriptPort) -> Vec<Vec<u8>> {
+    port.sent.iter().map(|s| s.0.clone()).filter(|f| f[1] == 0x07).collect()
+}
+
+#[test]
+fn cmouse_changes_are_openmouses_writecheckedbyte_frames() {
+    let (model, mut port, mt) = cmouse_port(x2_with_extras());
+    let mut go = |c: Change| -> Vec<Vec<u8>> {
+        port.sent.clear();
+        p::Cmouse.change(&mt, &mut port, c).unwrap();
+        // inside host control (setVerifiedByte → withDeviceControl): enter first, leave last
+        assert_eq!(port.sent.iter().find(|s| s.0[1] == 0x03).map(|s| s.0[6]), Some(1), "{c:?}");
+        assert_eq!(port.sent.last().map(|s| s.0.clone()), Some(p::online_frame(false).to_vec()), "{c:?}");
+        writes(&port)
+    };
+    // frame [08 07 00 | addr hi lo | 02 | v, 0x55 − v | … | 0x55 − sum], sums worked out by hand:
+    // setDebounceTime(8) at 169 = 0xA9: 8+7+0xA9+2+8+0x4D = 271 → 15 → 0x46
+    assert_eq!(go(Change::Extra(Extra::Debounce, 8)), vec![r8(&[0x08, 0x07, 0x00, 0x00, 0xA9, 0x02, 0x08, 0x4D], 0x46).to_vec()]);
+    // setMotionSync(false) at 171 = 0xAB: 8+7+0xAB+2+0+0x55 = 273 → 17 → 0x44
+    assert_eq!(go(Change::Extra(Extra::MotionSync, 0)), vec![r8(&[0x08, 0x07, 0x00, 0x00, 0xAB, 0x02, 0x00, 0x55], 0x44).to_vec()]);
+    // setAngleSnapping(true) at 175 = 0xAF: 8+7+0xAF+2+1+0x54 = 277 → 21 → 0x40
+    assert_eq!(go(Change::Extra(Extra::AngleSnap, 1)), vec![r8(&[0x08, 0x07, 0x00, 0x00, 0xAF, 0x02, 0x01, 0x54], 0x40).to_vec()]);
+    // setRippleControl(false) at 177 = 0xB1: 8+7+0xB1+2+0+0x55 = 279 → 23 → 0x3E
+    assert_eq!(go(Change::Extra(Extra::RippleControl, 0)), vec![r8(&[0x08, 0x07, 0x00, 0x00, 0xB1, 0x02, 0x00, 0x55], 0x3E).to_vec()]);
+    // setPerformanceMode(false) at 181 = 0xB5: 8+7+0xB5+2+0+0x55 = 283 → 27 → 0x3A
+    assert_eq!(go(Change::Extra(Extra::Turbo, 0)), vec![r8(&[0x08, 0x07, 0x00, 0x00, 0xB5, 0x02, 0x00, 0x55], 0x3A).to_vec()]);
+    // the fake mouse holds what was written; the next read shows it
+    let (_, mut port2, mt2) = cmouse_port(model.borrow().clone());
+    let r = p::Cmouse.read(&mt2, &mut port2, ReadOptions::default()).unwrap();
+    let got: Vec<Option<i32>> = r.extras.iter().map(|e| e.value).collect();
+    assert_eq!(got, vec![Some(8), Some(0), Some(1), Some(0), Some(0)]);
+}
+
+#[test]
+fn cmouse_refuses_what_openmouse_does_not_take_before_a_byte_leaves() {
+    let (_, mut port, mt) = cmouse_port(x2_with_extras());
+    for c in [Change::Extra(Extra::Debounce, 16), Change::Extra(Extra::Debounce, -1), Change::Extra(Extra::MotionSync, 2), Change::Extra(Extra::Turbo, -1)] {
+        port.sent.clear();
+        assert!(p::Cmouse.change(&mt, &mut port, c).is_err(), "{c:?}");
+        assert!(port.sent.is_empty(), "{c:?}: nothing sent");
+    }
+}
+
 // ---------------------------------------------------------------- XS-1 (X3 Medium)
 
 /// An XS-1 report as Windows sends it: report id 0, then OpenMouse's 64-byte packet `[0x00, command…, cks_lo, cks_hi]`.
@@ -228,6 +315,58 @@ fn xs1_driver_reads_and_writes_the_openmouse_way() {
     assert!(!p::xs1_read_request_allowed(&port.sent[1].0), "a write is not a read request");
     assert!(p::Xs1.write(&mt, &mut port, Setting::Polling(1000)).is_err());
     assert!(p::Xs1.write(&mt, &mut port, Setting::Dpi(1610)).is_err(), "50-DPI steps");
+}
+
+#[test]
+fn xs1_extras_are_openmouses_queries_and_writes() {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    // a scripted X3: a store of the four flags, answered at packet byte 7 (our 8), set by the writes' last byte
+    let st: Rc<RefCell<std::collections::HashMap<[u8; 2], u8>>> = Rc::new(RefCell::new([([0x07, 0x05], 1), ([0x07, 0x03], 0), ([0x07, 0x04], 0), ([0x04, 0x03], 4)].into_iter().collect()));
+    let s2 = st.clone();
+    let info = hid_info("xs1", 0x3710, 0x5402, 0xFFFF, 0x01, (0, 0, 65));
+    let mut port = ScriptPort::new(info.clone(), move |out, how| {
+        let cmd = &out[2..5];
+        if matches!(how, HidTransfer::FeatureOut) {
+            s2.borrow_mut().insert([cmd[0], cmd[1]], out[8]);
+            return Ok(Vec::new());
+        }
+        let mut a = vec![0u8; 65];
+        a[1..4].copy_from_slice(cmd);
+        if let Some(v) = s2.borrow().get(&[cmd[0], cmd[1] & 0x7F]) {
+            a[8] = *v;
+        }
+        if cmd == [0x07, 0x82, 0x03] {
+            a[9] = 0x07;
+        }
+        Ok(a)
+    });
+    let mt = bu_mouse::pulsar::matches_xs1(&[&info], 0x3710, 0x5402).unwrap();
+    let r = p::Xs1.read(&mt, &mut port, ReadOptions::default()).unwrap();
+    // QUERY.motionSync [07 85 02], rippleControl [07 83 02], angleSnapping [07 84 02], debounce [04 83 03]
+    for (q, cks) in [([0x07, 0x85, 0x02], 0x8E), ([0x07, 0x83, 0x02], 0x8C), ([0x07, 0x84, 0x02], 0x8D), ([0x04, 0x83, 0x03], 0x8A)] {
+        assert!(port.sent.iter().any(|s| s.0 == xs1(&q, cks)), "{q:02x?}");
+    }
+    assert!(port.sent.iter().all(|s| p::xs1_read_request_allowed(&s.0)));
+    let got: Vec<(Extra, Option<i32>)> = r.extras.iter().map(|e| (e.extra, e.value)).collect();
+    assert_eq!(got, vec![(Extra::Debounce, Some(4)), (Extra::MotionSync, Some(1)), (Extra::AngleSnap, Some(0)), (Extra::RippleControl, Some(0))], "the card's order; no turbo on XS-1");
+    assert_eq!((r.lift_off, r.caps.lift_off.clone()), (Some(7), vec![7, 10, 20]), "Low = 0x07 = 0.7 mm");
+    // WRITE.motionSync(false) [07 05 02 00 00 01 00], debounce(9) [04 03 03 00 00 01 09], rippleControl(true), angleSnapping(true)
+    for (c, w, cks) in [
+        (Change::Extra(Extra::MotionSync, 0), vec![0x07, 0x05, 0x02, 0x00, 0x00, 0x01, 0x00], 0x0F),
+        (Change::Extra(Extra::Debounce, 9), vec![0x04, 0x03, 0x03, 0x00, 0x00, 0x01, 0x09], 0x14),
+        (Change::Extra(Extra::RippleControl, 1), vec![0x07, 0x03, 0x02, 0x00, 0x00, 0x01, 0x01], 0x0E),
+        (Change::Extra(Extra::AngleSnap, 1), vec![0x07, 0x04, 0x02, 0x00, 0x00, 0x01, 0x01], 0x0F),
+    ] {
+        port.sent.clear();
+        p::Xs1.change(&mt, &mut port, c).unwrap();
+        let out: Vec<&Vec<u8>> = port.sent.iter().filter(|s| s.1 == HidTransfer::FeatureOut).map(|s| &s.0).collect();
+        assert_eq!(out, vec![&xs1(&w, cks)], "{c:?}");
+    }
+    assert_eq!(*st.borrow().get(&[0x04, 0x03]).unwrap(), 9);
+    port.sent.clear();
+    assert!(p::Xs1.change(&mt, &mut port, Change::Extra(Extra::Debounce, 16)).is_err() && port.sent.is_empty(), "0-15 ms");
+    assert!(p::Xs1.change(&mt, &mut port, Change::Extra(Extra::Turbo, 1)).is_err() && port.sent.is_empty(), "no turbo on XS-1");
 }
 
 #[test]

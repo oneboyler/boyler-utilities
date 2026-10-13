@@ -6,7 +6,7 @@
 //! OpenMouse sends `sendReport(0, 64 bytes)`: byte i of its packet is byte i + 1 on Windows (report id 0 in front). The
 //! checksum is `(0xA1 - (sum of bytes 0..62)) & 0xFF`, byte 63.
 
-use bu_mouse::family::{self, Driver, Family, ReadOptions, Setting};
+use bu_mouse::family::{self, Change, Driver, Extra, Family, Kind, ReadOptions, Setting};
 use bu_mouse::fake::{hid_info, ScriptPort};
 use bu_mouse::orbital as o;
 use bu_mouse::os::{HidInfo, HidTransfer};
@@ -454,4 +454,74 @@ fn settings_the_mouse_cannot_store_are_refused_before_a_byte_leaves() {
         assert!(o::Orbital.write(&matched(), &mut p, s).is_err(), "{s:?}");
     }
     assert!(p.sent.is_empty());
+}
+
+// ---------------------------------------------------------------- Order 110: debounce, Motion Sync, angle snapping, ripple
+
+#[test]
+fn ghost_read_shows_debounce_and_the_sensor_switches() {
+    let st = fake();
+    let mut p = port(&st);
+    let r = o::Orbital.read(&matched(), &mut p, ReadOptions::default()).unwrap();
+    // readStatus: debounceMs = systemData[5] = 4; motionSync / angleSnapping / rippleControl = sensorData[2] / [0] / [1] != 0
+    let got: Vec<(Extra, Option<i32>)> = r.extras.iter().map(|e| (e.extra, e.value)).collect();
+    assert_eq!(got, vec![(Extra::Debounce, Some(4)), (Extra::MotionSync, Some(1)), (Extra::AngleSnap, Some(0)), (Extra::RippleControl, Some(0))]);
+    // mergeEditableSettings: debounceMs clamped to 0..30
+    assert_eq!(r.extras[0].kind, Kind::Range { min: 0, max: 30, step: 1, unit: "ms" });
+    assert!(p.sent.iter().all(|s| o::read_request_allowed(&s.0)));
+}
+
+#[test]
+fn ghost_changes_are_openmouses_block_writes() {
+    // the sensor block with nothing changed sums to 2965: header 4 + 0xBC + 2 = 194; flags 1 + 1 + lift-off 1 + active 1 +
+    // mask 31 = 35; stages 2·(0x90+1) + 2·(0x20+3) + 2·(0x40+6) + 2·(0x80+0x0C) + 2·(0xC0+0x12) = 1200; colours 1536
+    let st = fake();
+    let go = |c: Change| -> Vec<u8> {
+        st.borrow_mut().seen.clear();
+        let mut p = port(&st);
+        o::Orbital.change(&matched(), &mut p, c).unwrap();
+        // read sensor, read system, the one block write, save, read sensor, read system
+        let k = kinds(&st);
+        assert_eq!((k.len(), k[0], k[1], k[3], k[4], k[5]), (6, (4, 0x81), (4, 0x83), (10, 0x81), (4, 0x81), (4, 0x83)), "{c:?}");
+        p.sent[2].0.clone()
+    };
+    let sensor = |set: &[(usize, u8)], crc: u8| {
+        let mut b = sensor_answer();
+        b[0..4].copy_from_slice(&[4, 0, 0xBC, 2]);
+        for (i, v) in set {
+            b[*i] = *v;
+        }
+        b[63] = crc;
+        let mut p = [0u8; 64];
+        p.copy_from_slice(&b);
+        wire(&p)
+    };
+    // setMotionSync(false): [6] = 0 → 2964 = 11·256 + 148 → 0xA1 − 0x94 = 0x0D
+    assert_eq!(go(Change::Extra(Extra::MotionSync, 0)), sensor(&[(6, 0)], 0x0D));
+    // setAngleSnapping(true) (motion sync now off): [4] = 1 → 2965 = 11·256 + 149 → 0xA1 − 0x95 = 0x0C
+    assert_eq!(go(Change::Extra(Extra::AngleSnap, 1)), sensor(&[(4, 1), (6, 0)], 0x0C));
+    // setRippleControl(true): [5] = 1 → 2966 → 0xA1 − 0x96 = 0x0B
+    assert_eq!(go(Change::Extra(Extra::RippleControl, 1)), sensor(&[(4, 1), (5, 1), (6, 0)], 0x0B));
+    // setDebounceTime(30): the system block, [9] = 30; 152 + sleep 90 + rate 3 + 30 + 3 = 278 → 22 → 0xA1 − 0x16 = 0x8B
+    let want = pk(&[(0, 4), (2, 0x90), (3, 4), (4, 0x2C), (5, 1), (6, 0x2C), (7, 1), (8, 3), (9, 30), (10, 1), (11, 1), (12, 1), (63, 0x8B)]);
+    assert_eq!(go(Change::Extra(Extra::Debounce, 30)), wire(&want));
+    let r = o::Orbital.read(&matched(), &mut port(&st), ReadOptions::default()).unwrap();
+    let got: Vec<Option<i32>> = r.extras.iter().map(|e| e.value).collect();
+    assert_eq!(got, vec![Some(30), Some(0), Some(1), Some(1)]);
+    assert_eq!(r.dpi, Some(800), "DPI untouched");
+}
+
+#[test]
+fn ghost_refuses_what_openmouse_does_not_take_before_a_byte_leaves() {
+    let st = fake();
+    for c in [Change::Extra(Extra::Debounce, 31), Change::Extra(Extra::MotionSync, 2), Change::Extra(Extra::Turbo, 1)] {
+        let mut p = port(&st);
+        assert!(o::Orbital.change(&matched(), &mut p, c).is_err(), "{c:?}");
+        assert!(p.sent.is_empty(), "{c:?}");
+    }
+    // a block the rewrite would change (an unknown non-zero byte): refused after the reads, nothing written
+    st.borrow_mut().sensor[4 + 36] = 9;
+    let mut p = port(&st);
+    assert!(o::Orbital.change(&matched(), &mut p, Change::Extra(Extra::MotionSync, 0)).is_err());
+    assert_eq!(kinds(&st), vec![(4, 0x81), (4, 0x83)]);
 }

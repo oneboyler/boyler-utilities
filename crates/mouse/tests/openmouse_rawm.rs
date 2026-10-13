@@ -10,7 +10,7 @@
 //! This family is HELD BACK in the device table (it needs a transfer that collects several input reports): the driver is
 //! proven here against a scripted link; the device table's own matcher is proven too, and the switch stays off.
 
-use bu_mouse::family::{Driver, Family, ReadOptions, Setting};
+use bu_mouse::family::{Change, Driver, Extra, Family, Kind, ReadOptions, Setting};
 use bu_mouse::fake::{hid_info, ScriptPort};
 use bu_mouse::os::HidInfo;
 use bu_mouse::rawm as rw;
@@ -356,6 +356,11 @@ struct Fake {
     quiet: bool,
     ignore_writes: bool,
     drop_field: Option<&'static str>,
+    /// Order 110: kd, ms, as, rctrl as the mouse holds them
+    kd: Vec<i64>,
+    ms: i64,
+    as_: i64,
+    rctrl: i64,
     queries: Vec<Vec<u8>>,
     sent: Vec<Vec<u8>>,
     pauses: Vec<u64>,
@@ -364,7 +369,7 @@ struct Fake {
 
 impl Fake {
     fn new() -> Self {
-        Fake { dpi: 1600, polling: 1000, battery: Some(80), crc: false, quiet: false, ignore_writes: false, drop_field: None, queries: Vec::new(), sent: Vec::new(), pauses: Vec::new(), pending: Vec::new() }
+        Fake { dpi: 1600, polling: 1000, battery: Some(80), crc: false, quiet: false, ignore_writes: false, drop_field: None, kd: vec![5, 5], ms: 1, as_: 0, rctrl: 1, queries: Vec::new(), sent: Vec::new(), pauses: Vec::new(), pending: Vec::new() }
     }
 
     fn json(&self) -> String {
@@ -373,6 +378,10 @@ impl Fake {
         o.insert("cpi".into(), self.dpi.into());
         o.insert("polling".into(), self.polling.into());
         o.insert("crc".into(), (self.crc as i64).into());
+        o.insert("kd".into(), self.kd.clone().into());
+        o.insert("ms".into(), self.ms.into());
+        o.insert("as".into(), self.as_.into());
+        o.insert("rctrl".into(), self.rctrl.into());
         match self.battery {
             Some(b) => o.insert("battery".into(), b.into()),
             None => o.remove("battery"),
@@ -394,6 +403,10 @@ impl rw::Link for Fake {
                 let inner = if msg[2] == 0x24 { &msg[5..] } else { &msg[..] };
                 self.dpi = inner[3] as i64 | (inner[4] as i64) << 8;
                 self.polling = inner[5] as i64 | (inner[6] as i64) << 8;
+                // the record's layout with three stages and no wide values: kd count at 23, then the delays, ms, at, as, rctrl
+                let n = inner[23] as usize;
+                self.kd = inner[24..24 + n].iter().map(|b| *b as i64).collect();
+                (self.ms, self.as_, self.rctrl) = (inner[24 + n] as i64, inner[26 + n] as i64, inner[27 + n] as i64);
             }
         }
         Ok(())
@@ -547,4 +560,63 @@ fn over_a_real_port_the_status_answer_comes_in_one_stream() {
     let mut p = ScriptPort::new(col, |_, _| Err(Error::BadAnswer("the mouse did not answer in time".into())));
     let r = rw::Rawm.read(&m, &mut p, ReadOptions::default()).unwrap();
     assert!(!r.online);
+}
+
+// ---------------------------------------------------------------- Order 110: debounce, Motion Sync, angle snapping, ripple
+
+#[test]
+fn the_status_shows_debounce_and_the_switches() {
+    let mut f = Fake::new();
+    let r = rw::read_with(&mut f, None, ReadOptions::default()).unwrap();
+    // readStatus: debounceMs = keyDelay[0] = 5; motionSync ms 1, angleSnapping as 0, rippleControl rctrl 1
+    let got: Vec<(Extra, Option<i32>)> = r.extras.iter().map(|e| (e.extra, e.value)).collect();
+    assert_eq!(got, vec![(Extra::Debounce, Some(5)), (Extra::MotionSync, Some(1)), (Extra::AngleSnap, Some(0)), (Extra::RippleControl, Some(1))]);
+    // setDebounceTime: "must fit in one byte"
+    assert_eq!(r.extras[0].kind, Kind::Range { min: 0, max: 255, step: 1, unit: "ms" });
+    assert_eq!(f.queries, vec![query_frame()], "the one status query");
+    // a field the status does not report: no row
+    let mut f = Fake::new();
+    f.drop_field = Some("rctrl");
+    let r = rw::read_with(&mut f, None, ReadOptions::default()).unwrap();
+    assert!(r.extras.iter().all(|e| e.extra != Extra::RippleControl));
+}
+
+#[test]
+fn the_changes_send_the_rebuilt_record_the_openmouse_way() {
+    // record(): key delays `02 | 05 05` at 23..26, then ms (26), at (27), as (28), rctrl (29)
+    let mut f = Fake::new();
+    // setDebounceTime(8): keyDelay.map(() => 8) → `02 | 08 08`
+    rw::change_with(&mut f, Change::Extra(Extra::Debounce, 8)).unwrap();
+    let mut want = record();
+    want[24] = 8;
+    want[25] = 8;
+    assert_eq!(f.sent, two_frames(&want));
+    assert_eq!((f.queries.len(), f.pauses.clone()), (2, vec![25, 100]), "query, two pieces 25 ms apart, 100 ms, query");
+    // setMotionSync(false): [26] = 0
+    f.sent.clear();
+    rw::change_with(&mut f, Change::Extra(Extra::MotionSync, 0)).unwrap();
+    want[26] = 0;
+    assert_eq!(f.sent, two_frames(&want));
+    // setAngleSnapping(true): [28] = 1
+    f.sent.clear();
+    rw::change_with(&mut f, Change::Extra(Extra::AngleSnap, 1)).unwrap();
+    want[28] = 1;
+    assert_eq!(f.sent, two_frames(&want));
+    // setRippleControl(false): [29] = 0
+    f.sent.clear();
+    rw::change_with(&mut f, Change::Extra(Extra::RippleControl, 0)).unwrap();
+    want[29] = 0;
+    assert_eq!(f.sent, two_frames(&want));
+    let r = rw::read_with(&mut f, None, ReadOptions::default()).unwrap();
+    assert_eq!(r.extras.iter().map(|e| e.value).collect::<Vec<_>>(), vec![Some(8), Some(0), Some(1), Some(0)]);
+    // a mouse that keeps its value: not confirmed
+    let mut f = Fake::new();
+    f.ignore_writes = true;
+    assert!(rw::change_with(&mut f, Change::Extra(Extra::MotionSync, 0)).is_err());
+    // refused before anything is asked
+    let mut f = Fake::new();
+    for c in [Change::Extra(Extra::Debounce, 256), Change::Extra(Extra::Debounce, -1), Change::Extra(Extra::MotionSync, 2), Change::Extra(Extra::Turbo, 1)] {
+        assert!(rw::change_with(&mut f, c).is_err(), "{c:?}");
+    }
+    assert!(f.queries.is_empty() && f.sent.is_empty());
 }

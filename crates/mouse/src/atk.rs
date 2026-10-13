@@ -38,9 +38,19 @@
 //! lift-off `[0, level - 1]`. DPI 10-42000 (10 up to 10000, 50 up to 30000, 100 above); polling 125..8000 (all seven codes, as
 //! OpenMouse offers them); lift-off 0.7-1.7 mm in 0.1 mm steps (level + 6 tenths: OpenMouse's slider is in mm).
 //!
+//! ## Order 110 (the owner's A_110_02 scope): debounce, Motion Sync, angle snapping, ripple
+//! `hid.js` keeps the four in the advanced block 0x00a9 (`[v, 0x55 - v]` pairs: debounce at offset 0, Motion Sync 2, angle
+//! snapping - "straight-line correction" on the R1 / A9 Plus - 6, ripple 8). OpenMouse reads the 10-byte block, replaces one
+//! pair, writes the whole block (`writeAdvanced`; the R1 Pro Max receiver: echoed, `writeR1ProMaxReceiverAdvanced`) and reads
+//! it back. Per model: R1 Pro Max (wired + receiver), R1 SE+ wired 2,32 and A9 Plus Nearlink: all four (debounce from
+//! OpenMouse's `R1_DEBOUNCE_MILLISECONDS` 0/1/2/4/8/15/20 - the row takes only those (Kind::Steps), any other value is refused before a
+//! byte leaves); R1 SE+ receiver: Motion Sync and ripple only - its debounce and angle snapping go through the live row 0x0070
+//! with nothing read back (HELD BACK, as its lift-off); R1 SE+ 2,31: none (OpenMouse blocks its writes).
+//! `bitmouse-hid.js` (ATK ZERO): Motion Sync (command 13), angle snapping (11, "linear correction"), ripple (12), debounce (22,
+//! 0-15 ms) - each one byte, fire-and-forget, then the config block (9) read back (payload 6 / 7 / 8 / 11).
+//!
 //! ## Left out on purpose
-//! Everything that is not DPI / polling / lift-off / battery: buttons, macros, RGB and DPI-LED colours, DPI stage count / active
-//! stage / stage colours, debounce, sleep, motion sync, ripple, angle snapping, performance / sensor modes, long-range, profile
+//! Everything else: buttons, macros, RGB and DPI-LED colours, DPI stages, sleep, performance / sensor modes, long-range, profile
 //! switching (`setCurrentConfig` 0x0f), receiver pairing (0x05 / 0x06), dongle light, firmware version, and every command the
 //! codec lists for firmware work (0x09 factory restore, 0x0d USB upgrade mode, 0x5a / 0x5b upgrade reports) - none is built here.
 //! R1 SE+ receiver polling read: OpenMouse decodes byte 1 of the live row whatever setting was written last (and falls back to
@@ -55,7 +65,7 @@
 //! Never run on a real unit; proven against OpenMouse's bytes (tests/openmouse_atk.rs).
 
 use crate::error::{Error, Result};
-use crate::family::{Caps, Changed, DpiCaps, Driver, Family, Matched, OnMouse, Port, ReadOptions, Setting};
+use crate::family::{check_extra, not_offered, Caps, Change, Changed, DpiCaps, Driver, Extra, ExtraRow, Family, Kind as Takes, Matched, OnMouse, Port, ReadOptions, Setting};
 use crate::os::{HidInfo, HidTransfer};
 
 /// ATK's own USB vendor id (`VENDOR_ID.atk`).
@@ -571,6 +581,11 @@ fn hid_read(kind: Kind, m: &Matched, port: &mut dyn Port, opt: ReadOptions) -> R
     if !kind.live() {
         r.lift_off = soft(read_eeprom(port, ADDR_LIFT_OFF, 2))?.and_then(|d| lift_off_tenths(d[0]));
     }
+    // Order 110: the advanced block (OpenMouse's readStatus `advanced`), for the models with rows
+    if !hid_rows(kind, id, None).is_empty() {
+        let adv = soft(read_eeprom(port, ADDR_ADVANCED, ADVANCED_LEN))?;
+        r.extras = hid_rows(kind, id, adv.as_deref());
+    }
     Ok(r)
 }
 
@@ -663,6 +678,70 @@ fn hid_write(kind: Kind, port: &mut dyn Port, s: Setting) -> Result<Changed> {
     }
 }
 
+// ================================================================ hid.js: Order 110 (debounce, Motion Sync, angle snapping, ripple)
+
+/// `REGISTER.advanced`: debounce, Motion Sync, sleep, angle snapping, ripple - one `[v, 0x55 - v]` pair each.
+pub const ADDR_ADVANCED: u16 = 0x00A9;
+pub const ADVANCED_LEN: usize = 10;
+/// The advanced block's offsets (OpenMouse's writeAdvanced offsets).
+pub const ADV_DEBOUNCE: usize = 0;
+pub const ADV_MOTION_SYNC: usize = 2;
+pub const ADV_ANGLE_SNAP: usize = 6;
+pub const ADV_RIPPLE: usize = 8;
+/// `R1_DEBOUNCE_MILLISECONDS` (wired R1, the Pro Max receiver, the A9 Plus Nearlink: `getDebounceOptions`).
+pub const R1_DEBOUNCE_MS: [i32; 7] = [0, 1, 2, 4, 8, 15, 20];
+
+/// The extra rows of a model line + identity, in the card's order, with their values from the advanced block (`None` = not
+/// read). OpenMouse's gates: the R1 SE+ receiver writes debounce and angle snapping only through the unconfirmed live row
+/// (held back); the catalog-only R1 SE+ 2,31 is never written.
+fn hid_rows(kind: Kind, id: (u8, u8), adv: Option<&[u8]>) -> Vec<ExtraRow> {
+    let byte = |o: usize| adv.and_then(|a| a.get(o).copied());
+    let flag = |e: Extra, o: usize| ExtraRow::switch(e, byte(o).map(|b| b == 1));
+    match kind {
+        Kind::SeReceiver => vec![flag(Extra::MotionSync, ADV_MOTION_SYNC), flag(Extra::RippleControl, ADV_RIPPLE)],
+        Kind::ProMaxWired | Kind::ProMaxReceiver | Kind::A9Plus => full_rows(byte(ADV_DEBOUNCE), flag),
+        Kind::SeWired if id == (2, 32) => full_rows(byte(ADV_DEBOUNCE), flag),
+        _ => Vec::new(),
+    }
+}
+
+fn full_rows(debounce: Option<u8>, flag: impl Fn(Extra, usize) -> ExtraRow) -> Vec<ExtraRow> {
+    vec![
+        // debounceMs: advanced[0]; only the values of OpenMouse's R1 list (R1_DEBOUNCE_MS: the card's - / + step through them)
+        ExtraRow::new(Extra::Debounce, Takes::Steps { values: R1_DEBOUNCE_MS.to_vec(), unit: "ms" }, debounce.map(i32::from)),
+        flag(Extra::MotionSync, ADV_MOTION_SYNC),
+        flag(Extra::AngleSnap, ADV_ANGLE_SNAP),
+        flag(Extra::RippleControl, ADV_RIPPLE),
+    ]
+}
+
+/// Order 110 on a hid.js mouse: checked first (only identity reads before a refusal), then `writeAdvanced` - the 10-byte block
+/// as read, one pair replaced, written whole (fire-and-forget; the Pro Max receiver echoes it) - and the byte read back.
+fn hid_change(kind: Kind, port: &mut dyn Port, c: Change) -> Result<()> {
+    let Change::Extra(e, v) = c;
+    let id = identify(port, TRIES as u32)?.ok_or_else(gone)?;
+    check_identity(kind, id)?;
+    check_extra(&hid_rows(kind, id, None), e, v)?;
+    if e == Extra::Debounce && !R1_DEBOUNCE_MS.contains(&v) {
+        return Err(Error::range(e.label(), format!("{v} ms (OpenMouse offers 0, 1, 2, 4, 8, 15 and 20 ms)")));
+    }
+    let offset = match e {
+        Extra::Debounce => ADV_DEBOUNCE,
+        Extra::MotionSync => ADV_MOTION_SYNC,
+        Extra::AngleSnap => ADV_ANGLE_SNAP,
+        Extra::RippleControl => ADV_RIPPLE,
+        _ => return Err(not_offered(c)),
+    };
+    let mut b = read_eeprom(port, ADDR_ADVANCED, ADVANCED_LEN)?;
+    b[offset..offset + 2].copy_from_slice(&scalar_pair(v as u8));
+    put(kind, port, ADDR_ADVANCED, &b)?;
+    let now = read_eeprom(port, ADDR_ADVANCED, ADVANCED_LEN)?[offset] as i32;
+    if now != v {
+        return Err(Error::BadAnswer(format!("the mouse kept {now} instead of {v} ({})", e.label())));
+    }
+    Ok(())
+}
+
 // ================================================================ BITMOUSE codec (ATK ZERO)
 
 pub const BM_USAGE_PAGE: u16 = 0xFF05;
@@ -700,6 +779,14 @@ pub const BM_DPI_CHUNK: u8 = 10;
 pub const BM_DPI_CHUNKS: u16 = 7;
 pub const BM_LIFT_MIN: u32 = 1;
 pub const BM_LIFT_MAX: u32 = 11;
+/// Order 110 commands (`BITMOUSE_COMMAND`), each one byte with lengths (3, 1) (`BITMOUSE_LENGTHS`).
+pub const BM_CMD_SET_LINEAR_CORRECTION: u8 = 11;
+pub const BM_CMD_SET_RIPPLE: u8 = 12;
+pub const BM_CMD_SET_MOTION_SYNC: u8 = 13;
+pub const BM_CMD_SET_DEBOUNCE: u8 = 22;
+pub const BM_LEN_FLAG: (u8, u8) = (3, 1);
+/// `DEBOUNCE_MAX_MS` of bitmouse-hid.js (setDebounceTime: 0..=15).
+pub const BM_DEBOUNCE_MAX_MS: i32 = 15;
 /// OpenMouse's `REPLY_TIMEOUT_MS` / `WRITE_SETTLE_MS` for this client
 const BM_TIMEOUT_MS: u32 = 700;
 const BM_SETTLE_MS: u64 = 120;
@@ -783,13 +870,18 @@ pub fn bm_decode_reply(wire: &[u8]) -> Option<BmReply> {
 pub struct BmConfig {
     pub polling_hz: Option<u32>,
     pub offset_calibration: u8,
+    /// Order 110: payload[6] motionSync, [7] linearCorrection (angle snapping), [8] rippleControl (each `== 1`), [11] debounce ms
+    pub motion_sync: bool,
+    pub linear_correction: bool,
+    pub ripple: bool,
+    pub debounce_ms: u8,
 }
 
 pub fn bm_decode_config(p: &[u8]) -> Option<BmConfig> {
     if p.len() < 12 {
         return None;
     }
-    Some(BmConfig { polling_hz: bm_polling_hz(p[2]), offset_calibration: p[5] })
+    Some(BmConfig { polling_hz: bm_polling_hz(p[2]), offset_calibration: p[5], motion_sync: p[6] == 1, linear_correction: p[7] == 1, ripple: p[8] == 1, debounce_ms: p[11] })
 }
 
 /// Lift-off in tenths of a mm from the config block: level = offsetCalibration + 1, level + 6 tenths (0.7 mm = level 1).
@@ -911,7 +1003,39 @@ fn bm_read(kind: Kind, m: &Matched, port: &mut dyn Port, opt: ReadOptions) -> Re
     r.battery_percent = bm_byte(port, target, BM_CMD_BATTERY, BM_LEN_BATTERY)?;
     r.charging = bm_byte(port, target, BM_CMD_CHARGING, BM_LEN_CHARGING)?.map(|b| b == 1);
     r.dpi = bm_dpi_block(port, target)?.and_then(|b| b.stages.get(b.current).map(|s| s.x));
+    r.extras = bm_rows(Some(&config));
     Ok(r)
+}
+
+/// The ATK ZERO's Order 110 rows in the card's order (bitmouse-hid.js readStatus: all from the config block).
+fn bm_rows(c: Option<&BmConfig>) -> Vec<ExtraRow> {
+    vec![
+        ExtraRow::new(Extra::Debounce, Takes::Range { min: 0, max: BM_DEBOUNCE_MAX_MS, step: 1, unit: "ms" }, c.map(|c| c.debounce_ms as i32)),
+        ExtraRow::switch(Extra::MotionSync, c.map(|c| c.motion_sync)),
+        ExtraRow::switch(Extra::AngleSnap, c.map(|c| c.linear_correction)),
+        ExtraRow::switch(Extra::RippleControl, c.map(|c| c.ripple)),
+    ]
+}
+
+/// Order 110 on the ATK ZERO: checked first, then OpenMouse's setFlag / setDebounceTime - the byte (fire-and-forget, 120 ms) -
+/// and the config block read back.
+fn bm_change(kind: Kind, port: &mut dyn Port, c: Change) -> Result<()> {
+    let Change::Extra(e, v) = c;
+    check_extra(&bm_rows(None), e, v)?;
+    let (cmd, field): (u8, fn(&BmConfig) -> i32) = match e {
+        Extra::MotionSync => (BM_CMD_SET_MOTION_SYNC, |c| c.motion_sync as i32),
+        Extra::AngleSnap => (BM_CMD_SET_LINEAR_CORRECTION, |c| c.linear_correction as i32),
+        Extra::RippleControl => (BM_CMD_SET_RIPPLE, |c| c.ripple as i32),
+        Extra::Debounce => (BM_CMD_SET_DEBOUNCE, |c| c.debounce_ms as i32),
+        _ => return Err(not_offered(c)),
+    };
+    let target = bm_target(kind);
+    bm_fire(port, target, cmd, BM_LEN_FLAG, &[v as u8])?;
+    let now = field(&bm_config(port, target)?);
+    if now != v {
+        return Err(Error::BadAnswer(format!("the mouse kept {now} instead of {v} ({})", e.label())));
+    }
+    Ok(())
 }
 
 fn bm_write(kind: Kind, port: &mut dyn Port, s: Setting) -> Result<Changed> {
@@ -966,7 +1090,9 @@ fn eeprom_read_ok(addr: u16, len: u8) -> bool {
     let lift_off = addr == ADDR_LIFT_OFF && len <= 2;
     let stages = (ADDR_DPI..=0x2B).contains(&addr) && end <= 0x2C;
     let live = addr == ADDR_LIVE && len <= 4;
-    (1..=10).contains(&len) && (system || lift_off || stages || live)
+    // Order 110: the advanced block
+    let advanced = addr == ADDR_ADVANCED && len as usize == ADVANCED_LEN;
+    (1..=10).contains(&len) && (system || lift_off || stages || live || advanced)
 }
 
 fn hid_read_allowed(out: &[u8]) -> bool {
@@ -1029,6 +1155,15 @@ impl Driver for Atk {
             bm_write(kind, port, s)
         } else {
             hid_write(kind, port, s)
+        }
+    }
+    /// Order 110: debounce / Motion Sync / angle snapping / ripple (checked against what OpenMouse offers this model first).
+    fn change(&self, m: &Matched, port: &mut dyn Port, c: Change) -> Result<()> {
+        let kind = Kind::of(m.variant).ok_or_else(|| Error::UnsupportedMouse("ATK / VXE (unknown model line)".into()))?;
+        if kind.bitmouse() {
+            bm_change(kind, port, c)
+        } else {
+            hid_change(kind, port, c)
         }
     }
 }

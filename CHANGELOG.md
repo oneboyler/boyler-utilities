@@ -1,6 +1,10 @@
 # Boyler Utilities — What's new
 
-## 1.1.0 (not released yet)
+## 1.1.1 (2026-10-13)
+- Mouse tab: five more settings of the mouse itself, under Lift-off distance - Debounce time (− / +), Motion Sync, Angle Snap, Ripple Control and Turbo Mode. Each mouse shows only the ones its driver can really change: Pulsar, ATK / VXE, Endgame Gear, Lamzu, WLMouse, Lingbao / Attack Shark (GearHub), Corsair, Teevolution, VGN, Ninjutso, Finalmouse, Zaunkoenig, Orbital, RAWM, Delux, ASUS, Incott, WALLHACK, MCHOSE and Keychron M6 (Turbo Mode on Pulsar, Teevolution, VGN and WLMouse); a mouse without them looks as before. Every change is saved on the mouse and read back.
+- Lift-off distance: 0.7 mm on the mice that have it (Pulsar and others).
+
+## 1.1.0 (2026-10-13)
 - Boyler Utilities is now free software under the GNU AGPL v3 (or later) - see Settings › Licences. Its mouse drivers are ported from OpenMouse (credited there).
 - Mouse tab: DPI, polling rate and battery (and lift-off distance on Pulsars) now work for many more mice - Pulsar (also the Tenz Signature, X2h, X2 V3 ES Mini, X2F and X3 Medium), Logitech (37 models, cabled or on a Lightspeed / Bolt receiver), Razer (14 models) and SteelSeries (10 models: polling rate and battery; DPI on the Rival 650 and Rival 310 only - on the others a DPI change from here would erase the presets saved on the mouse). Each mouse shows only the settings it supports. Opening the tab only reads the mouse; a setting changes only when you click it.
 - Pulsar X2 CrazyLight: works as before (now with exactly the requests OpenMouse sends).

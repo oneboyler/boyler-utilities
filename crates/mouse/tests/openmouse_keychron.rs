@@ -7,7 +7,7 @@
 //! without the id. Windows' buffer is the report id + the packet, zero-padded to the collection's report length: OpenMouse's
 //! byte i is our byte i + 1.
 
-use bu_mouse::family::{self, Driver, Family, Matched, ReadOptions, Setting};
+use bu_mouse::family::{self, Change, Driver, Extra, Family, Kind, Matched, ReadOptions, Setting};
 use bu_mouse::fake::{hid_info, ScriptPort};
 use bu_mouse::keychron as kc;
 use bu_mouse::os::{HidInfo, HidTransfer};
@@ -700,6 +700,8 @@ struct M6Model {
     stages: [u16; 5],
     f15: u8,
     stage_count: u8,
+    /// Order 110: debounce ms (status byte 17)
+    debounce: u8,
     battery_byte: u8,
     dpi_max: u16,
     dpi_step: u8,
@@ -733,6 +735,7 @@ impl M6Model {
             stages: [400, 800, 1600, 3200, 6400],
             f15: 0x15,
             stage_count: 5,
+            debounce: 4,
             battery_byte: 0x80 | 75,
             dpi_max: 0,
             dpi_step: 0,
@@ -768,6 +771,7 @@ impl M6Model {
         }
         b[15] = self.f15;
         b[16] = self.stage_count;
+        b[17] = self.debounce;
         b[19] = self.battery_byte;
         b[26] = self.old_flags[0];
         b[40] = self.dpi_max as u8;
@@ -866,7 +870,16 @@ impl M6Model {
                 } else {
                     self.b61 = (self.b61 & 0xF0) | (p[11] & 0x0F);
                 }
+                // Order 110: the switches (1 on, 2 off) into the flags byte: ripple 0x04, angle snapping 0x08, Motion Sync 0x10
+                for (tok, bit) in [(p[2], 0x04u8), (p[3], 0x08), (p[4], 0x10)] {
+                    match tok {
+                        1 => self.f15 |= bit,
+                        2 => self.f15 &= !bit,
+                        _ => {}
+                    }
+                }
             }
+            (0xB5, 0x43) => self.debounce = p[1],
             other => panic!("unexpected write {other:02x?}"),
         }
     }
@@ -895,7 +908,7 @@ fn m6_port(pid: u16, model: Rc<RefCell<M6Model>>) -> ScriptPort {
                 (0xB4, m.status())
             }
             (0xB3, 0x49) => (0xB4, m.xy_answer()),
-            (0xB5, c @ (0x40 | 0x41 | 0x42 | 0x4A)) | (0xB3, c @ 0x48) => {
+            (0xB5, c @ (0x40 | 0x41 | 0x42 | 0x43 | 0x4A)) | (0xB3, c @ 0x48) => {
                 m.apply(id, p);
                 let ack = vec![0xE4, m.ack_code, c];
                 (if id == 0xB3 { 0xB4 } else { 0xB6 }, ack)
@@ -1160,4 +1173,53 @@ fn a_receiver_with_nothing_paired_or_another_mouse_is_not_an_m6() {
     assert!(matches!(kc::Keychron.write(&m, &mut p, Setting::Dpi(1000)), Err(Error::UnsupportedMouse(_))));
     assert!(model.borrow().log.iter().all(|(o, _)| o[1] != 0x06), "no status read from a mouse that is not an M6");
     assert!(m6_writes(&model).is_empty());
+}
+
+// ---------------------------------------------------------------- Order 110 (M6): debounce, Motion Sync, angle snapping, ripple
+
+#[test]
+fn the_m6_extras_are_openmouses_0x42_and_0x43_packets() {
+    let (m, model, mut p) = m6_setup(0xD060, M6Model::new());
+    // keychronDecodeSettings: debounceMs = status [17] = 4; flags [15] = 0x15: ripple (0x04) on, angle snapping (0x08) off,
+    // Motion Sync (0x10) on
+    let r = kc::Keychron.read(&m, &mut p, ReadOptions::default()).unwrap();
+    let got: Vec<(Extra, Option<i32>)> = r.extras.iter().map(|e| (e.extra, e.value)).collect();
+    assert_eq!(got, vec![(Extra::Debounce, Some(4)), (Extra::MotionSync, Some(1)), (Extra::AngleSnap, Some(0)), (Extra::RippleControl, Some(1))]);
+    // KEYCHRON_DEBOUNCE_MAX_MS = 20
+    assert_eq!(r.extras[0].kind, Kind::Range { min: 0, max: 20, step: 1, unit: "ms" });
+    // writeSensorFlag("motionSync", false): keychronEncodeSensor of the status with motionSync off - [1] lod code 1, [2] ripple
+    // 1 (on), [3] angle 2 (off), [4] motion sync 2 (off), [6] scroll 1, [8] max speed 1
+    model.borrow_mut().log.clear();
+    kc::Keychron.change(&m, &mut p, Change::Extra(Extra::MotionSync, 0)).unwrap();
+    assert_eq!(m6_writes(&model), vec![mrep(0xB5, &[0x42, 1, 1, 2, 2, 0, 1, 0, 1])]);
+    // setAngleSnapping(true): [3] = 1
+    model.borrow_mut().log.clear();
+    kc::Keychron.change(&m, &mut p, Change::Extra(Extra::AngleSnap, 1)).unwrap();
+    assert_eq!(m6_writes(&model), vec![mrep(0xB5, &[0x42, 1, 1, 1, 2, 0, 1, 0, 1])]);
+    // setRippleControl(false): [2] = 2
+    model.borrow_mut().log.clear();
+    kc::Keychron.change(&m, &mut p, Change::Extra(Extra::RippleControl, 0)).unwrap();
+    assert_eq!(m6_writes(&model), vec![mrep(0xB5, &[0x42, 1, 2, 1, 2, 0, 1, 0, 1])]);
+    // setDebounceTime(20): keychronEncodeDebounce = [0x43, 20]
+    model.borrow_mut().log.clear();
+    kc::Keychron.change(&m, &mut p, Change::Extra(Extra::Debounce, 20)).unwrap();
+    assert_eq!(m6_writes(&model), vec![mrep(0xB5, &[0x43, 20])]);
+    let r = kc::Keychron.read(&m, &mut p, ReadOptions::default()).unwrap();
+    assert_eq!(r.extras.iter().map(|e| e.value).collect::<Vec<_>>(), vec![Some(20), Some(0), Some(1), Some(0)]);
+    assert_eq!(r.lift_off, Some(10), "the lift-off was re-sent as read");
+    // a mouse that keeps its value
+    model.borrow_mut().refuse_writes = true;
+    assert!(kc::Keychron.change(&m, &mut p, Change::Extra(Extra::MotionSync, 1)).is_err());
+    // refused before a byte leaves
+    model.borrow_mut().log.clear();
+    for c in [Change::Extra(Extra::Debounce, 21), Change::Extra(Extra::AngleSnap, 2), Change::Extra(Extra::Turbo, 1)] {
+        assert!(kc::Keychron.change(&m, &mut p, c).is_err(), "{c:?}");
+    }
+    assert!(model.borrow().log.is_empty());
+    // the Nape: OpenMouse's client throws for all four - nothing is sent
+    let (nm, nmodel, mut np) = nape_setup();
+    for c in [Change::Extra(Extra::Debounce, 4), Change::Extra(Extra::MotionSync, 1)] {
+        assert!(kc::Keychron.change(&nm, &mut np, c).is_err());
+    }
+    assert!(nape_writes(&nmodel).is_empty() && np.sent.is_empty());
 }

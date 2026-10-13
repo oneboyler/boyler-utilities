@@ -29,7 +29,11 @@
 //! `Port` adapter and today refuses the query - give it that transfer and set [`TRANSPORT_READY`] to switch the table on.
 //!
 //! Lift-off: left out. The mouse reports a level 1 (Low) or 2 (High) and OpenMouse offers only "Low" / "High", no millimetres.
-//! Also left out: motion sync, angle snapping / tuning, ripple control, performance mode, debounce, sleep timeout (the
+//! Order 110 (A_110_02 scope): debounce (setDebounceTime: every `kd` entry = the value, 0-255 ms - the client's own check),
+//! Motion Sync, angle snapping and ripple control (setBoolean) - each the same updateParams read-modify-write of the whole
+//! record as DPI / polling, confirmed by the second query. Shown only when the status JSON reports the field. The table switch
+//! ([`TRANSPORT_READY`]) is not touched here. Its setPerformanceMode is the power mode (`pm`), not the Pulsar turbo: left out.
+//! Also left out: angle tuning, performance mode, sleep timeout (the
 //! sleep command), lighting, DPI stages and their colours (echoed back unchanged by every write), the receiver framing
 //! (`0xC0 | channel`) - none of the twelve supported models is a receiver. OpenMouse sends no firmware-update, reset or
 //! pairing command to a RAWM mouse and neither does this file. One difference from OpenMouse on purpose: a mouse whose DPI
@@ -38,7 +42,7 @@
 //! table: not models on OpenMouse's supported list.
 
 use crate::error::{Error, Result};
-use crate::family::{Caps, Changed, DpiCaps, Family, Matched, OnMouse, Port, ReadOptions, Setting};
+use crate::family::{check_extra, Caps, Change, Changed, DpiCaps, Extra, ExtraRow, Family, Kind, Matched, OnMouse, Port, ReadOptions, Setting};
 use crate::os::{HidInfo, HidTransfer};
 use serde_json::Value;
 
@@ -457,6 +461,7 @@ pub fn read_with(link: &mut dyn Link, model: Option<&str>, _opt: ReadOptions) ->
     r.dpi = (dpi > 0).then_some(dpi);
     r.polling_hz = id.polling.filter(|p| *p > 0).map(|p| p as u32);
     r.wireless = id.wired.map(|w| !w);
+    r.extras = extras_from_identity(&id, false);
     Ok(r)
 }
 
@@ -516,7 +521,54 @@ pub fn write_with(link: &mut dyn Link, s: Setting) -> Result<Changed> {
     }
 }
 
+/// Order 110: setDebounceTime's range (one byte, the client's own check).
+pub const DEBOUNCE_MAX_MS: i32 = 255;
+
+/// readStatus' debounceMs (`keyDelay[0]`) and the three switches, in the card's order - each only when the status reports it
+/// (`all`: every row, for the guard before a write).
+pub fn extras_from_identity(id: &Identity, all: bool) -> Vec<ExtraRow> {
+    let mut v = Vec::new();
+    let debounce = id.key_delay.as_ref().and_then(|k| k.first().copied());
+    if all || debounce.is_some() {
+        v.push(ExtraRow::new(Extra::Debounce, Kind::Range { min: 0, max: DEBOUNCE_MAX_MS, step: 1, unit: "ms" }, debounce.map(|d| d as i32)));
+    }
+    for (e, f) in [(Extra::MotionSync, id.motion_sync), (Extra::AngleSnap, id.angle_snapping), (Extra::RippleControl, id.ripple_control)] {
+        if all || f.is_some() {
+            v.push(ExtraRow::switch(e, f));
+        }
+    }
+    v
+}
+
+/// Order 110: setDebounceTime / setMotionSync / setAngleSnapping / setRippleControl through updateParams, confirmed by the
+/// second query.
+pub fn change_with(link: &mut dyn Link, c: Change) -> Result<()> {
+    let Change::Extra(e, v) = c;
+    check_extra(&extras_from_identity(&Identity::default(), true), e, v)?;
+    let on = v == 1;
+    let (_, after) = update_params(link, &|i| {
+        match e {
+            Extra::Debounce => {
+                let kd = i.key_delay.as_mut().ok_or_else(|| Error::BadAnswer("RAWM did not report button debounce values; refusing a partial configuration write.".into()))?;
+                kd.iter_mut().for_each(|d| *d = v as i64);
+            }
+            Extra::MotionSync => i.motion_sync = Some(on),
+            Extra::AngleSnap => i.angle_snapping = Some(on),
+            _ => i.ripple_control = Some(on),
+        }
+        Ok(())
+    })?;
+    let now = extras_from_identity(&after, true).into_iter().find(|r| r.extra == e).and_then(|r| r.value);
+    if now != Some(v) {
+        return Err(Error::BadAnswer(format!("RAWM did not confirm the requested {}.", e.label())));
+    }
+    Ok(())
+}
+
 impl crate::family::Driver for Rawm {
+    fn change(&self, _m: &Matched, port: &mut dyn Port, c: Change) -> Result<()> {
+        change_with(&mut PortLink(port), c)
+    }
     fn read(&self, m: &Matched, port: &mut dyn Port, opt: ReadOptions) -> Result<OnMouse> {
         read_with(&mut PortLink(port), m.model, opt)
     }

@@ -17,6 +17,7 @@ fn main() {
         ("set profile 0x0F", pulsar::frame(pulsar::CMD_SET_PROFILE, 0, &[1])),
         ("write lock 0x03/1", pulsar::frame(pulsar::CMD_ONLINE, 0, &[1])),
         ("host control entered 0x03 [6]=1", pulsar::online_frame(true)),
+        ("Order 110 debounce write 0x07 @169", pulsar::write_byte_frame(pulsar::ADDR_DEBOUNCE, 4)),
     ] {
         println!("allow-list check: {name} -> {}", if pulsar::read_request_allowed(&f) { "ALLOWED (bug!)" } else { "refused" });
     }
@@ -51,8 +52,8 @@ fn main() {
         match r {
             Ok(o) => {
                 println!(
-                    "attempt {attempt}: model {:?}, wireless {:?}, online {}, battery {:?} % charging {:?}, DPI {:?}, polling {:?} Hz, lift-off {:?} (tenths of a mm), caps {:?}",
-                    o.model, o.wireless, o.online, o.battery_percent, o.charging, o.dpi, o.polling_hz, o.lift_off, o.caps
+                    "attempt {attempt}: model {:?}, wireless {:?}, online {}, battery {:?} % charging {:?}, DPI {:?}, polling {:?} Hz, lift-off {:?} (tenths of a mm), caps {:?}, extras {:?}",
+                    o.model, o.wireless, o.online, o.battery_percent, o.charging, o.dpi, o.polling_hz, o.lift_off, o.caps, o.extras.iter().map(|e| (e.extra.label(), e.value)).collect::<Vec<_>>()
                 );
                 if o.online || attempt == attempts {
                     break;

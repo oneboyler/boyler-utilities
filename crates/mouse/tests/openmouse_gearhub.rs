@@ -833,3 +833,77 @@ fn the_cable_writes_without_the_relay() {
     assert_eq!(g::GearHub.write(&m, &mut port, Setting::Dpi(3200)).unwrap().now, 3200);
     assert_eq!(mouse.borrow().stages[1].0, 3200);
 }
+
+// ---------------------------------------------------------------- Order 110: debounce, angle snapping, ripple
+
+use bu_mouse::family::{Change, Extra, Kind};
+
+/// The fake's OPTIONPARAM0 with debounce 4 ms (byte 10), the flags word 0x3b (byte 12: bit 2 = ripple off), straight
+/// correction on (byte 53).
+fn with_options(mouse: &Rc<RefCell<Mouse>>) {
+    let mut m = mouse.borrow_mut();
+    m.opt0[10] = 4;
+    m.opt0[12] = 0x3b;
+    m.opt0[53] = 1;
+}
+
+#[test]
+fn order_110_read_shows_debounce_angle_snapping_and_ripple() {
+    let (_, m, mouse, mut port) = dongle_setup(2285);
+    with_options(&mouse);
+    let s = g::GearHub.read(&m, &mut port, ReadOptions::default()).unwrap();
+    // readStatus: debounceMs = opt0[10], angleSnapping = opt0[53] !== 0, rippleControl = (opt0[12] & 4) !== 0
+    let got: Vec<(Extra, Option<i32>)> = s.extras.iter().map(|x| (x.extra, x.value)).collect();
+    assert_eq!(got, vec![(Extra::Debounce, Some(4)), (Extra::AngleSnap, Some(1)), (Extra::RippleControl, Some(0))]);
+    // GEARHUB_DEBOUNCE_MAX_MS = 10
+    assert_eq!(s.extras[0].kind, Kind::Range { min: 0, max: 10, step: 1, unit: "ms" });
+    // no read beyond the Order 104 ones (the same OPTIONPARAM0 answer)
+    let mut want = vec![poll(), select()];
+    want.extend(relayed(get_id()));
+    want.extend(relayed(get_dpi()));
+    want.extend(relayed(get_opt0()));
+    assert_eq!(sent(&port), want);
+}
+
+#[test]
+fn order_110_changes_are_openmouses_patchoptionparam0_bytes() {
+    for (c, offset, value) in [(Change::Extra(Extra::Debounce, 8), 10usize, 8u8), (Change::Extra(Extra::AngleSnap, 0), 53, 0), (Change::Extra(Extra::RippleControl, 1), 12, 0x3f)] {
+        let (_, m, mouse, mut port) = dongle_setup(2285);
+        with_options(&mouse);
+        g::GearHub.change(&m, &mut port, c).unwrap_or_else(|e| panic!("{c:?}: {e}"));
+        // the block: [0] 0x53, [7] = 255 - 0x53 = 0xac, [8..64) as D3 returned it, [17] = 255, [18] = 8, then the one byte
+        // (ripple: 0x3b | 1 << 2 = 0x3f)
+        let mut block = vec![0u8; 64];
+        for (i, b) in block.iter_mut().enumerate().skip(8) {
+            *b = (5 * i + 3) as u8;
+        }
+        block[0] = 0x53;
+        block[7] = 0xac;
+        block[9] = 1;
+        block[10] = 4;
+        block[12] = 0x3b;
+        block[17] = 255;
+        block[18] = 8;
+        block[52] = 1;
+        block[53] = 1;
+        block[offset] = value;
+        let mut want = vec![poll(), select()];
+        want.extend(relayed(get_id()));
+        want.extend(relayed(get_opt0()));
+        want.extend([poll(), rep(&block)]);
+        want.extend(relayed(get_opt0()));
+        assert_eq!(sent(&port), want, "{c:?}");
+        assert_eq!(mouse.borrow().opt0[offset], value);
+        assert!(!g::read_request_allowed(&rep(&block)));
+    }
+    // a mouse that ignores the write is an error
+    let (_, m, mouse, mut port) = dongle_setup(2285);
+    mouse.borrow_mut().ignore_writes = true;
+    assert!(matches!(g::GearHub.change(&m, &mut port, Change::Extra(Extra::Debounce, 2)), Err(Error::BadAnswer(_))));
+    // refused before a byte leaves: debounce 0-10, switches 0 / 1, no Motion Sync / turbo in OpenMouse's GearHub client
+    let (_, m, _, mut port) = dongle_setup(2285);
+    for c in [Change::Extra(Extra::Debounce, 11), Change::Extra(Extra::RippleControl, 2), Change::Extra(Extra::MotionSync, 1), Change::Extra(Extra::Turbo, 1)] {
+        assert!(g::GearHub.change(&m, &mut port, c).is_err(), "{c:?}");
+    }
+    assert!(port.sent.is_empty());
+}

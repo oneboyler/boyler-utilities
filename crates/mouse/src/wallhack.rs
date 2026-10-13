@@ -24,12 +24,17 @@
 //! driver takes any whole number 50-26000; what the sensor stores is unclear).
 //!
 //! Unclear: the report id the answers arrive with (taken to be 4 like the request; if the real mouse answers on another id, every
-//! read times out and the mouse shows as not answering). Left out: firmware versions, the settings OpenMouse also reads
-//! (motion sync, angle snapping, ripple, debounce, sleep, game mode, angle tuning, profile, dynamic sensitivity), button
+//! read times out and the mouse shows as not answering).
+//!
+//! Order 110 (A_110_02 scope): debounce (area 109, 0-20 ms), angle snapping (111), ripple (112), Motion Sync (113) - OpenMouse's
+//! writeVerifiedByte: the one-byte area write, then the byte read back; a read that is not answered leaves its row out.
+//!
+//! Left out: firmware versions, the settings OpenMouse also reads
+//! (sleep, game mode, angle tuning, profile, dynamic sensitivity), button
 //! bindings, macros, curves, pairing, `clearPairing`, `factoryReset` (never sent).
 
 use crate::error::{Error, Result};
-use crate::family::{Caps, Changed, DpiCaps, Driver, Family, Matched, OnMouse, Port, ReadOptions, Setting};
+use crate::family::{check_extra, Caps, Change, Changed, DpiCaps, Driver, Extra, ExtraRow, Family, Kind, Matched, OnMouse, Port, ReadOptions, Setting};
 use crate::os::{HidInfo, HidTransfer};
 
 pub const VENDOR_ID: u16 = 0x3879;
@@ -41,6 +46,14 @@ pub const PAYLOAD_LEN: usize = 63;
 /// Windows: the report id + the payload.
 pub const REPORT_LEN: usize = PAYLOAD_LEN + 1;
 pub const USAGE_PAGE: u16 = 0xFF1C;
+
+/// Order 110: WALLHACK_FLASH keyDebounceTime / angleSnapEnable / rippleControlEnable / motionSyncEnable.
+pub const AREA_DEBOUNCE: u16 = 109;
+pub const AREA_ANGLE_SNAP: u16 = 111;
+pub const AREA_RIPPLE: u16 = 112;
+pub const AREA_MOTION_SYNC: u16 = 113;
+/// setDebounceTime: 0-20 ms.
+pub const DEBOUNCE_MAX_MS: i32 = 20;
 
 pub const CMD_READ_AREA: u8 = 0xA4;
 pub const CMD_WRITE_AREA: u8 = 0xA5;
@@ -229,6 +242,27 @@ fn dpi_block(port: &mut dyn Port) -> Result<Option<Vec<u8>>> {
     optional(area_read(port, AREA_DPI_BLOCK, 9))
 }
 
+/// Order 110: the function-area byte of an extra.
+pub fn extra_area(e: Extra) -> Option<u16> {
+    Some(match e {
+        Extra::Debounce => AREA_DEBOUNCE,
+        Extra::MotionSync => AREA_MOTION_SYNC,
+        Extra::AngleSnap => AREA_ANGLE_SNAP,
+        Extra::RippleControl => AREA_RIPPLE,
+        Extra::Turbo => return None,
+    })
+}
+
+/// The rows the card can have, in its order (values none: the guard's rows).
+pub fn extra_rows() -> Vec<ExtraRow> {
+    vec![
+        ExtraRow::new(Extra::Debounce, Kind::Range { min: 0, max: DEBOUNCE_MAX_MS, step: 1, unit: "ms" }, None),
+        ExtraRow::switch(Extra::MotionSync, None),
+        ExtraRow::switch(Extra::AngleSnap, None),
+        ExtraRow::switch(Extra::RippleControl, None),
+    ]
+}
+
 // ---------------------------------------------------------------- the driver
 
 /// The WALLHACK M-001 driver.
@@ -255,7 +289,34 @@ impl Driver for Wallhack {
         }
         r.polling_hz = byte_at(port, AREA_REPORT_USB)?.and_then(rank_to_hz);
         r.lift_off = byte_at(port, AREA_SILENT_HEIGHT)?.and_then(lift_off_tenths);
+        // Order 110: readStatus' order - Motion Sync, angle snapping, ripple, debounce; rows in the card's order
+        let mut got = Vec::new();
+        for e in [Extra::MotionSync, Extra::AngleSnap, Extra::RippleControl, Extra::Debounce] {
+            got.push((e, if let Some(a) = extra_area(e) { byte_at(port, a)? } else { None }));
+        }
+        r.extras = extra_rows()
+            .into_iter()
+            .filter_map(|mut row| {
+                let raw = got.iter().find(|g| g.0 == row.extra).and_then(|g| g.1)?;
+                row.value = Some(if row.extra == Extra::Debounce { raw as i32 } else { (raw == 1) as i32 });
+                Some(row)
+            })
+            .collect();
         Ok(r)
+    }
+
+    /// Order 110: setDebounceTime / setMotionSync / setAngleSnapping / setRippleControl - checked before a byte leaves, then
+    /// writeVerifiedByte: the one-byte write, the byte read back.
+    fn change(&self, _m: &Matched, port: &mut dyn Port, c: Change) -> Result<()> {
+        let Change::Extra(e, v) = c;
+        check_extra(&extra_rows(), e, v)?;
+        let area = extra_area(e).ok_or_else(|| crate::family::not_offered(c))?;
+        send(port, &write_request(area, &[v as u8]))?;
+        let now = byte_at(port, area)?;
+        if now != Some(v as u8) {
+            return Err(Error::BadAnswer(format!("The mouse did not confirm the requested {}.", e.label())));
+        }
+        Ok(())
     }
 
     fn write(&self, _m: &Matched, port: &mut dyn Port, s: Setting) -> Result<Changed> {

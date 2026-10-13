@@ -205,7 +205,13 @@ struct Fake {
 
 /// 4 stages, stage 1 active, 1000 Hz, 400 / 800 / 1600 / 3200
 fn flash() -> Vec<u8> {
-    let mut f = vec![0u8; 30];
+    let mut f = vec![0u8; 190];
+    // Order 110 (TEEVOLUTION_FLASH, `[v, 0x55 − v]` pairs): debounceTime 169 = 4 ms, motionSync 171 on, angleSnapping 175 off,
+    // rippleControl 177 on, performanceState 181 on
+    for (a, v) in [(169usize, 4u8), (171, 1), (175, 0), (177, 1), (181, 1)] {
+        f[a] = v;
+        f[a + 1] = 0x55 - v;
+    }
     f[0..2].copy_from_slice(&[0x01, 0x54]);
     f[2..4].copy_from_slice(&[0x04, 0x51]);
     f[4..6].copy_from_slice(&[0x01, 0x54]);
@@ -293,7 +299,11 @@ fn reading_identifies_enters_host_control_reads_and_leaves() {
     let st = fake();
     let mut p = port(&st);
     let r = t::Teevolution.read(&matched(), &mut p, ReadOptions::default()).unwrap();
-    assert_eq!(cmds(&st), vec![(1, 0, 8), (3, 0, 1), (8, 0, 10), (8, 10, 10), (8, 20, 10), (4, 0, 0), (3, 0, 0)]);
+    // readFlash(reportRate 0, sensorMode 185 + 2): 18 chunks of ten, then 180..187 (7)
+    let mut want = vec![(1, 0, 8), (3, 0, 1)];
+    want.extend((0..18).map(|i| (8, i * 10, 10)));
+    want.extend([(8, 180, 7), (4, 0, 0), (3, 0, 0)]);
+    assert_eq!(cmds(&st), want);
     assert_eq!((r.online, r.dpi, r.polling_hz, r.battery_percent, r.charging, r.lift_off, r.wireless), (true, Some(800), Some(1000), Some(87), Some(true), None, Some(false)));
     assert_eq!(r.caps, t::caps(8000));
     // everything except the host-control entry is an allowed read request
@@ -435,4 +445,80 @@ fn values_the_mouse_cannot_store_are_refused_before_a_byte_leaves() {
         assert!(t::Teevolution.write(&matched(), &mut p, s).is_err(), "{s:?}");
     }
     assert!(p.sent.is_empty());
+}
+
+// ---------------------------------------------------------------- Order 110: debounce, Motion Sync, angle snapping, ripple, turbo
+
+use bu_mouse::family::{Change, Extra, Kind};
+
+#[test]
+fn terra_read_shows_every_setting_openmouse_reads() {
+    let st = fake();
+    let mut p = port(&st);
+    let r = t::Teevolution.read(&matched(), &mut p, ReadOptions::default()).unwrap();
+    // readStatus: debounceMs = flash[169]; motionSync / angleSnapping / rippleControl / performanceMode = flash[x] === 1
+    let got: Vec<(Extra, Option<i32>)> = r.extras.iter().map(|e| (e.extra, e.value)).collect();
+    assert_eq!(got, vec![(Extra::Debounce, Some(4)), (Extra::MotionSync, Some(1)), (Extra::AngleSnap, Some(0)), (Extra::RippleControl, Some(1)), (Extra::Turbo, Some(1))]);
+    // the Terra Pro profile: debounce { min 0, max 20 }
+    assert_eq!(r.extras[0].kind, Kind::Range { min: 0, max: 20, step: 1, unit: "ms" });
+    assert!(r.extras[1..].iter().all(|e| e.kind == Kind::Switch));
+    // reading: everything but the host-control entry passes the allow-list
+    let refused: Vec<usize> = p.sent.iter().enumerate().filter(|(_, s)| !t::read_request_allowed(&s.0)).map(|(i, _)| i).collect();
+    assert_eq!(refused, vec![1]);
+}
+
+/// The flash writes (command 7) a change sent, as Windows sends them.
+fn flash_writes(p: &ScriptPort) -> Vec<Vec<u8>> {
+    p.sent.iter().map(|s| s.0.clone()).filter(|f| f[1] == 7).collect()
+}
+
+#[test]
+fn terra_changes_are_openmouses_writeflash_bytes() {
+    let st = fake();
+    let go = |c: Change| -> Vec<Vec<u8>> {
+        let mut p = port(&st);
+        t::Teevolution.change(&matched(), &mut p, c).unwrap();
+        // identify, enter host control, the write, its read-back (addr, 2), leave
+        assert_eq!(cmds(&st).iter().rev().take(5).rev().copied().collect::<Vec<_>>(), vec![(1, 0, 8), (3, 0, 1), (7, p.sent[2].0[4], 2), (8, p.sent[2].0[4], 2), (3, 0, 0)], "{c:?}");
+        flash_writes(&p)
+    };
+    // writeCheckedByte(addr, v) = [07, 0, 0, addr, 02, v, 0x55 − v]; the sum is 7 + 2 + 0x55 + addr (v and 0x55 − v add to
+    // 0x55), so the checksum is 85 − 8 − 94 − addr = 239 − addr; Windows puts the id 8 in front
+    let w8 = |addr: u8, v: u8, crc: u8| t::wire(&pl(&[(0, 7), (3, addr), (4, 2), (5, v), (6, 0x55u8.wrapping_sub(v)), (15, crc)]), 17);
+    // setDebounceTime(8): 169 = 0xA9 → 70 = 0x46 ([.., 08, 4D])
+    assert_eq!(go(Change::Extra(Extra::Debounce, 8)), vec![w8(0xA9, 8, 0x46)]);
+    assert_eq!(go(Change::Extra(Extra::Debounce, 8))[0][6..8], [0x08, 0x4D]);
+    // setMotionSync(false): 171 = 0xAB → 68 = 0x44
+    assert_eq!(go(Change::Extra(Extra::MotionSync, 0)), vec![w8(0xAB, 0, 0x44)]);
+    // setAngleSnapping(true): 175 = 0xAF → 64 = 0x40 ([.., 01, 54])
+    assert_eq!(go(Change::Extra(Extra::AngleSnap, 1)), vec![w8(0xAF, 1, 0x40)]);
+    // setRippleControl(false): 177 = 0xB1 → 62 = 0x3E
+    assert_eq!(go(Change::Extra(Extra::RippleControl, 0)), vec![w8(0xB1, 0, 0x3E)]);
+    // setPerformanceMode(false): 181 = 0xB5 → 58 = 0x3A
+    assert_eq!(go(Change::Extra(Extra::Turbo, 0)), vec![w8(0xB5, 0, 0x3A)]);
+    // setDebounceTime(20): the top of the range; 0x55 − 20 = 0x41
+    assert_eq!(go(Change::Extra(Extra::Debounce, 20)), vec![w8(0xA9, 20, 0x46)]);
+    // the fake mouse holds what was written; a read shows it
+    let r = t::Teevolution.read(&matched(), &mut port(&st), ReadOptions::default()).unwrap();
+    let got: Vec<Option<i32>> = r.extras.iter().map(|e| e.value).collect();
+    assert_eq!(got, vec![Some(20), Some(0), Some(1), Some(0), Some(0)]);
+    // a sleeping mouse: offline, nothing written
+    st.borrow_mut().asleep = true;
+    let mut p = port(&st);
+    assert!(t::Teevolution.change(&matched(), &mut p, Change::Extra(Extra::MotionSync, 1)).is_err());
+    assert!(flash_writes(&p).is_empty());
+}
+
+#[test]
+fn terra_refuses_what_openmouse_does_not_take_before_a_byte_leaves() {
+    let st = fake();
+    for c in [
+        Change::Extra(Extra::Debounce, 21),
+        Change::Extra(Extra::Debounce, -1),
+        Change::Extra(Extra::MotionSync, 2),
+    ] {
+        let mut p = port(&st);
+        assert!(t::Teevolution.change(&matched(), &mut p, c).is_err(), "{c:?}");
+        assert!(p.sent.is_empty(), "{c:?}: nothing sent");
+    }
 }

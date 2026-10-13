@@ -42,10 +42,12 @@ fn reads_are_openmouses_payloads() {
     // readProfile's chunks: [08, 0, addrHi, addrLo, length, ...]; crc = 85 − (8 + 8 + addrHi + addrLo + length)
     // (0, 10): 85 − 26 = 59 = 0x3B · (10, 10): 85 − 36 = 49 = 0x31 · (20, 10): 85 − 46 = 39 = 0x27
     // (30, 10): 85 − 56 = 29 = 0x1D · (40, 4): 85 − 60 = 25 = 0x19
-    for ((addr, len), crc) in v::PROFILE_CHUNKS.iter().zip([0x3B, 0x31, 0x27, 0x1D, 0x19]) {
+    // Order 110: and 0xA8..0xB7 (debounce … performance mode): (0xA8, 10): 85 − (16 + 168 + 10) = −109 → 147 = 0x93 ·
+    // (0xB2, 5): 85 − (16 + 178 + 5) = −114 → 142 = 0x8E
+    for ((addr, len), crc) in v::PROFILE_CHUNKS.iter().zip([0x3B, 0x31, 0x27, 0x1D, 0x19, 0x93, 0x8E]) {
         assert_eq!(v::read_payload(*addr, *len), pl(&[(0, 8), (2, (addr >> 8) as u8), (3, *addr as u8), (4, *len), (15, crc)]), "{addr:#x}");
     }
-    assert_eq!(v::PROFILE_CHUNKS, [(0, 10), (10, 10), (20, 10), (30, 10), (40, 4)]);
+    assert_eq!(v::PROFILE_CHUNKS, [(0, 10), (10, 10), (20, 10), (30, 10), (40, 4), (0xA8, 10), (0xB2, 5)]);
     // writeScalar's read-back read(0, 2): 85 − (8 + 8 + 2) = 67 = 0x43
     assert_eq!(v::read_payload(0, 2), pl(&[(0, 8), (4, 2), (15, 0x43)]));
     // an address above 0xFF: read(0x0123, 5): 85 − (8 + 8 + 1 + 0x23 + 5) = 85 − 57 = 28 = 0x1C
@@ -98,7 +100,7 @@ fn windows_reports_carry_the_id() {
 
 /// The flash image of a mouse at 3 stages (400 / 800 / 1600), stage 1 active, 1000 Hz.
 fn flash() -> Vec<u8> {
-    let mut f = vec![0u8; 0x2C];
+    let mut f = vec![0u8; 0xB7];
     // scalars [value, 0x55 − value]: polling raw 1 → 54; stage count 3 → 52; active stage 1 → 54
     f[0..2].copy_from_slice(&[0x01, 0x54]);
     f[2..4].copy_from_slice(&[0x03, 0x52]);
@@ -107,6 +109,12 @@ fn flash() -> Vec<u8> {
     f[0x0C..0x10].copy_from_slice(&[0x07, 0x07, 0x00, 0x47]);
     f[0x10..0x14].copy_from_slice(&[0x0F, 0x0F, 0x00, 0x37]);
     f[0x14..0x18].copy_from_slice(&[0x1F, 0x1F, 0x00, 0x17]);
+    // Order 110 (VGN_ADDRESS scalars): debounce 0xA9 = 4, motionSync 0xAB = 1, angleSnapping 0xAF = 0, rippleControl 0xB1 = 1,
+    // performanceMode 0xB5 = 1
+    for (a, v) in [(0xA9, 4u8), (0xAB, 1), (0xAF, 0), (0xB1, 1), (0xB5, 1)] {
+        f[a] = v;
+        f[a + 1] = 0x55 - v;
+    }
     f
 }
 
@@ -287,7 +295,7 @@ fn cmds(st: &Rc<RefCell<Fake>>) -> Vec<(u8, u8, u8)> {
     st.borrow().seen.iter().map(|q| (q[0], q[3], q[4])).collect()
 }
 
-const READ_PROFILE: [(u8, u8, u8); 5] = [(8, 0, 10), (8, 10, 10), (8, 20, 10), (8, 30, 10), (8, 40, 4)];
+const READ_PROFILE: [(u8, u8, u8); 7] = [(8, 0, 10), (8, 10, 10), (8, 20, 10), (8, 30, 10), (8, 40, 4), (8, 0xA8, 10), (8, 0xB2, 5)];
 
 #[test]
 fn reading_asks_the_battery_then_the_profile() {
@@ -325,8 +333,8 @@ fn a_dpi_change_writes_the_active_stage_and_reads_back() {
     want.push((7, 0x10, 4));
     want.extend(READ_PROFILE);
     assert_eq!(cmds(&st), want);
-    assert_eq!(p.sent[5].0, v::wire(&v::write_payload(0x10, &[0x1F, 0x1F, 0x00, 0x17]), 17));
-    assert!(!v::read_request_allowed(&p.sent[5].0));
+    assert_eq!(p.sent[7].0, v::wire(&v::write_payload(0x10, &[0x1F, 0x1F, 0x00, 0x17]), 17));
+    assert!(!v::read_request_allowed(&p.sent[7].0));
     let f = st.borrow().flash.clone();
     assert_eq!(f[0x0C..0x18], [0x07, 0x07, 0x00, 0x47, 0x1F, 0x1F, 0x00, 0x17, 0x1F, 0x1F, 0x00, 0x17], "only stage 1 changed");
     // the highest value with its high bits
@@ -363,7 +371,7 @@ fn a_polling_change_writes_the_scalar_and_confirms_it() {
     want.push((8, 0, 2));
     want.extend(READ_PROFILE);
     assert_eq!(cmds(&st), want);
-    assert_eq!(p.sent[5].0, v::wire(&v::write_scalar_payload(0, 16), 17));
+    assert_eq!(p.sent[7].0, v::wire(&v::write_scalar_payload(0, 16), 17));
     assert_eq!(st.borrow().flash[0..2], [0x10, 0x45]);
     assert_eq!(v::Vgn.write(&matched(0xFB57), &mut port(&st, 0xFB57), Setting::Polling(125)).unwrap().before, Some(2000));
     assert_eq!(st.borrow().flash[0..2], [0x08, 0x4D]);
@@ -441,4 +449,74 @@ fn a_dpi_change_is_refused_when_the_active_stage_is_not_certain() {
     st.borrow_mut().flash[2..4].copy_from_slice(&[0x02, 0x53]);
     st.borrow_mut().flash[4..6].copy_from_slice(&[0x04, 0x51]);
     assert!(v::Vgn.write(&matched(0xFB57), &mut port(&st, 0xFB57), Setting::Polling(500)).is_ok());
+}
+
+// ---------------------------------------------------------------- Order 110: debounce, Motion Sync, angle snapping, ripple, turbo
+
+use bu_mouse::family::{Change, Extra, Kind};
+
+#[test]
+fn f2_read_shows_every_setting_openmouse_reads() {
+    let st = fake();
+    let mut p = port(&st, 0xFB56);
+    let r = v::Vgn.read(&matched(0xFB56), &mut p, ReadOptions::default()).unwrap();
+    assert!(p.sent.iter().all(|s| v::read_request_allowed(&s.0)), "read requests only");
+    // vgnDecodeProfile: debounceMs = scalar(0xA9); motionSync / angleSnapping / rippleControl / performanceMode = scalar != 0
+    let got: Vec<(Extra, Option<i32>)> = r.extras.iter().map(|e| (e.extra, e.value)).collect();
+    assert_eq!(got, vec![(Extra::Debounce, Some(4)), (Extra::MotionSync, Some(1)), (Extra::AngleSnap, Some(0)), (Extra::RippleControl, Some(1)), (Extra::Turbo, Some(1))]);
+    // setDebounceTime: 0-30 ms
+    assert_eq!(r.extras[0].kind, Kind::Range { min: 0, max: 30, step: 1, unit: "ms" });
+    assert!(r.extras[1..].iter().all(|e| e.kind == Kind::Switch));
+    // vgnUnpackScalar: a wrong parity byte = no value
+    st.borrow_mut().flash[0xAA] = 0;
+    let r = v::Vgn.read(&matched(0xFB56), &mut port(&st, 0xFB56), ReadOptions::default()).unwrap();
+    assert_eq!(r.extra(Extra::Debounce), None);
+}
+
+#[test]
+fn f2_changes_are_openmouses_writescalar_bytes() {
+    let st = fake();
+    let go = |c: Change| -> Vec<u8> {
+        st.borrow_mut().seen.clear();
+        let mut p = port(&st, 0xFB57);
+        v::Vgn.change(&matched(0xFB57), &mut p, c).unwrap();
+        // writeScalar: the write, then read(addr, 2)
+        let a = p.sent[0].0[4];
+        assert_eq!(cmds(&st), vec![(7, a, 2), (8, a, 2)], "{c:?}");
+        p.sent[0].0.clone()
+    };
+    // vgnBuildWriteScalarPayload(addr, v) = [07, 0, 0, addr, 02, v, 0x55 − v]; checksum 85 − (8 + 7 + 2 + 0x55 + addr) =
+    // 239 − addr; Windows puts the id 8 in front
+    let w8 = |addr: u8, val: u8, crc: u8| v::wire(&pl(&[(0, 7), (3, addr), (4, 2), (5, val), (6, 0x55u8.wrapping_sub(val)), (15, crc)]), 17);
+    // setDebounceTime(30): 0xA9 → 70 = 0x46 ([.., 1E, 37])
+    assert_eq!(go(Change::Extra(Extra::Debounce, 30)), w8(0xA9, 30, 0x46));
+    assert_eq!(w8(0xA9, 30, 0x46)[6..8], [0x1E, 0x37]);
+    // setMotionSync(false): 0xAB → 68 = 0x44
+    assert_eq!(go(Change::Extra(Extra::MotionSync, 0)), w8(0xAB, 0, 0x44));
+    // setAngleSnapping(true): 0xAF → 64 = 0x40
+    assert_eq!(go(Change::Extra(Extra::AngleSnap, 1)), w8(0xAF, 1, 0x40));
+    // setRippleControl(false): 0xB1 → 62 = 0x3E
+    assert_eq!(go(Change::Extra(Extra::RippleControl, 0)), w8(0xB1, 0, 0x3E));
+    // setPerformanceMode(false): 0xB5 → 58 = 0x3A
+    assert_eq!(go(Change::Extra(Extra::Turbo, 0)), w8(0xB5, 0, 0x3A));
+    // a read shows what was written
+    let r = v::Vgn.read(&matched(0xFB57), &mut port(&st, 0xFB57), ReadOptions::default()).unwrap();
+    let got: Vec<Option<i32>> = r.extras.iter().map(|e| e.value).collect();
+    assert_eq!(got, vec![Some(30), Some(0), Some(1), Some(0), Some(0)]);
+    // a mouse that ignores the write: the read-back says so
+    st.borrow_mut().ignore = true;
+    assert!(v::Vgn.change(&matched(0xFB57), &mut port(&st, 0xFB57), Change::Extra(Extra::Debounce, 5)).is_err());
+}
+
+#[test]
+fn f2_refuses_what_openmouse_does_not_take_before_a_byte_leaves() {
+    let st = fake();
+    for c in [
+        Change::Extra(Extra::Debounce, 31),
+        Change::Extra(Extra::MotionSync, 2),
+    ] {
+        let mut p = port(&st, 0xFB57);
+        assert!(v::Vgn.change(&matched(0xFB57), &mut p, c).is_err(), "{c:?}");
+        assert!(p.sent.is_empty(), "{c:?}: nothing sent");
+    }
 }

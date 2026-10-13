@@ -40,8 +40,12 @@
 //! 7 / 10 / 20 and 10 / 20 in the driver's tables - but a figure that stands only in a comment is not a figure OpenMouse
 //! itself uses (Order 104 rule, as for Logitech / Razer), so `Caps.lift_off` is EMPTY: the Mouse page shows no lift-off row for these.
 //!
-//! Left out on purpose: button mappings (`D0` / `50`), firmware (`80`), debounce, sleep time, angle snapping, ripple
-//! correction, DPI stage colour / count / active-stage selection (none is DPI / polling / lift-off / battery); OpenMouse's
+//! Order 110 (A_110_02 scope): debounce (OPTIONPARAM0 byte 10, 0-10 ms), angle snapping ("straight correction", byte 53)
+//! and ripple correction (bit 2 of byte 12) - OpenMouse's patchOptionParam0, the same `53` block write as polling (one
+//! byte changed, the rest as read), then the block read back (OpenMouse does not read back; the read is only a check).
+//!
+//! Left out on purpose: button mappings (`D0` / `50`), firmware (`80`), sleep time, DPI stage colour / count /
+//! active-stage selection (not in the Order 110 scope); OpenMouse's
 //! readStatus also reads the key matrix and the firmware - not needed here. There is NO firmware-update, reset or
 //! pairing command in OpenMouse's GearHub client and none here. A device id other than the three above (Attack Shark R3,
 //! AJAZZ AJ179 PRO, an unknown GearHub-V5 mouse) is refused as `UnsupportedMouse`: it is not on the SUPPORTED list.
@@ -49,7 +53,7 @@
 //! an unknown code reads as "polling rate not shown" here (OpenMouse falls back to 1000).
 
 use crate::error::{Error, Result};
-use crate::family::{Caps, Changed, DpiCaps, Family, Matched, OnMouse, Port, ReadOptions, Setting};
+use crate::family::{check_extra, Caps, Change, Changed, DpiCaps, Extra, ExtraRow, Family, Kind, Matched, OnMouse, Port, ReadOptions, Setting};
 use crate::os::{HidInfo, HidTransfer};
 
 pub const VENDOR_ID: u16 = 0x3151;
@@ -92,6 +96,14 @@ pub const TARGET_MOUSE: u8 = 0x05;
 
 pub const OPT0_REPORT_RATE: usize = 9;
 pub const OPT0_SILENT_HEIGHT: usize = 52;
+/// Order 110: OPTIONPARAM0 debounce ms (byte 10, 0-10 ms), the flags word (byte 12; ripple correction = bit 2), straight
+/// correction = angle snapping (byte 53, 0 / 1).
+pub const OPT0_DEBOUNCE: usize = 10;
+pub const OPT0_FLAGS: usize = 12;
+pub const OPT0_FLAG_RIPPLE: u8 = 1 << 2;
+pub const OPT0_STRAIGHT_CORRECTION: usize = 53;
+/// `GEARHUB_DEBOUNCE_MAX_MS`
+pub const DEBOUNCE_MAX_MS: i32 = 10;
 pub const DPI_X_OFFSET: usize = 8;
 pub const DPI_Y_OFFSET: usize = 24;
 pub const DPI_RGB_OFFSET: usize = 40;
@@ -468,12 +480,38 @@ impl crate::family::Driver for GearHub {
             Ok(o) => {
                 r.polling_hz = rate_hz(o[OPT0_REPORT_RATE]);
                 // lift-off is not shown (see the header): its millimetres stand only in a comment of OpenMouse's source
+                r.extras = extra_rows(Some(&o));
             }
-            Err(Error::BadAnswer(_)) => {}
+            Err(Error::BadAnswer(_)) => r.extras = extra_rows(None),
             Err(e) => return Err(e),
         }
         Ok(r)
     }
+
+    /// Order 110: setDebounceTime / setAngleSnapping / setRippleControl - checked first, then patchOptionParam0 (one byte
+    /// of the block as read) and the block read back.
+    fn change(&self, m: &Matched, port: &mut dyn Port, c: Change) -> Result<()> {
+        let Change::Extra(e, v) = c;
+        check_extra(&extra_rows(None), e, v)?;
+        let mut link = Link::new(m, port)?;
+        if link.dongle && !link.poll(port)?.mouse_online {
+            return Err(Error::MouseGone("the mouse is asleep or out of range of its receiver".into()));
+        }
+        link.identify(port)?;
+        let current = link.option0(port)?;
+        let (offset, value) = match e {
+            Extra::AngleSnap => (OPT0_STRAIGHT_CORRECTION, v as u8),
+            Extra::RippleControl => (OPT0_FLAGS, if v == 1 { current[OPT0_FLAGS] | OPT0_FLAG_RIPPLE } else { current[OPT0_FLAGS] & !OPT0_FLAG_RIPPLE }),
+            _ => (OPT0_DEBOUNCE, v as u8),
+        };
+        link.write(port, &option0_command(&current, offset, value)?)?;
+        let now = extra_rows(Some(&link.option0(port)?)).into_iter().find(|r| r.extra == e).and_then(|r| r.value);
+        if now != Some(v) {
+            return Err(Error::BadAnswer(format!("the mouse kept {now:?} instead of {v} ({})", e.label())));
+        }
+        Ok(())
+    }
+
 
     /// setDpi / setPollingRate / setLiftOffDistance as OpenMouse's client does them (read-modify-write of the whole table /
     /// block), then a read-back of what was written.
@@ -522,6 +560,17 @@ impl crate::family::Driver for GearHub {
             Setting::LiftOff(_) => Err(lift_off_refused()),
         }
     }
+}
+
+/// The Order 110 rows from an OPTIONPARAM0 answer, in the card's order (readStatus: debounceMs = opt0[10], angleSnapping =
+/// opt0[53] !== 0, rippleControl = (opt0[12] & 4) !== 0).
+fn extra_rows(o: Option<&[u8]>) -> Vec<ExtraRow> {
+    let at = |i: usize| o.and_then(|o| o.get(i).copied());
+    vec![
+        ExtraRow::new(Extra::Debounce, Kind::Range { min: 0, max: DEBOUNCE_MAX_MS, step: 1, unit: "ms" }, at(OPT0_DEBOUNCE).map(i32::from)),
+        ExtraRow::switch(Extra::AngleSnap, at(OPT0_STRAIGHT_CORRECTION).map(|b| b != 0)),
+        ExtraRow::switch(Extra::RippleControl, at(OPT0_FLAGS).map(|b| b & OPT0_FLAG_RIPPLE != 0)),
+    ]
 }
 
 fn lift_off_refused() -> Error {

@@ -198,8 +198,8 @@ fn only_openmouses_read_requests_pass_the_allow_list() {
         rq(0x02, 0x02, 0x01, 0x00, &[1, 0x40]),
         rq(0x02, 0x02, 0x01, 0x08, &[1, 0x87]),
         rq(0x02, 0x0a, 0x01, 0x01, &[1, 2, 0x03, 0x20, 0x03, 0x20, 0x0c, 0x80, 0x0c, 0x80]),
-        // other commands OpenMouse writes (sleep timeout 0x07, debounce 0x08 on the device page, angle snapping 0x04, motion
-        // sync 0x09, competitive 0x13, hyper 0x0b, ripple 0x0a, the dongle LED 0x04 on page 2) - never sent, never allowed
+        // writes (sleep timeout 0x07, debounce 0x08 on the device page, angle snapping 0x04, motion
+        // sync 0x09, competitive 0x13, hyper 0x0b, ripple 0x0a, the dongle LED 0x04 on page 2) - never allowed
         rq(0x02, 0x03, 0x00, 0x07, &[1, 0x01, 0x2c]),
         rq(0x02, 0x02, 0x00, 0x08, &[1, 4]),
         rq(0x02, 0x02, 0x01, 0x04, &[1, 1]),
@@ -211,11 +211,10 @@ fn only_openmouses_read_requests_pass_the_allow_list() {
     ] {
         assert!(!lz::read_request_allowed(&write), "{write:02x?}");
     }
-    // reads this driver never sends: debounce 0x88 on the device page, flags on the profile page, the LunaFury / magnetic reads
+    // reads this driver never sends: sleep 0x87, competitive 0x93 and other flags, the LunaFury / magnetic reads (Order 110: the
+    // debounce 0x88 and Motion Sync / angle snapping / ripple reads are allowed now - see order_110_reads_and_writes)
     for other in [
-        rq(0x02, 0x02, 0x00, 0x88, &[1]),
         rq(0x02, 0x03, 0x00, 0x87, &[1]),
-        rq(0x02, 0x02, 0x01, 0x84, &[1]),
         rq(0x02, 0x02, 0x01, 0x93, &[1]),
         rq(0x02, 0x02, 0x01, 0x94, &[1]),
         rq(0x02, 0x04, 0x00, 0x98, &[1]),
@@ -400,6 +399,10 @@ struct Mouse {
     keep_dpi: bool,
     claim_stages: Option<u8>,
     pending: Vec<u8>,
+    /// Order 110: debounce ms, the flags (Motion Sync, angle snapping, ripple), a write of them has no effect
+    debounce: u8,
+    flags: [u8; 3],
+    keep_extra: bool,
     last: Vec<u8>,
 }
 
@@ -423,6 +426,9 @@ impl Mouse {
             keep_dpi: false,
             claim_stages: None,
             pending: Vec::new(),
+            debounce: 4,
+            flags: [1, 0, 1],
+            keep_extra: false,
             last: Vec::new(),
         }
     }
@@ -457,6 +463,22 @@ impl Mouse {
                 (1, 0x82) => vec![args[0], self.active],
                 (1, 0x80) => vec![args[0], self.poll],
                 (1, 0x88) => vec![args[0], self.lift],
+                (0, 0x88) => vec![args[0], self.debounce],
+                (1, 0x89) => vec![args[0], self.flags[0]],
+                (1, 0x84) => vec![args[0], self.flags[1]],
+                (1, 0x8a) => vec![args[0], self.flags[2]],
+                (0, 0x08) | (1, 0x09) | (1, 0x04) | (1, 0x0a) => {
+                    assert_eq!((len, args[0]), (2, self.profile), "a write names the ACTIVE profile");
+                    if !self.keep_extra {
+                        match (page, cmd) {
+                            (0, _) => self.debounce = args[1],
+                            (_, 0x09) => self.flags[0] = args[1],
+                            (_, 0x04) => self.flags[1] = args[1],
+                            _ => self.flags[2] = args[1],
+                        }
+                    }
+                    args[..2].to_vec()
+                }
                 (1, 0x00) => {
                     assert_eq!((len, args[0]), (2, self.profile), "a write names the ACTIVE profile");
                     if !self.keep_polling {
@@ -540,6 +562,11 @@ fn reads_with_the_requests_openmouses_readstatus_sends() {
             rq(0x02, 0x02, 0x01, 0x82, &[1]),
             rq(0x02, 0x02, 0x01, 0x80, &[1]),
             rq(0x02, 0x02, 0x01, 0x88, &[1]),
+            // Order 110: PROFILE_READ.debounce (device page 0x88), angleSnapping 0x84, motionSync 0x89, rippleControl 0x8a
+            rq(0x02, 0x02, 0x00, 0x88, &[1]),
+            rq(0x02, 0x02, 0x01, 0x84, &[1]),
+            rq(0x02, 0x02, 0x01, 0x89, &[1]),
+            rq(0x02, 0x02, 0x01, 0x8a, &[1]),
         ]
     );
     assert!(port.sent.iter().all(|s| s.1 == feature0()), "SetFeature, then GetFeature at once (OpenMouse fetches before it waits)");
@@ -560,7 +587,7 @@ fn reads_address_the_profile_the_mouse_is_running() {
     mouse.borrow_mut().charging = 0;
     mouse.borrow_mut().percent = 101;
     let r = lz::Lamzu.read(&m, &mut port, ReadOptions::default()).unwrap();
-    assert_eq!(sent(&port)[3..], [rq(0x02, 0x0a, 0x01, 0x81, &[3, 6]), rq(0x02, 0x02, 0x01, 0x82, &[3]), rq(0x02, 0x02, 0x01, 0x80, &[3]), rq(0x02, 0x02, 0x01, 0x88, &[3])]);
+    assert_eq!(sent(&port)[3..7], [rq(0x02, 0x0a, 0x01, 0x81, &[3, 6]), rq(0x02, 0x02, 0x01, 0x82, &[3]), rq(0x02, 0x02, 0x01, 0x80, &[3]), rq(0x02, 0x02, 0x01, 0x88, &[3])]);
     // 0x40 = 4000 Hz, lift-off 0x87 = 0.7 mm, stage 1 = 800, battery 101 = unknown (OpenMouse: null), not charging
     assert_eq!((r.dpi, r.polling_hz, r.lift_off, r.battery_percent, r.charging), (Some(800), Some(4000), Some(7), None, Some(false)));
     // the 8K receiver: polling 500 - 8000
@@ -597,7 +624,7 @@ fn the_exchange_waits_out_busy_and_skips_a_stale_answer() {
     // two busy fetches, then the answer: fetched again without sending again
     mouse.borrow_mut().busy = 2;
     lz::Lamzu.read(&m, &mut port, ReadOptions::default()).unwrap();
-    assert_eq!(port.sent.len(), 7 + 2, "two extra fetches, no re-send");
+    assert_eq!(port.sent.len(), 11 + 2, "two extra fetches, no re-send (7 Order 104 reads + 4 Order 110 reads)");
     assert_eq!((&port.sent[0].1, &port.sent[1].1, &port.sent[2].1), (&feature0(), &HidTransfer::FeatureIn { reply_id: 0, reply_len: 65, wait_ms: 30 }, &HidTransfer::FeatureIn { reply_id: 0, reply_len: 65, wait_ms: 30 }));
     assert_eq!(port.sent[1].0, port.sent[0].0);
     // a stale answer (ok, but to the previous command) is skipped, not taken for this one's
@@ -605,7 +632,7 @@ fn the_exchange_waits_out_busy_and_skips_a_stale_answer() {
     mouse.borrow_mut().stale = 1;
     let r = lz::Lamzu.read(&m, &mut port, ReadOptions::default()).unwrap();
     assert_eq!((r.dpi, r.polling_hz, r.lift_off, r.battery_percent), (Some(1600), Some(1000), Some(10), Some(87)));
-    assert_eq!(port.sent.len(), 7 + 1);
+    assert_eq!(port.sent.len(), 11 + 1);
 }
 
 #[test]
@@ -614,7 +641,7 @@ fn a_request_the_mouse_does_not_support_is_dropped_not_fatal_for_a_read() {
     mouse.borrow_mut().unsupported = vec![(0, 0x83), (1, 0x88)];
     let r = lz::Lamzu.read(&m, &mut port, ReadOptions::default()).unwrap();
     // 0xa2 ends that request at once (no further fetches); the rest still reads
-    assert_eq!(port.sent.len(), 7);
+    assert_eq!(port.sent.len(), 11);
     assert_eq!((r.online, r.battery_percent, r.charging, r.dpi, r.polling_hz, r.lift_off), (true, None, None, Some(1600), Some(1000), None));
 }
 
@@ -811,4 +838,54 @@ fn every_model_reads_its_own_polling_list() {
     assert_eq!((rates(0x37b0, 0x9), rates(0x37b0, 0xf), rates(0x37b0, 0x10)), (k1.clone(), k1.clone(), k8));
     assert_eq!((rates(0x373e, 0x6a), rates(0x373e, 0x6b), rates(0x373e, 0x32), rates(0x373e, 0x33)), (full.clone(), full.clone(), k1.clone(), full.clone()));
     assert_eq!((rates(0x373e, 0x46), rates(0x373e, 0x47)), (k1, full));
+}
+
+// ---------------------------------------------------------------- Order 110: debounce, Motion Sync, angle snapping, ripple
+
+use bu_mouse::family::{Change, Extra, Kind};
+
+#[test]
+fn order_110_read_shows_debounce_and_the_flags_like_openmouse() {
+    let (m, mouse, mut port) = setup(0x373e, 0x001d);
+    mouse.borrow_mut().profile = 3;
+    let r = lz::Lamzu.read(&m, &mut port, ReadOptions::default()).unwrap();
+    // readStatus: debounceMs = debounce[1]; angleSnapping / motionSync / rippleControl = reply[1] === 1
+    assert_eq!(sent(&port)[7..], [rq(0x02, 0x02, 0x00, 0x88, &[3]), rq(0x02, 0x02, 0x01, 0x84, &[3]), rq(0x02, 0x02, 0x01, 0x89, &[3]), rq(0x02, 0x02, 0x01, 0x8a, &[3])]);
+    let got: Vec<(Extra, Option<i32>)> = r.extras.iter().map(|x| (x.extra, x.value)).collect();
+    assert_eq!(got, vec![(Extra::Debounce, Some(4)), (Extra::MotionSync, Some(1)), (Extra::AngleSnap, Some(0)), (Extra::RippleControl, Some(1))]);
+    assert_eq!(r.extras[0].kind, Kind::Range { min: 0, max: 15, step: 1, unit: "ms" });
+    assert!(port.sent.iter().all(|s| lz::read_request_allowed(&s.0)));
+    // each read is optional (.catch(() => null)): an unsupported one leaves its row without a value
+    let (m, mouse, mut port) = setup(0x373e, 0x001d);
+    mouse.borrow_mut().unsupported = vec![(0, 0x88), (1, 0x89)];
+    let r = lz::Lamzu.read(&m, &mut port, ReadOptions::default()).unwrap();
+    assert_eq!((r.extra(Extra::Debounce), r.extra(Extra::MotionSync), r.extra(Extra::AngleSnap)), (None, None, Some(0)));
+}
+
+#[test]
+fn order_110_changes_are_openmouses_setflag_and_setdebouncetime_bytes() {
+    let (m, mouse, mut port) = setup(0x373e, 0x001d);
+    mouse.borrow_mut().profile = 3;
+    // currentProfile (device 0x85), then write(page, command, profile, [value]) = length 2, [profile, value], then the read
+    for (c, write, read) in [
+        (Change::Extra(Extra::Debounce, 8), rq(0x02, 0x02, 0x00, 0x08, &[3, 8]), rq(0x02, 0x02, 0x00, 0x88, &[3])),
+        (Change::Extra(Extra::MotionSync, 0), rq(0x02, 0x02, 0x01, 0x09, &[3, 0]), rq(0x02, 0x02, 0x01, 0x89, &[3])),
+        (Change::Extra(Extra::AngleSnap, 1), rq(0x02, 0x02, 0x01, 0x04, &[3, 1]), rq(0x02, 0x02, 0x01, 0x84, &[3])),
+        (Change::Extra(Extra::RippleControl, 0), rq(0x02, 0x02, 0x01, 0x0a, &[3, 0]), rq(0x02, 0x02, 0x01, 0x8a, &[3])),
+    ] {
+        port.sent.clear();
+        lz::Lamzu.change(&m, &mut port, c).unwrap_or_else(|e| panic!("{c:?}: {e}"));
+        assert_eq!(sent(&port), vec![rq(0x02, 0x01, 0x00, 0x85, &[]), write.clone(), read], "{c:?}");
+        assert!(!lz::read_request_allowed(&write), "{c:?}: a write never passes the allow-list");
+    }
+    assert_eq!((mouse.borrow().debounce, mouse.borrow().flags), (8, [0, 1, 0]));
+    // a mouse that keeps the old value is an error
+    mouse.borrow_mut().keep_extra = true;
+    assert!(matches!(lz::Lamzu.change(&m, &mut port, Change::Extra(Extra::Debounce, 2)), Err(Error::BadAnswer(_))));
+    // refused before a byte leaves: debounce 0-15, switches 0 / 1, no turbo (Lamzu's "competitive mode" is not turbo)
+    port.sent.clear();
+    for c in [Change::Extra(Extra::Debounce, 16), Change::Extra(Extra::MotionSync, 2), Change::Extra(Extra::Turbo, 1)] {
+        assert!(lz::Lamzu.change(&m, &mut port, c).is_err(), "{c:?}");
+    }
+    assert!(port.sent.is_empty());
 }

@@ -17,6 +17,8 @@ use bu_keysound::synth::MouseButtonClass;
 use bu_keysound::{ClickStyle, Dev, Pack, CLICK_STYLES};
 
 pub(super) const K_MB: Key = key("mouse.btn");
+/// Order 114: the picture's column (as tall as the card)
+pub(super) const K_PIC: Key = key("mouse.pic");
 const K_MBT: Key = key("mouse.btnt");
 const K_BW: Key = key("mouse.bw");
 const K_BMODE: Key = key("mouse.bmode");
@@ -95,9 +97,16 @@ const SHAPES: [Shape; 5] = [
     (4, "M22.5 121.5a3.5 3.5 0 0 1 7 0V140.5a3.5 3.5 0 0 1-7 0Z", &[(18.0, 115.0, 34.0, 146.0)]),
     (3, "M22.5 152.5a3.5 3.5 0 0 1 7 0V171.5a3.5 3.5 0 0 1-7 0Z", &[(18.0, 147.0, 34.0, 178.0)]),
 ];
-/// The picture's column (the drawing's `.mz{flex:0 0 124px}`) and its height = the Your mouse card's.
+/// The picture's column (the drawing's `.mz{flex:0 0 124px}`) and its smallest height (a card of head + DPI + Polling + Lift-off).
+/// Order 114 (A_110_03): the picture is as tall as the Your mouse card (`picture(.., h)`) and its column as wide as the picture
+/// then is, never narrower than 124.
 pub(super) const PIC_COL_W: f32 = 124.0;
 pub(super) const PIC_H: f32 = 184.0;
+
+/// The column's width for a picture `h` tall.
+pub(super) fn pic_col_w(h: f32) -> f32 {
+    (VB.2 * h / VB.3).ceil().max(PIC_COL_W)
+}
 
 #[derive(Default)]
 pub(super) struct Btns {
@@ -178,18 +187,19 @@ impl Btns {
     // ------------------------------------------------------------------ the picture
 
     /// The mouse picture (left of the Your mouse card) + the small line under it.
-    pub fn picture(&mut self, cx: &mut Cx, test: bool) -> El {
+    pub fn picture(&mut self, cx: &mut Cx, test: bool, h: f32) -> El {
         self.ensure(test);
-        let s = PIC_H / VB.3;
-        let ox = (PIC_COL_W - VB.2 * s) / 2.0;
+        let s = h / VB.3;
+        let col_w = pic_col_w(h);
+        let ox = (col_w - VB.2 * s) / 2.0;
         let mut looks: Vec<(u16, f32, bool)> = Vec::new();
         for (slot, _, _) in SHAPES {
             let on = cx.hovered(idx(K_MB, slot as usize)) || self.sel == Some(slot);
             let hv = cx.tr(idx(K_MBT, slot as usize), 1, if on { 1.0 } else { 0.0 }, 120.0, EASE);
             looks.push((slot, hv, self.prefs.mouse_binds.get(slot).is_some()));
         }
-        let paint = El::paint(move |g, (x, y, _, _)| paint_mouse(g, x + ox, y, s, &looks)).abs(0.0, 0.0, f32::NAN, f32::NAN).size(PIC_COL_W, PIC_H).no_hit();
-        let mut col = El::block().size(PIC_COL_W, PIC_H).none().child(paint);
+        let paint = El::paint(move |g, (x, y, _, _)| paint_mouse(g, x + ox, y, s, &looks)).abs(0.0, 0.0, f32::NAN, f32::NAN).size(col_w, h).no_hit();
+        let mut col = El::block().size(col_w, h).none().key(K_PIC).child(paint);
         for (slot, _, rects) in SHAPES {
             for (x0, y0, x1, y1) in rects {
                 col = col.child(
@@ -206,8 +216,8 @@ impl Btns {
         // - under the mouse, moves nothing
         col.child(
             El::row()
-                .abs(-10.0, PIC_H + 4.0, f32::NAN, f32::NAN)
-                .w(PIC_COL_W + 20.0)
+                .abs(-10.0, h + 4.0, f32::NAN, f32::NAN)
+                .w(col_w + 20.0)
                 .justify(JustifyContent::CENTER)
                 .no_hit()
                 .child(El::text("Click a button to change it", Font::new(10.0, 400), FG3(), lh(10.0, 1.35)).none()),

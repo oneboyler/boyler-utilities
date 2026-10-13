@@ -145,7 +145,7 @@ fn reads_everything_with_read_requests_only() {
     assert_eq!(r.polling_hz, Some(1000));
     assert_eq!(r.lift_off, Some(10));
     assert_eq!(r.caps.polling, vec![125, 250, 500, 1000, 2000, 4000, 8000], "the 8K link allows all");
-    assert_eq!(r.caps.lift_off, vec![10, 20]);
+    assert_eq!(r.caps.lift_off, vec![7, 10, 20], "Order 110: 0.7 mm too");
     assert!(r.caps.battery && r.caps.dpi.is_some());
     // every frame that went out passes the read allow-list, and none changed the mouse
     for req in &model.borrow().seen {

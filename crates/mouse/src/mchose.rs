@@ -36,12 +36,20 @@
 //!
 //! Lift-off: left out. OpenMouse's pages show Low / Medium / High; its model table (`MCHOSE_PRODUCTS.liftOffDistances`,
 //! A7 V2 Ultra+: 0.7, 1, 2 mm) is only used for HOW MANY steps there are, never to say which step is which millimetre, so
-//! a mm figure would be our guess. Also left out: profiles, stage count, sleep, debounce, motion sync / angle snapping /
-//! ripple / performance mode / angle tuning, buttons, macros, profile names, firmware version. OpenMouse sends no
+//! a mm figure would be our guess.
+//!
+//! Order 110 (A_110_02 scope, A7 V2): debounce 0-20 ms (the configuration write 0x57 with keyDebounce, byte 18, echoed like
+//! DPI / polling), Motion Sync / angle snapping (OpenMouse's "linear correction" bit) / ripple: the performance command
+//! `[0x42, current lift-off step, ripple, line, motionSync, 0 …]` (1 on, 2 off, 0 unchanged) on the short channel, 2 s, the
+//! configuration read back - up to 3 times, as OpenMouse. Read from config bytes 17 (bits 0x10 / 0x08 / 0x04) and 18. The
+//! mode (Performance / eSports / Ultra) is not the Pulsar turbo: left out.
+//!
+//! Also left out: profiles, stage count, sleep, mode, angle tuning,
+//! buttons, macros, profile names, firmware version. OpenMouse sends no
 //! firmware-update, bootloader or reset command to a Mchose mouse and neither does this file.
 
 use crate::error::{Error, Result};
-use crate::family::{Caps, Changed, DpiCaps, Family, Matched, OnMouse, Port, ReadOptions, Setting};
+use crate::family::{check_extra, Caps, Change, Changed, DpiCaps, Extra, ExtraRow, Family, Kind, Matched, OnMouse, Port, ReadOptions, Setting};
 use crate::os::{HidInfo, HidTransfer};
 
 pub const VENDOR_ID: u16 = 0x3837;
@@ -149,6 +157,10 @@ pub mod v2 {
         pub wireless_rate_index: usize,
         pub dpi_stages: [u32; DPI_STAGES],
         pub stage_count: u8,
+        /// Order 110: the `sensor` byte (17: lift-off bits 0-1, ripple 0x04, angle snapping / linear correction 0x08, Motion
+        /// Sync 0x10, the mode in bits 6-7) and keyDebounce (18)
+        pub sensor: u8,
+        pub key_debounce: u8,
     }
 
     pub fn decode_config(p: &[u8]) -> Option<Config> {
@@ -167,6 +179,8 @@ pub mod v2 {
             wireless_rate_index: (p[2] >> 4) as usize,
             dpi_stages,
             stage_count: p.get(16).copied().unwrap_or(0),
+            sensor: p.get(17).copied().unwrap_or(0),
+            key_debounce: p.get(18).copied().unwrap_or(0),
         })
     }
 
@@ -190,6 +204,8 @@ pub mod v2 {
         pub wired_rate_index: Option<usize>,
         pub wireless_rate_index: Option<usize>,
         pub dpi_stages: Option<[u32; DPI_STAGES]>,
+        /// Order 110: keyDebounce (byte 18)
+        pub key_debounce: Option<u8>,
     }
 
     /// mchoseEncodeConfigWrite: the tokens of the 0x57 write: the command byte, then the payload that was read, echoed byte
@@ -208,7 +224,37 @@ pub mod v2 {
                 out[1 + 4 + i * 2 + 1] = ((v >> 8) & 0xFF) as u8;
             }
         }
+        if let Some(d) = ch.key_debounce {
+            out[1 + 18] = d;
+        }
         Some(out)
+    }
+
+    /// Order 110: the performance command (0x42, short channel).
+    pub const CMD_PERFORMANCE: u8 = 0x42;
+    /// MCHOSE_DEBOUNCE_MAX_MS.
+    pub const DEBOUNCE_MAX_MS: i32 = 20;
+    pub const SENSOR_RIPPLE: u8 = 0x04;
+    pub const SENSOR_LINEAR: u8 = 0x08;
+    pub const SENSOR_MOTION_SYNC: u8 = 0x10;
+
+    /// The three processing switches a performance write changes (`None` = leave it alone).
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub struct Processing {
+        pub ripple: Option<bool>,
+        pub angle_snapping: Option<bool>,
+        pub motion_sync: Option<bool>,
+    }
+
+    /// mchoseEncodePerformance(liftOffIndex, changes) without mode / angle tuning: `[0x42, lod, ripple, line, motionSync, 0, 0,
+    /// 0, 0, 0]`, a switch 1 = on, 2 = off, 0 = unchanged.
+    pub fn encode_performance(lift_off_index: u8, ch: &Processing) -> [u8; 10] {
+        let t = |v: Option<bool>| match v {
+            None => 0,
+            Some(true) => 1,
+            Some(false) => 2,
+        };
+        [CMD_PERFORMANCE, lift_off_index & 0x03, t(ch.ripple), t(ch.angle_snapping), t(ch.motion_sync), 0, 0, 0, 0, 0]
     }
 
     /// One entry of the A7 V2 family's model table (`MCHOSE_PRODUCTS`).
@@ -525,7 +571,62 @@ fn v2_read(m: &Matched, port: &mut dyn Port, opt: ReadOptions) -> Result<OnMouse
         r.dpi = c.dpi_stages.get(stage).copied().filter(|d| *d > 0);
         r.polling_hz = product.and_then(|p| v2::polling_rates(p.max_polling).get(rate).copied());
     }
+    if config.is_some() {
+        r.extras = v2_extras(config.as_ref());
+    }
     Ok(r)
+}
+
+/// Order 110: readStatus' debounceMs (keyDebounce) and the processing switches from the sensor byte, in the card's order
+/// (`None` = the guard's rows).
+pub fn v2_extras(c: Option<&v2::Config>) -> Vec<ExtraRow> {
+    let bit = |b: u8| c.map(|c| c.sensor & b != 0);
+    vec![
+        ExtraRow::new(Extra::Debounce, Kind::Range { min: 0, max: v2::DEBOUNCE_MAX_MS, step: 1, unit: "ms" }, c.map(|c| c.key_debounce as i32)),
+        ExtraRow::switch(Extra::MotionSync, bit(v2::SENSOR_MOTION_SYNC)),
+        ExtraRow::switch(Extra::AngleSnap, bit(v2::SENSOR_LINEAR)),
+        ExtraRow::switch(Extra::RippleControl, bit(v2::SENSOR_RIPPLE)),
+    ]
+}
+
+/// OpenMouse's PERFORMANCE_SETTLE_MS / PERFORMANCE_ATTEMPTS: the performance command is slow; send, wait, read, up to 3 times
+/// until the read shows the change.
+pub const PERFORMANCE_SETTLE_MS: u64 = 2000;
+pub const PERFORMANCE_ATTEMPTS: u32 = 3;
+
+/// Order 110 (A7 V2): setDebounceTime = the configuration write with keyDebounce; setMotionSync / setAngleSnapping /
+/// setRippleControl = writePerformance(the current lift-off step, that one switch).
+fn v2_change(port: &mut dyn Port, c: Change) -> Result<()> {
+    let Change::Extra(e, v) = c;
+    check_extra(&v2_extras(None), e, v)?;
+    let payload = v2_read_config_payload(port, POLL_ATTEMPTS)?.ok_or_else(|| Error::BadAnswer("the mouse did not return its configuration".into()))?;
+    let cur = v2::decode_config(&payload).ok_or_else(|| Error::BadAnswer("the mouse did not return its configuration".into()))?;
+    let value_of = |c: &v2::Config| v2_extras(Some(c)).into_iter().find(|r| r.extra == e).and_then(|r| r.value);
+    if e == Extra::Debounce {
+        let after = v2_write_config(port, &payload, &v2::Changes { key_debounce: Some(v as u8), ..Default::default() })?;
+        if value_of(&after) != Some(v) {
+            return Err(Error::BadAnswer("the mouse did not accept the new debounce time".into()));
+        }
+        return Ok(());
+    }
+    let on = Some(v == 1);
+    let ch = match e {
+        Extra::MotionSync => v2::Processing { motion_sync: on, ..Default::default() },
+        Extra::AngleSnap => v2::Processing { angle_snapping: on, ..Default::default() },
+        _ => v2::Processing { ripple: on, ..Default::default() },
+    };
+    let len = port.info().feature_len as usize;
+    let out = v2::feature_report(v2::SHORT_ID, &v2::encode_command(&v2::encode_performance(cur.sensor & 0x03, &ch), v2::SHORT_TOKENS), len).ok_or_else(|| Error::UnsupportedMouse("the Mchose config report is too short".into()))?;
+    for _ in 0..PERFORMANCE_ATTEMPTS {
+        port.exchange(&out, &HidTransfer::FeatureOut)?;
+        port.pause_ms(PERFORMANCE_SETTLE_MS);
+        if let Some(after) = v2_read_config_payload(port, POLL_ATTEMPTS)?.and_then(|p| v2::decode_config(&p)) {
+            if value_of(&after) == Some(v) {
+                return Ok(());
+            }
+        }
+    }
+    Err(Error::BadAnswer(format!("the mouse did not accept the {} change", e.label())))
 }
 
 /// Send a configuration write (0x57, long), wait, and read the configuration again.
@@ -721,6 +822,13 @@ impl crate::family::Driver for Mchose {
             CLIENT_V2 => v2_read(m, port, opt),
             CLIENT_A5 => a5_read(m, port),
             v => Err(Error::UnsupportedMouse(format!("Mchose client {v:#06x}"))),
+        }
+    }
+    /// Order 110: the A7 V2's debounce and processing switches (the A5 Pro Max is held back: not in the table).
+    fn change(&self, m: &Matched, port: &mut dyn Port, c: Change) -> Result<()> {
+        match m.variant & 0xFF {
+            CLIENT_V2 => v2_change(port, c),
+            _ => Err(crate::family::not_offered(c)),
         }
     }
     fn write(&self, m: &Matched, port: &mut dyn Port, s: Setting) -> Result<Changed> {

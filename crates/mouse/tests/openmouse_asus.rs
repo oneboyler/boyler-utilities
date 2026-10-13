@@ -5,7 +5,7 @@
 //! OpenMouse sends `sendReport(0, 64 bytes)`; Windows puts report id 0 in front: OpenMouse's byte i is our byte i + 1.
 
 use bu_mouse::asus as a;
-use bu_mouse::family::{self, Driver, Family, ReadOptions, Setting};
+use bu_mouse::family::{self, Change, Driver, Extra, Family, Kind, ReadOptions, Setting};
 use bu_mouse::fake::{hid_info, ScriptPort};
 use bu_mouse::os::{HidInfo, HidTransfer};
 use bu_mouse::Error;
@@ -180,6 +180,9 @@ fn caps_are_what_openmouse_offers() {
 struct Fake {
     dpi: [u32; 2],
     rate_byte: u8,
+    /// Order 110: the debounce byte (10) and angle snapping (12)
+    debounce: u8,
+    snap: u8,
     stage: u8,
     asleep: bool,
     silent: bool,
@@ -190,7 +193,7 @@ struct Fake {
 }
 
 fn fake() -> Rc<RefCell<Fake>> {
-    Rc::new(RefCell::new(Fake { dpi: [800, 1600], rate_byte: 3, stage: 2, asleep: false, silent: false, ignore: false, seen: Vec::new() }))
+    Rc::new(RefCell::new(Fake { dpi: [800, 1600], rate_byte: 3, debounce: 4, snap: 1, stage: 2, asleep: false, silent: false, ignore: false, seen: Vec::new() }))
 }
 
 fn port(st: &Rc<RefCell<Fake>>) -> ScriptPort {
@@ -217,6 +220,8 @@ fn port(st: &Rc<RefCell<Fake>>) -> ScriptPort {
             match (q[0], q[1], q[2]) {
                 (0x12, 0x04, 0x00) => {
                     data = settings_answer(s.rate_byte);
+                    data[10] = s.debounce;
+                    data[12] = s.snap;
                     for i in 0..2 {
                         let enc = s.dpi[i] / 100 - 1;
                         data[4 + i * 2] = enc as u8;
@@ -228,6 +233,10 @@ fn port(st: &Rc<RefCell<Fake>>) -> ScriptPort {
                     if !s.ignore {
                         if field < 2 {
                             s.dpi[field as usize] = ((q[4] as u32) | (q[5] as u32) << 8) * 100 + 100;
+                        } else if field == 3 {
+                            s.debounce = q[4];
+                        } else if field == 4 {
+                            s.snap = q[4];
                         } else {
                             s.rate_byte = q[4];
                         }
@@ -342,6 +351,49 @@ fn values_the_mouse_cannot_store_are_refused_before_a_byte_leaves() {
     let mut p = port(&st);
     for s in [Setting::Dpi(50), Setting::Dpi(150), Setting::Dpi(12100), Setting::Polling(2000), Setting::Polling(8000), Setting::Polling(0), Setting::LiftOff(10)] {
         assert!(a::Asus.write(&matched(), &mut p, s).is_err(), "{s:?}");
+    }
+    assert!(p.sent.is_empty());
+}
+
+// ---------------------------------------------------------------- Order 110: debounce, angle snapping
+
+#[test]
+fn debounce_and_angle_snapping_are_openmouses_settings_fields() {
+    // asusDecodeSettings: debounceMs = raw 2-7 → raw × 4 + 4 (byte 10: 4 → 20 ms); angleSnapping = byte 12 === 1
+    let s = a::decode_settings(&settings_answer(3)).unwrap();
+    assert_eq!((s.debounce_ms, s.angle_snapping), (Some(20), true));
+    let mut raw = settings_answer(3);
+    raw[10] = 1;
+    raw[12] = 2;
+    let s = a::decode_settings(&raw).unwrap();
+    assert_eq!((s.debounce_ms, s.angle_snapping), (None, false), "raw 1 is no debounce value; only 0x01 is on");
+    let st = fake();
+    let mut p = port(&st);
+    let r = a::Asus.read(&matched(), &mut p, ReadOptions::default()).unwrap();
+    assert_eq!(r.extras.iter().map(|e| (e.extra, e.value)).collect::<Vec<_>>(), vec![(Extra::Debounce, Some(20)), (Extra::AngleSnap, Some(1))]);
+    // ASUS_DEBOUNCE_MS = [12, 16, 20, 24, 28, 32]
+    assert_eq!(r.extras[0].kind, Kind::Range { min: 12, max: 32, step: 4, unit: "ms" });
+    // asusSetDebounceRequest(32) = request(0x51, 0x31, settingField = 2 stages + 1 = 3, 0x00, 32 / 4 − 1 = 7), then the save `50 03`,
+    // then the settings read
+    p.sent.clear();
+    a::Asus.change(&matched(), &mut p, Change::Extra(Extra::Debounce, 32)).unwrap();
+    assert_eq!(p.sent.iter().map(|s| s.0.clone()).collect::<Vec<_>>(), vec![rep(&[0x51, 0x31, 0x03, 0x00, 0x07]), rep(&[0x50, 0x03]), rep(&[0x12, 0x04, 0x00])]);
+    assert!(!a::read_request_allowed(&p.sent[0].0));
+    // asusSetAngleSnappingRequest(false) = request(0x51, 0x31, 2 + 2 = 4, 0x00, 0x00)
+    p.sent.clear();
+    a::Asus.change(&matched(), &mut p, Change::Extra(Extra::AngleSnap, 0)).unwrap();
+    assert_eq!(p.sent[0].0, rep(&[0x51, 0x31, 0x04, 0x00, 0x00]));
+    let r = a::Asus.read(&matched(), &mut p, ReadOptions::default()).unwrap();
+    assert_eq!((r.extra(Extra::Debounce), r.extra(Extra::AngleSnap), r.polling_hz), (Some(32), Some(0), Some(1000)));
+    // 12 ms: raw 2
+    assert_eq!(a::set_debounce_request(12).unwrap()[4], 2);
+    // a mouse that ignores it
+    st.borrow_mut().ignore = true;
+    assert!(a::Asus.change(&matched(), &mut p, Change::Extra(Extra::AngleSnap, 1)).is_err());
+    // refused before a byte leaves: values outside ASUS_DEBOUNCE_MS, settings OpenMouse has no command for
+    p.sent.clear();
+    for c in [Change::Extra(Extra::Debounce, 10), Change::Extra(Extra::Debounce, 13), Change::Extra(Extra::Debounce, 36), Change::Extra(Extra::AngleSnap, 2), Change::Extra(Extra::MotionSync, 1), Change::Extra(Extra::RippleControl, 1), Change::Extra(Extra::Turbo, 1)] {
+        assert!(a::Asus.change(&matched(), &mut p, c).is_err(), "{c:?}");
     }
     assert!(p.sent.is_empty());
 }

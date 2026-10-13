@@ -5,7 +5,7 @@
 //! OpenMouse sends `sendReport(4, 63 bytes)` with no checksum: simple `[0, 0, cmd]`, read `[0, 0, 0xA4, n, addrLo, addrHi, 0]`,
 //! write `[0, 0, 0xA5, n, addrLo, addrHi, 0, data...]`. Windows puts the id 4 in front: OpenMouse's byte i is our byte i + 1.
 
-use bu_mouse::family::{self, Driver, Family, ReadOptions, Setting};
+use bu_mouse::family::{self, Change, Driver, Extra, Family, Kind, ReadOptions, Setting};
 use bu_mouse::fake::{hid_info, ScriptPort};
 use bu_mouse::os::{HidInfo, HidTransfer};
 use bu_mouse::wallhack as w;
@@ -208,6 +208,10 @@ fn fake() -> Rc<RefCell<Fake>> {
     area[12] = 0; // stage 1
     area[77..86].copy_from_slice(&[1, 0, 0x20, 0x03, 0x90, 1, 0xFF, 0xFF, 0]); // 800 DPI
     area[110] = 1; // 1 mm
+    // Order 110: keyDebounceTime 109 = 4 ms, angleSnapEnable 111 off, rippleControlEnable 112 on, motionSyncEnable 113 on
+    area[109] = 4;
+    area[112] = 1;
+    area[113] = 1;
     Rc::new(RefCell::new(Fake { area, battery: Some((77, 0)), silent: false, ignore: false, mute_addr: None, wrong_echo: false, seen: Vec::new() }))
 }
 
@@ -281,7 +285,8 @@ fn reading_asks_battery_stage_dpi_polling_and_lift_off() {
     let mut p = port(&st);
     let r = w::Wallhack.read(&matched(), &mut p, ReadOptions::default()).unwrap();
     assert!(p.sent.iter().all(|s| w::read_request_allowed(&s.0)), "read requests only");
-    assert_eq!(cmds(&st), vec![(0xBA, 0), (0xA4, 12), (0xA4, 77), (0xA4, 11), (0xA4, 110)]);
+    // (Order 110: then Motion Sync 113, angle snapping 111, ripple 112, debounce 109 - readStatus' order)
+    assert_eq!(cmds(&st), vec![(0xBA, 0), (0xA4, 12), (0xA4, 77), (0xA4, 11), (0xA4, 110), (0xA4, 113), (0xA4, 111), (0xA4, 112), (0xA4, 109)]);
     assert_eq!((r.online, r.dpi, r.polling_hz, r.lift_off, r.battery_percent, r.charging), (true, Some(800), Some(1000), Some(10), Some(77), Some(false)));
     assert_eq!(r.caps, w::caps());
     // on another DPI stage the first record is not "the DPI": unknown, and the block is not even read
@@ -435,4 +440,42 @@ fn an_area_answer_for_another_address_is_not_taken() {
     }
     // a lift-off write is sent (its before is unknown) but its read-back is not accepted
     assert!(w::Wallhack.write(&matched(), &mut port(&st), Setting::LiftOff(20)).is_err());
+}
+
+// ---------------------------------------------------------------- Order 110: debounce, Motion Sync, angle snapping, ripple
+
+#[test]
+fn the_extras_are_openmouses_function_area_bytes() {
+    let st = fake();
+    let mut p = port(&st);
+    let r = w::Wallhack.read(&matched(), &mut p, ReadOptions::default()).unwrap();
+    // readStatus: debounceMs = the raw byte 109; the switches = byte === 1
+    let got: Vec<(Extra, Option<i32>)> = r.extras.iter().map(|e| (e.extra, e.value)).collect();
+    assert_eq!(got, vec![(Extra::Debounce, Some(4)), (Extra::MotionSync, Some(1)), (Extra::AngleSnap, Some(0)), (Extra::RippleControl, Some(1))]);
+    // setDebounceTime: 0-20 ms
+    assert_eq!(r.extras[0].kind, Kind::Range { min: 0, max: 20, step: 1, unit: "ms" });
+    // writeVerifiedByte(address, v) = wallhackBuildWrite(address, [v]) = [0, 0, 0xA5, 1, address, 0, 0, v], then readByte(address)
+    for (c, addr, v) in [(Change::Extra(Extra::Debounce, 20), 0x6Du8, 20u8), (Change::Extra(Extra::MotionSync, 0), 0x71, 0), (Change::Extra(Extra::AngleSnap, 1), 0x6F, 1), (Change::Extra(Extra::RippleControl, 0), 0x70, 0)] {
+        p.sent.clear();
+        w::Wallhack.change(&matched(), &mut p, c).unwrap();
+        assert_eq!(p.sent.iter().map(|s| s.0.clone()).collect::<Vec<_>>(), vec![rep(&[(3, 0xA5), (4, 1), (5, addr), (8, v)]), rep(&[(3, 0xA4), (4, 1), (5, addr)])], "{c:?}");
+        assert_eq!(p.sent[0].1, HidTransfer::OutputOnly);
+        assert!(!w::read_request_allowed(&p.sent[0].0));
+    }
+    let r = w::Wallhack.read(&matched(), &mut port(&st), ReadOptions::default()).unwrap();
+    assert_eq!(r.extras.iter().map(|e| e.value).collect::<Vec<_>>(), vec![Some(20), Some(0), Some(1), Some(0)]);
+    // a mouse that keeps its value
+    st.borrow_mut().ignore = true;
+    assert!(w::Wallhack.change(&matched(), &mut port(&st), Change::Extra(Extra::MotionSync, 1)).is_err());
+    // refused before a byte leaves
+    let mut p = port(&st);
+    for c in [Change::Extra(Extra::Debounce, 21), Change::Extra(Extra::MotionSync, 2), Change::Extra(Extra::Turbo, 1)] {
+        assert!(w::Wallhack.change(&matched(), &mut p, c).is_err(), "{c:?}");
+    }
+    assert!(p.sent.is_empty());
+    // an area byte that is not answered: no row
+    let st = fake();
+    st.borrow_mut().mute_addr = Some(112);
+    let r = w::Wallhack.read(&matched(), &mut port(&st), ReadOptions::default()).unwrap();
+    assert!(r.extras.iter().all(|e| e.extra != Extra::RippleControl) && r.extras.len() == 3);
 }

@@ -23,13 +23,16 @@
 //! 0..3) · 13 USB high speed · 14 angle snapping · 15 primary button right. A read-modify-write of one word whose every
 //! field is read back first, so nothing we do not show is lost (angle snapping and the primary button are copied through).
 //!
-//! Left out on purpose: angle snapping, USB speed (changed only as OpenMouse's setPollingRate does: a rate above 1000 Hz
+//! Order 110 (A_110_02 scope): angle snapping (bit 14) - setAngleSnapping through the same `update` (read, change the bit,
+//! write when it differs, read back the whole word). The client has no debounce / Motion Sync / ripple / turbo.
+//!
+//! Left out on purpose: USB speed (changed only as OpenMouse's setPollingRate does: a rate above 1000 Hz
 //! switches the mouse to high speed), primary button, and the factory reset (`zaunkoenigBuildFactoryResetPayload`).
 //! Lift-off: OpenMouse's `liftOffDistanceMm` is a real millimetre figure (1, 2, 3 mm; the M2K 2 and 3), so it is offered.
 //! Proven only against OpenMouse's bytes (tests); never run on a real unit.
 
 use crate::error::{Error, Result};
-use crate::family::{Caps, Changed, DpiCaps, Family, Matched, OnMouse, Port, ReadOptions, Setting};
+use crate::family::{check_extra, Caps, Change, Changed, DpiCaps, Extra, ExtraRow, Family, Kind, Matched, OnMouse, Port, ReadOptions, Setting};
 use crate::os::{HidInfo, HidTransfer};
 
 pub const VENDOR_ID: u16 = 0x0483;
@@ -236,7 +239,26 @@ impl crate::family::Driver for Zaunkoenig {
             return Err(Error::UnsupportedMouse(format!("Unsupported Zaunkoenig firmware: {shown}. {MINIMUM_FIRMWARE_MARKER} is required.")));
         }
         let c = read_word(port, d)?.1;
-        Ok(OnMouse { online: true, dpi: Some(c.dpi), polling_hz: Some(c.polling_hz), lift_off: Some(c.lift_off_mm * 10), wireless: Some(false), caps: caps(d), ..Default::default() })
+        let extras = vec![ExtraRow::switch(Extra::AngleSnap, Some(c.angle_snapping))];
+        Ok(OnMouse { online: true, dpi: Some(c.dpi), polling_hz: Some(c.polling_hz), lift_off: Some(c.lift_off_mm * 10), wireless: Some(false), caps: caps(d), extras, ..Default::default() })
+    }
+
+    /// Order 110: setAngleSnapping = OpenMouse's `update` with only bit 14 changed (re-encoding the decoded word gives back
+    /// every other bit as read), written when it differs, the whole word read back.
+    fn change(&self, m: &Matched, port: &mut dyn Port, c: Change) -> Result<()> {
+        let d = the_device(m)?;
+        let Change::Extra(e, v) = c;
+        check_extra(&[ExtraRow::new(Extra::AngleSnap, Kind::Switch, None)], e, v)?;
+        let (current_word, _) = read_word(port, d)?;
+        let word = (current_word & !0x4000) | if v == 1 { 0x4000 } else { 0 };
+        if word != current_word {
+            let len = port.info().feature_len as usize;
+            port.exchange(&config_report(word, len), &HidTransfer::FeatureOut)?;
+        }
+        if read_word(port, d)?.0 != word {
+            return Err(Error::BadAnswer("The Zaunkoenig mouse did not retain the requested configuration".into()));
+        }
+        Ok(())
     }
 
     /// OpenMouse's `update`: read the word, change one field, write it when it differs, read it again and refuse when the

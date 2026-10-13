@@ -250,6 +250,12 @@ impl<O: MouseOs> Mouse<O> {
         self.change(m, Setting::LiftOff(tenths_mm)).map(|_| ())
     }
 
+    /// Order 110: one stage / extra change from a click, through the mouse's driver (it checks the value, writes the way
+    /// OpenMouse does and reads it back). The page reads the mouse again after it.
+    pub fn apply_change(&mut self, m: &YourMouse, c: family::Change) -> Result<()> {
+        self.with_driver(m, |d, mt, p| d.change(mt, p, c))
+    }
+
     /// Puts a mouse setting back exactly as it was before the last change made here ("dpi", "polling", "lift_off").
     pub fn undo_on_mouse(&mut self, m: &YourMouse, what: &'static str) -> Result<()> {
         let Some(UndoValue::OnMouse(old)) = self.take_undo(&UndoKey::OnMouse(what)) else {

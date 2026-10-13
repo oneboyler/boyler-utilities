@@ -10,7 +10,7 @@
 //! `!payload[j]`; our byte 1 is `!0x57 = 0xA8`.
 //! A5: the 64-byte body is `[0, 0, route 2, length, page, command, data...]`, not inverted, behind the feature report id.
 
-use bu_mouse::family::{Driver, Family, Matched, ReadOptions, Setting};
+use bu_mouse::family::{Change, Driver, Extra, Family, Kind, Matched, ReadOptions, Setting};
 use bu_mouse::fake::{hid_info, ScriptPort};
 use bu_mouse::mchose::{self as mc, a5, v2};
 use bu_mouse::os::{HidInfo, HidTransfer};
@@ -336,6 +336,23 @@ fn v2_setup(mouse: Rc<RefCell<V2Mouse>>) -> (Matched, ScriptPort) {
                 }
                 let payload = mo.payload_for(cmd).unwrap();
                 Ok(raw_reply(out[0], cmd, &payload))
+            }
+            // Order 110: the performance command on the short channel: tokens [0x42, lod, ripple, line, motionSync, ...] inverted;
+            // a switch 1 = on, 2 = off, 0 = unchanged (bits 0x04 / 0x08 / 0x10 of config byte 17, lift-off in bits 0-1)
+            HidTransfer::FeatureOut if out[..2] == [0x11, 0xBD] => {
+                if !mo.ignore_writes {
+                    let t: Vec<u8> = out[1..21].iter().map(|b| !*b).collect();
+                    let mut s = (mo.config[17] & !0x03) | (t[1] & 0x03);
+                    for (tok, bit) in [(t[2], 0x04u8), (t[3], 0x08), (t[4], 0x10)] {
+                        match tok {
+                            1 => s |= bit,
+                            2 => s &= !bit,
+                            _ => {}
+                        }
+                    }
+                    mo.config[17] = s;
+                }
+                Ok(Vec::new())
             }
             HidTransfer::FeatureOut => {
                 assert_eq!(out[..2], [0x12, 0xA8], "only the configuration write is ever sent");
@@ -863,4 +880,67 @@ fn an_a5_driver_works_on_a_collection_longer_than_65() {
     });
     let r = mc::Mchose.read(&m, &mut p, ReadOptions::default()).unwrap();
     assert_eq!((r.online, r.dpi, r.polling_hz), (true, Some(800), Some(1000)));
+}
+
+// ---------------------------------------------------------------- Order 110 (A7 V2): debounce, Motion Sync, angle snapping, ripple
+
+/// The performance frame OpenMouse sends for these tokens: `[0x11, ~tokens (20, zeros inverted), zeros up to 65]`.
+fn perf_frame(tokens: &[u8]) -> Vec<u8> {
+    let mut t = tokens.to_vec();
+    t.resize(20, 0);
+    cat(&[&[0x11], &t.iter().map(|b| !*b).collect::<Vec<_>>(), &rep(0, 44)])
+}
+
+#[test]
+fn a7_extras_read_like_openmouse() {
+    // config byte 17 = 0x91: Motion Sync (0x10) on, linear correction / angle snapping (0x08) off, ripple (0x04) off, lift-off
+    // step 1; keyDebounce byte 18 = 4
+    let mouse = Rc::new(RefCell::new(V2Mouse::new(0x4021)));
+    let (m, mut p) = v2_setup(mouse);
+    let r = mc::Mchose.read(&m, &mut p, ReadOptions::default()).unwrap();
+    let got: Vec<(Extra, Option<i32>)> = r.extras.iter().map(|e| (e.extra, e.value)).collect();
+    assert_eq!(got, vec![(Extra::Debounce, Some(4)), (Extra::MotionSync, Some(1)), (Extra::AngleSnap, Some(0)), (Extra::RippleControl, Some(0))]);
+    // MCHOSE_DEBOUNCE_MAX_MS = 20
+    assert_eq!(r.extras[0].kind, Kind::Range { min: 0, max: 20, step: 1, unit: "ms" });
+    assert!(p.sent.iter().all(|s| mc::read_request_allowed(&s.0)));
+}
+
+#[test]
+fn a7_extras_are_openmouses_frames() {
+    let mouse = Rc::new(RefCell::new(V2Mouse::new(0x4021)));
+    let (m, mut p) = v2_setup(mouse.clone());
+    let writes = |p: &ScriptPort| -> Vec<Vec<u8>> { p.sent.iter().filter(|s| s.1 == HidTransfer::FeatureOut).map(|s| s.0.clone()).collect() };
+    // setMotionSync(false): writePerformance(lift-off step 1, { motionSync: false }) = [0x42, 1, 0, 0, 2, 0, 0, 0, 0, 0]
+    mc::Mchose.change(&m, &mut p, Change::Extra(Extra::MotionSync, 0)).unwrap();
+    assert_eq!(writes(&p), vec![perf_frame(&[0x42, 1, 0, 0, 2])]);
+    assert_eq!(perf_frame(&[0x42, 1, 0, 0, 2])[..6], [0x11, 0xBD, 0xFE, 0xFF, 0xFF, 0xFD]);
+    assert!(!mc::read_request_allowed(&writes(&p)[0]));
+    // setAngleSnapping(true): line = 1 → [0x42, 1, 0, 1, 0, ...]
+    p.sent.clear();
+    mc::Mchose.change(&m, &mut p, Change::Extra(Extra::AngleSnap, 1)).unwrap();
+    assert_eq!(writes(&p), vec![perf_frame(&[0x42, 1, 0, 1, 0])]);
+    // setRippleControl(true): ripple = 1 → [0x42, 1, 1, 0, 0, ...]
+    p.sent.clear();
+    mc::Mchose.change(&m, &mut p, Change::Extra(Extra::RippleControl, 1)).unwrap();
+    assert_eq!(writes(&p), vec![perf_frame(&[0x42, 1, 1, 0, 0])]);
+    // setDebounceTime(20): the 0x57 write of the payload just read, byte 18 = 20, every other byte echoed
+    p.sent.clear();
+    let mut want = mouse.borrow().config.clone();
+    want[18] = 20;
+    mc::Mchose.change(&m, &mut p, Change::Extra(Extra::Debounce, 20)).unwrap();
+    assert_eq!(writes(&p), vec![write_frame(&want)]);
+    let r = mc::Mchose.read(&m, &mut p, ReadOptions::default()).unwrap();
+    assert_eq!(r.extras.iter().map(|e| e.value).collect::<Vec<_>>(), vec![Some(20), Some(0), Some(1), Some(1)]);
+    assert_eq!(mouse.borrow().config[17], 0x8D, "mode bits and lift-off kept");
+    // a mouse that ignores the performance command: sent 3 times (PERFORMANCE_ATTEMPTS), then an error
+    mouse.borrow_mut().ignore_writes = true;
+    p.sent.clear();
+    assert!(mc::Mchose.change(&m, &mut p, Change::Extra(Extra::MotionSync, 1)).is_err());
+    assert_eq!(writes(&p).len(), 3);
+    // refused before a byte leaves
+    p.sent.clear();
+    for c in [Change::Extra(Extra::Debounce, 21), Change::Extra(Extra::MotionSync, 2), Change::Extra(Extra::Turbo, 1)] {
+        assert!(mc::Mchose.change(&m, &mut p, c).is_err(), "{c:?}");
+    }
+    assert!(p.sent.is_empty());
 }

@@ -26,13 +26,18 @@
 //! Read-only proof: reading needs the host-control ENTRY (command 3, byte 5 = 1), which [`read_request_allowed`] refuses (as
 //! pulsar.rs refuses host control entered); only the exit, the identify, the battery query and flash reads pass.
 //!
-//! Left out on purpose: lift-off (Low / Medium / High = raw 3 / 1 / 2, no millimetre figure), debounce, sleep, motion sync,
-//! angle snapping, ripple, performance mode, sensor mode, DPI light, profile switch (command 15), button mapping, the LCD
-//! clock of the RapidSync dongle (a different collection, report 10), firmware / RSSI / dongle-version reads, the DPI stage
-//! count and active-stage editors. OpenMouse sends no firmware or reset command here and neither does this file.
+//! Order 110 (A_110_02 scope): debounce (0-20 ms, the Terra Pro profile), Motion Sync, angle snapping, ripple control and the
+//! highest-performance mode (flash 181 = 0xB5, the Pulsar cMouse's turbo address: [`Extra::Turbo`]) - each OpenMouse's
+//! setVerifiedByte inside host control: writeCheckedByte, then the pair read back. The read is OpenMouse's readStatus flash
+//! read, `0 .. sensorMode + 2` (187 bytes).
+//!
+//! Left out on purpose: lift-off (Low / Medium / High = raw 3 / 1 / 2, no millimetre figure), sleep, performance duration,
+//! sensor mode, DPI light, profile switch (command 15), button mapping, the LCD clock of the RapidSync dongle (a different
+//! collection, report 10), firmware / RSSI / dongle-version reads, the DPI stage count and active-stage editors. OpenMouse
+//! sends no firmware or reset command here and neither does this file.
 
 use crate::error::{Error, Result};
-use crate::family::{Caps, Changed, DpiCaps, Driver, Family, Matched, OnMouse, Port, ReadOptions, Setting};
+use crate::family::{check_extra, Caps, Change, Changed, DpiCaps, Driver, Extra, ExtraRow, Family, Kind, Matched, OnMouse, Port, ReadOptions, Setting};
 use crate::os::{HidInfo, HidTransfer};
 
 pub const VENDOR_ID: u16 = 0x3554;
@@ -56,6 +61,16 @@ pub const FLASH_REPORT_RATE: u16 = 0;
 pub const FLASH_MAX_DPI_STAGE: u16 = 2;
 pub const FLASH_CURRENT_DPI: u16 = 4;
 pub const FLASH_DPI_VALUES: u16 = 12;
+pub const FLASH_DEBOUNCE: u16 = 169;
+pub const FLASH_MOTION_SYNC: u16 = 171;
+pub const FLASH_ANGLE_SNAP: u16 = 175;
+pub const FLASH_RIPPLE: u16 = 177;
+/// performanceState (Teevolink "Highest performance"; the Pulsar cMouse's turbo at the same address)
+pub const FLASH_PERFORMANCE: u16 = 181;
+/// readStatus: readFlash(reportRate, sensorMode 185 + 2).
+pub const FLASH_READ_LEN: u16 = 187;
+/// The Terra Pro profile's debounce range (ms).
+pub const DEBOUNCE_MAX_MS: i32 = 20;
 /// Terra Pro: four stage records.
 pub const STAGE_COUNT: usize = 4;
 pub const POLLING_RATES: [u32; 7] = [125, 250, 500, 1000, 2000, 4000, 8000];
@@ -381,13 +396,49 @@ fn offline() -> Error {
     Error::BadAnswer("The Teevolution mouse is offline. Move it or click a button, then retry.".into())
 }
 
-/// The part of the flash this app reads: bytes `0..30` in three chunks of ten (OpenMouse reads `0..187` in chunks of ten from 0).
+/// readStatus's flash read: `0 .. sensorMode + 2` in chunks of ten (the last one 7 bytes).
 fn read_settings(port: &mut dyn Port) -> Result<Vec<u8>> {
     let mut f = Vec::new();
-    for a in [0u16, 10, 20] {
-        f.extend(read_flash(port, a, 10)?);
+    let mut a = 0u16;
+    while a < FLASH_READ_LEN {
+        let n = (FLASH_READ_LEN - a).min(10) as u8;
+        f.extend(read_flash(port, a, n)?);
+        a += n as u16;
     }
     Ok(f)
+}
+
+/// readStatus's debounceMs (the raw byte) and the four switches (`=== 1`), in the card's order.
+pub fn extras_from_flash(flash: &[u8]) -> Vec<ExtraRow> {
+    let at = |a: u16| flash.get(a as usize).copied();
+    let on = |a: u16| at(a).map(|v| v == 1);
+    vec![
+        ExtraRow::new(Extra::Debounce, Kind::Range { min: 0, max: DEBOUNCE_MAX_MS, step: 1, unit: "ms" }, at(FLASH_DEBOUNCE).map(i32::from)),
+        ExtraRow::switch(Extra::MotionSync, on(FLASH_MOTION_SYNC)),
+        ExtraRow::switch(Extra::AngleSnap, on(FLASH_ANGLE_SNAP)),
+        ExtraRow::switch(Extra::RippleControl, on(FLASH_RIPPLE)),
+        ExtraRow::switch(Extra::Turbo, on(FLASH_PERFORMANCE)),
+    ]
+}
+
+fn extra_addr(e: Extra) -> u16 {
+    match e {
+        Extra::Debounce => FLASH_DEBOUNCE,
+        Extra::MotionSync => FLASH_MOTION_SYNC,
+        Extra::AngleSnap => FLASH_ANGLE_SNAP,
+        Extra::RippleControl => FLASH_RIPPLE,
+        Extra::Turbo => FLASH_PERFORMANCE,
+    }
+}
+
+/// setVerifiedByte inside host control: writeCheckedByte `[v, 0x55 − v]`, the pair read back, its first byte must be `v`.
+fn set_verified_byte(p: &mut dyn Port, addr: u16, v: u8, what: &str) -> Result<()> {
+    write_flash(p, addr, &[v, 0x55u8.wrapping_sub(v)])?;
+    let now = read_flash(p, addr, 2)?[0];
+    if now != v {
+        return Err(Error::BadAnswer(format!("The mouse did not confirm the requested {what}.")));
+    }
+    Ok(())
 }
 
 /// The enabled stage count and the active stage of a flash image (decodeDpiStageCount; `min(currentDpi, count - 1)`).
@@ -431,11 +482,22 @@ impl Driver for Teevolution {
         let o = FLASH_DPI_VALUES as usize + active * 4;
         r.dpi = decode_dpi(&flash[o..o + 4]);
         r.polling_hz = decode_polling(flash[FLASH_REPORT_RATE as usize]);
+        r.extras = extras_from_flash(&flash);
         if let Some((pct, charging)) = battery {
             r.battery_percent = pct;
             r.charging = Some(charging);
         }
         Ok(r)
+    }
+
+    /// Order 110: setDebounceTime / setMotionSync / setAngleSnapping / setRippleControl / setPerformanceMode - checked before
+    /// a byte leaves, then identify, host control, setVerifiedByte, leave.
+    fn change(&self, _m: &Matched, port: &mut dyn Port, c: Change) -> Result<()> {
+        let Change::Extra(e, v) = c;
+        check_extra(&extras_from_flash(&[]), e, v)?;
+        let addr = extra_addr(e);
+        identify(port)?;
+        with_control(port, ONLINE_TRIES, |p| set_verified_byte(p, addr, v as u8, e.label()))?.ok_or_else(offline)
     }
 
     /// setDpi / setPollingRate inside host control: read, write, read back.

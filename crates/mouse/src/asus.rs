@@ -18,12 +18,15 @@
 //! Safety: a polling change writes the whole rate byte, so it is refused when the stored byte carries anything above the three
 //! rate bits (the "polling booster" nibble of newer firmware); nothing else is overwritten (a DPI write sets one stage).
 //!
+//! Order 110 (A_110_02 scope): debounce (`51 31 03 00 <ms/4 − 1>`, 12-32 ms in 4s) and angle snapping (`51 31 04 00 <on>`), each
+//! followed by the save and the settings read back; read from the settings block (bytes 10 and 12).
+//!
 //! Left out on purpose: lift-off (`51 35 FF 00 FF <0|1>` - OpenMouse offers Low / High with no millimetre figure, and the
-//! command "also resets the surface calibration"), debounce, angle snapping, lighting, profile switch (`50 02`), active-stage
+//! command "also resets the surface calibration"), lighting, profile switch (`50 02`), active-stage
 //! switch (`51 31 09 00 <stage+1>`), the battery (the Gladius II has none), polling above 1000 Hz (needs the Omni booster).
 
 use crate::error::{Error, Result};
-use crate::family::{Caps, Changed, DpiCaps, Driver, Family, Matched, OnMouse, Port, ReadOptions, Setting};
+use crate::family::{check_extra, Caps, Change, Changed, DpiCaps, Driver, Extra, ExtraRow, Family, Kind, Matched, OnMouse, Port, ReadOptions, Setting};
 use crate::os::{HidInfo, HidTransfer};
 
 pub const VENDOR_ID: u16 = 0x0B05;
@@ -81,6 +84,19 @@ pub fn set_polling_request(hz: u32) -> Option<Packet> {
     Some(request(&[0x51, 0x31, DPI_STAGES as u8, 0x00, idx as u8]))
 }
 
+/// Order 110: asusSetDebounceRequest: `51 31 <stages + 1> 00 <ms / 4 − 1>` for ASUS_DEBOUNCE_MS 12, 16 … 32.
+pub fn set_debounce_request(ms: u32) -> Option<Packet> {
+    if !(12..=32).contains(&ms) || !ms.is_multiple_of(4) {
+        return None;
+    }
+    Some(request(&[0x51, 0x31, DPI_STAGES as u8 + 1, 0x00, (ms / 4 - 1) as u8]))
+}
+
+/// Order 110: asusSetAngleSnappingRequest: `51 31 <stages + 2> 00 <on>`.
+pub fn set_angle_snapping_request(on: bool) -> Packet {
+    request(&[0x51, 0x31, DPI_STAGES as u8 + 2, 0x00, on as u8])
+}
+
 /// asusSaveRequest: `50 03`.
 pub fn save_request() -> Packet {
     request(&[0x50, 0x03])
@@ -112,6 +128,9 @@ pub struct Settings {
     /// the whole rate byte (the low three bits are the rate index)
     pub rate_byte: u8,
     pub polling_hz: u32,
+    /// Order 110: debounceMs (raw 2-7 → raw × 4 + 4; else none) and angleSnapping (== 1)
+    pub debounce_ms: Option<u8>,
+    pub angle_snapping: bool,
 }
 
 /// asusDecodeSettings (no booster): `None` for an answer that is not the settings block; an unknown polling value is `None`
@@ -126,7 +145,9 @@ pub fn decode_settings(data: &[u8]) -> Option<Settings> {
     for (i, d) in dpi_stages.iter_mut().enumerate() {
         *d = (u16::from_le_bytes([data[4 + i * 2], data[5 + i * 2]]) as u32 + 1) * DPI_STEP;
     }
-    Some(Settings { dpi_stages, rate_byte, polling_hz })
+    let raw = data[setting_offset(1)];
+    let debounce_ms = (0x02..=0x07).contains(&raw).then(|| raw * 4 + 4);
+    Some(Settings { dpi_stages, rate_byte, polling_hz, debounce_ms, angle_snapping: data[setting_offset(2)] == 0x01 })
 }
 
 /// asusDecodeProfile: (onboard profile 1-based, active DPI stage 0-based); `None` = not a profile answer or a stage outside
@@ -160,6 +181,15 @@ pub fn read_request_allowed(out: &[u8]) -> bool {
         return false;
     }
     [read_settings_request(), read_profile_request()].iter().any(|r| r[..] == out[1..REPORT_LEN])
+}
+
+/// readStatus' debounceMs (the Gladius II has the debounce setting) and angleSnapping, in the card's order (`None` = the
+/// guard's rows). Debounce: ASUS_DEBOUNCE_MS = 12, 16 … 32 ms.
+pub fn extras(s: Option<&Settings>) -> Vec<ExtraRow> {
+    vec![
+        ExtraRow::new(Extra::Debounce, Kind::Range { min: 12, max: 32, step: 4, unit: "ms" }, s.and_then(|s| s.debounce_ms).map(i32::from)),
+        ExtraRow::switch(Extra::AngleSnap, s.map(|s| s.angle_snapping)),
+    ]
 }
 
 pub fn caps() -> Caps {
@@ -214,7 +244,26 @@ impl Driver for Asus {
         r.online = true;
         r.dpi = Some(s.dpi_stages[stage]);
         r.polling_hz = Some(s.polling_hz);
+        r.extras = extras(Some(&s));
         Ok(r)
+    }
+
+    /// Order 110: setDebounceTime / setAngleSnapping - checked before a byte leaves (debounce: one of ASUS_DEBOUNCE_MS; OpenMouse
+    /// would round to the nearest, the card offers only those), the write, the save, the settings read back.
+    fn change(&self, _m: &Matched, port: &mut dyn Port, c: Change) -> Result<()> {
+        let Change::Extra(e, v) = c;
+        check_extra(&extras(None), e, v)?;
+        let req = match e {
+            Extra::Debounce => set_debounce_request(v as u32).ok_or_else(|| Error::range(e.label(), format!("{v} ms")))?,
+            _ => set_angle_snapping_request(v == 1),
+        };
+        exchange(port, &req, 3)?;
+        exchange(port, &save_request(), 2)?;
+        let now = extras(Some(&read_settings(port)?)).into_iter().find(|r| r.extra == e).and_then(|r| r.value);
+        if now != Some(v) {
+            return Err(Error::BadAnswer(format!("the mouse kept {now:?} instead of {v} ({})", e.label())));
+        }
+        Ok(())
     }
 
     /// setDpi: profile (the active stage), the stage's write, the save, the settings read-back. setPollingRate: the write, the

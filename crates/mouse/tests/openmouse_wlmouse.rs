@@ -308,11 +308,15 @@ struct Mouse {
     unsupported: Vec<(u8, u8)>,
     /// answer "pending" this many times first
     pending: u32,
+    /// Order 110: debounce ms; the flags Motion Sync, angle snapping, ripple, turbo; their writes have no effect
+    debounce: u8,
+    flags: [u8; 4],
+    ignore_extra: bool,
 }
 
 impl Mouse {
     fn new() -> Self {
-        Mouse { awake: true, profile: 1, stages: vec![(800, 800), (1600, 1600), (3200, 3200)], active: 2, poll: 0x01, lift: 0x01, charging: 0, percent: 77, ..Default::default() }
+        Mouse { awake: true, profile: 1, stages: vec![(800, 800), (1600, 1600), (3200, 3200)], active: 2, poll: 0x01, lift: 0x01, charging: 0, percent: 77, debounce: 4, flags: [1, 0, 1, 0], ..Default::default() }
     }
     fn reply(&mut self, req: &[u8]) -> Vec<u8> {
         if !self.awake {
@@ -344,6 +348,24 @@ impl Mouse {
             (1, 0x82) => answer(0xa1, page, cmd, &[p, self.active]),
             (1, 0x80) => answer(0xa1, page, cmd, &[p, self.poll]),
             (1, 0x88) => answer(0xa1, page, cmd, &[p, self.lift]),
+            (0, 0x88) => answer(0xa1, page, cmd, &[p, self.debounce]),
+            (1, 0x89) => answer(0xa1, page, cmd, &[p, self.flags[0]]),
+            (1, 0x84) => answer(0xa1, page, cmd, &[p, self.flags[1]]),
+            (1, 0x8a) => answer(0xa1, page, cmd, &[p, self.flags[2]]),
+            (1, 0x93) => answer(0xa1, page, cmd, &[p, self.flags[3]]),
+            (0, 0x08) | (1, 0x09) | (1, 0x04) | (1, 0x0a) | (1, 0x13) => {
+                self.writes.push(req[..7 + len as usize].to_vec());
+                if args[0] == p && !self.ignore_extra {
+                    match (page, cmd) {
+                        (0, _) => self.debounce = args[1],
+                        (_, 0x09) => self.flags[0] = args[1],
+                        (_, 0x04) => self.flags[1] = args[1],
+                        (_, 0x0a) => self.flags[2] = args[1],
+                        _ => self.flags[3] = args[1],
+                    }
+                }
+                answer(0xa1, page, cmd, &[])
+            }
             // writes: the mouse applies them to the active profile only
             (1, 0x00) | (1, 0x08) | (1, 0x01) => {
                 self.writes.push(req[..7 + len as usize].to_vec());
@@ -398,6 +420,12 @@ fn reading_asks_only_what_openmouse_asks() {
         rq(0x02, 1, 0x82, &[1]),
         rq(0x02, 1, 0x80, &[1]),
         rq(0x02, 1, 0x88, &[1]),
+        // Order 110: debounce (device page 0x88), angle snapping 0x84, Motion Sync 0x89, ripple 0x8a, turbo 0x93
+        rq(0x02, 0, 0x88, &[1]),
+        rq(0x02, 1, 0x84, &[1]),
+        rq(0x02, 1, 0x89, &[1]),
+        rq(0x02, 1, 0x8a, &[1]),
+        rq(0x02, 1, 0x93, &[1]),
     ];
     assert_eq!(p.sent.iter().map(|s| s.0.clone()).collect::<Vec<_>>(), want);
     assert!(p.sent.iter().all(|s| s.1 == HidTransfer::Feature { reply_id: 0, reply_len: 65, wait_ms: 30 }));
@@ -623,4 +651,57 @@ fn a_mouse_that_does_not_keep_the_dpi_is_an_error() {
     });
     let e = wl::WlMouse.write(&m, &mut p, Setting::Dpi(2400)).unwrap_err();
     assert!(matches!(e, Error::BadAnswer(_)), "{e:?}");
+}
+
+// ---------------------------------------------------------------- Order 110: debounce, Motion Sync, angle snapping, ripple, turbo
+
+use bu_mouse::family::{Change, Extra, Kind};
+
+#[test]
+fn order_110_read_shows_debounce_and_the_flags_like_openmouse() {
+    let mouse = Rc::new(RefCell::new(Mouse::new()));
+    mouse.borrow_mut().profile = 2;
+    let (m, mut p) = setup(0xa883, None, &mouse);
+    let r = wl::WlMouse.read(&m, &mut p, ReadOptions::default()).unwrap();
+    // readStatus: debounceMs = debounce[1]; angleSnapping / motionSync / rippleControl / turboMode = reply[1] === 1
+    let sent: Vec<Vec<u8>> = p.sent.iter().map(|s| s.0.clone()).collect();
+    assert_eq!(sent[7..], [rq(0x02, 0, 0x88, &[2]), rq(0x02, 1, 0x84, &[2]), rq(0x02, 1, 0x89, &[2]), rq(0x02, 1, 0x8a, &[2]), rq(0x02, 1, 0x93, &[2])]);
+    let got: Vec<(Extra, Option<i32>)> = r.extras.iter().map(|x| (x.extra, x.value)).collect();
+    assert_eq!(got, vec![(Extra::Debounce, Some(4)), (Extra::MotionSync, Some(1)), (Extra::AngleSnap, Some(0)), (Extra::RippleControl, Some(1)), (Extra::Turbo, Some(0))]);
+    assert_eq!(r.extras[0].kind, Kind::Range { min: 0, max: 15, step: 1, unit: "ms" });
+    assert!(p.sent.iter().all(|s| wl::read_request_allowed(&s.0)));
+    // an unsupported read leaves its row without a value
+    mouse.borrow_mut().unsupported = vec![(1, 0x93)];
+    let (m, mut p) = setup(0xa883, None, &mouse);
+    assert_eq!(wl::WlMouse.read(&m, &mut p, ReadOptions::default()).unwrap().extra(Extra::Turbo), None);
+}
+
+#[test]
+fn order_110_changes_are_openmouses_setflag_and_setdebouncetime_bytes() {
+    let mouse = Rc::new(RefCell::new(Mouse::new()));
+    mouse.borrow_mut().profile = 2;
+    let (m, mut p) = setup(0xa883, None, &mouse);
+    // currentProfile (0x85), write(page, command, profile, [value]) = length 2 `[profile, value]`, then the read-back
+    for (c, write, read) in [
+        (Change::Extra(Extra::Debounce, 15), rq(0x02, 0, 0x08, &[2, 15]), rq(0x02, 0, 0x88, &[2])),
+        (Change::Extra(Extra::MotionSync, 0), rq(0x02, 1, 0x09, &[2, 0]), rq(0x02, 1, 0x89, &[2])),
+        (Change::Extra(Extra::AngleSnap, 1), rq(0x02, 1, 0x04, &[2, 1]), rq(0x02, 1, 0x84, &[2])),
+        (Change::Extra(Extra::RippleControl, 0), rq(0x02, 1, 0x0a, &[2, 0]), rq(0x02, 1, 0x8a, &[2])),
+        (Change::Extra(Extra::Turbo, 1), rq(0x02, 1, 0x13, &[2, 1]), rq(0x02, 1, 0x93, &[2])),
+    ] {
+        p.sent.clear();
+        wl::WlMouse.change(&m, &mut p, c).unwrap_or_else(|e| panic!("{c:?}: {e}"));
+        assert_eq!(p.sent.iter().map(|s| s.0.clone()).collect::<Vec<_>>(), vec![rq(0x01, 0, 0x85, &[]), write.clone(), read], "{c:?}");
+        assert!(!wl::read_request_allowed(&write), "{c:?}");
+    }
+    assert_eq!((mouse.borrow().debounce, mouse.borrow().flags), (15, [0, 1, 0, 1]));
+    // turbo needs high-speed mode on the mouse: one that leaves it off is an error, as in OpenMouse
+    mouse.borrow_mut().ignore_extra = true;
+    assert!(matches!(wl::WlMouse.change(&m, &mut p, Change::Extra(Extra::Turbo, 0)), Err(Error::BadAnswer(_))));
+    // refused before a byte leaves
+    p.sent.clear();
+    for c in [Change::Extra(Extra::Debounce, 16), Change::Extra(Extra::Turbo, 2), Change::Extra(Extra::MotionSync, -1)] {
+        assert!(wl::WlMouse.change(&m, &mut p, c).is_err(), "{c:?}");
+    }
+    assert!(p.sent.is_empty());
 }

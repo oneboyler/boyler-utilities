@@ -23,7 +23,7 @@ use bu_mouse::accel::panel::{rows, value_text, visible_rows, CapType, Curve, Fie
 use bu_mouse::accel::service::{header_line, RawAccelStatus, INSTALL_TEXT, INSTALL_TITLE};
 use bu_mouse::accel::switch::{PerApp, PresetId, RowId, Target};
 use bu_mouse::cursors::{Role, SetId};
-use bu_mouse::family::{lift_off_label, polling_chips, Caps};
+use bu_mouse::family::{lift_off_label, polling_chips, Caps, Change, Extra, ExtraRow, Kind};
 use bu_mouse::settings::{double_click_ms_for_step, double_click_step_for_ms, ScrollLines};
 
 use crate::anim::EASE;
@@ -53,6 +53,9 @@ const K_DPI: Key = key("cur.dpi");
 const K_DPIN: Key = key("cur.dpin");
 const K_HZ: Key = key("cur.hz");
 const K_LOD: Key = key("cur.lod");
+/// Order 110: Debounce time's − / value / + (`idx(K_DEB, 0..3)`) and the switches under it (`ext_key(e)`)
+const K_DEB: Key = key("cur.deb");
+const K_EXT: Key = key("cur.ext");
 const K_AC: Key = key("cur.ac");
 const K_ACH: Key = key("cur.ach");
 const K_ACT: Key = key("cur.act");
@@ -108,6 +111,18 @@ fn boxes(n: usize) -> segx::SegOpts {
 const CURVES: [Curve; 6] = Curve::ALL;
 /// The roles' names in the bubbles (`CROLES`) and the picker title (`CLONG`).
 const ROLE_TITLE: [&str; 7] = ["Normal", "Link", "Text", "Busy", "Working in background", "Move", "Resize"];
+
+/// Order 110 / 114: Debounce time's − / value / + (three equal boxes, nothing picked: a stepper made of the DPI row's piece), as
+/// wide as the LAST TWO button columns (2 x 58 + the 2 x 2 padding), so its boxes' edges are the 1600 box's left edge and the
+/// last box's right edge. No side padding: a two-digit value fits a third of it.
+const STEP3: segx::SegOpts = segx::SegOpts { px: 0.0, min_w: 2.0 * BOX_W + 4.0, ..segx::BASE };
+/// One third of the stepper (the columns are equal): what the value's words must fit in.
+const STEP_CELL_W: f32 = (2.0 * BOX_W) / 3.0;
+
+/// Order 110: a switch row's key.
+fn ext_key(e: Extra) -> Key {
+    idx(K_EXT, e as usize)
+}
 
 /// The app picker's games (`RAPPS`): id, name, glyph, tile gradient, the exe the per-app switch watches.
 struct Game {
@@ -226,6 +241,8 @@ pub struct Mouse {
     store_getting: Option<String>,
     /// Order 090: the big mouse picture + the button window + Click sounds
     btns: btns::Btns,
+    /// Order 110: a change of a row under Lift-off is on its way (clicks on those rows wait for its answer)
+    ext_pending: bool,
 }
 
 impl Mouse {
@@ -251,6 +268,8 @@ impl Mouse {
             self.v.win = win;
         }
         self.reading = r.reading_mouse;
+        // Order 110: the worker answered (its answers come in order): the rows are clickable again
+        self.ext_pending = false;
         if !self.panel_from_worker {
             self.panel = self.v.panel.clone();
             self.per_app = self.v.per_app.clone();
@@ -406,6 +425,17 @@ impl Mouse {
                 let ls = segx::seg_ex(cx, K_LOD, &llab, li, &boxes(lod_chips.len()));
                 rows.push(group::row(false, vec![group::lbl("Lift-off distance", None), group::ctl(vec![ls])]));
             }
+            // Order 110 (A_110_02): under Lift-off, the rows the mouse's driver has - Debounce time (− 4 ms +), Motion Sync,
+            // Angle Snap, Ripple Control, Turbo Mode - in the same row style
+            // Order 114 (A_110_03): the debounce is one row; the switches go two to a row (a lone one takes the left half)
+            let extras = self.extras().to_vec();
+            for r in extras.iter().filter(|r| !matches!(r.kind, Kind::Switch)) {
+                rows.push(self.extra_row(cx, r));
+            }
+            let switches: Vec<&ExtraRow> = extras.iter().filter(|r| matches!(r.kind, Kind::Switch)).collect();
+            for pair in switches.chunks(2) {
+                rows.push(self.switch_row(cx, pair[0], pair.get(1).copied()));
+            }
         } else {
             // a mouse the app can't talk to yet: `.ci.dim{background:var(--ctl);box-shadow:inset 0 0 0 .5px var(--hair)}`
             // `.ci.dim svg{stroke:var(--fg2)}`; `.ct{gap:7px}` name · `.ymd{color:var(--fg3);font-weight:400}` "—" · the link
@@ -430,7 +460,10 @@ impl Mouse {
         }
         // mouse-v9: two columns - the mouse (left, no panel) and the card (right); the mouse is as tall as the card, centred to it
         let test = self.test || self.fake;
-        let split = El::row().center().gap(4.0).child(self.btns.picture(cx, test)).child(group::grp(rows).flex1().min_w(0.0).key(K_CARD));
+        // Order 114 (A_110_03): the picture is as tall as the card (never shorter than the card of DPI + Polling + Lift-off),
+        // top on the card's top, bottom on its bottom: the card = the head (58) + 42 per other row
+        let card_h = 58.0 + 42.0 * (rows.len().max(1) - 1) as f32;
+        let split = El::row().center().gap(4.0).child(self.btns.picture(cx, test, card_h.max(btns::PIC_H))).child(group::grp(rows).flex1().min_w(0.0).key(K_CARD));
         // the drawing leaves 30 px under the columns (the hint sits in it) before the next card
         let mut out = El::block().child(gh).child(split).margin(0.0, 0.0, 30.0, 0.0);
         // Order 061: every other mouse Windows lists, named, with its VID:PID (so an unknown mouse can be reported)
@@ -479,6 +512,83 @@ impl Mouse {
         let on = ((cx.now / 530.0) as i64) % 2 == 0;
         let x = BOX_W / 2.0 + cx.g.text_width(t, f) / 2.0;
         b.child(El::block().abs(x.round(), 5.0, f32::NAN, f32::NAN).size(1.0, 14.0).bg(if on { FG() } else { Rgba(0.0, 0.0, 0.0, 0.0) }).no_hit())
+    }
+
+    /// Order 110: the rows under Lift-off as the mouse's driver read them (empty for a mouse without them).
+    fn extras(&self) -> &[ExtraRow] {
+        self.v.on_mouse.as_ref().map(|o| o.extras.as_slice()).unwrap_or(&[])
+    }
+
+    /// One row under Lift-off: a range = − value + (a click on − / + = one step, inside the mouse's own limits), a switch =
+    /// the app's switch. A value the mouse did not answer shows "—" / a greyed switch.
+    fn extra_row(&self, cx: &mut Cx, r: &ExtraRow) -> El {
+        let ctl = match &r.kind {
+            Kind::Range { .. } | Kind::Steps { .. } => {
+                let mut mid = r.value.map(|v| r.kind.words(v)).unwrap_or_else(|| "\u{2014}".to_string());
+                // a three-digit value ("255 ms") would not fit a third of the stepper: the unit sits close to it
+                if cx.g.text_width(&mid, Font::new(13.0, 400)) > STEP_CELL_W {
+                    mid = mid.replace(' ', "");
+                }
+                let labs = [Label::Text("\u{2212}"), Label::Text(mid.as_str()), Label::Text("+")];
+                segx::seg_ex(cx, K_DEB, &labs, None, &STEP3)
+            }
+            Kind::Switch => toggle::toggle(cx, ext_key(r.extra), r.value == Some(1), r.value.is_none()),
+        };
+        group::row(false, vec![group::lbl(r.extra.label(), None), group::ctl(vec![ctl])])
+    }
+
+    /// Order 114 (A_110_03): one row of up to two switches - label left, switch at the half's right end, a thin divider between the
+    /// halves (the right switch ends where the other rows' buttons end). A lone switch takes the left half (the divider stays,
+    /// invisible, so the half is as wide as in a full row).
+    fn switch_row(&self, cx: &mut Cx, a: &ExtraRow, b: Option<&ExtraRow>) -> El {
+        let mut half = |r: &ExtraRow| {
+            El::row()
+                .center()
+                .gap(12.0)
+                .flex1()
+                .min_w(0.0)
+                .child(group::lbl(r.extra.label(), None))
+                .child(group::ctl(vec![toggle::toggle(cx, ext_key(r.extra), r.value == Some(1), r.value.is_none())]))
+        };
+        let left = half(a);
+        let right = match b {
+            Some(b) => half(b),
+            None => El::block().flex1().min_w(0.0),
+        };
+        let line = if b.is_some() { HAIR() } else { Rgba(0.0, 0.0, 0.0, 0.0) };
+        group::row(false, vec![left, El::block().none().size(1.0, 24.0).bg(line).no_hit(), right])
+    }
+
+    /// A click on a row under Lift-off: − / + step the debounce (nothing past the mouse's limits), a switch flips. One write.
+    fn click_extra(&mut self, k: Key) -> bool {
+        // a click while the last change is still on its way would send the same value again (both start from the last read)
+        let mine = (0..3).any(|i| k == idx(K_DEB, i)) || self.extras().iter().any(|r| k == ext_key(r.extra));
+        if mine && self.ext_pending {
+            return true;
+        }
+        for r in self.extras().to_vec() {
+            match r.kind {
+                Kind::Range { .. } | Kind::Steps { .. } if (0..3).any(|i| k == idx(K_DEB, i)) => {
+                    // − / + = the next value the mouse takes (the value box itself does nothing)
+                    if let (Some(v), true) = (r.value, k != idx(K_DEB, 1)) {
+                        if let Some(to) = r.kind.step(v, k == idx(K_DEB, 2)) {
+                            self.send(Cmd::Change(Change::Extra(r.extra, to)));
+                            self.ext_pending = true;
+                        }
+                    }
+                    return true;
+                }
+                Kind::Switch if k == ext_key(r.extra) => {
+                    if let Some(v) = r.value {
+                        self.send(Cmd::Change(Change::Extra(r.extra, 1 - v.clamp(0, 1))));
+                        self.ext_pending = true;
+                    }
+                    return true;
+                }
+                _ => {}
+            }
+        }
+        false
     }
 
     // ================================================================== ACCELERATION
@@ -2195,6 +2305,9 @@ impl Mouse {
 
     fn click(&mut self, k: Key, now: f64, cx: &mut Cx) {
         if self.store_clicked(k, cx) {
+            return;
+        }
+        if self.click_extra(k) {
             return;
         }
         if let Some((_, ticks)) = &mut self.reset {

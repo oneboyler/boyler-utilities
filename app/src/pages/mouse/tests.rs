@@ -167,7 +167,7 @@ fn dpi_polling_lift_off_go_to_the_mouse_and_stay_out_of_the_change_log() {
     assert_eq!(toast(&m), Some("DPI 800 · saved on the mouse"));
     click(&mut m, idx(K_HZ, 2));
     assert_eq!(m.v.on_mouse.as_ref().unwrap().polling_hz, Some(4000));
-    click(&mut m, idx(K_LOD, 1));
+    click(&mut m, idx(K_LOD, 2));
     assert_eq!(m.v.on_mouse.as_ref().unwrap().lift_off, Some(20));
     // a typed DPI: the nearest value the mouse stores (10-DPI steps up to 10240; Order 042)
     typed(&mut m, K_DPIN, "1234", 0x0D);
@@ -751,15 +751,63 @@ fn the_mouse_is_the_cards_height_and_the_buttons_line_up_in_columns() {
     let l = render_page(&mut m, None);
     let card = l.rect_of(K_CARD).expect("card");
     let wheel = l.rect_of(idx(btns::K_MB, 2)).expect("wheel");
-    assert!((card.3 - btns::PIC_H).abs() < 0.5, "the card is {} px tall, the picture {}", card.3, btns::PIC_H);
+    // Order 114 (A_110_03): the picture is exactly as tall as the card, top on top, bottom on bottom
+    let pic = l.rect_of(btns::K_PIC).expect("the picture's column");
+    assert!((pic.1 - card.1).abs() < 0.5 && (pic.1 + pic.3 - card.1 - card.3).abs() < 0.5, "picture {pic:?} vs card {card:?}");
     assert!(wheel.1 > card.1 && wheel.1 < card.1 + card.3, "the wheel is beside the card");
     let col = |k: Key, i: usize| l.rect_of(idx(k, i)).unwrap_or_else(|| panic!("box {i}"));
     for i in 0..4 {
         let (d, h) = (col(K_DPI, i), col(K_HZ, i));
         assert!((d.0 - h.0).abs() < 0.5 && (d.2 - 58.0).abs() < 0.5 && (h.2 - 58.0).abs() < 0.5, "column {i}: dpi {d:?} polling {h:?}");
     }
-    let (lo, d2) = (col(K_LOD, 1), col(K_DPI, 3));
+    let (lo, d2) = (col(K_LOD, 2), col(K_DPI, 3));
     assert!((lo.0 - d2.0).abs() < 0.5 && (lo.2 - 58.0).abs() < 0.5, "lift-off {lo:?} vs {d2:?}");
+    // Order 114: the debounce's − / value / + start where the 1600 box starts and end where the last box ends
+    let (d0, d2b) = (col(K_DEB, 0), col(K_DEB, 2));
+    let (c2, c3) = (col(K_DPI, 2), col(K_DPI, 3));
+    assert!((d0.0 - c2.0).abs() < 0.5, "debounce left {d0:?} vs the 1600 box {c2:?}");
+    assert!((d2b.0 + d2b.2 - c3.0 - c3.2).abs() < 0.5, "debounce right {d2b:?} vs the last box {c3:?}");
+}
+
+/// Order 114 (A_110_03): the four switches go two to a row - Motion Sync | Angle Snap, Ripple Control | Turbo Mode - the right
+/// switch ends on the same right edge as the buttons above, the halves are equal.
+#[test]
+fn the_switches_stand_two_to_a_row() {
+    let mut m = opened();
+    let l = render_page(&mut m, None);
+    let r = |e: Extra| l.rect_of(ext_key(e)).unwrap_or_else(|| panic!("{e:?}"));
+    let (ms, an, rp, tb) = (r(Extra::MotionSync), r(Extra::AngleSnap), r(Extra::RippleControl), r(Extra::Turbo));
+    assert!((ms.1 - an.1).abs() < 0.5 && (rp.1 - tb.1).abs() < 0.5 && rp.1 > ms.1 + 20.0, "two rows: {ms:?} {an:?} {rp:?} {tb:?}");
+    assert!((ms.0 - rp.0).abs() < 0.5 && (an.0 - tb.0).abs() < 0.5, "the columns of the two rows are the same");
+    let last = l.rect_of(idx(K_DPI, 3)).expect("last dpi box");
+    // (a box sits 2 px inside its segmented control, whose right edge is the row's content edge)
+    assert!((an.0 + an.2 - (last.0 + last.2 + 2.0)).abs() < 0.5, "the right switch ends where the buttons end: {an:?} vs {last:?}");
+    let card = l.rect_of(K_CARD).expect("card");
+    assert!(ms.0 + ms.2 < card.0 + card.2 / 2.0 + 1.0 && an.0 > card.0 + card.2 / 2.0, "halves: {ms:?} | {an:?} in {card:?}");
+    // the card: head + DPI + Polling + Lift-off + Debounce + 2 switch rows
+    assert!((card.3 - (58.0 + 6.0 * 42.0)).abs() < 0.5, "card height {}", card.3);
+}
+
+/// Order 114: a mouse with fewer of these settings - a lone switch takes the left half (the pair's left column).
+#[test]
+fn a_lone_switch_takes_the_left_half() {
+    let mut m = opened();
+    let full_l = render_page(&mut m, None);
+    let full = full_l.rect_of(ext_key(Extra::MotionSync)).expect("motion sync");
+    if let Some(o) = m.v.on_mouse.as_mut() {
+        o.extras.retain(|r| matches!(r.extra, Extra::Debounce | Extra::MotionSync));
+    }
+    let l = render_page(&mut m, None);
+    let one = l.rect_of(ext_key(Extra::MotionSync)).expect("lone motion sync");
+    // (a shorter card makes a smaller picture, so the card is wider: compare to the card's middle)
+    let off = |l: &crate::ui::lay::Laid, r: (f32, f32, f32, f32)| {
+        let c = l.rect_of(K_CARD).expect("card");
+        c.0 + c.2 / 2.0 - (r.0 + r.2)
+    };
+    assert!((off(&l, one) - off(&full_l, full)).abs() < 0.5 && (one.2 - full.2).abs() < 0.5, "same place in its half: {one:?} vs {full:?}");
+    assert!(l.rect_of(ext_key(Extra::AngleSnap)).is_none());
+    let card = l.rect_of(K_CARD).expect("card");
+    assert!((card.3 - (58.0 + 5.0 * 42.0)).abs() < 0.5, "card height {}", card.3);
 }
 
 /// Order 097 (mouse-v9: `margin-top:30px` on the next card): 30 px between the Your mouse card and Mouse acceleration, the
@@ -793,7 +841,7 @@ fn a_mouse_gets_only_the_rows_its_driver_supports() {
     let mut p = opened();
     let l = render_page(&mut p, None);
     assert!(l.rect_of(idx(K_HZ, 3)).is_some() && l.rect_of(idx(K_LOD, 1)).is_some());
-    assert_eq!(p.chips(), (vec![1000, 2000, 4000, 8000], vec![10, 20]));
+    assert_eq!(p.chips(), (vec![1000, 2000, 4000, 8000], vec![7, 10, 20]), "Order 110: 0.7 mm too");
 }
 
 /// Order 104 proof pictures (`BU_PIC_OUT=<folder> cargo test -p bu-app proof_104 -- --ignored`): "Your mouse" for the X2
@@ -1168,4 +1216,136 @@ fn proof_066_pictures() {
         with_cx(|cx| el = Some(m.store_window(cx).unwrap()));
         crate::ui::lay::proof_png(El::block().w(crate::ui::WIN_W).h(crate::ui::WIN_H).child(el.unwrap()), crate::ui::WIN_W, crate::ui::WIN_H, 1.5, "066_get_more.png");
     }
+}
+
+/// The top of the laid-out text `s` (it must be there).
+fn text_y(l: &crate::ui::lay::Laid, s: &str) -> f32 {
+    text_rect(l, s).1
+}
+
+/// Order 110 (A_110_02): under Lift-off distance, in this order and in the same card, the rows the mouse's driver has:
+/// Debounce time (− 4 ms +), Motion Sync, Angle Snap, Ripple Control, Turbo Mode; Lift-off gets its 0.7 mm box.
+#[test]
+fn the_rows_under_lift_off_are_the_ones_the_mouse_has() {
+    let mut m = opened();
+    let l = render_page(&mut m, None);
+    let card = l.rect_of(K_CARD).expect("card");
+    assert!(has_text(&l, "0.7 mm") && has_text(&l, "1 mm") && has_text(&l, "2 mm"));
+    let names = ["Lift-off distance", "Debounce time", "Motion Sync", "Angle Snap", "Ripple Control", "Turbo Mode"];
+    let ys: Vec<f32> = names.iter().map(|n| text_y(&l, n)).collect();
+    // (Order 114: Motion Sync | Angle Snap and Ripple Control | Turbo Mode share a row each)
+    assert!(ys.windows(2).all(|w| w[1] >= w[0]) && ys[2] > ys[1] && ys[4] > ys[3], "in this order under Lift-off: {ys:?}");
+    assert!(ys.iter().all(|y| *y > card.1 && *y < card.1 + card.3), "all in the card");
+    assert!(has_text(&l, "4 ms"), "the owner's debounce");
+    let inside = |r: (f32, f32, f32, f32)| r.0 >= card.0 && r.0 + r.2 <= card.0 + card.2 + 0.5;
+    for i in 0..3 {
+        assert!(l.rect_of(idx(K_DEB, i)).is_some_and(inside), "debounce − / value / +: {i}");
+    }
+    for e in [Extra::MotionSync, Extra::AngleSnap, Extra::RippleControl, Extra::Turbo] {
+        assert!(l.rect_of(ext_key(e)).is_some_and(inside), "{e:?} switch");
+    }
+    // nothing of the dropped ideas
+    for t in ["DPI stages", "Rotation", "DPI light", "125", "250"] {
+        assert!(!has_text(&l, t), "{t}");
+    }
+    // the X3 Medium's client has no turbo: four rows; the mouse the app can't talk to: none
+    let mut x3 = opened_with(svc::Sample { xs1_mouse: true, ..Default::default() });
+    let l = render_page(&mut x3, None);
+    assert!(has_text(&l, "Debounce time") && has_text(&l, "Ripple Control") && !has_text(&l, "Turbo Mode"));
+    let mut un = opened_with(svc::Sample { unsupported_mouse: true, ..Default::default() });
+    let l = render_page(&mut un, None);
+    assert!(!has_text(&l, "Debounce time") && !has_text(&l, "Motion Sync"));
+}
+
+/// Order 110: one click = one write on the mouse, read back; − / + step the debounce inside the mouse's range; nothing goes
+/// into the change log (the mouse's own memory, like DPI).
+#[test]
+fn a_click_on_a_row_writes_it_to_the_mouse_once() {
+    let _s = Sv::start();
+    let mut m = opened();
+    let val = |m: &Mouse, e: Extra| m.v.on_mouse.as_ref().and_then(|o| o.extra(e));
+    click(&mut m, idx(K_DEB, 2));
+    assert_eq!(val(&m, Extra::Debounce), Some(5));
+    assert_eq!(toast(&m), Some("Debounce time 5 ms · saved on the mouse"));
+    click(&mut m, idx(K_DEB, 0));
+    click(&mut m, idx(K_DEB, 0));
+    assert_eq!(val(&m, Extra::Debounce), Some(3));
+    click(&mut m, ext_key(Extra::MotionSync));
+    assert_eq!(val(&m, Extra::MotionSync), Some(1));
+    assert_eq!(toast(&m), Some("Motion Sync On · saved on the mouse"));
+    for e in [Extra::AngleSnap, Extra::RippleControl, Extra::Turbo] {
+        click(&mut m, ext_key(e));
+        assert_eq!(val(&m, e), Some(1), "{e:?}");
+    }
+    click(&mut m, ext_key(Extra::Turbo));
+    assert_eq!(val(&m, Extra::Turbo), Some(0));
+    assert_eq!(toast(&m), Some("Turbo Mode Off · saved on the mouse"));
+    // the value box itself does nothing; − at 0 sends nothing
+    click(&mut m, idx(K_DEB, 1));
+    for _ in 0..4 {
+        click(&mut m, idx(K_DEB, 0));
+    }
+    assert_eq!(val(&m, Extra::Debounce), Some(0));
+    assert_eq!(toast(&m), Some("Debounce time 0 ms · saved on the mouse"));
+    assert!(crate::services::with(|s| crate::undo::records(&s.store, Some("cur"))).unwrap().is_empty());
+}
+
+/// Order 110 proof pictures (`BU_PIC_OUT=<folder> cargo test -p bu-app proof_110 -- --ignored`): the Mouse page for the X2
+/// CrazyLight (all five rows) and the X3 Medium (four), at Windows scale 1.0 and 1.25 (the 600 x 520 menu on a 1920x1080 /
+/// 3440x1440 screen).
+#[test]
+#[ignore]
+fn proof_110_rows_under_lift_off() {
+    if std::env::var("BU_PIC_OUT").is_err() {
+        return;
+    }
+    let _s = Sv::start();
+    for (name, sample) in [("x2_crazylight", svc::Sample::default()), ("x3_medium", svc::Sample { xs1_mouse: true, ..Default::default() })] {
+        let mut m = opened_with(sample);
+        for (screen, scale) in [("1920x1080", 1.0f32), ("3440x1440", 1.25)] {
+            let g = Gfx::new(1.0);
+            let mut st = State::default();
+            let mut cx = Cx::new(0.0, false, &g, &mut st);
+            let page = |m: &mut Mouse, cx: &mut Cx| El::block().w(600.0).pad(2.0, 26.0, 18.0, 26.0).children(m.build(cx));
+            let h = crate::ui::lay::Laid::new(&g, page(&mut m, &mut cx), 600.0, None).height.ceil();
+            let root = page(&mut m, &mut cx);
+            crate::ui::lay::proof_png(root, 600.0, h, scale, &format!("110_{name}_{screen}.png"));
+        }
+    }
+}
+
+/// Order 114 proof pictures (`BU_PIC_OUT=<folder> cargo test -p bu-app --bins proof_114 -- --ignored`): the X2 CrazyLight card
+/// (switches two to a row, Debounce on the last two columns, the picture as tall as the card) at 1920x1080 / 3440x1440.
+#[test]
+#[ignore]
+fn proof_114_card_layout() {
+    if std::env::var("BU_PIC_OUT").is_err() {
+        return;
+    }
+    let _s = Sv::start();
+    let mut m = opened();
+    for (screen, scale) in [("1920x1080", 1.0f32), ("3440x1440", 1.25)] {
+        let g = Gfx::new(1.0);
+        let mut st = State::default();
+        let mut cx = Cx::new(0.0, false, &g, &mut st);
+        let page = |m: &mut Mouse, cx: &mut Cx| El::block().w(600.0).pad(2.0, 26.0, 18.0, 26.0).children(m.build(cx));
+        let h = crate::ui::lay::Laid::new(&g, page(&mut m, &mut cx), 600.0, None).height.ceil();
+        let root = page(&mut m, &mut cx);
+        crate::ui::lay::proof_png(root, 600.0, h, scale, &format!("114_x2_crazylight_{screen}.png"));
+    }
+}
+
+/// Order 110 review: two quick clicks before the mouse is read back = one write (both would start from the same read).
+#[test]
+fn a_second_click_before_the_read_back_sends_nothing() {
+    let _s = Sv::start();
+    let mut m = opened();
+    with_cx(|cx| {
+        m.event(&Ev::Click(idx(K_DEB, 2)), cx);
+        m.event(&Ev::Click(idx(K_DEB, 2)), cx);
+    });
+    settle(&mut m);
+    assert_eq!(m.v.on_mouse.as_ref().and_then(|o| o.extra(Extra::Debounce)), Some(5), "4 + one step, not two writes of 5");
+    click(&mut m, idx(K_DEB, 2));
+    assert_eq!(m.v.on_mouse.as_ref().and_then(|o| o.extra(Extra::Debounce)), Some(6), "clickable again after the answer");
 }

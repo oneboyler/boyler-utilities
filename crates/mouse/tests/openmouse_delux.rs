@@ -9,7 +9,7 @@
 //! 46-48, 0x40 at 44, 0x02 at 49, `[50]` `[51]` the sum of bytes 3..49 (big endian); 56 bytes in all (52 over the cable).
 
 use bu_mouse::delux as dx;
-use bu_mouse::family::{Driver, Family, ReadOptions, Setting};
+use bu_mouse::family::{Change, Driver, Extra, Family, ReadOptions, Setting};
 use bu_mouse::fake::{hid_info, ScriptPort};
 use bu_mouse::os::{HidInfo, HidTransfer};
 use std::cell::RefCell;
@@ -458,4 +458,44 @@ fn a_dpi_the_mouse_would_read_back_as_another_is_refused_and_nothing_is_sent() {
     assert!(p.sent.is_empty());
     // a neighbour that is fine still works
     assert_eq!(dx::Delux.write(&m, &mut p, Setting::Dpi(20400)).unwrap().now, 20400);
+}
+
+// ---------------------------------------------------------------- Order 110: angle snapping and ripple control
+
+#[test]
+fn angle_snapping_and_ripple_are_the_tables_bytes_3_and_4() {
+    // readStatus: angleSnapping = table[3] === 1 (off), rippleControl = table[4] === 1 (on)
+    let mouse = new_mouse();
+    let (m, mut p) = setup(0xfa60, mouse.clone());
+    let r = d_read(&m, &mut p);
+    assert_eq!(r.extras.iter().map(|e| (e.extra, e.value)).collect::<Vec<_>>(), vec![(Extra::AngleSnap, Some(0)), (Extra::RippleControl, Some(1))]);
+    // setAngleSnapping(true): writeDpiTable with [3] = 1 → checksum 3944 + 1 = 3945 = 0x0F69; read, write, read back
+    p.sent.clear();
+    dx::Delux.change(&m, &mut p, Change::Extra(Extra::AngleSnap, 1)).unwrap();
+    let mut want = factory();
+    want[3] = 1;
+    want[50] = 0x0f;
+    want[51] = 0x69;
+    let mut padded = want.clone();
+    padded.resize(262, 0);
+    assert_eq!(p.sent.len(), 3);
+    assert_eq!(p.sent[1], (padded, HidTransfer::FeatureOut));
+    assert_eq!(mouse.borrow().table, want);
+    // setRippleControl(false): [4] = 0 → 3945 − 1 = 3944 = 0x0F68
+    dx::Delux.change(&m, &mut p, Change::Extra(Extra::RippleControl, 0)).unwrap();
+    want[4] = 0;
+    want[51] = 0x68;
+    assert_eq!(mouse.borrow().table, want);
+    let r = d_read(&m, &mut p);
+    assert_eq!((r.extra(Extra::AngleSnap), r.extra(Extra::RippleControl), r.dpi), (Some(1), Some(0), Some(1600)));
+    // a mouse that ignores it
+    mouse.borrow_mut().ignore_writes = true;
+    assert!(dx::Delux.change(&m, &mut p, Change::Extra(Extra::RippleControl, 1)).is_err());
+    // refused before a byte leaves: the cable (its table is held back), values and settings OpenMouse does not take here
+    let (m, mut p) = setup(0xfa55, new_mouse());
+    assert!(d_read(&m, &mut p).extras.is_empty(), "the cable reads nothing");
+    for c in [Change::Extra(Extra::AngleSnap, 1), Change::Extra(Extra::RippleControl, 0), Change::Extra(Extra::AngleSnap, 2), Change::Extra(Extra::MotionSync, 1), Change::Extra(Extra::Debounce, 4)] {
+        assert!(dx::Delux.change(&m, &mut p, c).is_err(), "{c:?}");
+    }
+    assert!(p.sent.is_empty());
 }

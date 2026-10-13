@@ -332,7 +332,8 @@ fn pro_max_wired_read() {
     assert_eq!((m.model, m.wireless), (Some("VXE R1 Pro Max"), Some(false)));
     let r = read(&m, &mut p);
     // OpenMouse: identify, battery, system row, the active stage, lift-off (the polling rate is byte 0 of the system row)
-    assert_eq!(sent(&p), vec![id_req(), batt_req(), rd_system6(), rd_stage1(), rd_lift()]);
+    // (the Order 110 advanced-block read follows: see the order 110 tests)
+    assert_eq!(sent(&p)[..5], [id_req(), batt_req(), rd_system6(), rd_stage1(), rd_lift()]);
     assert!(p.sent.iter().all(|(_, how)| matches!(how, HidTransfer::OutputThenInput { .. })));
     assert_eq!(
         r,
@@ -346,6 +347,7 @@ fn pro_max_wired_read() {
             lift_off: Some(10),
             wireless: Some(false),
             caps: r.caps.clone(),
+            extras: r.extras.clone(),
         }
     );
     assert_eq!(r.caps.dpi, Some(atk::dpi_caps(Sensor::Paw3395)));
@@ -357,7 +359,8 @@ fn pro_max_receiver_read_is_the_same_reads() {
     let (m, mut p, _) = hid_port(COMPX, 0xF58A, HidMouse::new((2, 27)));
     assert_eq!((m.model, m.wireless), (Some("VXE R1 Pro Max"), Some(true)));
     let r = read(&m, &mut p);
-    assert_eq!(sent(&p), vec![id_req(), batt_req(), rd_system6(), rd_stage1(), rd_lift()]);
+    // (the Order 110 advanced-block read follows: see the order 110 tests)
+    assert_eq!(sent(&p)[..5], [id_req(), batt_req(), rd_system6(), rd_stage1(), rd_lift()]);
     assert_eq!((r.dpi, r.polling_hz, r.lift_off, r.online, r.wireless), (Some(800), Some(1000), Some(10), true, Some(true)));
 }
 
@@ -403,7 +406,7 @@ fn se_receiver_read_asks_if_the_mouse_is_online_and_reads_the_live_row() {
     assert_eq!((m.model, m.wireless), (Some("VXE R1 SE+"), Some(true)));
     let r = read(&m, &mut p);
     // no lift-off read: the receiver's lift-off is held back (the live row cannot be confirmed), so no row and no 0x000a read
-    assert_eq!(sent(&p), vec![id_req(), batt_req(), online_req(), rd_system6(), rd_stage1(), rd_live()]);
+    assert_eq!(sent(&p)[..6], [id_req(), batt_req(), online_req(), rd_system6(), rd_stage1(), rd_live()]);
     assert_eq!((r.dpi, r.polling_hz, r.lift_off, r.online), (Some(800), Some(500), None, true));
     assert_eq!((r.caps.polling.clone(), r.caps.lift_off.clone()), (vec![250, 500, 1000], Vec::<u32>::new()));
     // the row holds another setting last (here debounce, selector 2): its value byte is not a polling rate
@@ -426,7 +429,8 @@ fn a9_plus_read() {
     let (m, mut p, _) = hid_port(ATK, 0x1115, HidMouse::new((2, 83)));
     assert_eq!((m.model, m.wireless), (Some("ATK A9 Plus"), None));
     let r = read(&m, &mut p);
-    assert_eq!(sent(&p), vec![id_req(), batt_req(), rd_system6(), rd_stage1(), rd_lift()]);
+    // (the Order 110 advanced-block read follows: see the order 110 tests)
+    assert_eq!(sent(&p)[..5], [id_req(), batt_req(), rd_system6(), rd_stage1(), rd_lift()]);
     assert_eq!(r.model.as_deref(), Some("ATK A9 Plus Nearlink"));
     assert_eq!((r.dpi, r.polling_hz, r.lift_off, r.caps.polling.clone()), (Some(800), Some(1000), Some(10), vec![125, 250, 500, 1000]));
     // not more than 6 stages: a count byte of 8 is cut to 6 (OpenMouse MAX_DPI_STAGES), the active stage to the last one
@@ -839,13 +843,16 @@ struct ZeroMouse {
     awake: bool,
     ignore_writes: bool,
     writes: Vec<(u8, Vec<u8>)>,
+    /// Order 110: the config block's flags (payload 6 motion sync, 7 linear correction, 8 ripple) and debounce (payload 11)
+    flags: [u8; 3],
+    debounce: u8,
 }
 
 impl ZeroMouse {
     fn new(target: u8) -> Self {
         let mut table = h("01 08  20 03 20 03 10 20 30 00  40 06 40 06 10 20 30 00"); // current 1; stage 0 = 800, stage 1 = 1600 (colour b 10 g 20 r 30)
         table.resize(70, 0);
-        Self { target, poll_code: 2, offset_cal: 3, battery: 64, charging: 0, table, awake: true, ignore_writes: false, writes: Vec::new() }
+        Self { target, poll_code: 2, offset_cal: 3, battery: 64, charging: 0, table, awake: true, ignore_writes: false, writes: Vec::new(), flags: [0, 0, 0], debounce: 4 }
     }
     fn reply(&self, cmd: u8, status: u8, payload: &[u8]) -> Vec<u8> {
         let mut v = vec![8, 0x72, status, 0x3A, self.target, cmd, payload.len() as u8];
@@ -867,6 +874,7 @@ impl ZeroMouse {
             2 => (12, 10),
             3 => (4, 2),
             7 | 15 => (2, 1),
+            11 | 12 | 13 | 22 => (3, 1),
             9 => (19, 17),
             23 => (10, 13),
             c => panic!("unexpected command {c}"),
@@ -875,12 +883,16 @@ impl ZeroMouse {
             return Ok(self.reply(cmd, 0xFF, &[]));
         }
         match (cmd, how) {
-            (1..=3, HidTransfer::OutputOnly) => {
+            (1..=3 | 11..=13 | 22, HidTransfer::OutputOnly) => {
                 self.writes.push((cmd, p[..expected.1 as usize].to_vec()));
                 if !self.ignore_writes {
                     match cmd {
                         1 => self.poll_code = p[0],
                         3 => self.offset_cal = p[1],
+                        13 => self.flags[0] = p[0],
+                        11 => self.flags[1] = p[0],
+                        12 => self.flags[2] = p[0],
+                        22 => self.debounce = p[0],
                         _ => {
                             let i = 2 + 8 * p[0] as usize;
                             self.table[i..i + 8].copy_from_slice(&[p[1], p[2], p[3], p[4], p[5], p[6], p[7], 0]);
@@ -892,8 +904,11 @@ impl ZeroMouse {
                 }
                 Ok(Vec::new())
             }
-            (1..=3, _) => panic!("a write must not wait for an answer"),
-            (9, _) => Ok(self.reply(9, 0, &[1, 2, self.poll_code, 0, 0, self.offset_cal, 0, 0, 0, 0x1E, 0, 4, 0, 0, 0, 0, 0])),
+            (1..=3 | 11..=13 | 22, _) => panic!("a write must not wait for an answer"),
+            (9, _) => {
+                let (fl, d) = (self.flags, self.debounce);
+                Ok(self.reply(9, 0, &[1, 2, self.poll_code, 0, 0, self.offset_cal, fl[0], fl[1], fl[2], 0x1E, 0, d, 0, 0, 0, 0, 0]))
+            }
             (7, _) => Ok(self.reply(7, 0, &[self.battery])),
             (15, _) => Ok(self.reply(15, 0, &[self.charging])),
             (23, _) => {
@@ -1009,6 +1024,7 @@ fn zero_wired_read() {
             lift_off: Some(10),
             wireless: Some(false),
             caps: r.caps.clone(),
+            extras: r.extras.clone(),
         }
     );
     assert_eq!(r.caps.dpi, Some(atk::bm_dpi_caps()));
@@ -1196,4 +1212,180 @@ fn the_two_clients_never_claim_the_same_interface() {
     let own: Vec<&HidInfo> = both.iter().collect();
     let got = atk::matches(&own, COMPX, 0xF58C).unwrap();
     assert_eq!(got.config.usage_page, 0xFF02);
+}
+
+// ================================================================== Order 110: debounce, Motion Sync, angle snapping, ripple
+
+use bu_mouse::family::{Change, Extra, Kind};
+
+/// readStatus' advanced read: read(0x00a9, 10) - crc 0x55 - (8 + 8 + 0xa9 + 0x0a = 0xc3) = 0x92
+fn rd_adv() -> String {
+    f("08 00 00 a9 0a", 0x92)
+}
+
+/// The advanced block written whole (writeAdvanced): every pair sums to 0x55, so crc = 0x55 - ((8 + 7 + 0 + 0xa9 + 0x0a + 5 x 0x55
+/// = 0xc2 + 0x1a9 = 0x26b) & 0xff) = 0x55 - 0x6b = 0xea for any values.
+fn wr_adv(pairs: &str) -> String {
+    f(&format!("07 00 00 a9 0a {pairs}"), 0xEA)
+}
+
+/// A hid.js mouse whose advanced block holds debounce 4 ms, Motion Sync on, sleep 6 (1 min), angle snapping on, ripple off.
+fn with_adv(mut m: HidMouse) -> HidMouse {
+    m.mem[0xA9..0xB3].copy_from_slice(&h("04 51 01 54 06 4f 01 54 00 55"));
+    m
+}
+
+fn extras(r: &OnMouse) -> Vec<(Extra, Option<i32>)> {
+    r.extras.iter().map(|e| (e.extra, e.value)).collect()
+}
+
+#[test]
+fn order_110_hid_read_shows_every_setting_openmouse_reads() {
+    // R1 Pro Max (wired + receiver), R1 SE+ wired 2,32, A9 Plus: debounceMs = advanced[0], motionSync = advanced[2] === 1,
+    // angleSnapping = advanced[6] === 1 (R1 / A9 "straight-line correction"), rippleControl = advanced[8] === 1
+    for (vid, pid, mouse) in [(COMPX, 0xF58C, HidMouse::new((2, 27))), (COMPX, 0xF58A, HidMouse::new((2, 27))), (COMPX, 0xF58F, HidMouse::new_se((2, 32))), (ATK, 0x1115, HidMouse::new((2, 83)))] {
+        let (m, mut p, _) = hid_port(vid, pid, with_adv(mouse));
+        let r = read(&m, &mut p);
+        assert_eq!(sent(&p), vec![id_req(), batt_req(), rd_system6(), rd_stage1(), rd_lift(), rd_adv()], "{pid:04x}");
+        assert_eq!(extras(&r), vec![(Extra::Debounce, Some(4)), (Extra::MotionSync, Some(1)), (Extra::AngleSnap, Some(1)), (Extra::RippleControl, Some(0))], "{pid:04x}");
+        // OpenMouse's R1 debounce list runs 0-20 ms
+        assert_eq!(r.extras[0].kind, Kind::Steps { values: vec![0, 1, 2, 4, 8, 15, 20], unit: "ms" });
+        assert_eq!(r.extras[1].kind, Kind::Switch);
+        assert!(p.sent.iter().all(|(o, _)| atk::read_request_allowed(o)));
+    }
+    // R1 SE+ receiver: Motion Sync and ripple only (its debounce / angle snapping go through the unconfirmed live row)
+    let mut mouse = with_adv(HidMouse::new_se((2, 32)));
+    mouse.mem[0x70..0x74].copy_from_slice(&h("0b 02 00 53"));
+    let (m, mut p, _) = hid_port(COMPX, 0xF58E, mouse);
+    let r = read(&m, &mut p);
+    assert_eq!(sent(&p), vec![id_req(), batt_req(), online_req(), rd_system6(), rd_stage1(), rd_live(), rd_adv()]);
+    assert_eq!(extras(&r), vec![(Extra::MotionSync, Some(1)), (Extra::RippleControl, Some(0))]);
+    // the catalog-only R1 SE+ 2,31: OpenMouse writes nothing to it, so no rows and no advanced read
+    let (m, mut p, _) = hid_port(COMPX, 0xF58F, with_adv(HidMouse::new_se((2, 31))));
+    let r = read(&m, &mut p);
+    assert!(r.extras.is_empty() && !sent(&p).contains(&rd_adv()));
+    // an advanced block that is not answered: the rows stay, their values are unknown
+    let st = Rc::new(RefCell::new(with_adv(HidMouse::new((2, 27)))));
+    let s2 = st.clone();
+    let (m, mut p, _) = hid_port(COMPX, 0xF58C, HidMouse::new((2, 27)));
+    p.answer = Box::new(move |o, how| if o[1] == 0x08 && o[4] == 0xA9 { Err(Error::BadAnswer("no answer".into())) } else { s2.borrow_mut().answer(o, how) });
+    let r = atk::Atk.read(&m, &mut p, ONE).unwrap();
+    assert_eq!(extras(&r), vec![(Extra::Debounce, None), (Extra::MotionSync, None), (Extra::AngleSnap, None), (Extra::RippleControl, None)]);
+}
+
+#[test]
+fn order_110_hid_changes_are_openmouses_writeadvanced_bytes() {
+    let writes = |p: &ScriptPort| p.sent.iter().filter(|(o, _)| o[1] == 0x07).map(|(o, how)| (hex(o), matches!(how, HidTransfer::OutputOnly))).collect::<Vec<_>>();
+    // R1 Pro Max over the cable: identify, read the block, write it whole with one pair replaced (no answer), read it back
+    let (m, mut p, st) = hid_port(COMPX, 0xF58C, with_adv(HidMouse::new((2, 27))));
+    for (c, pairs) in [
+        (Change::Extra(Extra::Debounce, 8), "08 4d 01 54 06 4f 01 54 00 55"),     // setDebounceTime(8): offset 0 <- [08, 0x55 - 8]
+        (Change::Extra(Extra::MotionSync, 0), "08 4d 00 55 06 4f 01 54 00 55"),   // setMotionSync(false): offset 2
+        (Change::Extra(Extra::AngleSnap, 0), "08 4d 00 55 06 4f 00 55 00 55"),    // setAngleSnapping(false): offset 6
+        (Change::Extra(Extra::RippleControl, 1), "08 4d 00 55 06 4f 00 55 01 54"), // setRippleControl(true): offset 8
+    ] {
+        p.sent.clear();
+        atk::Atk.change(&m, &mut p, c).unwrap_or_else(|e| panic!("{c:?}: {e}"));
+        assert_eq!(sent(&p), vec![id_req(), rd_adv(), wr_adv(pairs), rd_adv()], "{c:?}");
+        assert!(is_out_only(&p, 2), "{c:?}: fire-and-forget over the cable");
+    }
+    assert_eq!(st.borrow().mem[0xA9..0xB3], h("08 4d 00 55 06 4f 00 55 01 54"), "sleep (offset 4) copied back unchanged");
+    let r = read(&m, &mut p);
+    assert_eq!(extras(&r), vec![(Extra::Debounce, Some(8)), (Extra::MotionSync, Some(0)), (Extra::AngleSnap, Some(0)), (Extra::RippleControl, Some(1))]);
+    // the Pro Max receiver: writeR1ProMaxReceiverAdvanced - the same block, echoed back by the receiver
+    let (m, mut p, _) = hid_port(COMPX, 0xF58A, with_adv(HidMouse::new((2, 27))));
+    atk::Atk.change(&m, &mut p, Change::Extra(Extra::Debounce, 20)).unwrap();
+    assert_eq!(sent(&p), vec![id_req(), rd_adv(), wr_adv("14 41 01 54 06 4f 01 54 00 55"), rd_adv()]);
+    assert!(matches!(p.sent[2].1, HidTransfer::OutputThenInput { echo: Some((1, 0x07)), .. }));
+    // the R1 SE+ receiver (write() is allowed on the live-settings transport) and the A9 Plus
+    let (m, mut p, _) = hid_port(COMPX, 0xF58E, with_adv(HidMouse::new_se((2, 32))));
+    atk::Atk.change(&m, &mut p, Change::Extra(Extra::MotionSync, 0)).unwrap();
+    assert_eq!(writes(&p), vec![(wr_adv("04 51 00 55 06 4f 01 54 00 55"), true)]);
+    let (m, mut p, _) = hid_port(ATK, 0x1115, with_adv(HidMouse::new((2, 83))));
+    atk::Atk.change(&m, &mut p, Change::Extra(Extra::RippleControl, 1)).unwrap();
+    assert_eq!(writes(&p), vec![(wr_adv("04 51 01 54 06 4f 01 54 01 54"), true)]);
+    // a mouse that keeps the old value is an error
+    let mut mouse = with_adv(HidMouse::new((2, 27)));
+    mouse.ignore_writes = true;
+    let (m, mut p, _) = hid_port(COMPX, 0xF58C, mouse);
+    assert!(matches!(atk::Atk.change(&m, &mut p, Change::Extra(Extra::MotionSync, 0)), Err(Error::BadAnswer(_))));
+}
+
+#[test]
+fn order_110_hid_refuses_what_openmouse_does_not_take_before_a_byte_leaves() {
+    let no_writes = |p: &ScriptPort| p.sent.iter().all(|(o, _)| atk::read_request_allowed(o));
+    let (m, mut p, _) = hid_port(COMPX, 0xF58C, with_adv(HidMouse::new((2, 27))));
+    // debounce: only OpenMouse's 0/1/2/4/8/15/20 ms; a switch takes 0 / 1; turbo is not offered (the 0x00b5 performance
+    // mode is ATK's generic "performanceMode", not the Pulsar turbo byte)
+    for c in [
+        Change::Extra(Extra::Debounce, 3),
+        Change::Extra(Extra::Debounce, 21),
+        Change::Extra(Extra::Debounce, -1),
+        Change::Extra(Extra::MotionSync, 2),
+        Change::Extra(Extra::Turbo, 1),
+    ] {
+        p.sent.clear();
+        assert!(atk::Atk.change(&m, &mut p, c).is_err(), "{c:?}");
+        assert!(no_writes(&p), "{c:?}: nothing but reads");
+    }
+    // the SE+ receiver: debounce and angle snapping are held back (live row, unconfirmed)
+    let (m, mut p, st) = hid_port(COMPX, 0xF58E, with_adv(HidMouse::new_se((2, 32))));
+    for c in [Change::Extra(Extra::Debounce, 4), Change::Extra(Extra::AngleSnap, 1)] {
+        assert!(atk::Atk.change(&m, &mut p, c).is_err(), "{c:?}");
+    }
+    assert!(no_writes(&p) && st.borrow().writes.is_empty());
+    // the SE+ 2,31: nothing
+    let (m, mut p, st) = hid_port(COMPX, 0xF58F, with_adv(HidMouse::new_se((2, 31))));
+    assert!(atk::Atk.change(&m, &mut p, Change::Extra(Extra::MotionSync, 0)).is_err());
+    assert!(no_writes(&p) && st.borrow().writes.is_empty());
+    // the allow-list: the advanced read passes, its write and a read of another length do not
+    assert!(atk::read_request_allowed(&h(&rd_adv())));
+    assert!(!atk::read_request_allowed(&h(&wr_adv("04 51 01 54 06 4f 01 54 00 55"))));
+    assert!(!atk::read_request_allowed(&atk::hid_wire(&atk::read_eeprom_frame(0x00A9, 4), 17)));
+}
+
+#[test]
+fn order_110_zero_reads_and_writes_the_config_flags_like_openmouse() {
+    // bitmouseDecodeConfig: payload[6] motionSync, [7] linearCorrection (angle snapping), [8] rippleControl, [11] debounceMs
+    let mut mouse = ZeroMouse::new(0);
+    mouse.flags = [1, 1, 0];
+    mouse.debounce = 8;
+    let (m, mut p, st) = zero_port(0x1154, mouse);
+    let r = read(&m, &mut p);
+    assert_eq!(extras(&r), vec![(Extra::Debounce, Some(8)), (Extra::MotionSync, Some(1)), (Extra::AngleSnap, Some(1)), (Extra::RippleControl, Some(0))]);
+    assert_eq!(r.extras[0].kind, Kind::Range { min: 0, max: 15, step: 1, unit: "ms" });
+    assert_eq!(p.sent.len(), 10, "no read beyond the Order 104 ones: config, battery, charging, 7 table chunks");
+    // bitmouseSetFlagRequest(cmd, [3, 1], value): checksum = 0x72 + 3 + 0 + target + cmd + 1 + value
+    let cfg = bm("08 9f 72 13 00 00 09 11");
+    for (c, frame) in [
+        (Change::Extra(Extra::MotionSync, 0), bm("08 83 72 03 00 00 0d 01 00")),    // 114 + 3 + 13 + 1 + 0 = 131
+        (Change::Extra(Extra::AngleSnap, 0), bm("08 81 72 03 00 00 0b 01 00")),     // 114 + 3 + 11 + 1 + 0 = 129
+        (Change::Extra(Extra::RippleControl, 1), bm("08 83 72 03 00 00 0c 01 01")), // 114 + 3 + 12 + 1 + 1 = 131
+        (Change::Extra(Extra::Debounce, 15), bm("08 9b 72 03 00 00 16 01 0f")),     // 114 + 3 + 22 + 1 + 15 = 155
+    ] {
+        p.sent.clear();
+        atk::Atk.change(&m, &mut p, c).unwrap_or_else(|e| panic!("{c:?}: {e}"));
+        assert_eq!(sent(&p), vec![frame, cfg.clone()], "{c:?}");
+        assert!(is_out_only(&p, 0), "{c:?}: fire-and-forget");
+    }
+    assert_eq!((st.borrow().flags, st.borrow().debounce), ([0, 0, 1], 15));
+    // behind the receiver: target 1, checksum + 1 (debounce 2: 114 + 3 + 1 + 22 + 1 + 2 = 143)
+    let (m, mut p, _) = zero_port(0x1155, ZeroMouse::new(1));
+    atk::Atk.change(&m, &mut p, Change::Extra(Extra::Debounce, 2)).unwrap();
+    assert_eq!(sent(&p)[0], bm("08 8f 72 03 00 01 16 01 02"));
+    // a mouse that keeps the old value
+    let mut mouse = ZeroMouse::new(0);
+    mouse.ignore_writes = true;
+    let (m, mut p, _) = zero_port(0x1154, mouse);
+    assert!(matches!(atk::Atk.change(&m, &mut p, Change::Extra(Extra::MotionSync, 1)), Err(Error::BadAnswer(_))));
+    // refused before a byte leaves: debounce 0-15 only, switches 0 / 1, nothing else
+    let (m, mut p, _) = zero_port(0x1154, ZeroMouse::new(0));
+    for c in [Change::Extra(Extra::Debounce, 16), Change::Extra(Extra::Debounce, -1), Change::Extra(Extra::RippleControl, 2), Change::Extra(Extra::Turbo, 1)] {
+        assert!(atk::Atk.change(&m, &mut p, c).is_err(), "{c:?}");
+    }
+    assert!(p.sent.is_empty(), "nothing sent");
+    // the flag writes are not reads
+    for frame in ["08 83 72 03 00 00 0d 01 00", "08 9b 72 03 00 00 16 01 0f"] {
+        assert!(!atk::read_request_allowed(&h(&bm(frame))));
+    }
 }

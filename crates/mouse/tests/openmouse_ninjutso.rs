@@ -11,7 +11,7 @@
 //! `[38, 0, 0, 1, 0, profile]`.
 
 use bu_mouse::error::Error;
-use bu_mouse::family::{self, Driver, Family, ReadOptions, Setting};
+use bu_mouse::family::{self, Change, Driver, Extra, Family, Kind, ReadOptions, Setting};
 use bu_mouse::fake::{hid_info, ScriptPort};
 use bu_mouse::ninjutso as n;
 use bu_mouse::os::{HidInfo, HidTransfer};
@@ -118,7 +118,12 @@ fn legacy_requests_are_openmouses() {
 /// stage count data[11], four DPI slots data[12..20] (raw = (dpi - 50) / 50), active stage data[20]; the checksum is the sum of
 /// the first `sum_end` bytes as a little-endian u16 at `sum_end` (701 / 71).
 fn dump(len: usize, battery: u8, count: u8, raw: [u8; 4], active: u8) -> Vec<u8> {
-    let mut v = buf(len, &[(0, 4), (9 + 7, battery), (9 + 11, count), (9 + 20, active)]);
+    dump_motion(len, battery, count, raw, active, 0)
+}
+
+/// [`dump`] with Motion Sync at data[23] (byte 9 + 23).
+fn dump_motion(len: usize, battery: u8, count: u8, raw: [u8; 4], active: u8, motion: u8) -> Vec<u8> {
+    let mut v = buf(len, &[(0, 4), (9 + 7, battery), (9 + 11, count), (9 + 20, active), (9 + 23, motion)]);
     for (i, r) in raw.iter().enumerate() {
         v[9 + 12 + i * 2] = *r;
     }
@@ -222,6 +227,8 @@ fn no_other_family_claims_a_ninjutso_id() {
 
 /// A fake Sora V3 / TEN answering the report-6 protocol.
 struct Cur {
+    /// Order 110: Motion Sync (command 14); `None` = not implemented (an all-zero answer)
+    motion: Option<u8>,
     profile: u8,
     stage: u8,
     battery: u8,
@@ -240,7 +247,7 @@ struct Cur {
 }
 
 fn cur(direct: bool) -> Rc<RefCell<Cur>> {
-    Rc::new(RefCell::new(Cur { profile: 1, stage: 0, battery: 87, charging: 0, dpi: [800, 1600, 3200, 6400], polling_code: 1, direct, silent: false, stale: 0, deaf: false, seen: Vec::new(), waits: Vec::new() }))
+    Rc::new(RefCell::new(Cur { motion: None, profile: 1, stage: 0, battery: 87, charging: 0, dpi: [800, 1600, 3200, 6400], polling_code: 1, direct, silent: false, stale: 0, deaf: false, seen: Vec::new(), waits: Vec::new() }))
 }
 
 fn cur_port(info: &HidInfo, m: Rc<RefCell<Cur>>) -> ScriptPort {
@@ -269,6 +276,10 @@ fn cur_port(info: &HidInfo, m: Rc<RefCell<Cur>>) -> ScriptPort {
                         vec![e as u8, (e >> 8) as u8, 0]
                     }
                     6 => vec![m.polling_code],
+                    14 => match m.motion {
+                        Some(b) => vec![b],
+                        None => return Ok(vec![0u8; 64]),
+                    },
                     _ => panic!("unexpected read {cmd}"),
                 };
                 let mut v = buf(64, &[(0, 6), (1, cmd)]);
@@ -283,7 +294,8 @@ fn cur_port(info: &HidInfo, m: Rc<RefCell<Cur>>) -> ScriptPort {
                         m.dpi[out[8] as usize] = d;
                     }
                     (6, 5) if !m.deaf => m.polling_code = out[8],
-                    (6, 3) | (6, 5) | (3, _) => {}
+                    (6, 13) if !m.deaf => m.motion = Some(out[8]),
+                    (6, 3) | (6, 5) | (6, 13) | (3, _) => {}
                     other => panic!("unexpected write {other:?}"),
                 }
                 Ok(Vec::new())
@@ -323,10 +335,13 @@ fn a_ten_reads_in_openmouses_order() {
             buf(64, &[(0, 6), (1, 17), (4, 1)]),
             buf(64, &[(0, 6), (1, 4), (4, 1), (6, 1), (7, 2), (8, 1)]),
             buf(64, &[(0, 6), (1, 6), (4, 1), (7, 2)]),
+            // Order 110: Motion Sync (14), optional - one ask; this fake does not implement it (all-zero answer): no row
+            buf(64, &[(0, 6), (1, 14), (4, 1), (7, 2)]),
         ]
     );
     assert!(port.sent.iter().all(|s| n::read_request_allowed(&s.0)));
     assert_eq!(port.sent[0].1, HidTransfer::Feature { reply_id: 6, reply_len: 64, wait_ms: 30 });
+    assert!(s.extras.is_empty(), "a Motion Sync read that is not answered: OpenMouse hides the row (hideMotionSync)");
 }
 
 #[test]
@@ -459,6 +474,8 @@ fn setting_polling_reads_back() {
 
 /// A fake Sora V2: profile query on report 5, settings dump on report 4, the DPI write on report 5 command 5.
 struct Leg {
+    /// Order 110: Motion Sync, data[23]
+    motion: u8,
     profile: u8,
     len: usize,
     battery: u8,
@@ -472,7 +489,7 @@ struct Leg {
 }
 
 fn leg(len: usize) -> Rc<RefCell<Leg>> {
-    Rc::new(RefCell::new(Leg { profile: 2, len, battery: 80, count: 3, raw: [15, 31, 63, 127], active: 1, silent: false, deaf: false, corrupt: false, seen: Vec::new() }))
+    Rc::new(RefCell::new(Leg { motion: 0, profile: 2, len, battery: 80, count: 3, raw: [15, 31, 63, 127], active: 1, silent: false, deaf: false, corrupt: false, seen: Vec::new() }))
 }
 
 fn leg_port(info: &HidInfo, m: Rc<RefCell<Leg>>) -> ScriptPort {
@@ -480,6 +497,13 @@ fn leg_port(info: &HidInfo, m: Rc<RefCell<Leg>>) -> ScriptPort {
         let mut m = m.borrow_mut();
         m.seen.push(out.to_vec());
         match (out[0], how) {
+            // Order 110: setMotionSync = command 6, the value at payload byte 8 (our 9)
+            (5, HidTransfer::FeatureOut) if out[1] == 6 => {
+                if !m.deaf {
+                    m.motion = out[9];
+                }
+                Ok(Vec::new())
+            }
             (5, HidTransfer::FeatureOut) => {
                 assert_eq!(out[1], 5, "only the DPI table is written");
                 if !m.deaf {
@@ -499,7 +523,7 @@ fn leg_port(info: &HidInfo, m: Rc<RefCell<Leg>>) -> ScriptPort {
             }
             (4, HidTransfer::Feature { reply_id: 4, wait_ms: 90, .. }) => {
                 assert_eq!((out.len(), out[1], out[6]), (m.len, 38, m.profile));
-                let mut d = dump(m.len, m.battery, m.count, m.raw, m.active);
+                let mut d = dump_motion(m.len, m.battery, m.count, m.raw, m.active, m.motion);
                 if m.corrupt {
                     d[m.len - 2] ^= 1;
                 }
@@ -720,4 +744,85 @@ fn an_all_zero_settings_answer_is_not_a_sora_v2_online() {
     assert!(n::Ninjutso.read(&m, &mut port, ReadOptions::default()).is_err());
     // the real dump still passes
     assert!(n::legacy_settings(&dump(704, 80, 3, [15, 31, 63, 127], 1), 703).is_ok());
+}
+
+// ---------------------------------------------------------------- Order 110: Motion Sync (the only one of the order's settings
+// NinjutsoHidClient has: no debounce, angle snapping, ripple or turbo command)
+
+#[test]
+fn motion_sync_reads_like_openmouse() {
+    // current: readCurrentOptional(14) = [14, 0, 0, 1, 0, 0, profile]; value[0] === 1
+    let (info, m) = current_mouse(0xE020);
+    let mouse = cur(false);
+    mouse.borrow_mut().motion = Some(1);
+    let mut port = cur_port(&info, mouse.clone());
+    let s = n::Ninjutso.read(&m, &mut port, ReadOptions::default()).unwrap();
+    let got: Vec<(Extra, Option<i32>, Kind)> = s.extras.iter().map(|e| (e.extra, e.value, e.kind.clone())).collect();
+    assert_eq!(got, vec![(Extra::MotionSync, Some(1), Kind::Switch)]);
+    assert_eq!(mouse.borrow().seen.last().unwrap(), &buf(64, &[(0, 6), (1, 14), (4, 1), (7, 1)]));
+    assert!(port.sent.iter().all(|s| n::read_request_allowed(&s.0)));
+    assert_eq!(port.sent.last().unwrap().1, HidTransfer::Feature { reply_id: 6, reply_len: 64, wait_ms: 30 }, "one ask");
+    assert_eq!(mouse.borrow().seen.len(), 7);
+    // Sora V2: readLegacyStatus motionSync = data[23] === 1
+    let (info, m) = legacy_mouse(704, "Ninjutso Sora V2");
+    let lm = leg(704);
+    lm.borrow_mut().motion = 1;
+    let mut port = leg_port(&info, lm);
+    let s = n::Ninjutso.read(&m, &mut port, ReadOptions::default()).unwrap();
+    assert_eq!(s.extras.iter().map(|e| (e.extra, e.value)).collect::<Vec<_>>(), vec![(Extra::MotionSync, Some(1))]);
+    assert!(port.sent.iter().all(|s| n::read_request_allowed(&s.0)));
+}
+
+#[test]
+fn motion_sync_changes_are_openmouses_bytes() {
+    // current: setMotionSync(true) = sendCurrent(13, [1]) = ninjutsoBuildRequest(13, profile 2, [1]) = [13, 0, 0, 1, 0, 1, 2, 1];
+    // report 6 in front, zero padded to the 64-byte feature report; then readCurrent(14) confirms
+    let (info, m) = current_mouse(0xE010);
+    let mouse = cur(true);
+    mouse.borrow_mut().profile = 2;
+    mouse.borrow_mut().motion = Some(0);
+    let mut port = cur_port(&info, mouse.clone());
+    n::Ninjutso.change(&m, &mut port, Change::Extra(Extra::MotionSync, 1)).unwrap();
+    assert_eq!(
+        mouse.borrow().seen,
+        vec![buf(64, &[(0, 6), (1, 16), (4, 1)]), buf(64, &[(0, 6), (1, 13), (4, 1), (6, 1), (7, 2), (8, 1)]), buf(64, &[(0, 6), (1, 14), (4, 1), (7, 2)])]
+    );
+    assert_eq!(port.sent[1].1, HidTransfer::FeatureOut);
+    assert!(!n::read_request_allowed(&port.sent[1].0));
+    assert_eq!(mouse.borrow().motion, Some(1));
+    // off: [13, 0, 0, 1, 0, 1, 2, 0]
+    n::Ninjutso.change(&m, &mut cur_port(&info, mouse.clone()), Change::Extra(Extra::MotionSync, 0)).unwrap();
+    assert_eq!(mouse.borrow().seen[4], buf(64, &[(0, 6), (1, 13), (4, 1), (6, 1), (7, 2), (8, 0)]));
+    // a mouse that ignores it
+    mouse.borrow_mut().deaf = true;
+    let e = n::Ninjutso.change(&m, &mut cur_port(&info, mouse.clone()), Change::Extra(Extra::MotionSync, 1)).unwrap_err();
+    assert!(matches!(&e, Error::BadAnswer(t) if t.contains("left Motion Sync off")), "{e}");
+    // Sora V2: ninjutsoLegacyRequest(6, profile 2, 1) = [6, 0, 0, 1, 0, 2, 22, 0, 1]; report 5 in front, padded to 704; the
+    // settings dump before (profile) and after (data[23] confirms)
+    let (info, m) = legacy_mouse(704, "Ninjutso Sora V2");
+    let lm = leg(704);
+    let mut port = leg_port(&info, lm.clone());
+    n::Ninjutso.change(&m, &mut port, Change::Extra(Extra::MotionSync, 1)).unwrap();
+    let kinds: Vec<(u8, bool)> = port.sent.iter().map(|(o, h)| (o[0], *h == HidTransfer::FeatureOut)).collect();
+    assert_eq!(kinds, vec![(5, false), (4, false), (5, true), (5, false), (4, false)]);
+    let mut want = buf(704, &[(0, 5), (1, 6), (4, 1), (6, 2), (7, 22), (9, 1)]);
+    want.truncate(704);
+    assert_eq!(port.sent[2].0, want);
+    assert_eq!(lm.borrow().motion, 1);
+}
+
+#[test]
+fn motion_sync_refusals_send_nothing() {
+    let (info, m) = current_mouse(0xE020);
+    let mouse = cur(false);
+    let (linfo, lm) = legacy_mouse(704, "Ninjutso Sora V2");
+    let leg_mouse = leg(704);
+    for c in [Change::Extra(Extra::MotionSync, 2), Change::Extra(Extra::Debounce, 4), Change::Extra(Extra::AngleSnap, 1), Change::Extra(Extra::RippleControl, 1), Change::Extra(Extra::Turbo, 1)] {
+        let mut port = cur_port(&info, mouse.clone());
+        assert!(n::Ninjutso.change(&m, &mut port, c).is_err(), "{c:?}");
+        assert!(port.sent.is_empty(), "{c:?}");
+        let mut port = leg_port(&linfo, leg_mouse.clone());
+        assert!(n::Ninjutso.change(&lm, &mut port, c).is_err(), "{c:?}");
+        assert!(port.sent.is_empty(), "{c:?}");
+    }
 }

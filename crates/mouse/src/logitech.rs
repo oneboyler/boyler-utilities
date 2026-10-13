@@ -988,6 +988,7 @@ impl crate::family::Driver for Logitech {
             lift_off: None,
             wireless: Some(!wired),
             caps: Caps { dpi: dpi_caps(&options), polling, lift_off: Vec::new(), battery: bat.is_some() },
+            ..Default::default()
         })
     }
 

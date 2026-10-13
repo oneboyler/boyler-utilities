@@ -27,8 +27,13 @@
 //! other options are re-sent as read from the status, byte for byte as OpenMouse does), or 0x48 (DPI with separate X / Y
 //! on firmware that flags it). Firmware flags decide which form a mouse uses; all forms are ported.
 //!
+//! Order 110 (A_110_02 scope, M6 only - the Nape client throws "not supported" for all of them): debounce 0-20 ms
+//! (keychronEncodeDebounce `[0x43, ms]`) and Motion Sync / angle snapping / ripple (writeSensorFlag: the 0x42 packet with every
+//! sensor option as read, the one switch changed), each confirmed by the status read (byte 17, flags byte 15). The "20K FPS"
+//! switch (setPerformanceMode / maxSpeed) is not the Pulsar turbo: left out.
+//!
 //! Left out on purpose: the Nape's DPI stage select / orientation / layers / keymap / sleep, and for the M6 the DPI stage
-//! select and count, sleep, debounce, profile, angle tuning, motion sync / ripple / angle snapping / 20K FPS toggles,
+//! select and count, sleep, profile, angle tuning, the 20K FPS toggle,
 //! buttons, lighting, firmware query (none is DPI / polling / lift-off / battery). The Nape via a receiver (0xd026 / 0xd029) is
 //! in OpenMouse's driver but not on the SUPPORTED list ("driver knows, list doesn't"). OpenMouse sends no firmware, DFU or
 //! reset command to a Keychron mouse and neither does this file.
@@ -37,7 +42,7 @@
 //! before any driver is asked - see [`MOUSE_PRODUCT_IDS`].
 
 use crate::error::{Error, Result};
-use crate::family::{Caps, Changed, DpiCaps, Family, Matched, OnMouse, Port, ReadOptions, Setting};
+use crate::family::{check_extra, Caps, Change, Changed, DpiCaps, Extra, ExtraRow, Family, Kind, Matched, OnMouse, Port, ReadOptions, Setting};
 use crate::os::{HidInfo, HidTransfer};
 
 pub const VENDOR_ID: u16 = 0x3434;
@@ -94,6 +99,9 @@ const SET_RECEIVER_STATE: u8 = 0x03;
 const SET_DPI: u8 = 0x40;
 const SET_POLLING: u8 = 0x41;
 const SET_SENSOR: u8 = 0x42;
+/// Order 110: KEYCHRON_SET.debounce and KEYCHRON_DEBOUNCE_MAX_MS.
+const SET_DEBOUNCE: u8 = 0x43;
+pub const M6_DEBOUNCE_MAX_MS: i32 = 20;
 const WRITE_POLLING_SETS: u8 = 0x4A;
 const READ_POLLING_SETS: u8 = 0x4B;
 const M6_QUERY_TIMEOUT_MS: u32 = 1200;
@@ -306,6 +314,8 @@ pub struct Status {
     pub angle_snapping: bool,
     pub motion_sync: bool,
     pub scroll_reversed: bool,
+    /// Order 110: keychronDecodeSettings' debounceMs (byte 17)
+    pub debounce_ms: u8,
     pub polling_table: Vec<u8>,
     pub polling_count: usize,
     pub dpi_max: u32,
@@ -339,6 +349,7 @@ pub fn m6_decode_status(b: &[u8], ident: &Identity) -> Option<Status> {
         angle_snapping: f & 0x08 != 0,
         motion_sync: f & 0x10 != 0,
         scroll_reversed: f & 0x40 != 0,
+        debounce_ms: at(b, 17),
         polling_table: tail[..tail.len().min(POLLING_GEARS)].to_vec(),
         polling_count: (if at(b, 49) == 0 { POLLING_GEARS } else { at(b, 49) as usize }).min(POLLING_GEARS),
         dpi_max: read_u16(b, 40),
@@ -555,13 +566,28 @@ impl LiftOffChoices {
 /// keychronEncodeSensor (0x42) with `lod` / `lodLevel` as writeSensor sends them: every sensor option re-sent as read (1 = on,
 /// 2 = off, except `maxSpeed`: 2 = on, 1 = off; always sent), the lift-off in the code byte or the level byte, the other 0.
 pub fn m6_encode_sensor(s: &Status, level_mode: bool, code: u8) -> [u8; M6_SETTINGS_LEN] {
+    m6_encode_sensor_with(s, level_mode, code, (s.ripple_control, s.angle_snapping, s.motion_sync))
+}
+
+/// Order 110: writeSensorFlag - the same 0x42 packet with the lift-off as read (code or level byte) and the three switches
+/// (ripple, angle snapping, Motion Sync) as given.
+pub fn m6_encode_sensor_flags(s: &Status, level_mode: bool, flags: (bool, bool, bool)) -> [u8; M6_SETTINGS_LEN] {
+    m6_encode_sensor_with(s, level_mode, if level_mode { s.lod_level } else { s.lod }, flags)
+}
+
+/// Order 110: keychronEncodeDebounce: `[0x43, ms]`.
+pub fn m6_encode_debounce(ms: u8) -> [u8; M6_SETTINGS_LEN] {
+    m6_settings_packet(&[SET_DEBOUNCE, ms])
+}
+
+fn m6_encode_sensor_with(s: &Status, level_mode: bool, code: u8, (ripple, angle, motion): (bool, bool, bool)) -> [u8; M6_SETTINGS_LEN] {
     let flag = |on: bool| if on { 1 } else { 2 };
     let mut p = [0u8; M6_SETTINGS_LEN];
     p[0] = SET_SENSOR;
     p[1] = if level_mode { 0 } else { code };
-    p[2] = flag(s.ripple_control);
-    p[3] = flag(s.angle_snapping);
-    p[4] = flag(s.motion_sync);
+    p[2] = flag(ripple);
+    p[3] = flag(angle);
+    p[4] = flag(motion);
     p[6] = if s.scroll_reversed { 2 } else { 1 };
     p[8] = if s.max_speed { 2 } else { 1 }; // inverted vs the other toggles, as keychronEncodeSensor: maxSpeed ? 2 : 1
     p[11] = if level_mode { code } else { 0 };
@@ -878,6 +904,7 @@ fn m6_read(port: &mut dyn Port, pid: u16, r: &mut OnMouse) -> Result<()> {
     r.dpi = dpi.stages.get(dpi.active).copied();
     r.polling_hz = g.rate();
     r.lift_off = m6_lift_off_choices(&st).current(&st);
+    r.extras = m6_extras(Some(&st));
     if st.battery_percent <= 100 {
         r.battery_percent = Some(st.battery_percent);
         r.charging = Some(st.charging);
@@ -954,6 +981,40 @@ fn m6_write(port: &mut dyn Port, pid: u16, set: Setting) -> Result<Changed> {
     }
 }
 
+/// Order 110: the status' debounceMs (byte 17) and the three switches (flags byte 15: ripple 0x04, angle snapping 0x08,
+/// Motion Sync 0x10), in the card's order (`None` = the guard's rows).
+pub fn m6_extras(st: Option<&Status>) -> Vec<ExtraRow> {
+    vec![
+        ExtraRow::new(Extra::Debounce, Kind::Range { min: 0, max: M6_DEBOUNCE_MAX_MS, step: 1, unit: "ms" }, st.map(|s| s.debounce_ms as i32)),
+        ExtraRow::switch(Extra::MotionSync, st.map(|s| s.motion_sync)),
+        ExtraRow::switch(Extra::AngleSnap, st.map(|s| s.angle_snapping)),
+        ExtraRow::switch(Extra::RippleControl, st.map(|s| s.ripple_control)),
+    ]
+}
+
+/// Order 110 (M6): setDebounceTime (0x43, then the status read back) / writeSensorFlag (0x42 with every sensor option as
+/// read and the one switch changed, then the status read back).
+fn m6_change(port: &mut dyn Port, pid: u16, c: Change) -> Result<()> {
+    let Change::Extra(e, v) = c;
+    check_extra(&m6_extras(None), e, v)?;
+    let s = m6_open(port, pid)?.ok_or_else(|| Error::BadAnswer("the Keychron M6 did not answer - it may be asleep or not paired to this receiver".into()))?;
+    let st = m6_status(port, &s)?;
+    let on = v == 1;
+    let packet = match e {
+        Extra::Debounce => m6_encode_debounce(v as u8),
+        Extra::MotionSync => m6_encode_sensor_flags(&st, m6_lift_off_choices(&st).level_mode, (st.ripple_control, st.angle_snapping, on)),
+        Extra::AngleSnap => m6_encode_sensor_flags(&st, m6_lift_off_choices(&st).level_mode, (st.ripple_control, on, st.motion_sync)),
+        Extra::RippleControl => m6_encode_sensor_flags(&st, m6_lift_off_choices(&st).level_mode, (on, st.angle_snapping, st.motion_sync)),
+        Extra::Turbo => return Err(crate::family::not_offered(c)),
+    };
+    m6_write_settings(port, &packet)?;
+    let now = m6_extras(Some(&m6_status(port, &s)?)).into_iter().find(|r| r.extra == e).and_then(|r| r.value);
+    if now != Some(v) {
+        return Err(Error::BadAnswer(format!("the Keychron M6 kept {now:?} instead of {v} ({})", e.label())));
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------- the driver
 
 /// The Keychron driver: the Nape Pro client or the M6's Launcher client (by the product id).
@@ -973,6 +1034,15 @@ impl crate::family::Driver for Keychron {
             m6_read(port, pid, &mut r)?;
         }
         Ok(r)
+    }
+
+    /// Order 110: the M6's debounce and sensor switches (the Nape client throws "not supported" for all of them).
+    fn change(&self, m: &Matched, port: &mut dyn Port, c: Change) -> Result<()> {
+        let pid = the_variant(m)?;
+        if pid == PID_NAPE {
+            return Err(crate::family::not_offered(c));
+        }
+        m6_change(port, pid, c)
     }
 
     /// One setting the way the model's OpenMouse client writes it, then the read-back that confirms it. Before the write, the

@@ -218,6 +218,127 @@ pub struct OnMouse {
     /// `Some` when the mouse's answer says how it is linked
     pub wireless: Option<bool>,
     pub caps: Caps,
+    /// Order 110: the extra settings the driver offers (Debounce time, Motion Sync, Angle Snap, Ripple Control, Turbo Mode -
+    /// only those its OpenMouse client sends), in the card's order, each with its value
+    pub extras: Vec<ExtraRow>,
+}
+
+impl OnMouse {
+    /// The value read for one extra setting.
+    pub fn extra(&self, e: Extra) -> Option<i32> {
+        self.extras.iter().find(|r| r.extra == e).and_then(|r| r.value)
+    }
+}
+
+/// One of the five settings Order 110 adds under Lift-off distance (the owner, A_110_02), in the card's order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum Extra {
+    /// click debounce, ms (a range: the mouse's own limits)
+    Debounce,
+    MotionSync,
+    AngleSnap,
+    RippleControl,
+    /// Pulsar's turbo / highest-performance mode (the Compx performanceState byte, or a client's turboMode)
+    Turbo,
+}
+
+impl Extra {
+    /// The card's order.
+    pub const ALL: [Extra; 5] = [Extra::Debounce, Extra::MotionSync, Extra::AngleSnap, Extra::RippleControl, Extra::Turbo];
+
+    /// The row's words on the card (Pulsar's own names).
+    pub fn label(self) -> &'static str {
+        match self {
+            Extra::Debounce => "Debounce time",
+            Extra::MotionSync => "Motion Sync",
+            Extra::AngleSnap => "Angle Snap",
+            Extra::RippleControl => "Ripple Control",
+            Extra::Turbo => "Turbo Mode",
+        }
+    }
+}
+
+/// What an extra setting takes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Kind {
+    /// on (1) / off (0)
+    Switch,
+    /// any value min..=max in steps; `unit` follows the number ("ms")
+    Range { min: i32, max: i32, step: i32, unit: &'static str },
+    /// only these values, ascending (e.g. ATK's debounce 0, 1, 2, 4, 8, 15, 20 ms)
+    Steps { values: Vec<i32>, unit: &'static str },
+}
+
+impl Kind {
+    /// Does the mouse take this value?
+    pub fn allows(&self, v: i32) -> bool {
+        match self {
+            Kind::Switch => v == 0 || v == 1,
+            Kind::Range { min, max, step, .. } => (*min..=*max).contains(&v) && (v - min) % (*step).max(1) == 0,
+            Kind::Steps { values, .. } => values.contains(&v),
+        }
+    }
+    /// A value's words ("4 ms", "On").
+    pub fn words(&self, v: i32) -> String {
+        match self {
+            Kind::Switch => if v != 0 { "On" } else { "Off" }.to_string(),
+            Kind::Range { unit: "", .. } | Kind::Steps { unit: "", .. } => v.to_string(),
+            Kind::Range { unit, .. } | Kind::Steps { unit, .. } => format!("{v} {unit}"),
+        }
+    }
+    /// The card's − / + from `v`: the next value the mouse takes below / above it (`None` at the end, or for a switch). A value
+    /// read outside the range goes to the nearest end with either button (never a stuck row).
+    pub fn step(&self, v: i32, up: bool) -> Option<i32> {
+        match self {
+            Kind::Switch => None,
+            Kind::Range { min, max, .. } if !(*min..=*max).contains(&v) => Some(v.clamp(*min, *max)),
+            Kind::Range { min, max, step, .. } => Some(if up { v + step } else { v - step }).filter(|t| (*min..=*max).contains(t)),
+            Kind::Steps { values, .. } => match (values.first(), values.last()) {
+                (Some(lo), Some(hi)) if v < *lo || v > *hi => Some(v.clamp(*lo, *hi)),
+                _ => if up { values.iter().find(|x| **x > v) } else { values.iter().rev().find(|x| **x < v) }.copied(),
+            },
+        }
+    }
+}
+
+/// One extra setting on the card: what it is, what it takes, its value as read (`None` = not answered).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExtraRow {
+    pub extra: Extra,
+    pub kind: Kind,
+    pub value: Option<i32>,
+}
+
+impl ExtraRow {
+    pub fn new(extra: Extra, kind: Kind, value: Option<i32>) -> Self {
+        Self { extra, kind, value }
+    }
+    pub fn switch(extra: Extra, value: Option<bool>) -> Self {
+        Self { extra, kind: Kind::Switch, value: value.map(i32::from) }
+    }
+}
+
+/// One change from a click on an extra row (Order 110). The driver writes it the way OpenMouse does and reads it back; the
+/// page then reads the mouse again.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Change {
+    /// an extra setting → this value (a switch: 1 / 0)
+    Extra(Extra, i32),
+}
+
+/// The error for a change the mouse's driver does not offer.
+pub fn not_offered(c: Change) -> crate::error::Error {
+    let Change::Extra(e, _) = c;
+    crate::error::Error::range(e.label(), "this mouse has no such setting here".to_string())
+}
+
+/// Finds the row of `e` in a read and checks the value against its kind (the driver's guard before any byte leaves).
+pub fn check_extra(extras: &[ExtraRow], e: Extra, v: i32) -> Result<()> {
+    match extras.iter().find(|r| r.extra == e) {
+        Some(r) if r.kind.allows(v) => Ok(()),
+        Some(r) => Err(crate::error::Error::range(e.label(), format!("{} is not a value this mouse takes", r.kind.words(v)))),
+        None => Err(not_offered(Change::Extra(e, v))),
+    }
 }
 
 /// A change that went through: what the mouse has now and what it had before (for undo; `None` = could not be read).
@@ -256,6 +377,11 @@ pub trait Driver {
     fn read(&self, m: &Matched, port: &mut dyn Port, opt: ReadOptions) -> Result<OnMouse>;
     /// One setting, the way OpenMouse writes it, read back to confirm.
     fn write(&self, m: &Matched, port: &mut dyn Port, s: Setting) -> Result<Changed>;
+    /// Order 110: one stage / extra change, the way OpenMouse writes it, read back to confirm. Families without it refuse
+    /// before a byte leaves.
+    fn change(&self, _m: &Matched, _port: &mut dyn Port, c: Change) -> Result<()> {
+        Err(not_offered(c))
+    }
 }
 
 /// The families, in OpenMouse's registry order (the first that matches wins).
@@ -431,6 +557,22 @@ mod tests {
         assert_eq!((c.wheel(26000, true), c.wheel(50, false)), (26000, 50), "stops at the ends");
         let h = DpiCaps::uniform(100, 25600, 100);
         assert_eq!((h.wheel(800, true), h.wheel(800, false)), (900, 700), "a 100-step mouse never sticks");
+    }
+
+    #[test]
+    fn minus_and_plus_go_to_the_next_value_the_mouse_takes() {
+        let r = Kind::Range { min: 0, max: 15, step: 1, unit: "ms" };
+        assert_eq!((r.step(4, true), r.step(4, false), r.step(15, true), r.step(0, false)), (Some(5), Some(3), None, None));
+        // ATK's debounce: only 0, 1, 2, 4, 8, 15, 20 ms (OpenMouse)
+        let s = Kind::Steps { values: vec![0, 1, 2, 4, 8, 15, 20], unit: "ms" };
+        assert_eq!((s.step(2, true), s.step(4, false), s.step(20, true), s.step(0, false)), (Some(4), Some(2), None, None));
+        assert_eq!(s.step(3, true), Some(4), "a value between steps goes to the next one");
+        assert_eq!(s.step(3, false), Some(2));
+        assert!(s.allows(8) && !s.allows(3));
+        assert_eq!(s.words(8), "8 ms");
+        // a value the mouse reports outside its own range (flash 0xFF): either button brings it back to the nearest end
+        assert_eq!((r.step(255, false), r.step(255, true), r.step(-3, true)), (Some(15), Some(15), Some(0)));
+        assert_eq!((s.step(99, false), s.step(99, true)), (Some(20), Some(20)));
     }
 
     #[test]

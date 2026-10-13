@@ -8,7 +8,7 @@
 //! right. OpenMouse sends it with `sendFeatureReport(3, [lo, hi, 0, 0])`; Windows puts the report id in front: `[3, lo, hi, 0, 0]`.
 
 use bu_mouse::error::Error;
-use bu_mouse::family::{self, Driver, Family, ReadOptions, Setting};
+use bu_mouse::family::{self, Change, Driver, Extra, Family, Kind, ReadOptions, Setting};
 use bu_mouse::fake::{hid_info, ScriptPort};
 use bu_mouse::os::{HidInfo, HidTransfer};
 use bu_mouse::zaunkoenig as z;
@@ -396,4 +396,40 @@ fn a_saved_dpi_above_the_models_maximum_does_not_block_polling_or_lift_off() {
     assert_eq!((c.now, c.before), (1600, Some(25_600)));
     // and a value that is out of range is still refused with the DPI error
     assert!(matches!(z::Zaunkoenig.write(&m, &mut port, Setting::Dpi(25_600)), Err(Error::OutOfRange { .. })));
+}
+
+// ---------------------------------------------------------------- Order 110: angle snapping (the client's only one of the order's settings)
+
+#[test]
+fn angle_snapping_is_bit_14_of_the_word() {
+    let info = control(0xA462);
+    let m = z::matches(&[&info], 0x0483, 0xA462).unwrap();
+    // read: angleSnapping = Boolean(word & 0x4000)
+    let mo = mouse(M3K_BASE | 0x4000);
+    let s = z::Zaunkoenig.read(&m, &mut port_for(&info, mo), ReadOptions::default()).unwrap();
+    assert_eq!(s.extras.iter().map(|e| (e.extra, e.value, e.kind.clone())).collect::<Vec<_>>(), vec![(Extra::AngleSnap, Some(1), Kind::Switch)]);
+    let s = z::Zaunkoenig.read(&m, &mut port_for(&info, mouse(M3K_BASE)), ReadOptions::default()).unwrap();
+    assert_eq!(s.extra(Extra::AngleSnap), Some(0));
+    // setAngleSnapping(true) on 0x1a0f: update = read, write 0x1a0f | 0x4000 = 0x5a0f as [3, 0x0F, 0x5A, 0, 0 …], read back
+    let mo = mouse(M3K_BASE);
+    let mut port = port_for(&info, mo.clone());
+    z::Zaunkoenig.change(&m, &mut port, Change::Extra(Extra::AngleSnap, 1)).unwrap();
+    assert_eq!(mo.borrow().seen, vec![vec![3], padded(&[3, 0x0F, 0x5A]), vec![3]]);
+    assert_eq!(port.sent[1].1, HidTransfer::FeatureOut);
+    // off again: 0x1a0f = [3, 0x0F, 0x1A]
+    z::Zaunkoenig.change(&m, &mut port, Change::Extra(Extra::AngleSnap, 0)).unwrap();
+    assert_eq!(mo.borrow().seen[4], padded(&[3, 0x0F, 0x1A]));
+    // unchanged: no write (wantedWord === the current word)
+    z::Zaunkoenig.change(&m, &mut port, Change::Extra(Extra::AngleSnap, 0)).unwrap();
+    assert_eq!(mo.borrow().seen.len(), 8);
+    // a mouse that does not keep it
+    mo.borrow_mut().deaf = true;
+    assert!(z::Zaunkoenig.change(&m, &mut port, Change::Extra(Extra::AngleSnap, 1)).is_err());
+    // refused before a byte leaves
+    let mo = mouse(M3K_BASE);
+    let mut port = port_for(&info, mo.clone());
+    for c in [Change::Extra(Extra::AngleSnap, 2), Change::Extra(Extra::MotionSync, 1), Change::Extra(Extra::Debounce, 4)] {
+        assert!(z::Zaunkoenig.change(&m, &mut port, c).is_err(), "{c:?}");
+    }
+    assert!(mo.borrow().seen.is_empty());
 }

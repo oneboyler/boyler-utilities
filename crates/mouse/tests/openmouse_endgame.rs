@@ -1328,3 +1328,123 @@ fn endgame_ids_belong_to_no_other_family() {
         assert!(e::matches(&[&i], vid, pid).is_none());
     }
 }
+
+// ======================================================================================== Order 110: Motion Sync, angle snapping, ripple
+
+use bu_mouse::family::{Change, Extra};
+
+fn extras(r: &bu_mouse::family::OnMouse) -> Vec<(Extra, Option<i32>)> {
+    r.extras.iter().map(|x| (x.extra, x.value)).collect()
+}
+
+fn change_op1(pid: u16, m: &Rc<RefCell<Op1Mouse>>, c: Change) -> (Result<(), Error>, ScriptPort) {
+    let mut port = op1_port(pid, m);
+    let r = e::Endgame.change(&matched(pid, LEN as u16), &mut port, c);
+    (r, port)
+}
+
+fn change_ot(pid: u16, m: &Rc<RefCell<OtMouse>>, c: Change) -> (Result<(), Error>, ScriptPort) {
+    let mut port = ot_port(pid, m, 64);
+    let r = e::Endgame.change(&matched(pid, 64), &mut port, c);
+    (r, port)
+}
+
+#[test]
+fn order_110_op1_read_shows_motion_sync_angle_snapping_and_ripple() {
+    // readStatus: motionSync = config[28] !== 0, angleSnapping = config[26] !== 0, rippleControl = config[27] !== 0
+    let mut c = base();
+    c[26] = 1;
+    c[27] = 0;
+    c[28] = 1;
+    let (r, port) = read(0x1978, &Op1Mouse::new(c));
+    assert_eq!(extras(&r), vec![(Extra::MotionSync, Some(1)), (Extra::AngleSnap, Some(1)), (Extra::RippleControl, Some(0))]);
+    assert_eq!(sends(&port), vec![load_report()], "the same config read, nothing more");
+    assert!(port.sent.iter().all(|(o, _)| e::read_request_allowed(o)));
+}
+
+#[test]
+fn order_110_op1_changes_are_openmouses_setboolean_bytes() {
+    // 8K: writeConfigRaw [0xA0, 0x11, config[2..]] with the one byte changed, every other byte as read
+    for (c, offset, value) in [(Change::Extra(Extra::MotionSync, 1), 28usize, 1u8), (Change::Extra(Extra::AngleSnap, 0), 26, 0), (Change::Extra(Extra::RippleControl, 1), 27, 1)] {
+        let mut b = base();
+        b[26] = 1;
+        b[27] = 0;
+        let m = Op1Mouse::new(b.clone());
+        let (r, port) = change_op1(0x1978, &m, c);
+        r.unwrap_or_else(|x| panic!("{c:?}: {x}"));
+        let mut want = b.clone();
+        want[1] = 0x11;
+        want[offset] = value;
+        let s = sends(&port);
+        assert_eq!(s.len(), 3, "{c:?}: load, store, load");
+        assert_eq!((&s[0], &s[1], &s[2]), (&load_report(), &want, &load_report()), "{c:?}");
+        assert_eq!(m.borrow().cfg[offset], value);
+    }
+    // 4K v2: Motion Sync (config[28] = blob 0x0c) is the first byte of the power block (op 0x15, declared 10, chunk 0); angle
+    // snapping / ripple (config[26] / [27] = blob 0x0a / 0x0b) are bytes 3 / 4 of the sensor block (op 0x14, declared 28)
+    let b = base();
+    let m = Op1Mouse::new(b.clone());
+    m.borrow_mut().glass_in_power = true;
+    let (r, port) = change_op1(0x1984, &m, Change::Extra(Extra::MotionSync, 1));
+    r.unwrap();
+    let power = [1, b[21], b[22], b[20], b[77], b[84], b[91], b[98], b[105], b[19], b[127]];
+    let s = sends(&port);
+    assert_eq!(s.len(), 3, "load, power block, load");
+    assert_eq!(s[1], hdr(0x15, 10, 0, &power));
+    let m = Op1Mouse::new(b.clone());
+    let (r, port) = change_op1(0x1984, &m, Change::Extra(Extra::RippleControl, 0));
+    r.unwrap();
+    let mut sensor = vec![b[23], b[24], b[25], b[26], 0, b[17], b[30], b[29]];
+    sensor.extend_from_slice(&b[51..71]);
+    assert_eq!(sends(&port)[1], hdr(0x14, 28, 0, &sensor));
+    // a mouse that keeps the old value is an error
+    let m = Op1Mouse::new(base());
+    m.borrow_mut().ignore_store = true;
+    assert!(matches!(change_op1(0x1978, &m, Change::Extra(Extra::MotionSync, 1)).0, Err(Error::BadAnswer(_))));
+}
+
+#[test]
+fn order_110_op1_refuses_what_openmouse_does_not_take_before_a_byte_leaves() {
+    // OP1 8K (no Motion Sync at 8 kHz) running at 8000 Hz: setMotionSync(true) throws before writing
+    let mut b = base();
+    b[21] = 1;
+    let m = Op1Mouse::new(b);
+    let (r, port) = change_op1(0x1964, &m, Change::Extra(Extra::MotionSync, 1));
+    assert!(matches!(r, Err(Error::OutOfRange { .. })));
+    assert!(sends(&port).iter().all(|o| e::read_request_allowed(o)) && m.borrow().stores == 0);
+    // switches take 0 / 1; nothing else is offered (no debounce setter in OpenMouse's OP1 client)
+    let m = Op1Mouse::new(base());
+    for c in [Change::Extra(Extra::MotionSync, 2), Change::Extra(Extra::Debounce, 4), Change::Extra(Extra::Turbo, 1)] {
+        let (r, port) = change_op1(0x1978, &m, c);
+        assert!(r.is_err(), "{c:?}");
+        assert!(port.sent.is_empty(), "{c:?}: nothing sent");
+    }
+}
+
+#[test]
+fn order_110_ot_reads_and_writes_the_profile_flags_like_openmouse() {
+    // profileFlags (u32 LE at 12): angleSnapping = 1 << 3, rippleControl = 1 << 6; ot_effect() holds 0x48 = both on
+    let m = OtMouse::new(ot_effect());
+    let (r, port) = ot_read(0x1906, &m, ReadOptions::default());
+    assert_eq!(extras(&r), vec![(Extra::AngleSnap, Some(1)), (Extra::RippleControl, Some(1))]);
+    assert_eq!(sends(&port), vec![query(0)]);
+    // setAngleSnapping(false): flags 0x48 & !0x08 = 0x40; the main block (packet byte 3 + 12) carries it, everything else as read
+    let (r, port) = change_ot(0x1906, &m, Change::Extra(Extra::AngleSnap, 0));
+    r.unwrap();
+    let mut want = ot_effect();
+    want[12] = 0x40;
+    assert_eq!(m.borrow().eff, want);
+    assert_eq!(sends(&port)[11], want_set(&want, 0));
+    assert_eq!(sends(&port)[11][3 + 12], 0x40);
+    // setRippleControl(false) then (true): 0x40 -> 0x00 -> 0x40
+    change_ot(0x1906, &m, Change::Extra(Extra::RippleControl, 0)).0.unwrap();
+    assert_eq!(m.borrow().eff[12], 0x00);
+    change_ot(0x1906, &m, Change::Extra(Extra::RippleControl, 1)).0.unwrap();
+    assert_eq!(m.borrow().eff[12], 0x40);
+    // refused before a byte leaves: Motion Sync (two OT flags, no plain switch), anything else, a value a switch does not take
+    for c in [Change::Extra(Extra::MotionSync, 1), Change::Extra(Extra::AngleSnap, 2), Change::Extra(Extra::Debounce, 2), Change::Extra(Extra::Turbo, 1)] {
+        let (r, port) = change_ot(0x1906, &m, c);
+        assert!(r.is_err(), "{c:?}");
+        assert!(port.sent.is_empty(), "{c:?}");
+    }
+}

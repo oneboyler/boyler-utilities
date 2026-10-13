@@ -32,15 +32,18 @@
 //! set = tenths of a mm, else whole mm; Low 0x87 = 0.7 mm, Medium 0x01 = 1 mm, High 0x02 = 2 mm): the three settings OpenMouse
 //! can write are 7 / 10 / 20 tenths here. (Decision for the lead: the labels carry no mm, the wire value does.)
 //!
-//! Left out on purpose: everything that is not DPI / polling / lift-off / battery - sleep timeout, debounce, DPI-stage count,
-//! angle snapping, motion sync, competitive / hyper mode, ripple control, the dongle LED, the LunaFury controls (Lightning
+//! Order 110 (A_110_02 scope): debounce (device page: write 0x08 `[profile, ms]` 0-15 ms, read 0x88), Motion Sync (profile
+//! page 0x09 / 0x89), angle snapping (0x04 / 0x84), ripple control (0x0a / 0x8a): OpenMouse's setFlag / setDebounceTime -
+//! the active profile asked first, the write, the read-back (answer byte 1) must hold the value. Each read is optional.
+//!
+//! Left out on purpose: sleep timeout, DPI-stage count, competitive / hyper mode, the dongle LED, the LunaFury controls (Lightning
 //! Trigger, per-button latency, wheel guard, sensor angle) and the magnetic-switch commands (RAWM Leviathan V4 GT only, not
 //! on the list). The firmware reads are sent only as "is it answering" (the mouse's, as readStatus does first); the receiver's
 //! firmware is not read. OpenMouse sends no firmware-update, DFU or reset command to these mice and neither does this file.
 //! The Atlantis client (`drivers/lamzu-atlantis/hid.js`) is not ported: its only list entry is "likely", not "supported".
 
 use crate::error::{Error, Result};
-use crate::family::{Caps, Changed, DpiCaps, Driver, Family, Matched, OnMouse, Port, ReadOptions, Setting};
+use crate::family::{check_extra, Caps, Change, Changed, DpiCaps, Driver, Extra, ExtraRow, Family, Kind, Matched, OnMouse, Port, ReadOptions, Setting};
 use crate::os::{HidInfo, HidTransfer};
 
 /// The shared CompX ODM vendor id (Lamzu's older models, CRDRAKO, LunaFury, Attack Shark ...).
@@ -197,6 +200,39 @@ pub fn read_polling(profile: u8) -> Req {
 /// PROFILE_READ.liftOffDistance(profile) {mouse, profile page, 0x88, 2, [profile]}: answer `[1]` = the lift-off value.
 pub fn read_lift_off(profile: u8) -> Req {
     req(PAGE_PROFILE, 0x88, 0x02, &[profile])
+}
+
+/// Order 110: PROFILE_READ.debounce(profile) {mouse, DEVICE page, 0x88, 2, [profile]}: answer `[1]` = ms.
+pub fn read_debounce(profile: u8) -> Req {
+    req(PAGE_DEVICE, 0x88, 0x02, &[profile])
+}
+
+/// Order 110: write(device page, WRITE.debounce = 0x08, profile, [ms]).
+pub fn write_debounce(profile: u8, ms: u8) -> Req {
+    req(PAGE_DEVICE, 0x08, 2, &[profile, ms])
+}
+
+/// Order 110: the profile-page flags as (setting, write command, read command): WRITE / PROFILE_READ motionSync 0x09 / 0x89,
+/// angleSnapping 0x04 / 0x84, rippleControl 0x0a / 0x8a.
+pub const FLAGS: [(Extra, u8, u8); 3] = [(Extra::MotionSync, 0x09, 0x89), (Extra::AngleSnap, 0x04, 0x84), (Extra::RippleControl, 0x0a, 0x8a)];
+/// `DEBOUNCE_MAX_MS`
+pub const DEBOUNCE_MAX_MS: i32 = 15;
+
+/// Order 110: PROFILE_READ of a flag {mouse, profile page, read command, 2, [profile]}: answer `[1]` = 1 when on.
+pub fn read_flag(profile: u8, command: u8) -> Req {
+    req(PAGE_PROFILE, command, 0x02, &[profile])
+}
+
+/// Order 110: write(profile page, flag command, profile, [on]).
+pub fn write_flag(profile: u8, command: u8, on: bool) -> Req {
+    req(PAGE_PROFILE, command, 2, &[profile, on as u8])
+}
+
+/// The Order 110 rows in the card's order (Debounce, Motion Sync, angle snapping, ripple), values `None` = not read.
+fn rows(debounce: Option<i32>, flags: [Option<bool>; 3]) -> Vec<ExtraRow> {
+    let mut v = vec![ExtraRow::new(Extra::Debounce, Kind::Range { min: 0, max: DEBOUNCE_MAX_MS, step: 1, unit: "ms" }, debounce)];
+    v.extend(FLAGS.iter().zip(flags).map(|(f, on)| ExtraRow::switch(f.0, on)));
+    v
 }
 
 /// write(profile page, WRITE.pollingRate = 0x00, profile, [code]): length = the argument count.
@@ -371,6 +407,8 @@ pub fn read_request_allowed(out: &[u8]) -> bool {
         (PAGE_PROFILE, 0x81, 0x0a) => args[0] >= 1 && args[1] == 6 && zeros(2),
         // active stage, polling rate, lift-off distance: [profile]
         (PAGE_PROFILE, 0x82, 0x02) | (PAGE_PROFILE, 0x80, 0x02) | (PAGE_PROFILE, 0x88, 0x02) => args[0] >= 1 && zeros(1),
+        // Order 110: debounce (device page), Motion Sync / angle snapping / ripple (profile page): [profile]
+        (PAGE_DEVICE, 0x88, 0x02) | (PAGE_PROFILE, 0x89, 0x02) | (PAGE_PROFILE, 0x84, 0x02) | (PAGE_PROFILE, 0x8a, 0x02) => args[0] >= 1 && zeros(1),
         _ => false,
     }
 }
@@ -470,7 +508,7 @@ pub struct Lamzu;
 impl Driver for Lamzu {
     /// READ requests only: the reads OpenMouse's readStatus sends for DPI, polling, lift-off and battery (plus its first, the
     /// mouse's firmware version, as "is it answering"; no answer = asleep or out of range = `online: false`). Every one passes
-    /// [`read_request_allowed`]. OpenMouse's other reads (sleep, debounce, flags, receiver firmware) are not sent. There is no
+    /// [`read_request_allowed`]. Order 110 adds its debounce and flag reads; its other reads (sleep, receiver firmware) are not sent. There is no
     /// wake loop in OpenMouse to count, so `online_tries` has nothing to limit: one request waits at most ~2.5 s.
     fn read(&self, m: &Matched, port: &mut dyn Port, _opt: ReadOptions) -> Result<OnMouse> {
         let p = the_product(m)?;
@@ -496,7 +534,35 @@ impl Driver for Lamzu {
         }
         r.polling_hz = optional(polling_now(port, p, profile))?.flatten();
         r.lift_off = optional(lift_off_now(port, p, profile))?.flatten();
+        // Order 110: debounce, then the flags (readStatus' order), each `.catch(() => null)`
+        let debounce = optional(request(port, p, &read_debounce(profile)))?.and_then(|a| a.get(1).map(|b| *b as i32));
+        let mut flags = [None; 3];
+        for (i, f) in [1usize, 0, 2].into_iter().map(|i| (i, FLAGS[i])) {
+            flags[i] = optional(request(port, p, &read_flag(profile, f.2)))?.and_then(|a| a.get(1).map(|b| *b == 1));
+        }
+        // a setting the mouse did not answer (unsupported on this model) gets no row, as OpenMouse hides its control
+        r.extras = rows(debounce, flags).into_iter().filter(|x| x.value.is_some()).collect();
         Ok(r)
+    }
+
+    /// Order 110: setDebounceTime / setMotionSync / setAngleSnapping / setRippleControl - checked first, then the active
+    /// profile, the write, the read-back.
+    fn change(&self, m: &Matched, port: &mut dyn Port, c: Change) -> Result<()> {
+        let p = the_product(m)?;
+        let Change::Extra(e, v) = c;
+        check_extra(&rows(None, [None; 3]), e, v)?;
+        let profile = current_profile(port, p)?;
+        let (write, read) = match FLAGS.iter().find(|f| f.0 == e) {
+            Some(f) => (write_flag(profile, f.1, v == 1), read_flag(profile, f.2)),
+            None => (write_debounce(profile, v as u8), read_debounce(profile)),
+        };
+        request(port, p, &write)?;
+        // OpenMouse's confirm: a flag reads on when its byte === 1 (anything else = off); debounce is the byte itself
+        let now = request(port, p, &read)?.get(1).copied().map(|b| if e == Extra::Debounce { b as i32 } else { (b == 1) as i32 });
+        if now != Some(v) {
+            return Err(Error::BadAnswer(format!("the mouse kept {now:?} instead of {v} ({})", e.label())));
+        }
+        Ok(())
     }
 
     /// setDpi / setPollingRate / setLiftOffDistance the way LamzuHidClient does them: ask for the active profile, the write,

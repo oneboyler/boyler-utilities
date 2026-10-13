@@ -106,8 +106,8 @@ fn only_read_requests_pass_the_allow_list() {
     ] {
         assert!(!cs::read_request_allowed(&rep(bytes)), "{bytes:02x?}");
     }
-    // GETs OpenMouse has but this file never sends (mask, lift, snap), a slot beyond 5, a GET with a value, another id, junk
-    for bytes in [&[0x0eu8, 0x13, 0x05, 0x00][..], &[0x0e, 0x13, 0x03, 0x00], &[0x0e, 0x13, 0x04, 0x00], &[0x0e, 0x13, 0xd6, 0x00], &[0x0e, 0x13, 0x02, 0x01], &[0x0e, 0x13, 0x02, 0x00, 0x05], &[0x0e, 0x0a, 0x00]] {
+    // GETs OpenMouse has but this file never sends (mask, lift), a slot beyond 5, a GET with a value, another id, junk
+    for bytes in [&[0x0eu8, 0x13, 0x05, 0x00][..], &[0x0e, 0x13, 0x03, 0x00], &[0x0e, 0x13, 0xd6, 0x00], &[0x0e, 0x13, 0x02, 0x01], &[0x0e, 0x13, 0x02, 0x00, 0x05], &[0x0e, 0x0a, 0x00]] {
         assert!(!cs::read_request_allowed(&rep(bytes)), "{bytes:02x?}");
     }
     let mut id1 = rep(&[0x0e, 0x01, 0x00]);
@@ -189,6 +189,8 @@ struct Mouse {
     /// a SET clears the colour (what OpenMouse says happens when a write omits it)
     clear_colour: bool,
     /// the first n GET answers are a stale buffer (another command's answer)
+    /// Order 110: angle snapping (MOUSE_SNAP 0x04: answer byte 4)
+    snap: u8,
     stale: u32,
 }
 
@@ -219,6 +221,7 @@ impl Mouse {
         }
         match (p[1], p[2]) {
             (0x01, _) => r[17] = self.interval_ms,
+            (0x13, 0x04) => r[5] = self.snap,
             (0x13, 0x02) => {
                 let (x, y, _) = self.stages[self.slot as usize];
                 r[5] = self.slot;
@@ -237,8 +240,13 @@ impl Mouse {
     }
     fn set(&mut self, p: &[u8]) {
         self.sets.push(p.to_vec());
-        assert_eq!((p[0], p[1]), (0x07, 0x13), "the only SET is the stage write");
+        assert_eq!((p[0], p[1]), (0x07, 0x13), "the only SETs are the stage write and setSnap");
         if self.ignore_sets {
+            return;
+        }
+        if p[2] == 0x04 {
+            assert_eq!((p[3], p[5]), (0x00, 0x05), "setSnap: [07 13 04 00 on 05]");
+            self.snap = p[4];
             return;
         }
         let slot = (p[2] - 0xd0) as usize;
@@ -275,7 +283,8 @@ fn reading_asks_only_what_openmouse_asks() {
     let r = cs::Corsair.read(&matched(), &mut p, ReadOptions::default()).unwrap();
     assert!(p.sent.iter().all(|s| cs::read_request_allowed(&s.0)), "read requests only");
     // the identity, then the current DPI
-    assert_eq!(p.sent.iter().map(|s| s.0.clone()).collect::<Vec<_>>(), vec![rep(&[0x0e, 0x01, 0x00]), rep(&[0x0e, 0x13, 0x02, 0x00])]);
+    // (Order 110: then angle snapping, corsairEncode.snap 0e 13 04 00)
+    assert_eq!(p.sent.iter().map(|s| s.0.clone()).collect::<Vec<_>>(), vec![rep(&[0x0e, 0x01, 0x00]), rep(&[0x0e, 0x13, 0x02, 0x00]), rep(&[0x0e, 0x13, 0x04, 0x00])]);
     assert!(p.sent.iter().all(|s| s.1 == HidTransfer::Feature { reply_id: 0, reply_len: 65, wait_ms: 20 }));
     // slot 2 = 1200 DPI; interval 1 ms = 1000 Hz
     assert_eq!((r.online, r.dpi, r.polling_hz, r.battery_percent, r.lift_off, r.wireless), (true, Some(1200), Some(1000), None, None, Some(false)));
@@ -299,7 +308,7 @@ fn a_stale_answer_is_asked_again_and_a_silent_mouse_is_offline() {
     let mut p = port(&mouse);
     let r = cs::Corsair.read(&matched(), &mut p, ReadOptions::default()).unwrap();
     assert!(r.online && r.dpi == Some(1200));
-    assert_eq!(p.sent.len(), 3, "ident twice, current once");
+    assert_eq!(p.sent.len(), 4, "ident twice, current once, snap once");
     assert_eq!(p.sent[0].0, p.sent[1].0);
     // three stale answers in a row: no answer
     mouse.borrow_mut().stale = 3;
@@ -410,5 +419,43 @@ fn polling_and_lift_off_are_not_set() {
     let mut p = port(&mouse);
     assert!(cs::Corsair.write(&matched(), &mut p, Setting::Polling(500)).is_err());
     assert!(cs::Corsair.write(&matched(), &mut p, Setting::LiftOff(10)).is_err());
+    assert!(p.sent.is_empty());
+}
+
+// ---------------------------------------------------------------- Order 110: angle snapping
+
+use bu_mouse::family::{Change, Extra};
+
+#[test]
+fn order_110_angle_snapping_is_openmouses_snap_get_and_set() {
+    // corsairEncode.snap = corsairPacket(GET 0x0e, mouse 0x13, snap 0x04, live profile 0); setSnap adds [on, 0x05]
+    assert_eq!(cs::report(&cs::get_snap(), 65), rep(&[0x0e, 0x13, 0x04, 0x00]));
+    assert_eq!(cs::report(&cs::set_snap(true), 65), rep(&[0x07, 0x13, 0x04, 0x00, 0x01, 0x05]));
+    assert_eq!(cs::report(&cs::set_snap(false), 65), rep(&[0x07, 0x13, 0x04, 0x00, 0x00, 0x05]));
+    // corsairDecode.snap: byte 4 !== 0 (OpenMouse's reply has no report id)
+    assert_eq!((cs::decode_snap(&[0x0e, 0x13, 0x04, 0x00, 0x02]), cs::decode_snap(&[0x0e, 0x13, 0x04, 0x00, 0x00]), cs::decode_snap(&[0x0e])), (Some(true), Some(false), None));
+    // read: the row with the mouse's value
+    let mouse = Rc::new(RefCell::new(Mouse::new()));
+    mouse.borrow_mut().snap = 1;
+    let mut p = port(&mouse);
+    let r = cs::Corsair.read(&matched(), &mut p, ReadOptions::default()).unwrap();
+    assert_eq!(r.extras.iter().map(|x| (x.extra, x.value)).collect::<Vec<_>>(), vec![(Extra::AngleSnap, Some(1))]);
+    // setAngleSnapping(false): the SET (no answer), then the GET confirms
+    let mut p = port(&mouse);
+    cs::Corsair.change(&matched(), &mut p, Change::Extra(Extra::AngleSnap, 0)).unwrap();
+    assert_eq!(p.sent.iter().map(|s| s.0.clone()).collect::<Vec<_>>(), vec![rep(&[0x07, 0x13, 0x04, 0x00, 0x00, 0x05]), rep(&[0x0e, 0x13, 0x04, 0x00])]);
+    assert_eq!(p.sent[0].1, HidTransfer::FeatureOut);
+    assert_eq!(mouse.borrow().snap, 0);
+    assert!(!cs::read_request_allowed(&p.sent[0].0) && cs::read_request_allowed(&p.sent[1].0));
+    // a mouse that keeps the old value
+    mouse.borrow_mut().ignore_sets = true;
+    let mut p = port(&mouse);
+    assert!(matches!(cs::Corsair.change(&matched(), &mut p, Change::Extra(Extra::AngleSnap, 1)), Err(Error::BadAnswer(_))));
+    // refused before a byte leaves: 0 / 1 only, nothing else (OpenMouse's NIGHTSWORD client has no Motion Sync / ripple /
+    // debounce / turbo)
+    let mut p = port(&mouse);
+    for c in [Change::Extra(Extra::AngleSnap, 2), Change::Extra(Extra::MotionSync, 1), Change::Extra(Extra::RippleControl, 1), Change::Extra(Extra::Debounce, 4), Change::Extra(Extra::Turbo, 1)] {
+        assert!(cs::Corsair.change(&matched(), &mut p, c).is_err(), "{c:?}");
+    }
     assert!(p.sent.is_empty());
 }

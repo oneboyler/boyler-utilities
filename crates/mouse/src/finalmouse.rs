@@ -27,12 +27,17 @@
 //! OpenMouse's order and the one that worked is used for the rest. Unclear: whether the mouse's inner-length byte always equals 2 +
 //! payload length (it is matched for every length from there up to 62).
 //!
-//! Left out on purpose: motion sync, dongle LED, tournament scroll, every Starlight X command, profile commands (not DPI /
-//! polling / lift-off / battery). OpenMouse sends no firmware, DFU or reset command and neither does this file.
+//! Order 110 (A_110_02 scope): Motion Sync - the only one of debounce / Motion Sync / angle snapping / ripple / turbo the client
+//! has. Read: the burst's command-18 answer (`motionSync: payload[0] === 1`), asked like the other values; not answered = no row
+//! (OpenMouse's motionSync stays null). Write: setMotionSync = one frame `[0x04, 3, 0x80 | 18, 1, on]`; OpenMouse reads nothing back,
+//! this file asks the burst for command 18 again (the order's read-back). The lift-off chips already hold both ULX stops.
+//!
+//! Left out on purpose: dongle LED, tournament scroll, every Starlight X command, profile commands. OpenMouse sends no
+//! firmware, DFU or reset command and neither does this file.
 //! Proven only against OpenMouse's bytes (tests); never run on a real unit.
 
 use crate::error::{Error, Result};
-use crate::family::{Caps, Changed, DpiCaps, Family, Matched, OnMouse, Port, ReadOptions, Setting};
+use crate::family::{check_extra, Caps, Change, Changed, DpiCaps, Extra, ExtraRow, Family, Kind, Matched, OnMouse, Port, ReadOptions, Setting};
 use crate::os::{HidInfo, HidTransfer};
 
 pub const VENDOR_ID: u16 = 0x361D;
@@ -53,6 +58,8 @@ pub const CMD_POLLING: u8 = 17;
 pub const CMD_LIFT_OFF: u8 = 21;
 pub const CMD_WAKE_ALL: u8 = 96;
 pub const CMD_DONGLE_INFO: u8 = 10;
+/// Order 110: Motion Sync (write `[on]`; the burst answers it with command 18 too)
+pub const CMD_MOTION_SYNC: u8 = 18;
 
 /// DPI_MIN / DPI_MAX (getDpiOptions: every integer between)
 pub const DPI_MIN: u32 = 50;
@@ -87,6 +94,11 @@ pub fn polling_request(hz: u32, len: usize) -> Option<Vec<u8>> {
     POLLING.contains(&hz).then(|| request(MAIN_OUT, CMD_POLLING, &(hz as u16).to_le_bytes(), len))
 }
 
+/// setMotionSync: `buildFinalmouseReport(18, [on])` on report 0x04.
+pub fn motion_sync_request(on: bool, len: usize) -> Vec<u8> {
+    request(MAIN_OUT, CMD_MOTION_SYNC, &[on as u8], len)
+}
+
 pub fn lift_off_request(mm: u32, len: usize) -> Option<Vec<u8>> {
     LIFT_OFF_MM.contains(&mm).then(|| request(MAIN_OUT, CMD_LIFT_OFF, &[mm as u8], len))
 }
@@ -100,6 +112,8 @@ pub enum Update {
     LiftOffMm(u32),
     /// command 37: 1 = charging
     Charging(u8),
+    /// command 18: Motion Sync (1 = on)
+    MotionSync(u8),
     /// command 38: state of charge in percent
     BatterySoc(u8),
 }
@@ -123,6 +137,7 @@ pub fn decode_report(report: &[u8]) -> Option<Update> {
         3 => u16le(payload).map(Update::Dpi),
         4 => u16le(payload).map(Update::Polling),
         5 => u16le(payload).map(Update::BatteryMv),
+        18 => payload.first().map(|b| Update::MotionSync(*b)),
         21 => payload.first().map(|b| Update::LiftOffMm(*b as u32)),
         37 => payload.first().map(|b| Update::Charging(*b)),
         38 if payload.len() >= 3 => Some(Update::BatterySoc(payload[0])),
@@ -238,6 +253,10 @@ impl crate::family::Driver for Finalmouse {
         if let Some(Update::Charging(s)) = ask(port, q, 37, 1, NEXT_MS)? {
             r.charging = Some(s == 1);
         }
+        // Order 110: Motion Sync from the same burst (motionSync: payload[0] === 1); no answer = no row
+        if let Some(Update::MotionSync(v)) = ask(port, q, CMD_MOTION_SYNC, 1, NEXT_MS)? {
+            r.extras = vec![ExtraRow::switch(Extra::MotionSync, Some(v == 1))];
+        }
         // the lift-off query names its own answer (command 21)
         if let Some(Update::LiftOffMm(mm)) = ask(port, &reqs[0], 21, 1, NEXT_MS)? {
             if LIFT_OFF_MM.contains(&mm) {
@@ -245,6 +264,24 @@ impl crate::family::Driver for Finalmouse {
             }
         }
         Ok(r)
+    }
+
+    /// Order 110: setMotionSync - checked before a byte leaves, then one frame, then command 18 asked again to confirm.
+    fn change(&self, _m: &Matched, port: &mut dyn Port, c: Change) -> Result<()> {
+        let Change::Extra(e, v) = c;
+        check_extra(&[ExtraRow::new(Extra::MotionSync, Kind::Switch, None)], e, v)?;
+        let len = out_len(port);
+        port.exchange(&motion_sync_request(v == 1, len), &HidTransfer::OutputOnly)?;
+        // OpenMouse reads nothing back; the order wants a read-back: the burst's command-18 answer, asked like the read does
+        for q in read_requests(len) {
+            if let Some(Update::MotionSync(now)) = ask(port, &q, CMD_MOTION_SYNC, 1, FIRST_MS)? {
+                if now as i32 != v {
+                    return Err(Error::BadAnswer(format!("the mouse kept Motion Sync {}", if now == 1 { "on" } else { "off" })));
+                }
+                return Ok(());
+            }
+        }
+        Err(Error::BadAnswer("the mouse did not confirm Motion Sync".into()))
     }
 
     /// OpenMouse's setDpi / setPollingRate / setLiftOffDistance: one frame, nothing read back (so `before` is `None`).
