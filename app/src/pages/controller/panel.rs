@@ -36,6 +36,8 @@ struct Cols {
 }
 
 const PANEL: Cols = Cols { lw: LW, w: PANEL_IN };
+/// The Controller settings popup's rows: label 150 px; the dialog's content 480 - 2 x 18, the group's padding 2 x 12
+const DLG: Cols = Cols { lw: 150.0, w: super::DLG_W - 36.0 - 24.0 };
 use super::PANEL_LEFT;
 
 /// A switch that is off when the file has no value / on when it holds anything but 0.
@@ -774,4 +776,27 @@ pub(super) fn wells(cx: &mut Cx, key: Key, w: Wells, src: Rc<RefCell<Lv>>, side:
         .margin(0.0, 0.0, 8.0, 0.0)
         .child(El::col().min_w(0.0).child(dz_well).child(dz_cap))
         .child(El::col().min_w(0.0).child(cv_well).child(cv_cap))
+}
+
+/// The Controller settings popup's stick rows (Order 102): "Left stick dead zone" / "Right stick dead zone" write the
+/// dead zone (`deadzone_inner_radius`, the layout's own key) into the layout of the game shown at the top, live - the same
+/// value as the "Dead zone" row of that stick's own window.
+pub(super) fn dead_zone_rows(o: &mut Open, cx: &mut Cx) -> Vec<El> {
+    let mut rows = Vec::new();
+    for (side, id, label) in [(Side::Left, "pf.lsdz", "Left stick dead zone"), (Side::Right, "pf.rsdz", "Right stick dead zone")] {
+        let v = o.view.as_ref().and_then(|v| v.sticks.iter().find(|s| s.side == side)).cloned();
+        let dead = v.is_none();
+        let (raw, outer) = match &v {
+            Some(v) => (sv(&v.settings, StickSetting::DeadZone), stick_dz(v).1),
+            None => (None, 100.0),
+        };
+        let el = o.r_slider_in(cx, DLG, id, label, (0.0, 60.0, 1.0), 8.0, Conv::Radius, Fmt::Pct, W::Stick(side, StickSetting::DeadZone), raw, dead, (0.0, outer - 5.0));
+        // the change log / undo words of this row
+        let k = Open::k(id);
+        if let Some(e) = o.rows.get_mut(&k) {
+            e.1 = format!("Controller settings \u{b7} {label}");
+        }
+        rows.push(el);
+    }
+    rows
 }

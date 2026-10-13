@@ -47,7 +47,7 @@ use crate::ui::{cmix, ACC, FG, FG2, FG3, HAIR, HOV, POP, WHITE, WIN_W};
 
 use data::Svc;
 use look::ActShow;
-use work::{After, Job, Want, Wr};
+use work::{After, Job, Verdict, Verify, Want, Wr};
 use pic::{Pic, Pid};
 
 const K_GAME: Key = key("pad.game");
@@ -71,6 +71,13 @@ const K_TOAST: Key = key("pad.toast");
 /// the "Please launch Steam" glass (it takes every click under it) and its button
 const K_GATE: Key = key("pad.gate");
 const K_LAUNCH: Key = key("pad.launch");
+/// "Put mine back" (Order 102): Steam replaced the values the app wrote
+const K_MINE: Key = key("pad.mine");
+/// How often the open tab asks the worker whether Steam has loaded the written layout yet (it reads Steam's log)
+const VERIFY_MS: f64 = 4000.0;
+/// the watch waits in the app's keep while the menu is closed (Steam loads the layout when the game gets focus back, which
+/// is after the menu closed)
+const CHK_KEEP: &str = "pad.chk";
 /// "Launch Steam" waits this long for Steam before it can be clicked again
 const LAUNCH_WAIT_MS: f64 = 20000.0;
 /// every panel / popup control: sub(K_C, "<id>")
@@ -172,6 +179,51 @@ enum Back {
 enum Drift {
     Run { side: Side, at: f64, max: f32 },
     Done { side: Side, max: f32, dz: f64 },
+}
+
+/// Did Steam keep what the app wrote? (Order 102; Steam can load a game's layout and, with Steam Cloud, put other values
+/// over it.) After a layout write the open tab asks its worker every `VERIFY_MS` whether Steam's log says it loaded the
+/// file since; when it did, the file is read again: ours = done (nothing shown), other values = `Replaced` (a line in the
+/// tab with "Put mine back").
+#[derive(Clone, Debug)]
+struct Chk {
+    key: String,
+    kind: PadKind,
+    set: u32,
+    game: String,
+    /// every change written since the last check (later ones win: they are applied in this order)
+    changes: Vec<Change>,
+    /// where Steam's log ended before the first / before the newest of them
+    mark: u64,
+    mark_last: u64,
+    file: std::path::PathBuf,
+    /// a question is out at the worker
+    out: bool,
+    /// when it was last asked (`NEG_INFINITY` = not yet)
+    asked: f64,
+    /// how many answers in a row were "not yet" (the questions get further apart: 4 s, 8, 16, 32, 64 s)
+    misses: u32,
+    /// Steam loaded the file and other values are in it
+    replaced: bool,
+    /// a change was written while the question was out: its answer is thrown away and the question asked again
+    stale: bool,
+    /// which watch this is (an answer for an older one is thrown away)
+    gen: u64,
+}
+
+impl Chk {
+    /// Keep the last change per target (a later one replaces the earlier one of the same thing).
+    fn push(&mut self, new: &[Change]) {
+        for n in new {
+            self.changes.retain(|c| !c.same_target(n));
+            self.changes.push(n.clone());
+        }
+    }
+
+    /// How long to wait before the next question.
+    fn every(&self) -> f64 {
+        VERIFY_MS * f64::from(1u32 << self.misses.min(4))
+    }
 }
 
 /// How long the stick is watched.
@@ -348,6 +400,10 @@ struct Open {
     /// "Launch Steam" was clicked (its button waits for Steam)
     launch_at: Option<f64>,
     drift: Option<Drift>,
+    /// Order 102: the last layout write(s) and whether Steam kept them
+    chk: Option<Chk>,
+    /// the last watch's generation
+    chk_gen: u64,
     /// the drift bar's share 0..1, read by the bar when it is painted
     drift_share: Rc<Cell<f32>>,
     /// the whole second "Hands off · N s" shows (a change builds the page), and when the bar was last given a share
@@ -569,6 +625,8 @@ impl Open {
             steam_up: true,
             launch_at: None,
             drift: None,
+            chk: env.keep.get::<Chk>(CHK_KEEP).map(|c| Chk { out: false, stale: false, asked: f64::NEG_INFINITY, misses: 0, gen: 0, ..c }),
+            chk_gen: 0,
             drift_share: Rc::new(Cell::new(0.0)),
             drift_secs: 0,
             drift_at: f64::NEG_INFINITY,
@@ -685,7 +743,8 @@ impl Open {
     fn drain(&mut self, now: f64) -> bool {
         let mut any = false;
         while let Ok(d) = self.done.try_recv() {
-            any = true;
+            // a "Steam has not loaded it yet" answer shows nothing (Order 102: no frame every few seconds)
+            any |= !matches!(d, work::Done::Verified(_, Verdict::NotYet));
             if d.is_state() {
                 self.out_state = self.out_state.saturating_sub(1);
             } else {
@@ -736,9 +795,12 @@ impl Open {
                     self.apply(l);
                 }
             }
-            work::Done::Wrote { r, recs, loaded, after } => {
+            work::Done::Wrote { r, recs, loaded, after, watch } => {
                 // the change log: written by the next build (`cx.record`)
                 self.rec_q.extend(recs);
+                if r.is_ok() {
+                    self.watch_layout(&after, watch);
+                }
                 match r {
                     Ok(id) => self.wrote(after, id, &loaded, now),
                     Err(e) => self.failed(after, e, now),
@@ -748,6 +810,7 @@ impl Open {
                 }
             }
             work::Done::Live(l) => self.live = l,
+            work::Done::Verified(g, v) => self.verified(g, v),
             work::Done::Said(t) => {
                 if let Some(t) = t {
                     self.say(t, now);
@@ -794,7 +857,7 @@ impl Open {
     /// A write went through: its undo step (the view before it against the files read back after it) and its words.
     fn wrote(&mut self, after: After, id: u32, l: &work::Loaded, now: f64) {
         match after {
-            After::Layout { before, parts, game, kind, set, acting, fallback, say } => {
+            After::Layout { before, parts, changes: _, game, kind, set, acting, fallback, say } => {
                 if let (Some(b), Some(a)) = (before, Self::read_view(l, &game, kind)) {
                     let (bc, ac) = hist::layout_diff(&b, a, &parts, kind);
                     self.acting = acting;
@@ -832,6 +895,126 @@ impl Open {
                 }
             }
         }
+    }
+
+    // ---- did Steam keep what we wrote? (Order 102)
+
+    /// A layout write went through: remember what was written (the last change per target) and where Steam's log ended
+    /// before it.
+    fn watch_layout(&mut self, after: &After, watch: Option<(u64, std::path::PathBuf)>) {
+        match after {
+            // taken back / put back on purpose: nothing of the earlier writes of that game is waited for any more
+            After::Replay { step, .. } => {
+                let hist::What::Layout { game, .. } = &step.what else { return };
+                if self.chk.as_ref().is_some_and(|c| c.key == *game) {
+                    self.chk = None;
+                }
+            }
+            After::PartToSteam { game, .. } => {
+                if self.chk.as_ref().is_some_and(|c| c.key == *game) {
+                    self.chk = None;
+                }
+            }
+            After::Layout { changes, game, kind, set, .. } => {
+                let Some((mark, file)) = watch else { return };
+                match &mut self.chk {
+                    Some(c) if c.key == *game && c.kind == *kind && c.set == *set => {
+                        c.push(changes);
+                        c.file = file;
+                        c.mark_last = mark;
+                        c.replaced = false;
+                        c.misses = 0;
+                        c.asked = f64::NEG_INFINITY;
+                        // a question for fewer changes may be out: its answer is thrown away
+                        c.stale |= c.out;
+                    }
+                    _ => {
+                        // (a question of an older watch that is still out is thrown away by its generation)
+                        self.chk_gen += 1;
+                        let name = self.games.iter().find(|g| g.key == *game).map(|g| g.name.clone()).unwrap_or_else(|| game.clone());
+                        let mut c = Chk { key: game.clone(), kind: *kind, set: *set, game: name, changes: Vec::new(), mark, mark_last: mark, file, out: false, asked: f64::NEG_INFINITY, misses: 0, replaced: false, stale: false, gen: self.chk_gen };
+                        c.push(changes);
+                        self.chk = Some(c);
+                    }
+                }
+            }
+            After::NewSet { .. } => {}
+        }
+    }
+
+    /// The worker's answer to "has Steam loaded it, and did it keep the values?" (`gen` = the watch that asked).
+    fn verified(&mut self, gen: u64, v: Verdict) {
+        let Some(c) = &mut self.chk else { return };
+        if c.gen != gen {
+            return;
+        }
+        c.out = false;
+        if std::mem::take(&mut c.stale) {
+            // answered for fewer changes than are written now: ask again
+            c.asked = f64::NEG_INFINITY;
+            return;
+        }
+        match v {
+            Verdict::NotYet => c.misses += 1,
+            Verdict::Kept => self.chk = None,
+            Verdict::Replaced => c.replaced = true,
+        }
+    }
+
+    /// Ask the worker whether Steam has loaded the written layout (every `c.every()` - longer after each "not yet" - and
+    /// only while Steam runs).
+    fn chk_tick(&mut self, now: f64) {
+        if !self.steam_up {
+            return;
+        }
+        let Some(c) = &mut self.chk else { return };
+        if c.out || c.replaced || now - c.asked < c.every() {
+            return;
+        }
+        c.out = true;
+        c.asked = now;
+        let v = Verify { key: c.key.clone(), kind: c.kind, set: c.set, changes: c.changes.clone(), mark: c.mark, mark_last: c.mark_last, file: c.file.clone(), gen: c.gen };
+        self.send(Job::Verify(v));
+    }
+
+    /// When the next step is due: the next question, or (one is out; a "not yet" answer wakes nothing) picking its answer up.
+    fn chk_wake(&self, now: f64) -> Option<f64> {
+        let c = self.chk.as_ref()?;
+        if !self.steam_up || c.replaced {
+            return None;
+        }
+        let due = if c.asked.is_finite() { c.asked + c.every() } else { 0.0 };
+        Some(if c.out && due <= now { now + 500.0 } else { due })
+    }
+
+    /// "Put mine back": write what the app wrote again (one write, one undo step, watched again).
+    fn put_mine_back(&mut self, now: f64) {
+        let Some(c) = self.chk.clone() else { return };
+        if self.game().map(|g| g.key.as_str()) != Some(c.key.as_str()) || self.kind != c.kind {
+            self.say(format!("Pick {} to put your settings back", c.game), now);
+            return;
+        }
+        if self.set != c.set {
+            let title = self.sets.iter().find(|s| s.id == c.set).map(|s| s.title.clone()).unwrap_or_else(|| "its action set".into());
+            self.say(format!("Switch back to {title} to put your settings back"), now);
+            return;
+        }
+        self.acting = None;
+        self.write(c.changes, now);
+    }
+
+    /// The line under the set row once Steam replaced the values (Order 102): plain words + one link.
+    fn replaced_line(&mut self, cx: &mut Cx) -> Option<El> {
+        let c = self.chk.as_ref().filter(|c| c.replaced)?;
+        let words = format!("Steam changed {}\u{2019}s controller settings back \u{b7} your values were replaced", c.game);
+        Some(
+            El::row()
+                .center()
+                .gap(8.0)
+                .margin(0.0, 0.0, 6.0, 0.0)
+                .child(El::text(words, Font::new(11.5, 400), FG2(), lh(11.5, 1.35)).ellipsis().shrink(1.0).min_w(0.0))
+                .child(link::link(cx, K_MINE, "Put mine back", 11.5)),
+        )
     }
 
     /// A write did not go through: its words; an undo / redo step goes back to its list (the files read again show what
@@ -959,6 +1142,7 @@ impl Open {
         let after = After::Layout {
             before,
             parts: hist::parts_of(&changes),
+            changes: changes.clone(),
             game: g.key.clone(),
             kind,
             set,
@@ -1100,6 +1284,7 @@ impl Open {
         let steam = self.steam_tick();
         let live = self.live_tick(now);
         let drift = self.drift_tick(now);
+        self.chk_tick(now);
         // "Starting Steam…" (at most LAUNCH_WAIT_MS after the click): its end repaints (Order 042 review) - the menu sleeps
         // until then (`wake_at`; Order 047: no frames while it waits)
         let launching = match self.launch_at {
@@ -1339,6 +1524,11 @@ impl Page for Controller {
         // writes still queued (Order 047: their change-log entries are taken at the next opening / reset)
         if let Some(o) = self.o.take() {
             o.keep.put(hist::KEEP, o.hist.clone());
+            // Steam loads the layout when the game gets focus back - after this menu closed: the watch waits for it
+            match &o.chk {
+                Some(c) => o.keep.put(CHK_KEEP, c.clone()),
+                None => o.keep.remove(CHK_KEEP),
+            }
             // (a tab closed before its first answer has nothing to show next time)
             if o.ready {
                 o.keep.put(SNAP, o.snap());
@@ -1365,7 +1555,7 @@ impl Page for Controller {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
         };
-        min(min(launch, toast), min(o.lv_wake(), o.drift_wake()))
+        min(min(min(launch, toast), min(o.lv_wake(), o.drift_wake())), o.chk_wake(_now))
     }
     fn live_only(&self) -> bool {
         self.o.as_ref().is_some_and(|o| o.live_only)
@@ -1500,6 +1690,8 @@ impl crate::undo::Resettable for Controller {
     }
     fn reset_done(&mut self) {
         if let Some(o) = self.o.as_mut() {
+            // the files were put back on purpose: nothing of what was written is waited for any more (Order 102)
+            o.chk = None;
             o.reload();
         }
     }
@@ -1573,7 +1765,10 @@ impl Open {
         let st = foot_stack(s, self.pic.h, self.kind.has_gyro());
         let lift = BIG_W * self.pic.h / pic::PIC_W - (st.links + 16.0);
         let reset = reset::reset_line(cx, K_RESET, Some("Steam\u{2019}s layout")).margin(6.0 - lift, 0.0, 2.0, 0.0).z(2);
-        let rest = vec![self.pdq(cx), self.body(cx), reset];
+        let mut rest = vec![self.pdq(cx)];
+        rest.extend(self.replaced_line(cx));
+        rest.push(self.body(cx));
+        rest.push(reset);
         if self.steam_up {
             let mut v = vec![head];
             v.extend(rest);
@@ -2119,6 +2314,7 @@ impl Open {
                 return;
             }
             K_OPENSTEAM => return self.open_in_steam(now),
+            K_MINE => return self.put_mine_back(now),
             K_STEAMSET => return self.part_to_steam(now),
             _ => {}
         }
@@ -2587,12 +2783,20 @@ impl Open {
         }
     }
 
-    /// "Controller settings": only "Button sounds" (the app's own setting). The rows that wrote Steam's
+    /// "Controller settings": the stick dead zones of the game shown at the top (Order 102: written live into that game's
+    /// layout, the way Steam's remaps are) and "Button sounds" (the app's own setting). The rows that wrote Steam's
     /// `preferences_<serial>.vdf` are gone (Order 101): Steam ignores that file while it runs and rewrites it from the cloud.
     fn settings_dialog(&mut self, cx: &mut Cx, at: f64) -> El {
+        let words = match self.game() {
+            Some(g) => format!("Dead zones apply to {} \u{b7} the game picked at the top \u{b7} Steam takes them when you click back into the game", g.name),
+            None => "Pick a game at the top \u{b7} the dead zones are saved in that game\u{2019}s layout".to_string(),
+        };
+        let why = El::text(words, Font::new(12.0, 400), FG2(), 16.0).wrapping().margin(0.0, 0.0, 12.0, 0.0);
+        let rows = panel::dead_zone_rows(self, cx);
+        let grp = pieces::group::grp(vec![El::col().items(AlignItems::STRETCH).children(rows)]).pad(2.0, 12.0, 6.0, 12.0);
         let t = self.fake || self.test;
         let bs = self.snd.settings_rows(cx, t);
-        dialog::dialog(cx, K_DLG, DLG_W, "Controller settings", vec![bs], vec![], true, at)
+        dialog::dialog(cx, K_DLG, DLG_W, "Controller settings", vec![why, grp, bs], vec![], true, at)
     }
 
     // ============================================================================================ registry helpers (panel.rs)

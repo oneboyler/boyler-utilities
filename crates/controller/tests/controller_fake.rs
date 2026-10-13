@@ -396,7 +396,7 @@ fn backup_before_the_first_write_and_undo_restores_exactly() {
     let backup = std::path::PathBuf::from(BACKUPS).join(ACCOUNT).join(r"steamapps\common\Steam Controller Configs").join(ACCOUNT).join(r"config\252950\controller_ps5.vdf.original");
     assert_eq!(s.os().text(&backup).as_deref(), Some(orig.as_str()), "the original kept before the first write");
     let w = s.os().writes();
-    assert!(w[0].ends_with(".original") && w[1].ends_with("controller_ps5.vdf"), "backup first: {w:?}");
+    assert!(w[0].ends_with(".original") && w[1].ends_with(".last") && w[2].ends_with("controller_ps5.vdf"), "backups first: {w:?}");
     s.apply("252950", EDGE, 0, &Change::StickSetting { side: Side::Left, setting: StickSetting::DeadZone, value: Some(2000) }).unwrap();
     assert_eq!(s.os().text(&backup).as_deref(), Some(orig.as_str()), "the backup is never overwritten");
     assert!(s.has_original("252950", EDGE));
@@ -918,4 +918,82 @@ fn the_game_names_are_read_once_per_change() {
     let r2 = reads(&s);
     let _ = s.games(EDGE).unwrap();
     assert_eq!(reads(&s) - r2, full);
+}
+
+// ------------------------------------------------------------------------------------------------ Order 102: backup before every write, did Steam keep it
+
+fn dz(v: i64) -> Change {
+    Change::StickSetting { side: Side::Left, setting: StickSetting::DeadZone, value: Some(v) }
+}
+
+fn log_path() -> std::path::PathBuf {
+    std::path::PathBuf::from(STEAM).join("logs").join("controller_ui.txt")
+}
+
+#[test]
+fn every_write_keeps_the_file_it_replaces_as_last() {
+    let mut s = service();
+    let orig = text(&s, &rl_path());
+    let last = std::path::PathBuf::from(BACKUPS).join(ACCOUNT).join(r"steamapps\common\Steam Controller Configs").join(ACCOUNT).join(r"config\252950\controller_ps5.vdf.last");
+    s.apply("252950", EDGE, 0, &dz(1000)).unwrap();
+    assert_eq!(s.os().text(&last).as_deref(), Some(orig.as_str()), "the file as it was just before the write");
+    let after_first = text(&s, &rl_path());
+    s.apply("252950", EDGE, 0, &dz(2000)).unwrap();
+    assert_eq!(s.os().text(&last).as_deref(), Some(after_first.as_str()), "the next write keeps the one before it");
+    // the write that changes nothing writes (and keeps) nothing
+    let n = s.os().writes().len();
+    s.apply("252950", EDGE, 0, &dz(2000)).unwrap();
+    assert_eq!(s.os().writes().len(), n);
+}
+
+#[test]
+fn the_log_says_when_steam_loaded_the_file() {
+    let s = service();
+    let log = log_path();
+    assert_eq!(s.ui_log_mark(), 0, "no log yet");
+    let line = |t: &str| format!("[2026-10-12 {t}] Loaded Config for Local Selection Path for App ID 252950, Controller 0: {}\n", rl_path().display());
+    s.os().put(&log, line("06:38:18"));
+    let mark = s.ui_log_mark();
+    assert!(mark > 0);
+    assert!(!s.config_loaded_since(mark, &rl_path()), "an older line does not count");
+    assert!(s.config_loaded_since(0, &rl_path()), "the same line from the top does");
+    // another game's file, and the Desktop override, are not ours
+    let mut text_now = String::from_utf8(s.os().get(&log).unwrap()).unwrap();
+    text_now.push_str("[2026-10-12 06:41:27] Loaded Config for Local Override Path for App ID 413080, Controller 0: c:\\steam/controller_base/empty.vdf\n");
+    text_now.push_str(&format!("[2026-10-12 06:41:28] Loaded Config for Local Selection Path for App ID 1, Controller 0: {}\n", rl_path().display().to_string().replace("252950", "1")));
+    s.os().put(&log, &text_now);
+    assert!(!s.config_loaded_since(mark, &rl_path()));
+    // Steam loads ours: forward slashes and another case are the same path
+    text_now.push_str(&line("06:44:14").replace('\\', "/").to_uppercase().replace("LOADED CONFIG", "Loaded Config"));
+    s.os().put(&log, &text_now);
+    assert!(s.config_loaded_since(mark, &rl_path()));
+    // a log started again (shorter than the mark): read from its top
+    s.os().put(&log, line("07:00:00"));
+    assert!(s.config_loaded_since(mark + 10_000, &rl_path()));
+}
+
+#[test]
+fn the_layout_file_tells_whether_steam_kept_the_values() {
+    let mut s = service();
+    let changes = [dz(1111), Change::StickSetting { side: Side::Right, setting: StickSetting::DeadZone, value: Some(2222) }];
+    assert!(!s.changes_in_place("252950", EDGE, 0, &changes).unwrap(), "not written yet");
+    s.apply_all("252950", EDGE, 0, &changes).unwrap();
+    assert!(s.changes_in_place("252950", EDGE, 0, &changes).unwrap());
+    assert_eq!(s.layout_path("252950", EDGE).unwrap(), rl_path());
+    // Steam (its Cloud) writes its own copy over the file
+    let theirs = RL.to_string();
+    s.os().put(rl_path(), &theirs);
+    assert!(!s.changes_in_place("252950", EDGE, 0, &changes).unwrap());
+    // and when it keeps ours
+    s.apply_all("252950", EDGE, 0, &changes).unwrap();
+    assert!(s.changes_in_place("252950", EDGE, 0, &changes).unwrap());
+}
+
+#[test]
+fn the_same_target_is_the_same_thing_set_again() {
+    assert!(dz(1).same_target(&dz(2)));
+    assert!(!dz(1).same_target(&Change::StickSetting { side: Side::Right, setting: StickSetting::DeadZone, value: Some(1) }));
+    assert!(!dz(1).same_target(&Change::StickSetting { side: Side::Left, setting: StickSetting::FullAt, value: Some(1) }));
+    assert!(Change::GyroMode { mode: GyroMode::Off }.same_target(&Change::GyroMode { mode: GyroMode::Off }));
+    assert!(!dz(1).same_target(&Change::GyroMode { mode: GyroMode::Off }));
 }

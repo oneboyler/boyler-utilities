@@ -1,5 +1,11 @@
 # Boyler Utilities — What's new
 
+## 1.0.9 (2026-10-12)
+- Controller settings: Left / Right stick dead zone are back and now apply LIVE - they change the controller profile of the game picked at the top of the Controller tab (Steam picks it up when you click back into the game).
+- Every change to a game's controller profile is backed up first. If Steam (or its cloud copy) puts other values back, the tab tells you and offers "Put mine back".
+- Screenshots: dragging a screenshot into Photoshop (and other apps that take classic file drops) works now.
+- The Screenshot key does nothing while a game is in front (like macros and actions).
+
 ## 1.0.8 (2026-10-12)
 - Controller: the "Restart Steam to apply" button is gone - restarting Steam could make Steam reload a game's controller layout from its cloud copy and replace your own (stick dead zones changed). The app never restarts Steam.
 - Controller settings: the rows that Steam ignores while it runs (stick dead zones, anti-drift, gyro noise filter, rumble, light colour and brightness) are hidden until they can apply live. Button sounds stays. Per-game button, stick and trigger changes work as before (live).

@@ -46,6 +46,7 @@ fn main() {
                             match s.open(&g.key, kind) {
                                 Err(e) => println!("      can't read: {e}"),
                                 Ok(o) => {
+                                    println!("      Steam log: {} byte(s); has loaded this file: {}", s.ui_log_mark(), if s.config_loaded_since(0, &o.path) { "yes" } else { "no" });
                                     let h = o.layout.header();
                                     let sets: Vec<String> = o.layout.action_sets().into_iter().map(|a| a.title).collect();
                                     println!("      layout \"{}\" · {} · action sets: {}", h.title, h.controller_type, sets.join(", "));

@@ -7,6 +7,11 @@
 //!   without a Steam restart). The app never closes, restarts or starts Steam (Order 101).
 //! - Before the FIRST write of a file the app keeps its original bytes (`<backups>\<account>\<path under Steam>.original`,
 //!   or a `.absent` marker if the app created the file) — "Back to how your PC was" puts them back.
+//! - Before EVERY write of a file that exists the app also keeps the bytes it is about to replace (`….last`, overwritten by
+//!   the next write): the original stays the first copy, `.last` is the one before this write (Order 102).
+//! - After a write the app watches Steam's own log (`logs\controller_ui.txt`, "Loaded Config … <file>") to see whether Steam
+//!   read the file and whether it still holds the values the app wrote (Steam Cloud can replace a local layout): see
+//!   [`ControllerService::ui_log_mark`], [`ControllerService::config_loaded_since`], [`ControllerService::changes_in_place`].
 //! - Every write is one undo step (all files it touched); undo refuses when the file changed since (someone else wrote).
 //! - A community / template layout becomes the user's own copy on the first change (Steam does the same): the layout is
 //!   copied to `<game>\controller_<type>.vdf` with its `url` set, and `configset_controller_<type>.vdf` points the game at it.
@@ -216,6 +221,16 @@ impl<O: SteamOs> ControllerService<O> {
         }
     }
 
+    /// Keep the bytes a write is about to replace (`….last`; a file that did not exist leaves the previous `.last` alone).
+    fn keep_last(&self, file: &Path, before: Option<&[u8]>) -> Result<()> {
+        let Some(b) = before else { return Ok(()) };
+        let last = self.backup_path(file, ".last");
+        if let Some(dir) = last.parent() {
+            self.os.create_dir_all(dir)?;
+        }
+        self.os.write(&last, b)
+    }
+
     /// Write a set of files as one undo step (originals kept first; files in the given order).
     fn commit(&mut self, label: &str, files: Vec<(PathBuf, Vec<u8>)>) -> Result<()> {
         let mut step = Step { label: label.to_string(), files: Vec::new() };
@@ -225,6 +240,7 @@ impl<O: SteamOs> ControllerService<O> {
                 continue;
             }
             self.keep_original(&path, before.as_deref())?;
+            self.keep_last(&path, before.as_deref())?;
             if let Some(dir) = path.parent() {
                 if !self.os.exists(dir) {
                     self.os.create_dir_all(dir)?;
@@ -295,6 +311,43 @@ impl<O: SteamOs> ControllerService<O> {
             files.push((cs_path, bytes)); // after the layout: the index never points at a missing file
         }
         self.commit(&format!("{} · {label}", o.game.name), files)
+    }
+
+    // ------------------------------------------------------------------------------------------ did Steam keep it? (Order 102)
+
+    /// Steam's controller log (where it says "Loaded Config for … <file>").
+    pub fn ui_log_path(&self) -> PathBuf {
+        self.steam.dir.join("logs").join("controller_ui.txt")
+    }
+
+    /// Where the log ends now (bytes; 0 = no log). Taken BEFORE a write, so what Steam logs afterwards is told apart.
+    pub fn ui_log_mark(&self) -> u64 {
+        self.os.read(&self.ui_log_path()).map(|b| b.len() as u64).unwrap_or(0)
+    }
+
+    /// Did Steam log "Loaded Config … <file>" after `mark`? (A log that got shorter was started again: read from its top.)
+    pub fn config_loaded_since(&self, mark: u64, file: &Path) -> bool {
+        let Ok(bytes) = self.os.read(&self.ui_log_path()) else { return false };
+        let from = if mark as usize > bytes.len() { 0 } else { mark as usize };
+        let norm = |t: &str| t.replace('/', "\\").to_ascii_lowercase();
+        let want = norm(&file.to_string_lossy());
+        String::from_utf8_lossy(&bytes[from..]).lines().any(|l| l.contains("Loaded Config") && norm(l).contains(&want))
+    }
+
+    /// The file Steam reads for this game now (its layout).
+    pub fn layout_path(&self, key: &str, kind: PadKind) -> Result<PathBuf> {
+        Ok(self.open(key, kind)?.path)
+    }
+
+    /// Does the layout file, read again now, still hold every one of `changes`? (False = something - Steam, its Cloud -
+    /// wrote other values over them.)
+    pub fn changes_in_place(&self, key: &str, kind: PadKind, set: u32, changes: &[Change]) -> Result<bool> {
+        let o = self.open(key, kind)?;
+        let mut again = o.layout.clone();
+        for c in changes {
+            again.apply(set, c).map_err(|err| Error::Layout { path: o.path.clone(), err })?;
+        }
+        Ok(again.text() == o.layout.text())
     }
 
     /// Apply one change (one undo step).

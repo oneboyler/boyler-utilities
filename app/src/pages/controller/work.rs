@@ -76,7 +76,7 @@ pub enum Wr {
 #[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug)]
 pub enum After {
-    Layout { before: Option<PadView>, parts: Vec<Part>, game: String, kind: PadKind, set: u32, acting: Option<(Key, String)>, fallback: String, say: String },
+    Layout { before: Option<PadView>, parts: Vec<Part>, changes: Vec<Change>, game: String, kind: PadKind, set: u32, acting: Option<(Key, String)>, fallback: String, say: String },
     PartToSteam { before: Option<PadView>, part: Part, game: String, kind: PadKind, set: u32, name: String },
     NewSet { game: String, kind: PadKind, from: u32, title: String },
     /// an undo (`redo` false) / redo of this step
@@ -94,6 +94,34 @@ pub enum Job {
     Live { pad: Option<PadInfo>, old: Option<LiveView> },
     /// "Open in Steam": the link (needs Steam's process list), opened through the shell
     OpenInSteam { game: Game, test: bool },
+    /// Order 102: has Steam loaded the written layout, and did it keep the values?
+    Verify(Verify),
+}
+
+/// What was written to a game's layout and where Steam's log ended before (Order 102).
+#[derive(Clone, Debug)]
+pub struct Verify {
+    pub key: String,
+    pub kind: PadKind,
+    pub set: u32,
+    pub changes: Vec<Change>,
+    /// where Steam's log ended before the first / the newest of the writes
+    pub mark: u64,
+    pub mark_last: u64,
+    pub file: PathBuf,
+    /// which watch asked (an answer for an older watch is thrown away)
+    pub gen: u64,
+}
+
+/// The answer of a [`Job::Verify`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Verdict {
+    /// Steam has not loaded the file since (or it can't be told)
+    NotYet,
+    /// Steam loaded it and the values are still ours
+    Kept,
+    /// Steam loaded it and other values are in the file
+    Replaced,
 }
 
 impl Job {
@@ -109,10 +137,13 @@ pub enum Done {
     Opened { pads: Vec<PadInfo>, steam_dir: Option<PathBuf>, svc_ok: bool, running: bool, loaded: Loaded, live: Option<LiveView> },
     Loaded(Loaded),
     /// `r` = Ok(the new action set's id, 0 otherwise) or the error's words
-    Wrote { r: Result<u32, String>, recs: Vec<Rec>, loaded: Loaded, after: After },
+    /// `watch` = (Steam's log end before the write, the file Steam reads) of a layout write that went through (Order 102)
+    Wrote { r: Result<u32, String>, recs: Vec<Rec>, loaded: Loaded, after: After, watch: Option<(u64, PathBuf)> },
     Live(Option<LiveView>),
     /// a toast for the page (None = nothing to say)
     Said(Option<String>),
+    /// (the asking watch's generation, the verdict)
+    Verified(u64, Verdict),
 }
 
 impl Done {
@@ -141,8 +172,12 @@ pub fn start(svc: Shared, fake: bool, waker: crate::services::Waker) -> (Sender<
         // after the tab closed its sender, the jobs still queued are done (no write is lost), then the thread ends
         for job in jr {
             let d = w.run(job);
+            // "Steam has not loaded it yet" wakes nothing: the page takes it at its next timed step (Order 102: no frame every few seconds)
+            let quiet = matches!(d, Done::Verified(_, Verdict::NotYet));
             let _ = dt.send(d);
-            waker.wake();
+            if !quiet {
+                waker.wake();
+            }
         }
     });
     if let Err(e) = r {
@@ -177,6 +212,7 @@ impl Worker {
                 Done::Live(pad.and_then(|p| self.live(&p)))
             }
             Job::OpenInSteam { game, test } => Done::Said(self.open_in_steam(&game, test)),
+            Job::Verify(v) => Done::Verified(v.gen, self.verify(&v)),
         }
     }
 
@@ -219,11 +255,17 @@ impl Worker {
             Some(Ok(s)) => s,
             Some(Err(e)) => {
                 let e = e.clone();
-                return Done::Wrote { r: Err(e.clone()), recs: vec![], loaded: Loaded::empty(want.kind, Some(e)), after };
+                return Done::Wrote { r: Err(e.clone()), recs: vec![], loaded: Loaded::empty(want.kind, Some(e)), after, watch: None };
             }
-            None => return Done::Wrote { r: Err("Steam is not read yet".into()), recs: vec![], loaded: Loaded::empty(want.kind, None), after },
+            None => return Done::Wrote { r: Err("Steam is not read yet".into()), recs: vec![], loaded: Loaded::empty(want.kind, None), after, watch: None },
         };
+        // Order 102: where Steam's log ends before the write, so a "Loaded Config" after it is told apart
+        let mark = matches!(wr, Wr::Layout { gone: false, .. }).then(|| s.ui_log_mark());
         let (r, recs) = write_in(s, &wr);
+        let watch = match (&wr, &r, mark) {
+            (Wr::Layout { key, kind, .. }, Ok(_), Some(m)) => s.layout_path(key, *kind).ok().map(|p| (m, p)),
+            _ => None,
+        };
         // the set the page shows after it: the new one / the one it was made from (only when the write went through)
         match (&wr, &r) {
             (Wr::NewSet { .. }, Ok(id)) => want.set = Some(*id),
@@ -231,7 +273,32 @@ impl Worker {
             _ => {}
         }
         let loaded = load(s, &want);
-        Done::Wrote { r, recs, loaded, after }
+        Done::Wrote { r, recs, loaded, after, watch }
+    }
+
+    /// Order 102: did Steam read the layout file since the write (its log says "Loaded Config … <file>"), and does the file
+    /// still hold what the app wrote?
+    fn verify(&self, v: &Verify) -> Verdict {
+        let g = self.svc.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(Ok(s)) = &*g else { return Verdict::NotYet };
+        // Steam (its Cloud) pointed the game at another layout file: ours is not the one it plays with any more
+        let same = |a: &std::path::Path, b: &std::path::Path| a.to_string_lossy().to_ascii_lowercase() == b.to_string_lossy().to_ascii_lowercase();
+        if s.layout_path(&v.key, v.kind).is_ok_and(|p| !same(&p, &v.file)) {
+            return Verdict::Replaced;
+        }
+        if !s.config_loaded_since(v.mark, &v.file) {
+            return Verdict::NotYet;
+        }
+        match s.changes_in_place(&v.key, v.kind, v.set, &v.changes) {
+            // kept only counts once Steam loaded the file AFTER the newest write
+            Ok(true) if s.config_loaded_since(v.mark_last, &v.file) => Verdict::Kept,
+            Ok(true) => Verdict::NotYet,
+            Ok(false) => Verdict::Replaced,
+            // Steam's file has no such action set / can't be read as a layout
+            Err(bu_controller::Error::Layout { .. } | bu_controller::Error::Parse { .. }) => Verdict::Replaced,
+            // (a read that failed now: nothing to say)
+            Err(_) => Verdict::NotYet,
+        }
     }
 
     fn open_in_steam(&self, game: &Game, test: bool) -> Option<String> {

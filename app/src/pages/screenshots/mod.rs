@@ -1066,11 +1066,11 @@ impl Page for Screenshots {
     fn bar_shown(&self) -> bool {
         self.sel.len() > 1
     }
-    /// The Screenshot key: pressed anywhere (menu open or closed) = the capture overlay.
+    /// The Screenshot key: pressed anywhere (menu open or closed) = the capture overlay - not while a game is in front (Order 103).
     fn start(&self, s: &mut crate::services::Services) {
         s.add_action(crate::keys::Action::new(KEY_ACTION, "Screenshot", "shot"), |down| {
             if down {
-                let _ = key::screenshot_key();
+                let _ = key::on_key_down();
             }
         });
     }

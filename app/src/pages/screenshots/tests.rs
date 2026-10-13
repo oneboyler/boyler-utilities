@@ -743,3 +743,15 @@ fn space_and_enter_close_the_lightbox() {
         assert!(cx.used, "the key is the lightbox's");
     }
 }
+
+/// Order 103 (the Valorant capture scare): the Screenshot key does NOTHING while a game / full-screen window is in front,
+/// and works again when it is not.
+#[test]
+fn the_screenshot_key_does_nothing_while_a_game_is_in_front() {
+    let mut started = 0;
+    assert!(key::key_pressed(true, || { started += 1; Ok(()) }).is_ok());
+    assert_eq!(started, 0, "a game is in front: no capture");
+    assert!(key::key_pressed(false, || { started += 1; Ok(()) }).is_ok());
+    assert_eq!(started, 1, "no game in front: the capture starts");
+    assert_eq!(key::key_pressed(false, || Err("x".into())), Err("x".to_string()), "a start error is still passed on");
+}

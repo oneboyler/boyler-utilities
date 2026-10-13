@@ -169,6 +169,19 @@ impl Svc {
     pub fn preferences(&self) -> Result<Vec<Prefs>> {
         with!(self, s => s.preferences())
     }
+    // ---- did Steam keep what the app wrote? (Order 102)
+    pub fn ui_log_mark(&self) -> u64 {
+        with!(self, s => s.ui_log_mark())
+    }
+    pub fn config_loaded_since(&self, mark: u64, file: &std::path::Path) -> bool {
+        with!(self, s => s.config_loaded_since(mark, file))
+    }
+    pub fn layout_path(&self, key: &str, kind: PadKind) -> Result<PathBuf> {
+        with!(self, s => s.layout_path(key, kind))
+    }
+    pub fn changes_in_place(&self, key: &str, kind: PadKind, set: u32, changes: &[Change]) -> Result<bool> {
+        with!(self, s => s.changes_in_place(key, kind, set, changes))
+    }
     pub fn open_in_steam_link(&self, g: &Game) -> Result<String> {
         with!(self, s => s.open_in_steam_link(g))
     }
@@ -195,6 +208,19 @@ impl Svc {
         match self {
             Svc::Fake(s) => s.os().writes(),
             Svc::Real(_) => vec![],
+        }
+    }
+    /// How many files the fake Steam has read so far (tests).
+    pub fn fake_reads(&self) -> u64 {
+        match self {
+            Svc::Fake(s) => s.os().reads.load(std::sync::atomic::Ordering::Relaxed),
+            Svc::Real(_) => 0,
+        }
+    }
+    /// Puts a file into the fake Steam without a write-log entry (tests: Steam's own log, Steam writing over a layout).
+    pub fn fake_put(&self, path: &std::path::Path, bytes: &[u8]) {
+        if let Svc::Fake(s) = self {
+            s.os().put(path, bytes);
         }
     }
     pub fn fake_text(&self, path: &std::path::Path) -> Option<String> {

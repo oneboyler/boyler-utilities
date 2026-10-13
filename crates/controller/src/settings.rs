@@ -631,6 +631,29 @@ pub enum Change {
 }
 
 impl Change {
+    /// Do both changes set the same thing (the later one replaces the earlier)? Order 102: the app keeps the last change per
+    /// target to check that Steam kept them.
+    pub fn same_target(&self, o: &Change) -> bool {
+        use Change::*;
+        match (self, o) {
+            (ButtonAction { button: a, press: p, .. }, ButtonAction { button: b, press: q, .. }) => a == b && p == q,
+            (ButtonMacro { button: a, .. }, ButtonMacro { button: b, .. }) => a == b,
+            (ButtonSetting { button: a, setting: s, .. }, ButtonSetting { button: b, setting: t, .. }) => a == b && s == t,
+            (StickMode { side: a, .. }, StickMode { side: b, .. }) => a == b,
+            (StickSetting { side: a, setting: s, .. }, StickSetting { side: b, setting: t, .. }) => a == b && s == t,
+            (StickRing { side: a, .. }, StickRing { side: b, .. }) => a == b,
+            (TriggerAnalog { side: a, .. }, TriggerAnalog { side: b, .. }) => a == b,
+            (TriggerSetting { side: a, setting: s, .. }, TriggerSetting { side: b, setting: t, .. }) => a == b && s == t,
+            (TriggerAction { side: a, soft: s, .. }, TriggerAction { side: b, soft: t, .. }) => a == b && s == t,
+            (GyroMode { .. }, GyroMode { .. }) => true,
+            (GyroSetting { setting: a, .. }, GyroSetting { setting: b, .. }) => a == b,
+            (TouchMode { .. }, TouchMode { .. }) => true,
+            (TouchClick { half: a, .. }, TouchClick { half: b, .. }) => a == b,
+            (TouchSetting { setting: a, .. }, TouchSetting { setting: b, .. }) => a == b,
+            _ => false,
+        }
+    }
+
     /// Is this change possible on this pad (no gyro / touchpad on an Xbox pad, no back buttons on a plain DualSense)?
     pub fn fits(&self, kind: PadKind) -> bool {
         match self {

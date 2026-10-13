@@ -1492,7 +1492,8 @@ fn ctrl_z_during_a_write_undoes_the_newest_change() {
 // ------------------------------------------------------------------------------------------------ Order 101 (hotfix)
 
 /// Order 101: the app never restarts Steam and never writes the controller's `preferences_<serial>.vdf` (Steam ignores it while it
-/// runs and rewrites the game's layout from the cloud when it is restarted). Controller settings holds only "Button sounds".
+/// runs and rewrites the game's layout from the cloud when it is restarted). Controller settings holds "Button sounds" and (Order 102)
+/// the two stick dead zones, which go into the game's layout - not into that file.
 #[test]
 fn controller_settings_has_only_button_sounds_and_writes_no_steam_file() {
     let mut t = T::new();
@@ -1501,8 +1502,11 @@ fn controller_settings_has_only_button_sounds_and_writes_no_steam_file() {
     t.click(K_CTLSET);
     assert!(t.o().dlg.is_some(), "Controller settings are open");
     let gone = |t: &mut T, id: &str| t.popup_laid().rect_of(Open::k(id)).is_none();
-    for id in ["pf.lsdz", "pf.rsdz", "pf.anti", "pf.noise", "pf.rumble", "pf.lc", "pf.bri"] {
+    for id in ["pf.anti", "pf.noise", "pf.rumble", "pf.lc", "pf.bri"] {
         assert!(gone(&mut t, id), "{id} is hidden");
+    }
+    for id in ["pf.lsdz", "pf.rsdz"] {
+        assert!(!gone(&mut t, id), "{id} is back (Order 102)");
     }
     assert!(t.popup_laid().rect_of(snd::K_BSON).is_some(), "Button sounds stay");
     t.click(snd::K_BSON);
@@ -1686,4 +1690,228 @@ fn pad_090_macro() {
     t.click(idx(K_ACT, i));
     shot_090(&mut t, "pad_cross_macro");
     crate::services::shutdown();
+}
+
+// ------------------------------------------------------------------------------------------------ Order 102: live dead zones
+
+fn ui_log() -> std::path::PathBuf {
+    std::path::PathBuf::from(data::STEAM).join("logs").join("controller_ui.txt")
+}
+
+/// What Steam's controller log says when the game gets focus and Steam reads its layout file.
+fn loaded_line() -> String {
+    format!("[2026-10-12 06:44:14] Loaded Config for Local Selection Path for App ID 252950, Controller 0: {}\n", data::config().join(r"252950\controller_ps5.vdf").display())
+}
+
+fn has_key(e: &El, k: Key) -> bool {
+    e.key == Some(k) || e.children.iter().any(|c| has_key(c, k))
+}
+
+impl T {
+    /// `VERIFY_MS` later: the tab asks its worker whether Steam loaded the layout (frame steps as the menu makes them).
+    fn verify_round(&mut self) {
+        self.now += VERIFY_MS * 16.0 + 1.0;
+        let now = self.now;
+        self.p.tick(now);
+        self.settle();
+    }
+    fn stick_dz(&mut self, side: Side) -> Option<i64> {
+        self.o().view.as_ref().unwrap().sticks.iter().find(|s| s.side == side).and_then(|s| sv(&s.settings, StickSetting::DeadZone))
+    }
+    fn dz_log(&mut self, text: String) {
+        self.o().svc_do(|s| s.fake_put(&ui_log(), text.as_bytes())).unwrap();
+    }
+}
+
+#[test]
+fn controller_settings_dead_zones_write_the_shown_games_layout_with_a_backup() {
+    let mut t = T::new();
+    let orig = t.rl();
+    t.click(K_CTLSET);
+    assert!(t.o().dlg.is_some());
+    let (l0, r0) = (t.stick_dz(Side::Left), t.stick_dz(Side::Right));
+    let before = t.writes().len();
+    // 0..60 %: half the track = 30 %
+    t.slide("pf.lsdz", 0.5);
+    let want = bu_controller::settings::pct_to_radius(30.0);
+    assert_eq!(t.stick_dz(Side::Left), Some(want), "the left stick's dead zone in the layout");
+    assert_eq!(t.stick_dz(Side::Right), r0, "the right stick is untouched");
+    assert_ne!(l0, Some(want));
+    let layout_writes: Vec<String> = t.writes()[before..].iter().filter(|w| w.contains(r"Steam\steamapps")).cloned().collect();
+    assert_eq!(layout_writes.len(), 1, "one write of the layout: {layout_writes:?}");
+    // the file as it was just before the write is kept
+    let last = std::path::PathBuf::from(data::BACKUPS).join(data::ACCOUNT).join(r"steamapps\common\Steam Controller Configs").join(data::ACCOUNT).join(r"config\252950\controller_ps5.vdf.last");
+    assert_eq!(t.o().svc_do(|s| s.fake_text(&last)).unwrap().as_deref(), Some(orig.as_str()));
+    // the right stick has its own row
+    t.slide("pf.rsdz", 0.25);
+    assert_eq!(t.stick_dz(Side::Right), Some(bu_controller::settings::pct_to_radius(15.0)));
+    assert_eq!(t.stick_dz(Side::Left), Some(want));
+    // the same change is in the stick's own window (one value, two places) and is undoable with its words
+    t.undo();
+    assert_eq!(t.stick_dz(Side::Right), r0);
+    assert_eq!(t.toast(), "Undone \u{b7} Controller settings \u{b7} Right stick dead zone");
+}
+
+#[test]
+fn the_settings_dead_zone_rows_are_dead_without_a_layout() {
+    let mut t = T::new();
+    t.o().view = None;
+    t.click(K_CTLSET);
+    let k = Open::k("pf.lsdz");
+    assert!(matches!(t.o().ctl.get(&k), Some(Ctl::Dead)), "shown, not changeable");
+}
+
+#[test]
+fn steam_keeping_the_written_values_ends_the_watch_without_a_word() {
+    let mut t = T::new();
+    t.click(K_CTLSET);
+    t.slide("pf.lsdz", 0.5);
+    assert!(t.o().chk.is_some(), "watching the written file");
+    // Steam has not loaded it yet: nothing to say, still watching
+    t.verify_round();
+    assert!(t.o().chk.as_ref().is_some_and(|c| !c.replaced && !c.out));
+    // Steam loads it and the values are ours
+    t.dz_log(loaded_line());
+    t.verify_round();
+    assert!(t.o().chk.is_none(), "kept: done");
+    assert!(!t.toast().contains("Steam changed"), "nothing said");
+    let els = t.build();
+    assert!(!els.iter().any(|e| has_key(e, K_MINE)));
+}
+
+#[test]
+fn steam_replacing_the_written_values_is_said_plainly_with_one_put_mine_back() {
+    let mut t = T::new();
+    let orig = t.rl();
+    t.click(K_CTLSET);
+    t.slide("pf.lsdz", 0.5);
+    let mine = t.rl();
+    assert_ne!(mine, orig);
+    // Steam Cloud puts its copy back, then Steam loads the file
+    let path = data::config().join(r"252950\controller_ps5.vdf");
+    t.o().svc_do(|s| s.fake_put(&path, orig.as_bytes())).unwrap();
+    let before = t.build();
+    assert!(!before.iter().any(|e| has_key(e, K_MINE)), "nothing said before Steam loaded it");
+    t.dz_log(loaded_line());
+    t.verify_round();
+    assert!(t.o().chk.as_ref().is_some_and(|c| c.replaced));
+    let els = t.build();
+    assert!(els.iter().any(|e| has_key(e, K_MINE)), "the line with its link");
+    // one click puts the values back (one write), and they are watched again
+    let n = t.writes().len();
+    t.click(K_MINE);
+    assert_eq!(t.rl(), mine);
+    assert_eq!(t.writes()[n..].iter().filter(|w| w.contains(r"Steam\steamapps")).count(), 1);
+    assert!(t.o().chk.as_ref().is_some_and(|c| !c.replaced));
+    let els = t.build();
+    assert!(!els.iter().any(|e| has_key(e, K_MINE)), "the line is gone");
+}
+
+#[test]
+fn an_undo_ends_the_watch_so_it_never_calls_the_taken_back_values_replaced() {
+    let mut t = T::new();
+    t.click(K_CTLSET);
+    t.slide("pf.lsdz", 0.5);
+    assert!(t.o().chk.is_some());
+    t.undo();
+    assert!(t.o().chk.is_none());
+    t.dz_log(loaded_line());
+    t.verify_round();
+    assert!(t.o().chk.is_none());
+}
+
+#[test]
+fn a_watch_that_is_not_answered_yet_asks_again_only_every_few_seconds() {
+    let mut t = T::new();
+    t.click(K_CTLSET);
+    t.slide("pf.lsdz", 0.5);
+    let now = t.now;
+    let wake = t.p.wake_at(now);
+    assert!(wake.is_some(), "the menu wakes for the next question");
+    let reads = |t: &mut T| t.o().svc_do(|s| s.fake_reads()).unwrap();
+    t.verify_round();
+    let n = reads(&mut t);
+    // a frame step right after: no new question
+    let now = t.now + 100.0;
+    t.p.tick(now);
+    t.settle();
+    assert_eq!(reads(&mut t), n, "no second question inside VERIFY_MS");
+}
+
+#[test]
+fn the_watch_waits_in_the_keep_while_the_menu_is_closed() {
+    // Steam loads the layout when the game gets focus back - after the menu closed
+    let mut t = T::new();
+    t.click(K_CTLSET);
+    t.slide("pf.lsdz", 0.5);
+    assert!(t.o().chk.is_some());
+    let keep = t.o().keep.clone();
+    t.p.close();
+    assert!(t.p.o.is_none());
+    let env = Env { test: true, frozen: true, keep, ..Env::default() };
+    t.p.open(&env, 0.0);
+    t.settle();
+    assert!(t.o().chk.as_ref().is_some_and(|c| !c.out && !c.replaced), "the watch is back");
+    // (a new fake Steam does not hold the written value: Steam "loaded" something else)
+    t.dz_log(loaded_line());
+    t.verify_round();
+    assert!(t.o().chk.as_ref().is_some_and(|c| c.replaced));
+    // a watch that ended is not brought back
+    let mut u = T::new();
+    u.click(K_CTLSET);
+    u.slide("pf.lsdz", 0.5);
+    u.undo();
+    assert!(u.o().chk.is_none());
+    let keep = u.o().keep.clone();
+    u.p.close();
+    u.p.open(&Env { test: true, frozen: true, keep, ..Env::default() }, 0.0);
+    u.settle();
+    assert!(u.o().chk.is_none());
+}
+
+#[test]
+fn a_load_before_the_newest_write_is_not_kept_yet() {
+    let mut t = T::new();
+    t.click(K_CTLSET);
+    t.slide("pf.lsdz", 0.5);
+    t.dz_log(loaded_line());
+    // another write after that load: Steam has not loaded THIS one
+    t.slide("pf.lsdz", 0.25);
+    t.verify_round();
+    assert!(t.o().chk.as_ref().is_some_and(|c| !c.replaced), "still waiting, not 'kept'");
+    let mut log = loaded_line();
+    log.push_str(&loaded_line());
+    t.dz_log(log);
+    t.verify_round();
+    assert!(t.o().chk.is_none(), "loaded after the newest write: kept");
+}
+
+#[test]
+fn a_not_yet_answer_wakes_nothing_and_the_questions_get_further_apart() {
+    let mut t = T::new();
+    t.click(K_CTLSET);
+    t.slide("pf.lsdz", 0.5);
+    let gap = |t: &mut T| t.o().chk.as_ref().map(|c| c.every()).unwrap();
+    let g0 = gap(&mut t);
+    t.verify_round();
+    t.verify_round();
+    assert!(gap(&mut t) > g0, "after a 'not yet' the next question waits longer");
+    // an answer of an older watch is thrown away
+    let gen = t.o().chk.as_ref().unwrap().gen;
+    t.o().verified(gen + 7, Verdict::Replaced);
+    assert!(t.o().chk.as_ref().is_some_and(|c| !c.replaced));
+}
+
+#[test]
+fn put_mine_back_in_another_action_set_is_refused() {
+    let mut t = T::new();
+    t.click(K_CTLSET);
+    t.slide("pf.lsdz", 0.5);
+    let n = t.writes().len();
+    t.o().chk.as_mut().unwrap().set = 99;
+    t.o().chk.as_mut().unwrap().replaced = true;
+    t.click(K_MINE);
+    assert_eq!(t.writes().len(), n, "nothing written");
+    assert!(t.toast().starts_with("Switch back to"), "{}", t.toast());
+    assert!(t.o().chk.is_some(), "the watch stays");
 }
