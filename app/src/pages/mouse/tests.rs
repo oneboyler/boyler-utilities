@@ -597,7 +597,7 @@ fn opened_with(sample: svc::Sample) -> Mouse {
 /// install card): boxes as Chromium lays them out.
 #[test]
 fn unsupported_mouse_and_no_raw_accel_boxes() {
-    let mut m = opened_with(svc::Sample { unsupported_mouse: true, no_raw_accel: true });
+    let mut m = opened_with(svc::Sample { unsupported_mouse: true, no_raw_accel: true, ..Default::default() });
     assert!(!m.supported());
     let l = render_page(&mut m, None);
     // Order 094 (mouse-v9): the card is the right column now, so the name line is checked relative to the name (the drawing's
@@ -772,6 +772,41 @@ fn thirty_px_between_the_your_mouse_card_and_mouse_acceleration() {
     let ac = l.rect_of(K_ACH).expect("acceleration card header (the card starts with it)");
     let gap = ac.1 - (card.1 + card.3);
     assert!((gap - 30.0).abs() < 0.5, "{gap} px between the cards");
+}
+
+/// Order 104: a mouse whose driver supports less gets only those rows - the X3 Medium (XS-1: its polling rate can't be set,
+/// OpenMouse never writes it) shows DPI and Lift-off, no Polling rate row; its DPI and lift-off go to the mouse.
+#[test]
+fn a_mouse_gets_only_the_rows_its_driver_supports() {
+    let _s = Sv::start();
+    let mut m = opened_with(svc::Sample { xs1_mouse: true, ..Default::default() });
+    assert_eq!(m.v.mice.as_ref().unwrap()[0].name, "Pulsar X3 Medium");
+    assert_eq!(m.mouse_dpi(), Some(1600));
+    let l = render_page(&mut m, None);
+    assert!(l.rect_of(idx(K_DPI, 0)).is_some(), "DPI row");
+    assert!(l.rect_of(idx(K_HZ, 0)).is_none(), "no polling row: not settable on XS-1");
+    assert!(l.rect_of(idx(K_LOD, 0)).is_some() && l.rect_of(idx(K_LOD, 1)).is_some(), "lift-off 1 mm / 2 mm");
+    click(&mut m, idx(K_DPI, 1));
+    assert_eq!(m.mouse_dpi(), Some(800));
+    assert_eq!(toast(&m), Some("DPI 800 · saved on the mouse"));
+    // the Pulsar X2 CrazyLight keeps all three rows
+    let mut p = opened();
+    let l = render_page(&mut p, None);
+    assert!(l.rect_of(idx(K_HZ, 3)).is_some() && l.rect_of(idx(K_LOD, 1)).is_some());
+    assert_eq!(p.chips(), (vec![1000, 2000, 4000, 8000], vec![10, 20]));
+}
+
+/// Order 104 proof pictures (`BU_PIC_OUT=<folder> cargo test -p bu-app proof_104 -- --ignored`): "Your mouse" for the X2
+/// CrazyLight (all rows) and the X3 Medium (no polling row).
+#[test]
+#[ignore]
+fn proof_104_your_mouse_rows() {
+    let Ok(dir) = std::env::var("BU_PIC_OUT") else { return };
+    let _s = Sv::start();
+    for (name, sample) in [("104_x2_crazylight.png", svc::Sample::default()), ("104_x3_medium.png", svc::Sample { xs1_mouse: true, ..Default::default() })] {
+        let mut m = opened_with(sample);
+        let _ = render_page(&mut m, Some(&format!("{dir}\\{name}")));
+    }
 }
 
 /// Order 042 proof picture (`BU_PIC_OUT=<folder> cargo test -p bu-app proof_042 -- --ignored`): "Your mouse" with the mouse at 2400 DPI.

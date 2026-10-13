@@ -271,6 +271,52 @@ impl MouseOs for FakeOs {
     fn pause_ms(&self, _ms: u64) {}
 }
 
+/// A scripted mouse interface for the family drivers' tests (`crate::family::Port`): every request is kept in `sent`, and
+/// `answer` makes the reply (a fake mouse of that family).
+pub struct ScriptPort {
+    pub info: HidInfo,
+    pub sent: Vec<(Vec<u8>, HidTransfer)>,
+    pub answer: Answer,
+}
+
+/// How a [`ScriptPort`] answers one request.
+pub type Answer = Box<dyn FnMut(&[u8], &HidTransfer) -> Result<Vec<u8>>>;
+
+impl ScriptPort {
+    pub fn new(info: HidInfo, answer: impl FnMut(&[u8], &HidTransfer) -> Result<Vec<u8>> + 'static) -> Self {
+        Self { info, sent: Vec::new(), answer: Box::new(answer) }
+    }
+}
+
+impl crate::family::Port for ScriptPort {
+    fn exchange(&mut self, out: &[u8], how: &HidTransfer) -> Result<Vec<u8>> {
+        self.sent.push((out.to_vec(), how.clone()));
+        (self.answer)(out, how)
+    }
+    fn pause_ms(&mut self, _ms: u64) {}
+    fn info(&self) -> &HidInfo {
+        &self.info
+    }
+}
+
+/// An interface description for tests: `path`, ids, usage page / usage, input / output / feature report lengths.
+pub fn hid_info(path: &str, vid: u16, pid: u16, usage_page: u16, usage: u16, lens: (u16, u16, u16)) -> HidInfo {
+    HidInfo {
+        path: path.into(),
+        vid,
+        pid,
+        version: 0,
+        usage_page,
+        usage,
+        input_len: lens.0,
+        output_len: lens.1,
+        feature_len: lens.2,
+        interface: None,
+        product: None,
+        manufacturer: None,
+    }
+}
+
 pub fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect::<Vec<_>>().join(" ")
 }
@@ -297,10 +343,6 @@ pub struct CmouseModel {
     pub waking: u32,
     /// the next N online queries answer "busy" (`[10]` = 1)
     pub busy: u32,
-    /// settings reads answer status 1 until the app announced itself (0x02 01) - a dongle that needs it
-    pub needs_driver: bool,
-    /// the app announced itself (0x02 01, released by 0x02 00)
-    pub driver_on: bool,
 }
 
 impl CmouseModel {
@@ -317,7 +359,7 @@ impl CmouseModel {
             let r = crate::pulsar::encode_dpi_stage(*dpi).unwrap_or([0; 4]);
             mem[0x0C + 4 * i..0x10 + 4 * i].copy_from_slice(&r);
         }
-        Self { mem, online: true, locked: false, link_code: 5, model_code: 10, battery: (78, false, 3950), seen: Vec::new(), corrupt_next: false, require_lock: true, refuse_writes: false, waking: 0, busy: 0, needs_driver: false, driver_on: false }
+        Self { mem, online: true, locked: false, link_code: 5, model_code: 10, battery: (78, false, 3950), seen: Vec::new(), corrupt_next: false, require_lock: true, refuse_writes: false, waking: 0, busy: 0 }
     }
 
     /// One request → its answer (17 bytes, or `in_len` when the interface is longer).
@@ -340,23 +382,22 @@ impl CmouseModel {
                 a[12] = self.link_code;
                 a[13] = 1;
             }
-            // the real 8K dongle's two forms (measured: the hold answers status 1 and echoes its byte)
+            // host control as OpenMouse sends it (length 0, `[6]` = 1 enter / 0 leave): status 0, `[6]` = online, `[10]` =
+            // busy (a busy answer changes nothing)
             p::CMD_ONLINE if req[5] == 0 => {
                 let waking = self.waking > 0;
                 self.waking = self.waking.saturating_sub(1);
-                a[6] = (self.online && !waking) as u8;
-                a[10] = (self.busy > 0) as u8;
+                let busy = self.busy > 0;
                 self.busy = self.busy.saturating_sub(1);
-            }
-            p::CMD_ONLINE => {
-                a[2] = 1;
-                if self.online {
+                a[6] = (self.online && !waking) as u8;
+                a[10] = busy as u8;
+                if !busy && self.online {
                     self.locked = req[6] == 1;
-                    a[6] = req[6];
                 }
             }
-            p::CMD_DRIVER => {
-                self.driver_on = req[6] == 1;
+            // the length-1 form (what this app sent before Order 104; measured on the real 8K dongle: an ack, status 1)
+            p::CMD_ONLINE => {
+                a[2] = 1;
                 a[6] = req[6];
             }
             p::CMD_BATTERY => {
@@ -365,7 +406,7 @@ impl CmouseModel {
                 a[8..10].copy_from_slice(&self.battery.2.to_be_bytes());
             }
             p::CMD_READ => {
-                if self.online && (self.driver_on || !self.needs_driver) && addr + len <= self.mem.len() {
+                if self.online && addr + len <= self.mem.len() {
                     a[6..6 + len].copy_from_slice(&self.mem[addr..addr + len]);
                 } else {
                     a[2] = 1;

@@ -445,15 +445,21 @@ fn the_licences_file_parses_and_no_text_is_empty() {
 }
 
 /// The parts that are not crates: Skia and what is built into it, the Rust standard library, the setup's Inno Setup and
-/// Everything, the Raw Accel add-on.
+/// Everything, the Raw Accel add-on, OpenMouse (Order 104: AGPL-3.0-or-later, the mouse drivers are ported from it).
 #[test]
 fn the_licences_name_every_non_crate_part() {
     let d = licences::parse(licences::SRC).unwrap();
-    for n in ["Skia", "zlib (Chromium)", "libpng", "libjpeg-turbo", "HarfBuzz", "ICU", "Wuffs", "Expat", "Rust standard library", "Inno Setup", "Everything (voidtools)", "Raw Accel"] {
+    for n in ["Skia", "zlib (Chromium)", "libpng", "libjpeg-turbo", "HarfBuzz", "ICU", "Wuffs", "Expat", "Rust standard library", "Inno Setup", "Everything (voidtools)", "Raw Accel", "OpenMouse"] {
         assert!(d.parts.iter().any(|p| p.name == n), "{n} missing");
     }
     let skia = d.parts.iter().find(|p| p.name == "Skia").unwrap();
     assert!(skia.copyright.iter().any(|c| c.1.contains("Google") && c.0 == skia.texts[0]), "{skia:?}");
+    // Order 104: OpenMouse is credited with its licence text (the GNU AGPL v3), and the app's own licence is AGPL, not MIT
+    let om = d.parts.iter().find(|p| p.name == "OpenMouse").unwrap();
+    assert_eq!(om.declared, "AGPL-3.0-or-later");
+    let text = &d.texts[om.texts[0]];
+    assert!(text.lines.iter().any(|l| l.contains("GNU AFFERO GENERAL PUBLIC LICENSE")), "{}", text.id);
+    assert!(text.lines.iter().any(|l| l.contains("github.com/OpenMouse-Project/openmouse")));
 }
 
 /// Every crate listed is one Cargo.lock builds (at that version), and every crate a Cargo.toml of the app or of the
@@ -555,10 +561,10 @@ fn licences_open_a_part_and_go_back() {
     assert!(s.describe().ends_with("lic=-"), "{}", s.describe());
     ev(&mut s, &g, Ev::Click(K_LIC), 0.0);
     assert!(s.describe().contains("lic=list:"), "{}", s.describe());
-    // the list: header, line, a group header + box per group (Skia, Rust, Setup, Add-ons, Cursor packs, Data)
+    // the list: header, two lines, a group header + box per group (Skia, Rust, Setup, Add-ons, Code ported to Rust, Cursor packs, Data)
     let mut st = CssState::default();
     let mut cx = Cx::new(0.0, false, &g, &mut st);
-    assert_eq!(s.build(&mut cx).len(), 2 + 2 * 6);
+    assert_eq!(s.build(&mut cx).len(), 3 + 2 * 7);
     let d = licences::parse(licences::SRC).unwrap();
     let icu = d.parts.iter().position(|p| p.name == "ICU").unwrap();
     ev(&mut s, &g, Ev::Click(idx(licences::K_ROW, icu)), 0.0);

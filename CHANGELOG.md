@@ -1,5 +1,12 @@
 # Boyler Utilities — What's new
 
+## 1.1.0 (not released yet)
+- Boyler Utilities is now free software under the GNU AGPL v3 (or later) - see Settings › Licences. Its mouse drivers are ported from OpenMouse (credited there).
+- Mouse tab: DPI, polling rate and battery (and lift-off distance on Pulsars) now work for many more mice - Pulsar (also the Tenz Signature, X2h, X2 V3 ES Mini, X2F and X3 Medium), Logitech (37 models, cabled or on a Lightspeed / Bolt receiver), Razer (14 models) and SteelSeries (10 models: polling rate and battery; DPI on the Rival 650 and Rival 310 only - on the others a DPI change from here would erase the presets saved on the mouse). Each mouse shows only the settings it supports. Opening the tab only reads the mouse; a setting changes only when you click it.
+- Pulsar X2 CrazyLight: works as before (now with exactly the requests OpenMouse sends).
+- The Screenshot key works again while a game or a full-screen window is in front (1.0.9 made it do nothing there).
+- Mouse tab, more brands (all from OpenMouse's supported list): ATK / VXE, Endgame Gear, Lamzu (also CRDRAKO, LunaFury, Attack Shark R5 Ultra), WLMouse, VAXEE, Corsair, Redragon, Attack Shark / Lingbao (GearHub), Glorious, Ninjutso, Finalmouse, Zaunkoenig, RAWM, Mchose, Delux, Dareu, Keychron, Incott, K-snake, Microsoft, moddoMOUSE, Teevolution, Wallhack, VGN, ASUS, Orbital and Rapoo - roughly 70 more models, well over 130 in all. Each mouse shows only what its driver can really do (DPI, polling rate, lift-off distance, battery); where changing a setting from here would overwrite other settings saved on the mouse, that setting is left to the brand's own software.
+
 ## 1.0.9 (2026-10-12)
 - Controller settings: Left / Right stick dead zone are back and now apply LIVE - they change the controller profile of the game picked at the top of the Controller tab (Steam picks it up when you click back into the game).
 - Every change to a game's controller profile is backed up first. If Steam (or its cloud copy) puts other values back, the tab tells you and offers "Put mine back".

@@ -62,4 +62,4 @@ Pull requests are welcome. Add a feature, fix a bug, make it better.
 
 ## License
 
-MIT, see [LICENSE](LICENSE). Third-party licences are listed in the app under Settings > Licences.
+AGPL-3.0-or-later, see [LICENSE](LICENSE). The mouse drivers (DPI, polling rate, lift-off, battery) are ported to Rust from [OpenMouse](https://github.com/OpenMouse-Project/openmouse) (AGPL-3.0-or-later). Third-party licences are listed in the app under Settings > Licences.

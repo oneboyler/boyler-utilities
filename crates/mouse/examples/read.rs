@@ -16,6 +16,7 @@ fn main() {
         ("factory reset 0x09", pulsar::frame(pulsar::CMD_RESET, 0, &[])),
         ("set profile 0x0F", pulsar::frame(pulsar::CMD_SET_PROFILE, 0, &[1])),
         ("write lock 0x03/1", pulsar::frame(pulsar::CMD_ONLINE, 0, &[1])),
+        ("host control entered 0x03 [6]=1", pulsar::online_frame(true)),
     ] {
         println!("allow-list check: {name} -> {}", if pulsar::read_request_allowed(&f) { "ALLOWED (bug!)" } else { "refused" });
     }
@@ -28,11 +29,15 @@ fn main() {
             return;
         }
     };
-    let Some(y) = mice.into_iter().find(|y| y.protocol.is_some()) else {
+    let Some(y) = mice.into_iter().find(|y| y.supported()) else {
         println!("no supported mouse connected");
         return;
     };
-    println!("mouse: {} (VID {:04X} PID {:04X})", y.name, y.vid, y.pid);
+    println!("mouse: {} (VID {:04X} PID {:04X}), driver family {:?}", y.name, y.vid, y.pid, y.family());
+    // Order 104: the allow-list of THAT mouse's family (the Pulsar one above is only the first)
+    if let Some(f) = y.family() {
+        m = Mouse::new(RealOs::read_requests_for(f), AppDirs::new(std::path::PathBuf::from(r"C:\BoylerUtilities-scratch\lane-g\read-appdata")));
+    }
     // `--once`: a single attempt (used for the approved retry after a first run that got no full answer)
     let attempts = if std::env::args().any(|a| a == "--once") { 1 } else { 2 };
     let mut shown = 0;
@@ -46,8 +51,8 @@ fn main() {
         match r {
             Ok(o) => {
                 println!(
-                    "attempt {attempt}: model {:?} (family {:#04x}, model code {}), link {:?}, online {}, battery {:?} % charging {:?} ({:?} mV), stage {:?}, DPI {:?}, polling {:?} Hz, lift-off {:?} (tenths of a mm)",
-                    o.model, o.family, o.model_code, o.link, o.online, o.battery_percent, o.charging, o.battery_mv, o.stage, o.dpi, o.polling_hz, o.lift_off
+                    "attempt {attempt}: model {:?}, wireless {:?}, online {}, battery {:?} % charging {:?}, DPI {:?}, polling {:?} Hz, lift-off {:?} (tenths of a mm), caps {:?}",
+                    o.model, o.wireless, o.online, o.battery_percent, o.charging, o.dpi, o.polling_hz, o.lift_off, o.caps
                 );
                 if o.online || attempt == attempts {
                     break;

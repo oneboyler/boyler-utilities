@@ -4,6 +4,7 @@
 use bu_mouse::device::*;
 use bu_mouse::fake::{CmouseModel, FakeOs};
 use bu_mouse::os::HidInfo;
+use bu_mouse::family::Family;
 use bu_mouse::pulsar::{self as p, Link};
 use bu_mouse::{AppDirs, Error, Mouse};
 use std::cell::RefCell;
@@ -55,14 +56,14 @@ fn identifies_the_pulsar_dongle_and_the_other_brand() {
     let (m, _, y) = setup();
     assert_eq!(y.name, "Pulsar X2 CrazyLight");
     assert_eq!((y.vid, y.pid), (0x3710, 0x5406));
-    assert_eq!(y.protocol, Some(Protocol::PulsarCmouse));
+    assert_eq!(y.family(), Some(Family::PulsarCmouse));
     assert_eq!(y.config_path.as_deref(), Some(CFG), "the FF02 collection, not FF06");
     assert_eq!(y.sub_line(), "Wireless · saved on the mouse itself");
     assert_eq!(y.link(), Some(("Open Pulsar web settings".into(), "https://bbb.pulsar.gg/")));
     let all = m.mice().unwrap();
     assert_eq!(all.len(), 2);
     let other = &all[1];
-    assert_eq!(other.protocol, None);
+    assert_eq!(other.family(), None);
     assert_eq!(other.name, "Other Mouse");
     assert_eq!(other.sub_line(), "DPI and polling for this mouse aren't supported yet");
     assert_eq!(other.link(), Some(("open its web settings".into(), "https://www.logitechg.com/innovation/g-hub")));
@@ -78,11 +79,12 @@ fn unknown_brand_has_no_link_and_shared_vids_name_no_brand() {
     assert_eq!(y.brand, None);
 }
 
+
 #[test]
 fn a_dongle_without_its_config_collection_is_not_called_supported() {
     let list = vec![hid(r"\\?\hid#vid_3710&pid_5406&mi_00#a", 0x3710, 0x5406, 0x01, 0x02, 8, 0)];
     let y = find_mice(&list).remove(0);
-    assert_eq!(y.protocol, None);
+    assert_eq!(y.family(), None);
     assert_eq!(y.name, "Pulsar X2 CrazyLight");
 }
 
@@ -97,23 +99,69 @@ fn the_cable_is_preferred_over_the_dongle() {
     assert_eq!(y.sub_line(), "Saved on the mouse itself");
 }
 
+/// Order 104 review: a cabled mouse of ANOTHER brand does not push the Pulsar dongle's mouse off "Your mouse" (the
+/// cable-first rule is for the same mouse on cable + dongle).
+#[test]
+fn another_brands_cabled_mouse_does_not_take_your_mouse() {
+    // a Pulsar on its cable + a Razer DeathAdder V2 Pro on its dongle (0x7d, the 91-byte feature report on its mouse
+    // collection): the cable no longer wins across brands - the device list's order (by id) stands
+    let list = vec![
+        hid(r"\\?\hid#vid_3710&pid_3414&mi_00#w", 0x3710, 0x3414, 0x01, 0x02, 8, 0),
+        hid(r"\\?\hid#vid_3710&pid_3414&mi_01&col05#w2", 0x3710, 0x3414, 0xFF02, 0x02, 17, 17),
+        HidInfo { feature_len: 91, ..hid(r"\\?\hid#vid_1532&pid_007d&mi_00#r", 0x1532, 0x007D, 0x01, 0x02, 8, 0) },
+    ];
+    let all = find_mice(&list);
+    assert!(all.len() == 2 && all.iter().all(|m| m.supported()), "{all:?}");
+    assert_eq!((all[0].vid, all[0].wireless, all[1].wireless), (0x1532, Some(true), Some(false)));
+    // the same mouse on cable + dongle: the cable first (unchanged)
+    let mut both = pulsar_list();
+    both.extend(list[..2].iter().cloned());
+    assert_eq!(find_mice(&both)[0].pid, 0x3414);
+}
+
+/// Order 104: OpenMouse's PulsarHidClient claims every Pulsar-vendor mouse with the report-8 config collection - the
+/// newer Pulsars on its SUPPORTED list (Tenz Signature, X2h, X2 V3 ES Mini, X2F) have no product ids there.
+#[test]
+fn any_pulsar_with_the_config_collection_gets_the_cmouse_driver() {
+    let list = vec![
+        HidInfo { product: Some("Pulsar X2F".into()), ..hid(r"\\?\hid#vid_3710&pid_1234&mi_00#a", 0x3710, 0x1234, 0x01, 0x02, 8, 0) },
+        hid(r"\\?\hid#vid_3710&pid_1234&mi_01&col05#b", 0x3710, 0x1234, 0xFF02, 0x02, 17, 17),
+    ];
+    let y = find_mice(&list).remove(0);
+    assert_eq!(y.family(), Some(Family::PulsarCmouse));
+    assert_eq!(y.name, "Pulsar X2F", "no table name: the product string");
+    assert_eq!(y.config_path.as_deref(), Some(r"\\?\hid#vid_3710&pid_1234&mi_01&col05#b"));
+}
+
 #[test]
 fn reads_everything_with_read_requests_only() {
     let (mut m, model, y) = setup();
     let r = m.read_on_mouse(&y, ReadOptions::default()).unwrap();
-    assert_eq!(r.model, Some("Pulsar X2 CrazyLight"));
-    assert_eq!(r.link, Link::Wireless8k);
+    assert_eq!(r.model.as_deref(), Some("Pulsar X2 CrazyLight"));
+    assert_eq!(r.wireless, Some(true));
     assert!(r.online);
-    assert_eq!((r.battery_percent, r.charging, r.battery_mv), (Some(78), Some(false), Some(3950)));
-    assert_eq!(r.stage, Some(1));
-    assert_eq!(r.dpi, Some((800, 800)));
+    assert_eq!((r.battery_percent, r.charging), (Some(78), Some(false)));
+    assert_eq!(r.dpi, Some(800));
     assert_eq!(r.polling_hz, Some(1000));
     assert_eq!(r.lift_off, Some(10));
+    assert_eq!(r.caps.polling, vec![125, 250, 500, 1000, 2000, 4000, 8000], "the 8K link allows all");
+    assert_eq!(r.caps.lift_off, vec![10, 20]);
+    assert!(r.caps.battery && r.caps.dpi.is_some());
     // every frame that went out passes the read allow-list, and none changed the mouse
     for req in &model.borrow().seen {
         assert!(p::read_request_allowed(req), "not a read request: {req:02x?}");
     }
     assert_eq!(model.borrow().mem, CmouseModel::new().mem);
+    assert!(!model.borrow().locked, "reading never enters host control");
+}
+
+#[test]
+fn the_link_limits_the_polling_chips() {
+    let (mut m, model, y) = setup();
+    model.borrow_mut().link_code = 1; // 4K dongle
+    let r = m.read_on_mouse(&y, ReadOptions::default()).unwrap();
+    assert_eq!(r.caps.polling, vec![125, 250, 500, 1000, 2000, 4000]);
+    assert_eq!(bu_mouse::family::polling_chips(&r.caps), vec![500, 1000, 2000, 4000]);
 }
 
 #[test]
@@ -128,26 +176,25 @@ fn offline_mouse_gives_battery_but_no_settings() {
     assert_eq!(onlines, 1, "online_tries 1 = asked once, no loop (A_009_01)");
 }
 
+/// The write session is OpenMouse's withDeviceControl: host control entered (length 0, `[6]` = 1), the reads and the one
+/// write, read back, host control left (`[6]` = 0). No 0x02 announce (OpenMouse never sends it).
 #[test]
 fn set_dpi_rounds_writes_the_active_stage_and_undo_puts_it_back() {
     let (mut m, model, y) = setup();
+    let caps = m.read_on_mouse(&y, ReadOptions::default()).unwrap().caps;
     let before = model.borrow().mem.clone();
-    assert_eq!(m.set_dpi(&y, 1234).unwrap(), "DPI 1230 · saved on the mouse");
+    model.borrow_mut().seen.clear();
+    assert_eq!(m.set_dpi(&y, 1234, &caps).unwrap(), "DPI 1230 · saved on the mouse");
     let rec = p::encode_dpi_stage(1230).unwrap();
     assert_eq!(&model.borrow().mem[0x10..0x14], &rec, "stage 1 (active) at 0x0C + 4");
     assert_eq!(&model.borrow().mem[0x0C..0x10], &before[0x0C..0x10], "other stages untouched");
-    assert!(!model.borrow().locked, "unlocked again");
-    // the sequence: online? (query) → announce → read active stage → read old record → lock → write → read back →
-    // unlock → release
+    assert!(!model.borrow().locked, "host control left again");
     let cmds: Vec<(u8, u8, u8)> = model.borrow().seen.iter().map(|s| (s[1], s[5], s[6])).collect();
-    let tail: Vec<(u8, u8, u8)> = cmds[cmds.len() - 9..].to_vec();
     assert_eq!(
-        tail.iter().map(|c| c.0).collect::<Vec<_>>(),
-        vec![p::CMD_ONLINE, p::CMD_DRIVER, p::CMD_READ, p::CMD_READ, p::CMD_ONLINE, p::CMD_WRITE, p::CMD_READ, p::CMD_ONLINE, p::CMD_DRIVER]
+        cmds,
+        vec![(p::CMD_ONLINE, 0, 1), (p::CMD_READ, 2, 0), (p::CMD_READ, 4, 0), (p::CMD_WRITE, 4, rec[0]), (p::CMD_READ, 4, 0), (p::CMD_ONLINE, 0, 0)],
+        "enter · active stage · old record · write · read back · leave"
     );
-    assert_eq!((tail[0].1, tail[4], tail[7]), (0, (p::CMD_ONLINE, 1, 1), (p::CMD_ONLINE, 1, 0)), "query (length 0), lock (1), unlock (0)");
-    assert_eq!((tail[1].2, tail[8].2), (1, 0), "announced, then released");
-    assert!(!model.borrow().driver_on);
     m.undo_on_mouse(&y, "dpi").unwrap();
     assert_eq!(model.borrow().mem, before);
     assert!(matches!(m.undo_on_mouse(&y, "dpi"), Err(Error::NothingToUndo(_))));
@@ -155,18 +202,20 @@ fn set_dpi_rounds_writes_the_active_stage_and_undo_puts_it_back() {
 
 #[test]
 fn dpi_custom_rules() {
-    // Order 042: every value the mouse can store (10-DPI steps up to 10240, 50 up to 25600, 100 up to 32000)
-    assert_eq!(custom_dpi(2400), 2400);
-    assert_eq!(custom_dpi(1234), 1230);
-    assert_eq!(custom_dpi(1236), 1240);
-    assert_eq!(custom_dpi(12345), 12350);
-    assert_eq!(custom_dpi(26049), 26000);
-    assert_eq!(custom_dpi(10), 50);
-    assert_eq!(custom_dpi(99999), 26000);
-    for d in [50, 2400, 1230, 10240, 12350, 25600, 26000] {
-        assert!(bu_mouse::pulsar::encode_dpi_stage(custom_dpi(d)).is_some(), "{d} can be stored");
-        assert_eq!(bu_mouse::pulsar::decode_dpi_stage(&bu_mouse::pulsar::encode_dpi_stage(d).unwrap()), Some((d, d)), "{d} reads back");
+    // the cMouse steps (OpenMouse's pulsarDpiOptions: 10 to 10000, 50 from 10050) inside the app's 50-26000 (Order 042)
+    let c = p::dpi_caps();
+    assert_eq!(c.nearest(2400), 2400);
+    assert_eq!(c.nearest(1234), 1230);
+    assert_eq!(c.nearest(1236), 1240);
+    assert_eq!(c.nearest(12345), 12350);
+    assert_eq!(c.nearest(26049), 26000);
+    assert_eq!(c.nearest(10), 50);
+    assert_eq!(c.nearest(99999), 26000);
+    for d in [50, 2400, 1230, 10000, 10050, 12350, 25600, 26000] {
+        assert!(p::encode_dpi_stage(c.nearest(d)).is_some(), "{d} can be stored");
+        assert_eq!(p::decode_dpi_stage(&p::encode_dpi_stage(d).unwrap()), Some(d), "{d} reads back");
     }
+    assert_eq!(p::encode_dpi_stage(10240), None, "OpenMouse has no 10240 (10-steps end at 10000)");
     assert_eq!(dpi_chip(1600), Some(2));
     assert_eq!(dpi_chip(1250), None, "a typed value lights no chip");
 }
@@ -174,10 +223,12 @@ fn dpi_custom_rules() {
 #[test]
 fn polling_respects_the_link_and_undo_restores() {
     let (mut m, model, y) = setup();
-    m.set_polling(&y, 8000, Link::Wireless8k).unwrap();
+    m.set_polling(&y, 8000).unwrap();
     assert_eq!(&model.borrow().mem[0..2], &p::scalar_pair(0x40));
-    assert!(matches!(m.set_polling(&y, 8000, Link::Wireless4k), Err(Error::OutOfRange { .. })));
-    assert!(matches!(m.set_polling(&y, 3000, Link::Wireless8k), Err(Error::OutOfRange { .. })));
+    model.borrow_mut().link_code = 1; // 4K
+    assert!(matches!(m.set_polling(&y, 8000), Err(Error::OutOfRange { .. })));
+    assert!(matches!(m.set_polling(&y, 3000), Err(Error::OutOfRange { .. })));
+    model.borrow_mut().link_code = 5;
     m.undo_on_mouse(&y, "polling").unwrap();
     assert_eq!(&model.borrow().mem[0..2], &p::scalar_pair(0x01));
 }
@@ -193,27 +244,22 @@ fn lift_off_and_undo() {
 }
 
 #[test]
-fn bad_answers_and_asleep_mouse_are_errors_and_the_lock_is_always_released() {
+fn bad_answers_and_asleep_mouse_are_errors_and_host_control_is_always_left() {
     let (mut m, model, y) = setup();
+    let caps = m.read_on_mouse(&y, ReadOptions::default()).unwrap().caps;
     model.borrow_mut().corrupt_next = true;
     assert!(matches!(m.read_on_mouse(&y, ReadOptions::default()), Err(Error::BadAnswer(_))));
     model.borrow_mut().online = false;
-    assert!(matches!(m.set_dpi(&y, 800), Err(Error::MouseGone(_))));
+    assert!(matches!(m.set_dpi(&y, 800, &caps), Err(Error::MouseGone(_))));
     model.borrow_mut().online = true;
-    // a write the mouse refuses (status 1) → error, but the unlock still goes out
+    // a write the mouse refuses (status 1) → error, but host control is still left
     model.borrow_mut().refuse_writes = true;
     let before = model.borrow().mem.clone();
-    assert!(matches!(m.set_dpi(&y, 1600), Err(Error::BadAnswer(_))));
+    assert!(matches!(m.set_dpi(&y, 1600, &caps), Err(Error::BadAnswer(_))));
     assert_eq!(model.borrow().mem, before);
-    assert!(!model.borrow().locked, "unlock sent after the failed write");
+    assert!(!model.borrow().locked, "left after the failed write");
     let seen = model.borrow().seen.clone();
-    let last_write = seen.iter().rposition(|s| s[1] == p::CMD_WRITE).unwrap();
-    assert!(seen[last_write..].iter().any(|s| s[1] == p::CMD_ONLINE && s[5] == 1 && s[6] == 0), "the unlock follows the last write");
-    assert_eq!(seen.last().map(|s| (s[1], s[6])), Some((p::CMD_DRIVER, 0)), "the app released at the end");
-    // a broken stored stage pair is refused before anything is written
-    model.borrow_mut().refuse_writes = false;
-    model.borrow_mut().mem[0x04] = 7;
-    assert!(m.set_dpi(&y, 800).is_err());
+    assert_eq!(seen.last().map(|s| (s[1], s[5], s[6])), Some((p::CMD_ONLINE, 0, 0)), "the last frame leaves host control");
 }
 
 #[test]
@@ -223,7 +269,7 @@ fn unsupported_mouse_is_refused_without_sending() {
     let mut m = Mouse::new(os, AppDirs::new("unused"));
     let y = m.mice().unwrap().remove(0);
     assert!(matches!(m.read_on_mouse(&y, ReadOptions::default()), Err(Error::UnsupportedMouse(_))));
-    assert!(m.set_dpi(&y, 800).is_err());
+    assert!(m.set_polling(&y, 1000).is_err());
     assert!(m.os().log.iter().all(|l| !l.starts_with("hid_exchange")));
 }
 
@@ -236,12 +282,12 @@ fn admin_or_access_denied_comes_back_typed() {
 
 #[test]
 fn protocol_codecs_match_the_published_samples() {
-    // pulsar-mouse-linux verified samples: [x_lo, y_lo, flags]
+    // pulsar-mouse-linux verified samples: [x_lo, y_lo, flags] (OpenMouse's encoder gives the same bytes)
     for (dpi, s) in [(400, [0x27, 0x27, 0x00]), (800, [0x4F, 0x4F, 0x00]), (1600, [0x9F, 0x9F, 0x00]), (3200, [0x3F, 0x3F, 0x44]), (6400, [0x7F, 0x7F, 0x88]), (10000, [0xE7, 0xE7, 0xCC]), (12800, [0x37, 0x37, 0x22]), (20000, [0xC7, 0xC7, 0x22]), (32000, [0x77, 0x77, 0x33])] {
         let r = p::encode_dpi_stage(dpi).unwrap();
         assert_eq!(&r[..3], &s, "{dpi}");
         assert_eq!(r[3], p::checksum(&s));
-        assert_eq!(p::decode_dpi_stage(&r), Some((dpi, dpi)));
+        assert_eq!(p::decode_dpi_stage(&r), Some(dpi));
     }
     // battery request worked example: 08 04 00 … 00 49
     let f = p::frame(p::CMD_BATTERY, 0, &[]);
@@ -258,27 +304,22 @@ fn allow_list_refuses_every_changing_command() {
     assert!(!p::read_request_allowed(&p::frame(p::CMD_WRITE, 0, &[1, 0x54])));
     assert!(!p::read_request_allowed(&p::frame(p::CMD_RESET, 0, &[])));
     assert!(!p::read_request_allowed(&p::frame(p::CMD_SET_PROFILE, 0, &[1])));
-    assert!(!p::read_request_allowed(&p::frame(p::CMD_ONLINE, 0, &[1])), "the write lock");
+    assert!(!p::read_request_allowed(&p::online_frame(true)), "host control entered");
+    assert!(!p::read_request_allowed(&p::frame(p::CMD_ONLINE, 0, &[1])), "the length-1 lock");
     assert!(!p::read_request_allowed(&p::frame(0x02, 0, &[1])), "anything not listed");
     let mut bad = p::frame(p::CMD_BATTERY, 0, &[]);
     bad[16] ^= 1;
     assert!(!p::read_request_allowed(&bad), "a broken checksum");
-    assert!(p::read_request_allowed(&p::frame(p::CMD_ONLINE, 0, &[0])));
+    assert!(p::read_request_allowed(&p::online_query_frame()));
     assert!(p::read_request_allowed(&p::read_frame(0x0C, 4)));
     assert!(p::read_request_allowed(&p::identify_frame([1, 2, 3, 4])));
 }
 
-/// Test feedback: the polling rate was not shown for a detected mouse, and changing settings only worked on wireless
-/// with an error. The app asked "online?" with the HOLD form
-/// (length 1), which the real dongle only ACKs (status 1, `[6]` = 0 - measured, Order 009) - so the mouse always counted
-/// as asleep. Now: the QUERY form, polled while the mouse links.
+/// Test feedback (Order 029): the polling rate was not shown for a detected mouse. The online question is host
+/// control's leave form (length 0), polled while the mouse links.
 #[test]
-fn online_uses_the_query_form_and_waits_for_a_waking_mouse() {
+fn online_asks_with_the_length_0_form_and_waits_for_a_waking_mouse() {
     let (mut m, model, y) = setup();
-    // the dongle's answer to the hold form says nothing about the mouse
-    let hold = model.borrow_mut().answer(&p::hold_frame(false));
-    assert_eq!((hold[2], hold[6]), (1, 0));
-    model.borrow_mut().seen.clear();
     // a mouse that links after 40 polls (~0.8 s) and is busy twice more
     model.borrow_mut().waking = 40;
     model.borrow_mut().busy = 42;
@@ -287,10 +328,10 @@ fn online_uses_the_query_form_and_waits_for_a_waking_mouse() {
     assert_eq!(r.polling_hz, Some(1000));
     let queries: Vec<Vec<u8>> = model.borrow().seen.iter().filter(|s| s[1] == p::CMD_ONLINE).cloned().collect();
     assert_eq!(queries.len(), 43);
-    assert!(queries.iter().all(|q| q[5] == 0), "every online question is the query form (length 0)");
-    // a change on the waking wireless mouse works too
-    model.borrow_mut().waking = 30;
-    m.set_polling(&y, 2000, Link::Wireless8k).unwrap();
+    assert!(queries.iter().all(|q| q[5] == 0 && q[6] == 0), "every online question is the length-0 leave form");
+    // a change on a busy receiver: host control asked again until not busy
+    model.borrow_mut().busy = 3;
+    m.set_polling(&y, 2000).unwrap();
     assert_eq!(&model.borrow().mem[0..2], &p::scalar_pair(p::polling_code(2000).unwrap()));
 }
 
@@ -300,29 +341,22 @@ fn a_mouse_that_stays_asleep_is_one_clear_error() {
     model.borrow_mut().waking = u32::MAX;
     let r = m.read_on_mouse(&y, ReadOptions::default()).unwrap();
     assert!(!r.online && r.polling_hz.is_none());
-    match m.set_dpi(&y, 800) {
+    match m.set_lift_off(&y, 20) {
         Err(Error::MouseGone(t)) => assert!(t.contains("asleep"), "{t}"),
         other => panic!("{other:?}"),
     }
+    // Order 104 review: host control is left even when entering it failed (the enter may have arrived)
+    let last = model.borrow().seen.last().cloned().unwrap();
+    assert_eq!(last, p::online_frame(false).to_vec());
+    assert!(!model.borrow().locked);
 }
 
 #[test]
-fn a_dongle_that_wants_the_app_announced_gets_it_for_reads_and_is_released() {
-    let (mut m, model, y) = setup();
-    model.borrow_mut().needs_driver = true;
-    let r = m.read_on_mouse(&y, ReadOptions::default()).unwrap();
-    assert_eq!((r.polling_hz, r.dpi, r.lift_off), (Some(1000), Some((800, 800)), Some(10)));
-    assert!(!model.borrow().driver_on, "released after the read");
-    assert_eq!(model.borrow().mem, CmouseModel::new().mem, "nothing written");
-}
-
-#[test]
-fn the_query_and_hold_frames() {
-    assert_eq!(p::online_query_frame()[5], 0);
-    assert_eq!((p::hold_frame(true)[5], p::hold_frame(true)[6]), (1, 1));
+fn the_online_frames_are_openmouses() {
+    assert_eq!((p::online_query_frame()[5], p::online_query_frame()[6]), (0, 0));
+    assert_eq!((p::online_frame(true)[5], p::online_frame(true)[6]), (0, 1));
     assert!(p::read_request_allowed(&p::online_query_frame()));
-    assert!(!p::read_request_allowed(&p::hold_frame(true)));
-    assert!(!p::read_request_allowed(&p::frame(p::CMD_DRIVER, 0, &[1])), "the announce is not a read request");
+    assert!(!p::read_request_allowed(&p::online_frame(true)));
 }
 
 // ---- Order 061: every mouse is detected and named ----
@@ -338,7 +372,7 @@ fn the_x2_v2_on_the_shared_compx_id_is_named_and_gets_the_pulsar_link() {
     assert_eq!(y.name, "Pulsar X2A Wireless / X2 V2 Mini", "the model beats the receiver's generic product string");
     assert_eq!(y.ids(), "3554:F507");
     assert_eq!(y.brand.as_ref().map(|b| b.name), Some("Pulsar"));
-    assert_eq!(y.protocol, None, "not a proven protocol: DPI and polling stay unsupported, the web driver link is shown");
+    assert_eq!(y.family(), None, "not a proven protocol: DPI and polling stay unsupported, the web driver link is shown");
     assert_eq!(y.link(), Some(("open its web settings".into(), "https://bbb.pulsar.gg/")));
 }
 

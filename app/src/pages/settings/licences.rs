@@ -1,6 +1,7 @@
 //! Settings › About › Licences (Order 040): every third-party part the app ships - the crates compiled into the exe, the
-//! Rust standard library, Skia and the libraries built into it, the setup's Inno Setup and Everything, the Raw Accel add-on -
-//! each opening its licence text. The data is `app/assets/licences.txt` (made by `tools/licences/gen.py`, its format there),
+//! Rust standard library, Skia and the libraries built into it, the setup's Inno Setup and Everything, the Raw Accel add-on,
+//! OpenMouse (the code the mouse drivers are ported from) - each opening its licence text. The app itself is free software
+//! under the GNU AGPL v3 or later (Order 104; the list's line says so). The data is `app/assets/licences.txt` (made by `tools/licences/gen.py`, its format there),
 //! built into the exe; it is read only when the view opens and dropped with it (nothing at idle).
 //!
 //! Two levels inside the Settings tab: the list (a back arrow + "Licences", the parts in groups, rows like All shortcuts')
@@ -197,7 +198,11 @@ impl View {
     fn list(&self, cx: &mut Cx) -> Vec<El> {
         let mut out = vec![head(cx, "Licences")];
         let n = self.data.parts.len();
-        out.push(sub_line(format!("Boyler Utilities is built with these {n} parts from other people. Each one opens its licence.")));
+        out.push(sub_line(
+            "Boyler Utilities is free software under the GNU Affero General Public License v3.0 or later (AGPL-3.0-or-later). The mouse drivers are ported from OpenMouse, which has the same licence."
+                .to_string(),
+        ));
+        out.push(sub_line(format!("It is built with these {n} parts from other people. Each one opens its licence.")));
         let mut group_of: Option<&str> = None;
         let mut rows: Vec<El> = Vec::new();
         for (i, p) in self.data.parts.iter().enumerate() {

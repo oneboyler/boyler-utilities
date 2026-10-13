@@ -40,18 +40,15 @@ fn first_tile() -> Option<RECT> {
     Some(RECT { left: x, top: y, right: x + (131.0 * s).round() as i32, bottom: y + (74.0 * s).round() as i32 })
 }
 
-/// Order 103: the Screenshot key does nothing while a game / full-screen window is in front (the same Windows answer the
-/// macros and actions use: `bu_keysound::guard`) - a capture over a game freezes and covers it. `game` = that answer.
-pub fn key_pressed(game: bool, start: impl FnOnce() -> Result<(), String>) -> Result<(), String> {
-    if game {
-        return Ok(());
-    }
-    start()
+/// The Screenshot key was pressed (the keys manager's handler): the capture overlay opens, also while a game / full-screen
+/// window is in front (Order 108 undid Order 103's "does nothing in a game" - the owner: "when my valorant is open i can't screenshot").
+pub fn on_key_down() -> Result<(), String> {
+    key_pressed(screenshot_key)
 }
 
-/// The Screenshot key was pressed (the keys manager's handler): the capture overlay, unless a game is in front.
-pub fn on_key_down() -> Result<(), String> {
-    key_pressed(bu_keysound::guard::game_in_front(), screenshot_key)
+/// The press, with the capture start passed in so a test can run it without opening the overlay.
+pub fn key_pressed(start: impl FnOnce() -> Result<(), String>) -> Result<(), String> {
+    start()
 }
 
 /// Freeze every monitor and open the capture overlay.

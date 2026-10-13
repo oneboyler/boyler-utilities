@@ -10,7 +10,8 @@ What it lists (everything Boyler Utilities ships or installs that is not its own
     libraries built into it on Windows (zlib, libpng, libjpeg-turbo, HarfBuzz, ICU, Wuffs, Expat - FreeType is not used on
     Windows), with the licence files of the exact commits Skia's DEPS pins (m153);
   - the setup: Inno Setup (the setup exe is made with it) and Everything (the setup can download and install it);
-  - the add-on: Raw Accel (the Mouse page downloads and installs its official release).
+  - the add-on: Raw Accel (the Mouse page downloads and installs its official release);
+  - the code ported to Rust: OpenMouse (AGPL-3.0-or-later, the mouse drivers; Boyler Utilities itself is AGPL-3.0-or-later too).
 The texts that are not in the cargo registry are kept in tools/licences/extra/ (where each came from: NOTES below).
 
 A licence offered as a choice ("MIT OR Apache-2.0") is used as MIT (preference: MIT, Zlib, Apache-2.0, ...). Every distinct
@@ -50,6 +51,8 @@ TARGET = 'x86_64-pc-windows-msvc'
 #   innosetup.txt             license.txt of Inno Setup 6.7.0 (the one tools/installer/build.sh uses)
 #   rawaccel.txt              LICENSE inside the official RawAccel_v1.7.1.zip (the one crates/addons pins)
 #   rust-unicode.txt          the Rust toolchain's share/doc/rust/licenses/Unicode-3.0.txt (library/core/src/unicode)
+#   openmouse.txt             the notice of github.com/OpenMouse-Project/openmouse (commit c64437f65a1b9a992a56b48c330662c40a371085)
+#                             + the terms of its LICENSE (the standard GNU AGPL v3 text, the same as the repo's own LICENSE)
 #   gpl-3.0.txt               the LICENSE of github.com/ful1e5/Bibata_Cursor (the GNU GPL v3 text; the other cursor packs'
 #                             LICENSE / COPYING files are the same text, checked 2026-10-09)
 
@@ -58,6 +61,7 @@ SKIA = 'Skia and the libraries built into it'
 SETUP = 'Setup'
 ADDONS = 'Add-ons'
 DATA = 'Data (ids and names only)'
+PORTED = 'Code ported to Rust'
 CURSORS = 'Cursor packs you can download (not part of the app)'
 RUST = 'Rust standard library and crates'
 EXTRA_PARTS = [
@@ -72,6 +76,8 @@ EXTRA_PARTS = [
     (SETUP, 'Inno Setup', '6.7.0', 'Inno Setup License', [('innosetup.txt', None)], []),
     (SETUP, 'Everything (voidtools)', '1.4.1.1032', 'MIT AND BSD-3-Clause (PCRE)', [('everything.txt', None)], []),
     (ADDONS, 'Raw Accel', '1.7.1', 'MIT', [('rawaccel.txt', 'MIT')], []),
+    # Order 104: the mouse drivers are ported from OpenMouse (AGPL-3.0-or-later, the same licence as the app itself)
+    (PORTED, 'OpenMouse', 'c64437f', 'AGPL-3.0-or-later', [('openmouse.txt', None, 'GNU Affero General Public License v3')], []),
     # Order 066: the packs of "Get more cursors" - downloaded from their release pages only when the user clicks Get; the app ships none
     (CURSORS, 'Bibata cursors (ful1e5)', 'v2.0.7', 'GPL-3.0', [('gpl-3.0.txt', None, 'GNU General Public License v3')], []),
     (CURSORS, 'macOS style cursors (ful1e5 apple_cursor)', 'v2.0.1', 'GPL-3.0', [('gpl-3.0.txt', None, 'GNU General Public License v3')], []),

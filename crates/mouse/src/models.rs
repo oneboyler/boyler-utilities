@@ -8,7 +8,8 @@
 //! - pulsar-mouse-linux, MIT licence (github.com/packerlschupfer/pulsar-mouse-linux, README "Supported Mice"): the table
 //!   [`PULSAR`] - the whole Pulsar family, incl. the X2 V2 / X2A Wireless on the shared id 3554.
 //!
-//! NOT used: OpenMouse (AGPL-3.0) - copying its tables would put the app under the AGPL (Order 009 decision, kept in Order 061).
+//! (Until Order 104 OpenMouse was not used here; since then the app is AGPL-3.0-or-later and the mouse drivers - `crate::family` -
+//! are ported from it. This name table stays the MIT one.)
 
 /// Pulsar mice: (vid, pid, name). Includes Pulsar mice that sit on a chip maker's id (3554 CompX, 25A7).
 pub const PULSAR: &[(u16, u16, &str)] = &[

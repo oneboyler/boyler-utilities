@@ -114,19 +114,39 @@ pub fn exchange(path: &str, out: &[u8], how: &HidTransfer) -> Result<Vec<u8>> {
         }
     };
     match how {
-        HidTransfer::Feature { reply_id, reply_len } => {
-            let h = Handle(open(path, (GENERIC_READ | GENERIC_WRITE).0, FILE_FLAGS_AND_ATTRIBUTES(0)).map_err(gone)?);
-            if !unsafe { HidD_SetFeature(h.0, out.as_ptr() as *const _, out.len() as u32) } {
-                return Err(Error::os("HidD_SetFeature", unsafe { GetLastError() }.0 as i64));
+        HidTransfer::FeatureOut => {
+            let h = Handle(open_feature(path).map_err(gone)?);
+            set_feature(&h, out)?;
+            Ok(Vec::new())
+        }
+        HidTransfer::OutputOnly => {
+            let h = Handle(open(path, (GENERIC_READ | GENERIC_WRITE).0, FILE_FLAG_OVERLAPPED).map_err(gone)?);
+            let ev = Handle(unsafe { CreateEventW(None, true, false, None) }.map_err(|e| super::hr("CreateEvent", e))?);
+            let mut ov = OVERLAPPED { hEvent: ev.0, ..Default::default() };
+            let mut n = 0u32;
+            if let Err(e) = unsafe { WriteFile(h.0, Some(out), None, Some(&mut ov)) } {
+                if e.code() != ERROR_IO_PENDING.to_hresult() {
+                    return Err(super::hr("WriteFile (mouse)", e));
+                }
             }
-            let mut buf = vec![0u8; *reply_len];
-            if let Some(b) = buf.first_mut() {
-                *b = *reply_id;
+            wait(&h, &ev, &mut ov, Instant::now() + Duration::from_millis(1000), &mut n, "WriteFile (mouse)")?;
+            Ok(Vec::new())
+        }
+        HidTransfer::Feature { reply_id, reply_len, wait_ms } => {
+            let h = Handle(open_feature(path).map_err(gone)?);
+            set_feature(&h, out)?;
+            if *wait_ms > 0 {
+                std::thread::sleep(Duration::from_millis(*wait_ms as u64));
             }
-            if !unsafe { HidD_GetFeature(h.0, buf.as_mut_ptr() as *mut _, buf.len() as u32) } {
-                return Err(Error::os("HidD_GetFeature", unsafe { GetLastError() }.0 as i64));
+            get_feature(&h, *reply_id, *reply_len)
+        }
+        HidTransfer::FeatureIn { reply_id, reply_len, wait_ms } => {
+            // nothing is sent: `out` was sent by the transfer before this one
+            let h = Handle(open_feature(path).map_err(gone)?);
+            if *wait_ms > 0 {
+                std::thread::sleep(Duration::from_millis(*wait_ms as u64));
             }
-            Ok(buf)
+            get_feature(&h, *reply_id, *reply_len)
         }
         HidTransfer::OutputThenInput { reply_len, max_reads, timeout_ms, echo } => {
             let h = Handle(open(path, (GENERIC_READ | GENERIC_WRITE).0, FILE_FLAG_OVERLAPPED).map_err(gone)?);
@@ -161,7 +181,140 @@ pub fn exchange(path: &str, out: &[u8], how: &HidTransfer) -> Result<Vec<u8>> {
             }
             Err(Error::BadAnswer(format!("no answer with report id {:?} in {max_reads} reports", out.first())))
         }
+        HidTransfer::OutputThenMatch { reply_len, max_reads, timeout_ms, prefixes } => output_then_match(path, out, *reply_len, *max_reads, *timeout_ms, prefixes),
+        HidTransfer::OutputThenStream { reply_len, max_reads, timeout_ms, idle_ms } => output_then_stream(path, out, *reply_len, *max_reads, *timeout_ms, *idle_ms),
     }
+}
+
+/// `HidTransfer::OutputThenMatch`: WriteFile(out), then ReadFile input reports on the same handle until one starts with one
+/// of `prefixes` (other reports - notifications - are skipped).
+fn output_then_match(path: &str, out: &[u8], reply_len: usize, max_reads: u32, timeout_ms: u32, prefixes: &[Vec<u8>]) -> Result<Vec<u8>> {
+    let gone = |e: windows::core::Error| {
+        if e.code() == ERROR_FILE_NOT_FOUND.to_hresult() || e.code() == ERROR_DEVICE_NOT_CONNECTED.to_hresult() {
+            Error::MouseGone(path.into())
+        } else {
+            super::hr("open the mouse", e)
+        }
+    };
+    let h = Handle(open(path, (GENERIC_READ | GENERIC_WRITE).0, FILE_FLAG_OVERLAPPED).map_err(gone)?);
+    let ev = Handle(unsafe { CreateEventW(None, true, false, None) }.map_err(|e| super::hr("CreateEvent", e))?);
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms as u64);
+    let mut ov = OVERLAPPED { hEvent: ev.0, ..Default::default() };
+    let mut n = 0u32;
+    if let Err(e) = unsafe { WriteFile(h.0, Some(out), None, Some(&mut ov)) } {
+        if e.code() != ERROR_IO_PENDING.to_hresult() {
+            return Err(super::hr("WriteFile (mouse)", e));
+        }
+    }
+    wait(&h, &ev, &mut ov, deadline, &mut n, "WriteFile (mouse)")?;
+    for _ in 0..max_reads {
+        let mut buf = vec![0u8; reply_len];
+        let mut ov = OVERLAPPED { hEvent: ev.0, ..Default::default() };
+        if let Err(e) = unsafe { ReadFile(h.0, Some(&mut buf), None, Some(&mut ov)) } {
+            if e.code() != ERROR_IO_PENDING.to_hresult() {
+                return Err(super::hr("ReadFile (mouse)", e));
+            }
+        }
+        let mut got = 0u32;
+        wait(&h, &ev, &mut ov, deadline, &mut got, "ReadFile (mouse)")?;
+        buf.truncate(got as usize);
+        if prefixes.iter().any(|p| buf.len() >= p.len() && buf[..p.len()] == p[..]) {
+            return Ok(buf);
+        }
+    }
+    Err(Error::BadAnswer(format!("no matching answer in {max_reads} reports")))
+}
+
+/// `HidTransfer::OutputThenStream`: WriteFile(out), then ReadFile input reports on the same handle, all kept, until `max_reads`
+/// came, `timeout_ms` passed or `idle_ms` went by with no new report after the first.
+fn output_then_stream(path: &str, out: &[u8], reply_len: usize, max_reads: u32, timeout_ms: u32, idle_ms: u32) -> Result<Vec<u8>> {
+    let gone = |e: windows::core::Error| {
+        if e.code() == ERROR_FILE_NOT_FOUND.to_hresult() || e.code() == ERROR_DEVICE_NOT_CONNECTED.to_hresult() {
+            Error::MouseGone(path.into())
+        } else {
+            super::hr("open the mouse", e)
+        }
+    };
+    let h = Handle(open(path, (GENERIC_READ | GENERIC_WRITE).0, FILE_FLAG_OVERLAPPED).map_err(gone)?);
+    let ev = Handle(unsafe { CreateEventW(None, true, false, None) }.map_err(|e| super::hr("CreateEvent", e))?);
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms as u64);
+    let mut ov = OVERLAPPED { hEvent: ev.0, ..Default::default() };
+    let mut n = 0u32;
+    if let Err(e) = unsafe { WriteFile(h.0, Some(out), None, Some(&mut ov)) } {
+        if e.code() != ERROR_IO_PENDING.to_hresult() {
+            return Err(super::hr("WriteFile (mouse)", e));
+        }
+    }
+    wait(&h, &ev, &mut ov, deadline, &mut n, "WriteFile (mouse)")?;
+    if max_reads == 0 {
+        return Err(Error::BadAnswer("OutputThenStream: max_reads is 0".into()));
+    }
+    let mut all = Vec::new();
+    let mut count = 0u32;
+    while count < max_reads {
+        let mut buf = vec![0u8; reply_len];
+        let mut ov = OVERLAPPED { hEvent: ev.0, ..Default::default() };
+        if let Err(e) = unsafe { ReadFile(h.0, Some(&mut buf), None, Some(&mut ov)) } {
+            if e.code() != ERROR_IO_PENDING.to_hresult() {
+                return Err(super::hr("ReadFile (mouse)", e));
+            }
+        }
+        // after the first report only `idle_ms` of silence is waited for
+        let limit = if count == 0 { deadline } else { deadline.min(Instant::now() + Duration::from_millis(idle_ms as u64)) };
+        let mut got = 0u32;
+        if let Err(e) = wait(&h, &ev, &mut ov, limit, &mut got, "ReadFile (mouse)") {
+            // silence after the first report ends the burst; a real read error (device gone ...) is an error
+            if count == 0 || !matches!(e, Error::BadAnswer(_)) {
+                return Err(e);
+            }
+            break;
+        }
+        buf.truncate(got as usize);
+        all.extend(buf);
+        count += 1;
+    }
+    Ok(all)
+}
+
+/// A feature-report handle (overlapped, so the reply fetch can time out). Windows keeps a mouse's own collections (usage
+/// page 1 / usage 2 - where Razer talks) for itself and refuses read/write access there; feature reports still work on a
+/// handle opened with no access rights (hidapi's fallback), so that is the second try.
+fn open_feature(path: &str) -> windows::core::Result<HANDLE> {
+    open(path, (GENERIC_READ | GENERIC_WRITE).0, FILE_FLAG_OVERLAPPED).or_else(|e| if e.code() == ERROR_ACCESS_DENIED.to_hresult() { open(path, 0, FILE_FLAG_OVERLAPPED) } else { Err(e) })
+}
+
+fn set_feature(h: &Handle, out: &[u8]) -> Result<()> {
+    // (hidapi sends feature reports the same way, on its overlapped handle)
+    if !unsafe { HidD_SetFeature(h.0, out.as_ptr() as *const _, out.len() as u32) } {
+        return Err(Error::os("HidD_SetFeature", unsafe { GetLastError() }.0 as i64));
+    }
+    Ok(())
+}
+
+/// IOCTL_HID_GET_FEATURE (hidclass.h: HID_OUT_CTL_CODE(100)) - what HidD_GetFeature sends, here overlapped.
+const IOCTL_HID_GET_FEATURE: u32 = 0x000B_0192;
+/// The longest a mouse may take to hand over a feature report.
+const FEATURE_TIMEOUT_MS: u64 = 1000;
+
+/// HidD_GetFeature with a time limit (hidapi's hid_get_feature_report: the buffer goes in and out, byte 0 = report id): a
+/// mouse that stalls the request can't hold the worker thread - it is cancelled after [`FEATURE_TIMEOUT_MS`].
+fn get_feature(h: &Handle, reply_id: u8, reply_len: usize) -> Result<Vec<u8>> {
+    let mut buf = vec![0u8; reply_len];
+    if let Some(b) = buf.first_mut() {
+        *b = reply_id;
+    }
+    let ev = Handle(unsafe { CreateEventW(None, true, false, None) }.map_err(|e| super::hr("CreateEvent", e))?);
+    let mut ov = OVERLAPPED { hEvent: ev.0, ..Default::default() };
+    let mut n = 0u32;
+    let p = buf.as_mut_ptr() as *mut core::ffi::c_void;
+    let len = buf.len() as u32;
+    if let Err(e) = unsafe { windows::Win32::System::IO::DeviceIoControl(h.0, IOCTL_HID_GET_FEATURE, Some(p as *const _), len, Some(p), len, None, Some(&mut ov)) } {
+        if e.code() != ERROR_IO_PENDING.to_hresult() {
+            return Err(super::hr("HidD_GetFeature", e));
+        }
+    }
+    wait(h, &ev, &mut ov, Instant::now() + Duration::from_millis(FEATURE_TIMEOUT_MS), &mut n, "HidD_GetFeature (mouse)")?;
+    Ok(buf)
 }
 
 fn wait(h: &Handle, ev: &Handle, ov: &mut OVERLAPPED, deadline: Instant, n: &mut u32, op: &str) -> Result<()> {

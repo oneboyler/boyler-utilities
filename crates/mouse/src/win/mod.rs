@@ -26,7 +26,7 @@ enum Mode {
     Full,
     ReadOnly,
     /// read-only + READ requests to the mouse through `crate::pulsar::read_request_allowed` (A_009_01)
-    ReadRequests,
+    ReadRequests(crate::family::Family),
     Scratch(String),
 }
 
@@ -82,8 +82,14 @@ impl RealOs {
     /// Like `read_only`, but READ requests may go to the mouse: every frame is checked against the allow-list
     /// (`crate::pulsar::read_request_allowed`) BEFORE any byte leaves; writes, factory reset and profile switches are
     /// refused. Every request and answer is kept in `recorded` (A_009_01: logged byte for byte in the report).
+    /// This is the Pulsar cMouse allow-list (the owner's X2 CrazyLight); [`RealOs::read_requests_for`] takes another family's.
     pub fn read_requests_only() -> Self {
-        Self { mode: Mode::ReadRequests, recorded: Vec::new() }
+        Self::read_requests_for(crate::family::Family::PulsarCmouse)
+    }
+
+    /// [`RealOs::read_requests_only`] with the allow-list of family `f` (`crate::family::read_request_allowed`).
+    pub fn read_requests_for(f: crate::family::Family) -> Self {
+        Self { mode: Mode::ReadRequests(f), recorded: Vec::new() }
     }
 
     /// HKCU registry under `HKCU\<base>` (must start with `Software\BoylerUtilities-test\`); everything else refused /
@@ -111,7 +117,7 @@ impl RealOs {
     fn record_or_refuse(&mut self, what: String) -> Result<bool> {
         match &self.mode {
             Mode::Full => Ok(true),
-            Mode::ReadOnly | Mode::ReadRequests => Err(Error::ReadOnly(what)),
+            Mode::ReadOnly | Mode::ReadRequests(_) => Err(Error::ReadOnly(what)),
             Mode::Scratch(_) => {
                 self.recorded.push(what);
                 Ok(false)
@@ -277,7 +283,7 @@ impl MouseOs for RealOs {
 
     fn reg_write(&mut self, path: &str, name: &str, value: &RegValue) -> Result<()> {
         // Scratch mode writes for real, but only under its scratch key (`map`).
-        if matches!(self.mode, Mode::ReadOnly | Mode::ReadRequests) {
+        if matches!(self.mode, Mode::ReadOnly | Mode::ReadRequests(_)) {
             return Err(Error::ReadOnly(format!("reg_write {path}\\{name}")));
         }
         let (root, p) = self.map(Hive::Hkcu, path);
@@ -298,7 +304,7 @@ impl MouseOs for RealOs {
     }
 
     fn reg_delete_value(&mut self, path: &str, name: &str) -> Result<()> {
-        if matches!(self.mode, Mode::ReadOnly | Mode::ReadRequests) {
+        if matches!(self.mode, Mode::ReadOnly | Mode::ReadRequests(_)) {
             return Err(Error::ReadOnly(format!("reg_delete {path}\\{name}")));
         }
         let (root, p) = self.map(Hive::Hkcu, path);
@@ -409,8 +415,12 @@ impl MouseOs for RealOs {
     fn hid_exchange(&mut self, path: &str, out: &[u8], how: &HidTransfer) -> Result<Vec<u8>> {
         // Never in read-only or scratch mode — not even a "get" request reaches the mouse. In read-requests mode only
         // allow-listed READ frames go out, and every byte is recorded.
-        if self.mode == Mode::ReadRequests {
-            if !crate::pulsar::read_request_allowed(out) {
+        if let Mode::ReadRequests(f) = self.mode {
+            // a FeatureIn transfer sends NOTHING (`out` is only the earlier request it fetches the answer to), so it always passes;
+            // every other transfer sends `out`, which must be one of the family's read requests (Order 105 review: a blank "get"
+            // buffer must not pass when it would go out as a SetFeature)
+            let sends_nothing = matches!(how, HidTransfer::FeatureIn { .. });
+            if !sends_nothing && !crate::family::read_request_allowed(f, out) {
                 self.recorded.push(format!("REFUSED (not a read request): {}", crate::fake::hex(out)));
                 return Err(Error::ReadOnly(format!("not an allow-listed read request: {}", crate::fake::hex(out))));
             }

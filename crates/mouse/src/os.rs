@@ -113,12 +113,30 @@ pub struct HidInfo {
 /// How a request goes to the mouse and how its answer comes back (vendor protocols differ).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum HidTransfer {
-    /// HidD_SetFeature(out) then HidD_GetFeature(report id = `reply_id`, `reply_len` bytes incl. the id)
-    Feature { reply_id: u8, reply_len: usize },
+    /// HidD_SetFeature(out), a pause of `wait_ms` (Razer / Pulsar XS-1 answer only after it), then HidD_GetFeature(report id
+    /// = `reply_id`, `reply_len` bytes incl. the id)
+    Feature { reply_id: u8, reply_len: usize, wait_ms: u32 },
+    /// A pause of `wait_ms`, then HidD_GetFeature only (report id = `reply_id`, `reply_len` bytes incl. the id): fetches the
+    /// answer to the request sent just before, again, WITHOUT sending anything (Razer: a "busy" answer means the same
+    /// request answers a little later). `out` is that earlier request - not sent, passed so the read-only allow-list sees it.
+    FeatureIn { reply_id: u8, reply_len: usize, wait_ms: u32 },
+    /// HidD_SetFeature(out) only - a request the mouse does not answer (the answer is `[]`)
+    FeatureOut,
+    /// WriteFile(out) only - a request the mouse does not answer (the answer is `[]`)
+    OutputOnly,
     /// WriteFile(out) on the interface, then ReadFile input reports until one passes the protocol's check
     /// (at most `max_reads` reports, `timeout_ms` in total). The service checks the answer; the OS layer only moves bytes.
     /// `echo`: (byte index, value) that must also match in the answer (e.g. the echoed command) — other reports are skipped.
     OutputThenInput { reply_len: usize, max_reads: u32, timeout_ms: u32, echo: Option<(usize, u8)> },
+    /// Like `OutputThenInput`, but the answer is the first input report that starts with one of `prefixes` (byte for
+    /// byte, report id included) - for a protocol whose answer can come in several shapes (Logitech HID++: the reply, or
+    /// an error frame naming the request) among other reports on the same interface (notifications) that must be skipped.
+    OutputThenMatch { reply_len: usize, max_reads: u32, timeout_ms: u32, prefixes: Vec<Vec<u8>> },
+    /// WriteFile(out) on the interface, then ReadFile input reports on the SAME handle (each `reply_len` bytes, report id
+    /// included) until `max_reads` reports came, `timeout_ms` passed in total, or `idle_ms` went by without a new report after
+    /// the first. The answer is all the reports back to back (RAWM: a JSON of a few hundred bytes in 4-8 reports). No report
+    /// at all = an error.
+    OutputThenStream { reply_len: usize, max_reads: u32, timeout_ms: u32, idle_ms: u32 },
 }
 
 /// Raw Accel driver version (GET_VERSION ioctl).

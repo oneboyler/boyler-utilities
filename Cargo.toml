@@ -6,7 +6,7 @@ resolver = "2"
 
 [workspace.package]
 edition = "2021"
-license = "MIT"
+license = "AGPL-3.0-or-later"
 
 [profile.dev]
 debug = "line-tables-only"   # keeps each lane's build folder small (disk is tight)

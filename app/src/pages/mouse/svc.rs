@@ -20,7 +20,6 @@ use bu_mouse::cursors::{CursorsState, Pack, Role, SetId};
 use bu_mouse::device::{OnMouse, ReadOptions, YourMouse};
 use bu_mouse::fake::{CmouseModel, FakeOs};
 use bu_mouse::os::{DriverVersion, HidInfo, MouseOs, WinRaw, WinSetting};
-use bu_mouse::pulsar::Link;
 use bu_mouse::settings::WindowsMouse;
 use bu_mouse::{AppDirs, Mouse};
 
@@ -298,6 +297,9 @@ pub fn sample_fake() -> Mouse<FakeOs> {
 pub struct Sample {
     pub unsupported_mouse: bool,
     pub no_raw_accel: bool,
+    /// Order 104: a Pulsar X3 Medium (XS-1 driver: DPI + lift-off, its polling rate is not settable) - a mouse whose driver
+    /// supports less than the X2 CrazyLight's
+    pub xs1_mouse: bool,
 }
 
 pub fn sample_fake_with(sample: Sample) -> Mouse<FakeOs> {
@@ -338,6 +340,52 @@ pub fn sample_fake_with(sample: Sample) -> Mouse<FakeOs> {
             product: Some("Lamzu Maya X".into()),
             manufacturer: None,
         }];
+    }
+    if sample.xs1_mouse {
+        const X3: &str = r"\\?\hid#vid_3710&pid_5402&mi_01&col02#sample";
+        let base = HidInfo {
+            path: r"\\?\hid#vid_3710&pid_5402&mi_00#sample".into(),
+            vid: 0x3710,
+            pid: 0x5402,
+            version: 0x0100,
+            usage_page: 0x01,
+            usage: 0x02,
+            input_len: 8,
+            output_len: 0,
+            feature_len: 0,
+            interface: Some(0),
+            product: Some("Pulsar 4K Dongle".into()),
+            manufacturer: None,
+        };
+        os.hid = vec![base.clone(), HidInfo { path: X3.into(), usage_page: 0xFFFF, usage: 0x01, input_len: 0, feature_len: 65, interface: Some(1), ..base }];
+        // the XS-1 answers (OpenMouse's offsets, +1 for the report id): DPI 1600 both axes, lift-off Medium, battery 64 %
+        let mut dpi = 1600u16;
+        os.mice.insert(
+            X3.into(),
+            Box::new(move |out: &[u8]| {
+                let cmd = [out[2], out[3], out[4]];
+                if cmd[1] & 0x80 == 0 {
+                    // a write (feature report out, no answer)
+                    if cmd == [0x05, 0x02, 0x05] {
+                        dpi = u16::from_le_bytes([out[8], out[9]]);
+                    }
+                    return Ok(Vec::new());
+                }
+                let mut a = vec![0u8; 65];
+                a[2..5].copy_from_slice(&cmd);
+                match cmd {
+                    [0x08, 0x81, 0x01] => a[7] = 64,
+                    [0x05, 0x82, 0x05] => {
+                        let b = dpi.to_le_bytes();
+                        a[8..12].copy_from_slice(&[b[0], b[1], b[0], b[1]]);
+                    }
+                    [0x07, 0x82, 0x03] => a[9] = 0x0A,
+                    [0x08, 0x85, 0x03] => a[8] = 30,
+                    _ => {}
+                }
+                Ok(a)
+            }),
+        );
     }
     os.rawaccel_version = if sample.no_raw_accel { None } else { Some(DriverVersion { major: 1, minor: 7, patch: 0 }) };
     let mut m = Mouse::new(os, AppDirs::new(r"C:\BoylerUtilities-test-no-such-folder\mouse"));
@@ -629,7 +677,7 @@ pub fn same_mice(a: &[YourMouse], b: &[YourMouse]) -> bool {
 /// What the first ("Your mouse") supported mouse reports; a mouse that just woke gets ~3 s to link (ReadOptions default).
 fn read_first<O: MouseOs>(m: &mut Mouse<O>, mice: &[YourMouse]) -> Option<OnMouse> {
     match mice.first() {
-        Some(y) if y.protocol.is_some() => m.read_on_mouse(y, ReadOptions::default()).ok(),
+        Some(y) if y.supported() => m.read_on_mouse(y, ReadOptions::default()).ok(),
         _ => None,
     }
 }
@@ -729,10 +777,10 @@ fn apply<O: MouseOs>(m: &mut Mouse<O>, mice: &[YourMouse], on: &mut Option<OnMou
         },
         Cmd::Dpi(v) | Cmd::Polling(v) | Cmd::LiftOff(v) => {
             let Some(y) = mice.first() else { return Some("No mouse found".into()) };
-            let link = on.as_ref().map(|o| o.link).unwrap_or(Link::from_code(5));
+            let caps = on.as_ref().map(|o| o.caps.clone()).unwrap_or_default();
             let r = match c {
-                Cmd::Dpi(_) => m.set_dpi(y, v).map(Some),
-                Cmd::Polling(_) => m.set_polling(y, v, link).map(|_| Some(format!("Polling {v} Hz · saved on the mouse"))),
+                Cmd::Dpi(_) => m.set_dpi(y, v, &caps).map(Some),
+                Cmd::Polling(_) => m.set_polling(y, v).map(|_| Some(format!("Polling {v} Hz · saved on the mouse"))),
                 _ => m.set_lift_off(y, v).map(|_| None),
             };
             match r {

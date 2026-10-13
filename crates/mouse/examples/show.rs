@@ -28,14 +28,14 @@ fn main() {
                     y.vid,
                     y.pid,
                     y.brand.as_ref().map(|b| b.name).unwrap_or("unknown"),
-                    if y.protocol.is_some() { "SUPPORTED (DPI / polling / lift-off / battery)" } else { "not supported" }
+                    if y.supported() { "SUPPORTED (DPI / polling / lift-off / battery)" } else { "not supported" }
                 );
                 println!("    sub-line: {}", y.sub_line());
                 if let Some((t, u)) = y.link() {
                     println!("    link: {t} -> {u}");
                 }
-                if let Some(p) = &y.config_path {
-                    println!("    config interface: {p} (out {} / in {} bytes)", y.output_len, y.input_len);
+                if let Some(d) = &y.driver {
+                    println!("    driver {:?}, config interface: {} (out {} / in {} / feature {} bytes)", d.family, d.config.path, d.config.output_len, d.config.input_len, d.config.feature_len);
                 }
             }
         }
@@ -201,7 +201,7 @@ fn main() {
     // registry path) — never a real driver WRITE.
     let gone = PathBuf::from(r"C:\BoylerUtilities-scratch\lane-g\no-such-folder");
     println!("refused: writer.exe in a missing folder -> {:?}", m.os_mut().rawaccel_writer(&gone, &gone.join("s.json"), "{}"));
-    println!("refused: a request to a missing HID path -> {:?}", m.os_mut().hid_exchange(r"\\?\hid#no-such-device", &[0u8; 17], &bu_mouse::os::HidTransfer::Feature { reply_id: 8, reply_len: 17 }));
+    println!("refused: a request to a missing HID path -> {:?}", m.os_mut().hid_exchange(r"\\?\hid#no-such-device", &[0u8; 17], &bu_mouse::os::HidTransfer::Feature { reply_id: 8, reply_len: 17, wait_ms: 0 }));
     println!("refused: a registry write -> {:?}", m.os_mut().reg_write(r"Software\BoylerUtilities-test\G\never", "x", &bu_mouse::os::RegValue::Dword(1)));
 
     println!("\n== Cursors ==");

@@ -23,7 +23,7 @@ use bu_mouse::accel::panel::{rows, value_text, visible_rows, CapType, Curve, Fie
 use bu_mouse::accel::service::{header_line, RawAccelStatus, INSTALL_TEXT, INSTALL_TITLE};
 use bu_mouse::accel::switch::{PerApp, PresetId, RowId, Target};
 use bu_mouse::cursors::{Role, SetId};
-use bu_mouse::device::{LIFT_OFF_CHIPS, POLLING_CHIPS};
+use bu_mouse::family::{lift_off_label, polling_chips, Caps};
 use bu_mouse::settings::{double_click_ms_for_step, double_click_step_for_ms, ScrollLines};
 
 use crate::anim::EASE;
@@ -98,7 +98,11 @@ const DPI_BOXES: [u32; 3] = [400, 800, 1600];
 /// One box of the DPI / Polling / Lift-off buttons: 58 px wide, so their columns line up row under row.
 const BOX_W: f32 = 58.0;
 const BOX4: segx::SegOpts = segx::SegOpts { px: 4.0, min_w: 4.0 * BOX_W + 4.0, ..segx::BASE };
-const BOX2: segx::SegOpts = segx::SegOpts { px: 4.0, min_w: 2.0 * BOX_W + 4.0, ..segx::BASE };
+
+/// `n` equal boxes on the DPI boxes' columns (BOX4 for four, the lift-off's two before Order 104).
+fn boxes(n: usize) -> segx::SegOpts {
+    segx::SegOpts { px: 4.0, min_w: n as f32 * BOX_W + 4.0, ..segx::BASE }
+}
 
 /// The drawing's AMODES (the curve popup).
 const CURVES: [Curve; 6] = Curve::ALL;
@@ -268,11 +272,21 @@ impl Mouse {
     }
 
     fn supported(&self) -> bool {
-        self.v.mice.as_ref().and_then(|m| m.first()).map(|y| y.protocol.is_some()).unwrap_or(true)
+        self.v.mice.as_ref().and_then(|m| m.first()).map(|y| y.supported()).unwrap_or(true)
     }
 
     fn mouse_dpi(&self) -> Option<u32> {
-        self.v.on_mouse.as_ref().and_then(|o| o.dpi).map(|d| d.0)
+        self.v.on_mouse.as_ref().and_then(|o| o.dpi)
+    }
+
+    /// What the mouse can do (its driver says, Order 104) - `None` until it was read.
+    fn caps(&self) -> Option<&Caps> {
+        self.v.on_mouse.as_ref().map(|o| &o.caps)
+    }
+
+    /// The polling chips (the mouse's highest four settable rates) and the lift-off chips (tenths of a mm) it offers.
+    fn chips(&self) -> (Vec<u32>, Vec<u32>) {
+        self.caps().map(|c| (polling_chips(c), c.lift_off.clone())).unwrap_or_default()
     }
 
 
@@ -368,20 +382,30 @@ impl Mouse {
             if editing {
                 s = s.child(self.dpi_input(cx));
             }
-            rows.push(group::row(false, vec![group::lbl("DPI", None), group::ctl(vec![s])]));
+            // Order 104: every mouse with a driver gets these rows - only the ones (and the chips) its driver says it supports
+            let (hz_chips, lod_chips) = self.chips();
+            if self.caps().is_some_and(|c| c.dpi.is_some()) {
+                rows.push(group::row(false, vec![group::lbl("DPI", None), group::ctl(vec![s])]));
+            }
             // Polling rate: "Hz" left of the buttons, whose columns are the DPI boxes' columns; no sub-lines (Lift-off too)
-            let hz = self.v.on_mouse.as_ref().and_then(|o| o.polling_hz);
-            let hl: Vec<String> = POLLING_CHIPS.iter().map(|d| d.to_string()).collect();
-            let hlab: Vec<Label> = hl.iter().map(|s| Label::Text(s.as_str())).collect();
-            let hi = hz.and_then(|h| POLLING_CHIPS.iter().position(|c| *c == h));
-            let hs = segx::seg_ex(cx, K_HZ, &hlab, hi, &BOX4);
-            // .unit{font-size:12px;color:var(--fg3)}
-            let unit = El::text("Hz", Font::new(12.0, 400), FG3(), lh(12.0, 1.35)).none();
-            rows.push(group::row(false, vec![group::lbl("Polling rate", None), group::ctl(vec![unit, hs])]));
-            let lo = self.v.on_mouse.as_ref().and_then(|o| o.lift_off);
-            let li = lo.and_then(|l| LIFT_OFF_CHIPS.iter().position(|c| *c == l));
-            let ls = segx::seg_ex(cx, K_LOD, &[Label::Text("1 mm"), Label::Text("2 mm")], li, &BOX2);
-            rows.push(group::row(false, vec![group::lbl("Lift-off distance", None), group::ctl(vec![ls])]));
+            if !hz_chips.is_empty() {
+                let hz = self.v.on_mouse.as_ref().and_then(|o| o.polling_hz);
+                let hl: Vec<String> = hz_chips.iter().map(|d| d.to_string()).collect();
+                let hlab: Vec<Label> = hl.iter().map(|s| Label::Text(s.as_str())).collect();
+                let hi = hz.and_then(|h| hz_chips.iter().position(|c| *c == h));
+                let hs = segx::seg_ex(cx, K_HZ, &hlab, hi, &boxes(hz_chips.len()));
+                // .unit{font-size:12px;color:var(--fg3)}
+                let unit = El::text("Hz", Font::new(12.0, 400), FG3(), lh(12.0, 1.35)).none();
+                rows.push(group::row(false, vec![group::lbl("Polling rate", None), group::ctl(vec![unit, hs])]));
+            }
+            if !lod_chips.is_empty() {
+                let lo = self.v.on_mouse.as_ref().and_then(|o| o.lift_off);
+                let li = lo.and_then(|l| lod_chips.iter().position(|c| *c == l));
+                let ll: Vec<String> = lod_chips.iter().map(|t| lift_off_label(*t)).collect();
+                let llab: Vec<Label> = ll.iter().map(|s| Label::Text(s.as_str())).collect();
+                let ls = segx::seg_ex(cx, K_LOD, &llab, li, &boxes(lod_chips.len()));
+                rows.push(group::row(false, vec![group::lbl("Lift-off distance", None), group::ctl(vec![ls])]));
+            }
         } else {
             // a mouse the app can't talk to yet: `.ci.dim{background:var(--ctl);box-shadow:inset 0 0 0 .5px var(--hair)}`
             // `.ci.dim svg{stroke:var(--fg2)}`; `.ct{gap:7px}` name · `.ymd{color:var(--fg3);font-weight:400}` "—" · the link
@@ -441,7 +465,10 @@ impl Mouse {
             .key(K_DPIN)
             .cursor(Cursor::Text)
             .wheel_steps()
-            .title(&format!("Type any DPI, {} \u{2013} {}", bu_mouse::device::DPI_RANGE.0, bu_mouse::device::DPI_RANGE.1));
+            .title(&{
+                let (lo, hi) = self.caps().and_then(|c| c.dpi.as_ref()).map(|d| (d.min(), d.max())).unwrap_or((50, 26000));
+                format!("Type any DPI, {lo} \u{2013} {hi}")
+            });
         if t.is_empty() {
             b = b.child(El::text("DPI", Font::new(12.0, 400), FG3(), lh(12.0, 1.35)).none());
         } else {
@@ -1566,6 +1593,7 @@ impl Page for Mouse {
             if let Some(v) = std::env::var("BU_TEST_PAGE_STATE").ok().and_then(|v| v.strip_prefix("cur:").map(str::to_string)) {
                 sample.unsupported_mouse = v.split(';').any(|p| p == "mouse=other");
                 sample.no_raw_accel = v.split(';').any(|p| p == "raw=none");
+                sample.xs1_mouse = v.split(';').any(|p| p == "mouse=x3");
             }
         }
         self.test = env.test;
@@ -1760,8 +1788,11 @@ impl Page for Mouse {
             // e.preventDefault();setDpi(YM.dpi+(e.deltaY<0?50:-50),true);})`, L4338)
             Ev::Wheel(k, d) => {
                 if *k == K_DPIN {
-                    if let Some(v) = self.mouse_dpi() {
-                        self.send(Cmd::Dpi(if *d > 0 { v + 50 } else { v.saturating_sub(50) }));
+                    if let (Some(v), Some(c)) = (self.mouse_dpi(), self.caps().and_then(|c| c.dpi.clone())) {
+                        let to = c.wheel(v, *d > 0);
+                        if to != v {
+                            self.send(Cmd::Dpi(to));
+                        }
                     }
                 }
             }
@@ -2067,7 +2098,8 @@ impl Mouse {
 
     fn commit_dpi(&mut self) {
         if let Ok(v) = self.dpi_text.parse::<u32>() {
-            if Some(bu_mouse::device::custom_dpi(v)) != self.mouse_dpi() {
+            let to = self.caps().and_then(|c| c.dpi.as_ref()).map(|d| d.nearest(v));
+            if to.is_some() && to != self.mouse_dpi() {
                 self.send(Cmd::Dpi(v));
             }
         }
@@ -2244,11 +2276,15 @@ impl Mouse {
             }
             _ if (0..4).any(|i| k == idx(K_HZ, i)) => {
                 let i = (0..4).find(|i| k == idx(K_HZ, *i)).unwrap_or(0);
-                self.send(Cmd::Polling(POLLING_CHIPS[i]));
+                if let Some(hz) = self.chips().0.get(i).copied() {
+                    self.send(Cmd::Polling(hz));
+                }
             }
-            _ if (0..2).any(|i| k == idx(K_LOD, i)) => {
-                let i = (0..2).find(|i| k == idx(K_LOD, *i)).unwrap_or(0);
-                self.send(Cmd::LiftOff(LIFT_OFF_CHIPS[i]));
+            _ if (0..8).any(|i| k == idx(K_LOD, i)) => {
+                let i = (0..8).find(|i| k == idx(K_LOD, *i)).unwrap_or(0);
+                if let Some(t) = self.chips().1.get(i).copied() {
+                    self.send(Cmd::LiftOff(t));
+                }
             }
             _ if k == K_ACT => {
                 let on = !self.panel.on;
