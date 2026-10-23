@@ -163,6 +163,9 @@ pub struct El {
     pub translate_pct: (f32, f32),
     /// Order 025: CSS `filter` colour functions on the box AND its subtree (`brightness(1.08)`, `grayscale(1)`), one layer
     pub color_filter: Vec<crate::gfx::CssColor>,
+    /// Order 116: CSS `filter: blur(<px>)` on the box AND its subtree (0 = none): one layer, blurred with sigma = this
+    /// (Filter Effects: the value IS the standard deviation) - the privacy eye (`pieces::eye`)
+    pub blur: f32,
     /// Order 025: the slim scrollbar thumb of an inner scrolling list (`::-webkit-scrollbar` 9 px, no arrows), drawn over
     /// the box's right edge from its ONE child's height and upward move (Lane K's `cx.scroll_box` shape)
     pub slim_thumb: Option<SlimThumb>,
@@ -225,6 +228,7 @@ impl Default for El {
             translate: (0.0, 0.0),
             translate_pct: (0.0, 0.0),
             color_filter: Vec::new(),
+            blur: 0.0,
             slim_thumb: None,
             scale: 1.0,
             rotate: 0.0,
@@ -584,6 +588,12 @@ impl El {
     /// layer; under the box's opacity). `CssColor::Brightness(1.0)` / `Grayscale(0.0)` change nothing, but still make the layer.
     pub fn color_filter(mut self, f: crate::gfx::CssColor) -> El {
         self.color_filter.push(f);
+        self
+    }
+    /// Order 116: CSS `filter: blur(<px>)` - the box and everything inside it drawn into one layer and blurred (sigma = px;
+    /// the blur reaches 3 sigma past the box). Under the box's opacity, after its colour filters.
+    pub fn blur(mut self, px: f32) -> El {
+        self.blur = px.max(0.0);
         self
     }
     /// Order 025: an inner list's slim scrollbar thumb (`SlimThumb::GLASS` = `.rsl2` / `.pml` /

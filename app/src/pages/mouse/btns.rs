@@ -87,6 +87,8 @@ const HALF_R: &str = "M85 9 C 121 9 143 30 143 68 L 143 108 L 85 108 Z";
 const LINES: [(f32, f32, f32, f32); 3] = [(27.0, 108.0, 143.0, 108.0), (85.0, 8.5, 85.0, 30.0), (85.0, 68.0, 85.0, 108.0)];
 /// the side buttons' places cut out of the body outline (the drawing's mask): x, y, w, h, radius
 const CUTS: [(f32, f32, f32, f32, f32); 2] = [(22.5, 118.0, 7.0, 26.0, 3.5), (22.5, 149.0, 7.0, 26.0, 3.5)];
+/// The wheel's slot (the third shape).
+const WHEEL: u16 = 2;
 /// (slot, shape, hit rects (x0, y0, x1, y1) in the picture's units). The halves' hit boxes follow their rounded top; the side
 /// buttons' are a little wider than they are drawn so a slim button is easy to click. Back (3) is the lower side button.
 type Shape = (u16, &'static str, &'static [(f32, f32, f32, f32)]);
@@ -778,11 +780,17 @@ fn paint_mouse(g: &crate::gfx::Gfx, x: f32, y: f32, s: f32, looks: &[(u16, f32, 
     }
     g.stroke_geom_ex(&g.path(BODY), 1.5, ink, false, true, 1.0);
     cv.restore();
-    // the halves' hover fill (no outline of their own), then the lines over it
+    // the halves' hover fill (no outline of their own), then the lines over it. Order 118: the wheel sits on top - its place is
+    // cut out of the fill, so the left / right highlight never shows under (or through) the wheel
+    cv.save();
+    if let Some((_, wheel, _)) = SHAPES.iter().find(|s| s.0 == WHEEL) {
+        cv.clip_path(&g.path(wheel), sk::ClipOp::Difference, true);
+    }
     for (slot, d, _) in SHAPES.iter().take(2) {
         let Some((_, hv, _)) = looks.iter().find(|l| l.0 == *slot).copied() else { continue };
         g.fill_geom(&g.path(d), ACC().mul_a(0.22 * hv));
     }
+    cv.restore();
     for (x1, y1, x2, y2) in LINES {
         g.line(x1, y1, x2, y2, 1.5, ink, false);
     }
@@ -926,6 +934,30 @@ mod tests {
         paint_with(&mut m, &format!("{OUT094}/app_top_typing.png"), false, 0.0, &[], Some(K_DPIN));
         paint_with(&mut m, &format!("{OUT094}/app_top_hover_wheel.png"), false, 0.0, &[idx(K_MB, 2)], None);
         paint_with(&mut m, &format!("{OUT094}/app_top_hover_left.png"), false, 0.0, &[idx(K_MB, 0)], None);
+    }
+
+    /// Order 118 picture (run: cargo test -p bu-app picture_118 -- --ignored): the picture at 3x with the left / right button lit - the
+    /// wheel sits on top, the highlight is cut out under it.
+    #[test]
+    #[ignore]
+    fn picture_118_wheel_over_the_highlight() {
+        let out = r"C:\BoylerUtilities-scratch\118";
+        let _ = std::fs::create_dir_all(out);
+        let g = Gfx::new(1.0);
+        let s = 3.0;
+        let (w, h) = ((VB.2 * s).ceil() as i32, (VB.3 * s).ceil() as i32);
+        for (name, lit) in [("left", [1.0f32, 0.0]), ("right", [0.0, 1.0]), ("both", [1.0, 1.0])] {
+            let looks = vec![(0u16, lit[0], false), (1, lit[1], false), (2, 0.0, false), (3, 0.0, false), (4, 0.0, false)];
+            let mut surf = crate::gfx::new_surface(w, h).unwrap();
+            g.begin(surf.canvas());
+            g.fill_rect(0.0, 0.0, w as f32, h as f32, Rgba::rgb(20, 24, 40));
+            paint_mouse(&g, 0.0, 0.0, s, &looks);
+            g.end();
+            // SAFETY: COM for the WIC encoder on this test thread.
+            let _ = unsafe { windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_MULTITHREADED) };
+            let px = crate::png::from_surface(&mut surf);
+            crate::png::save_png(&px, &format!("{out}\\118_mouse_{name}.png")).expect("save");
+        }
     }
 
     /// A button's window: the jobs, the sounds and their settings land in the shared settings; left / right keep their job.

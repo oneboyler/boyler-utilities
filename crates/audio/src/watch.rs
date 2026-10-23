@@ -22,6 +22,7 @@ use std::thread::JoinHandle;
 use std::time::Instant;
 use windows::core::{implement, Interface, Ref, PCWSTR};
 use windows::Win32::Foundation::PROPERTYKEY;
+use windows::Win32::Media::Audio::Endpoints::{IAudioEndpointVolume, IAudioEndpointVolumeCallback, IAudioEndpointVolumeCallback_Impl};
 use windows::Win32::Media::Audio::*;
 use windows::Win32::System::Com::CLSCTX_ALL;
 
@@ -30,6 +31,8 @@ pub struct WatchConfig {
     pub keep_devices: bool,
     pub new_apps: bool,
     pub new_apps_volume: f32,
+    /// Order 118: the locked input volume (None = unlocked).
+    pub mic_lock: Option<f32>,
     /// Decide everything but change nothing (the OS layer refuses) — proof / measuring runs.
     pub read_only: bool,
 }
@@ -37,7 +40,7 @@ pub struct WatchConfig {
 impl Default for WatchConfig {
     /// The drawing's defaults (A_012_01): Keep my devices on; New apps volume on, 50 %.
     fn default() -> Self {
-        WatchConfig { keep_devices: true, new_apps: crate::newvol::DEFAULT_ON, new_apps_volume: crate::newvol::DEFAULT_VOLUME, read_only: false }
+        WatchConfig { keep_devices: true, new_apps: crate::newvol::DEFAULT_ON, new_apps_volume: crate::newvol::DEFAULT_VOLUME, mic_lock: None, read_only: false }
     }
 }
 
@@ -55,6 +58,10 @@ enum Msg {
     Session(Ctl),
     Keep(bool),
     NewApps(bool, f32),
+    /// Order 118: lock the default input volume at this value (None = unlock).
+    Lock(Option<f32>),
+    /// The default input device's volume changed (device id, volume).
+    InputVol(String, f32),
     Quit,
 }
 
@@ -98,6 +105,22 @@ impl IMMNotificationClient_Impl for DeviceClient_Impl {
         Ok(())
     }
     fn OnPropertyValueChanged(&self, _id: &PCWSTR, _key: &PROPERTYKEY) -> windows::core::Result<()> {
+        Ok(())
+    }
+}
+
+#[implement(IAudioEndpointVolumeCallback)]
+struct VolClient {
+    tx: Sender<Msg>,
+    id: String,
+}
+
+impl IAudioEndpointVolumeCallback_Impl for VolClient_Impl {
+    fn OnNotify(&self, pnotify: *mut AUDIO_VOLUME_NOTIFICATION_DATA) -> windows::core::Result<()> {
+        // SAFETY: Windows passes a valid notification for the call; only the master volume is read.
+        if let Some(n) = unsafe { pnotify.as_ref() } {
+            let _ = self.tx.send(Msg::InputVol(self.id.clone(), n.fMasterVolume));
+        }
         Ok(())
     }
 }
@@ -149,6 +172,11 @@ impl Watcher {
     pub fn set_new_apps(&self, on: bool, volume: f32) {
         let _ = self.tx.send(Msg::NewApps(on, volume));
     }
+    /// Order 118: lock the default input device's volume at `volume` (0.0 ... 1.0); None unlocks. Put back at once, now and
+    /// whenever Windows or an app changes it.
+    pub fn set_mic_lock(&self, volume: Option<f32>) {
+        let _ = self.tx.send(Msg::Lock(volume));
+    }
     pub fn log(&self) -> Vec<String> {
         self.log.lock().map(|l| l.clone()).unwrap_or_default()
     }
@@ -180,12 +208,29 @@ fn run(cfg: WatchConfig, tx: Sender<Msg>, rx: Receiver<Msg>, log: &WatchLog) -> 
     let mut eng = Engine::new(os, cfg.keep_devices, NewAppsVolume::new(cfg.new_apps, cfg.new_apps_volume, filetime_now()))?;
     let client: IMMNotificationClient = DeviceClient { tx: tx.clone() }.into();
     unsafe { en.RegisterEndpointNotificationCallback(&client) }.map_err(|e| crate::real::os_err("RegisterEndpointNotificationCallback", e))?;
-    let notif: IAudioSessionNotification = SessionClient { tx }.into();
+    let notif: IAudioSessionNotification = SessionClient { tx: tx.clone() }.into();
+    let mut vol_reg: Option<VolReg> = None;
+    if cfg.mic_lock.is_some() {
+        eng.lock.set(cfg.mic_lock);
+        sync_lock(&mut eng, &mut vol_reg, &tx, log);
+        for d in eng.enforce_lock() {
+            push(log, format!("mic lock at start -> {}", describe_did(&d)));
+        }
+    }
     let mut regs: HashMap<String, IAudioSessionManager2> = HashMap::new();
     if eng.new_apps.is_on() {
         sync_sessions(&mut eng, &notif, &mut regs, log);
     }
-    push(log, format!("watching: keep devices {}, new apps volume {} {:.0} %", eng.keep.is_on(), eng.new_apps.is_on(), eng.new_apps.volume() * 100.0));
+    push(
+        log,
+        format!(
+            "watching: keep devices {}, new apps volume {} {:.0} %, mic lock {}",
+            eng.keep.is_on(),
+            eng.new_apps.is_on(),
+            eng.new_apps.volume() * 100.0,
+            eng.lock.locked().map(|v| format!("{:.0} %", v * 100.0)).unwrap_or_else(|| "off".into())
+        ),
+    );
     let t0 = Instant::now();
     // blocks until Windows (or the app) has something — the thread sleeps in between
     while let Ok(m) = rx.recv() {
@@ -214,6 +259,15 @@ fn run(cfg: WatchConfig, tx: Sender<Msg>, rx: Receiver<Msg>, log: &WatchLog) -> 
                 resync = true;
                 Some(Event::Device(DeviceEvent::Gone { id }))
             }
+            Msg::Lock(v) => {
+                eng.lock.set(v);
+                sync_lock(&mut eng, &mut vol_reg, &tx, log);
+                let line = format!("mic lock {}", v.map(|v| format!("at {:.0} %", v * 100.0)).unwrap_or_else(|| "off".into()));
+                let did = eng.enforce_lock();
+                push(log, format!("{:>9.3}s {line}{}", now.as_secs_f64(), did.iter().map(|d| format!(" -> {}", describe_did(d))).collect::<String>()));
+                None
+            }
+            Msg::InputVol(id, v) => Some(Event::InputVolume { id, volume: v }),
             Msg::Default(flow, role, id) => Some(Event::Device(DeviceEvent::DefaultChanged { flow, role, id })),
             Msg::Session(Ctl(c)) => match session_info(&c) {
                 Some((info, vol, meter)) => {
@@ -229,7 +283,11 @@ fn run(cfg: WatchConfig, tx: Sender<Msg>, rx: Receiver<Msg>, log: &WatchLog) -> 
                 Event::SessionCreated(s) => Some(s.key.clone()),
                 _ => None,
             };
-            let did = eng.handle(ev, now);
+            let mut did = eng.handle(ev, now);
+            if sync_lock(&mut eng, &mut vol_reg, &tx, log) {
+                // the default input device changed: the new one may already be off the locked value
+                did.extend(eng.enforce_lock());
+            }
             if let Some(k) = new_key {
                 eng.os.forget_session(&k);
             }
@@ -245,11 +303,48 @@ fn run(cfg: WatchConfig, tx: Sender<Msg>, rx: Receiver<Msg>, log: &WatchLog) -> 
             }
         }
     }
+    if let Some(r) = vol_reg.take() {
+        let _ = unsafe { r.vol.UnregisterControlChangeNotify(&r.cb) };
+    }
     for (_, m) in regs.drain() {
         let _ = unsafe { m.UnregisterSessionNotification(&notif) };
     }
     let _ = unsafe { en.UnregisterEndpointNotificationCallback(&client) };
     Ok(())
+}
+
+/// The volume callback registered on the default input device while the mic is locked.
+struct VolReg {
+    id: String,
+    vol: IAudioEndpointVolume,
+    cb: IAudioEndpointVolumeCallback,
+}
+
+/// Listens to the volume of the default input device while (and only while) the lock is on; moves with the default
+/// device. True when it now listens to a different device.
+fn sync_lock(eng: &mut Engine<RealOs>, reg: &mut Option<VolReg>, tx: &Sender<Msg>, log: &WatchLog) -> bool {
+    let want = eng.lock.watching().map(str::to_string);
+    if reg.as_ref().map(|r| r.id.as_str()) == want.as_deref() {
+        return false;
+    }
+    if let Some(r) = reg.take() {
+        let _ = unsafe { r.vol.UnregisterControlChangeNotify(&r.cb) };
+    }
+    let Some(id) = want else { return false };
+    let cb: IAudioEndpointVolumeCallback = VolClient { tx: tx.clone(), id: id.clone() }.into();
+    match eng.os.endpoint_volume(&id).and_then(|v| {
+        unsafe { v.RegisterControlChangeNotify(&cb) }.map_err(|e| crate::real::os_err("RegisterControlChangeNotify", e))?;
+        Ok(v)
+    }) {
+        Ok(vol) => {
+            *reg = Some(VolReg { id, vol, cb });
+            true
+        }
+        Err(e) => {
+            push(log, format!("mic lock: volume notifications on {id}: {e}"));
+            false
+        }
+    }
 }
 
 /// The device's flow and whether it is on.
@@ -311,6 +406,7 @@ fn describe(ev: &Event) -> String {
         Event::Device(DeviceEvent::DefaultChanged { flow, role, id }) => {
             format!("default {flow:?} {role:?} changed{}", if id.is_none() { " to none" } else { "" })
         }
+        Event::InputVolume { volume, .. } => format!("input volume now {:.0} %", volume * 100.0),
         Event::SessionCreated(s) => format!(
             "new session pid {} ({})",
             s.pid,
@@ -323,6 +419,26 @@ fn describe_did(d: &Did) -> String {
     match d {
         Did::PutBack { role, .. } => format!("put the chosen device back ({role:?})"),
         Did::NewAppVolume { pid, volume, .. } => format!("pid {pid} set to {:.0} %", volume * 100.0),
+        Did::LockPutBack { from, to, .. } => format!("input volume {:.0} % put back to {:.0} %", from * 100.0, to * 100.0),
         Did::Failed(e) => format!("not done: {e}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Windows' volume callback becomes a message with the device id and the master volume (and nothing else).
+    #[test]
+    fn the_volume_callback_posts_the_device_and_its_master_volume() {
+        let (tx, rx) = channel::<Msg>();
+        let cb: IAudioEndpointVolumeCallback = VolClient { tx, id: "mic-1".into() }.into();
+        let mut n = AUDIO_VOLUME_NOTIFICATION_DATA { fMasterVolume: 0.37, ..Default::default() };
+        unsafe { cb.OnNotify(&mut n) }.unwrap();
+        match rx.try_recv() {
+            Ok(Msg::InputVol(id, v)) => assert_eq!((id.as_str(), v), ("mic-1", 0.37)),
+            _ => panic!("no InputVol message"),
+        }
+        assert!(rx.try_recv().is_err());
     }
 }

@@ -3,10 +3,11 @@
 2 ICON "assets/pane_light.ico"
 1 24 "app.manifest"
 
-// the name Windows shows (Task Manager, the file's properties)
+// the name Windows shows (Task Manager, the file's properties); the version comes from Cargo.toml: build.rs writes version.h
+#include "version.h"
 1 VERSIONINFO
-FILEVERSION 1,0,4,0
-PRODUCTVERSION 1,0,4,0
+FILEVERSION BU_VER_COMMA
+PRODUCTVERSION BU_VER_COMMA
 FILEOS 0x40004
 FILETYPE 0x1
 BEGIN
@@ -17,8 +18,8 @@ BEGIN
       VALUE "FileDescription", "Boyler Utilities"
       VALUE "ProductName", "Boyler Utilities"
       VALUE "OriginalFilename", "Boyler Utilities.exe"
-      VALUE "FileVersion", "1.0.4"
-      VALUE "ProductVersion", "1.0.4"
+      VALUE "FileVersion", BU_VER_STR
+      VALUE "ProductVersion", BU_VER_STR
     END
   END
   BLOCK "VarFileInfo"

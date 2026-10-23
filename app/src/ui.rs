@@ -13,6 +13,7 @@ pub mod gallery;
 pub mod lay;
 pub mod picker;
 pub mod pieces;
+pub mod taborder;
 
 use std::collections::HashMap;
 
@@ -295,9 +296,24 @@ const DOCK_Y: f32 = 9.0;
 /// SCR_FADE: the edge fade width (and how far the active icon stays clear of it)
 const SCR_FADE: f32 = 30.0;
 
-/// An icon's left edge inside `.dock` (scroll 0).
-fn dock_x(i: usize) -> f32 {
-    DOCK_PAD + i as f32 * (DT_W + DT_GAP)
+/// Order 119: how many icons the row shows at once, whole, when there are more than that (the 14 it showed before Order 116 +
+/// Notes: through Search); the rest are behind the row's scroll as before.
+const DOCK_SHOWN: usize = 15;
+
+/// Order 119: the row's one-icon step with `n` icons: `DT_W + DT_GAP` for a short row; for a long one tighter - the icons keep
+/// their size, only the gap shrinks - so the first `DOCK_SHOWN` icons sit whole in the strip, the last of them clear of the right
+/// edge's fade (`SCR_FADE`, and the 6 px `reveal` keeps an active icon from it, so choosing it does not scroll the row).
+/// (Order 116's Notes icon had pushed the 15th, Search, behind the scroll.)
+fn dock_step(n: usize) -> f32 {
+    if n < DOCK_SHOWN {
+        return DT_W + DT_GAP;
+    }
+    (DS_W - SCR_FADE - 6.5 - DT_W - DOCK_PAD) / (DOCK_SHOWN - 1) as f32
+}
+
+/// An icon's left edge inside `.dock` (scroll 0) with `n` icons in the row.
+fn dock_x_n(n: usize, i: usize) -> f32 {
+    DOCK_PAD + i as f32 * dock_step(n)
 }
 
 // ------------------------------------------------------------------ hit targets
@@ -506,6 +522,30 @@ pub struct Ui {
     switch_wait: Option<f64>,
     /// Order 047: the clicked tab's page is in this frame - (click time, its values were in = not the HOLD_MS give-up)
     pub switch_shown: Option<(f64, bool)>,
+    /// Order 116: the top row's right-click menu ("Rearrange tabs" / "Reset order") open at (x, y)
+    dock_menu: Option<(f32, f32)>,
+    /// Order 116: rearrange mode (icons are dragged to new places; a click elsewhere ends it)
+    arrange: bool,
+    /// Order 116: the icon being dragged in rearrange mode
+    drag: Option<DockDrag>,
+    /// Order 116: each icon's drawn offset from its own place (px; they glide aside while one is dragged, and to their new
+    /// places after a reorder)
+    slot_dx: Vec<Tween>,
+}
+
+/// Order 116: an icon held in rearrange mode.
+#[derive(Clone, Copy, Debug)]
+struct DockDrag {
+    /// its index in the row
+    i: usize,
+    /// the pointer's distance from the icon's left edge at the press
+    grab: f32,
+    /// the icon's left edge now (dock coordinates, `dock_x` scale)
+    x: f32,
+    /// the pointer moved enough to count as a drag
+    moved: bool,
+    /// where it would land now
+    to: usize,
 }
 
 /// After a tab opens its transitions jump for this long (its real values arrive without a slide from the defaults).
@@ -539,13 +579,15 @@ struct ReviewBg {
 
 const K_REVIEW: Key = el::key("frame.review");
 const K_TOAST: Key = el::key("frame.toast");
+/// Order 116: the top row's right-click menu
+const K_DOCKMENU: Key = el::key("frame.dockmenu");
 
 impl Ui {
     /// The menu opens on its first tab: the one `set_first_tab` named (the tab shown last / a key's tab), else Audio -
     /// opened like every tab (`Page::open` makes its service; `close` drops it).
     pub fn new(rm: bool, frozen: bool, now: f64) -> Ui {
         // an add-on's tab only while the add-on is on (Order 035)
-        let pages: Vec<Box<dyn Page>> = pages::all().into_iter().filter(|p| crate::addons::tab_visible(p.id())).collect();
+        let pages: Vec<Box<dyn Page>> = ordered_pages();
         let first = FIRST_TAB.with(|f| f.borrow_mut().take()).and_then(|id| pages.iter().position(|p| p.id() == id)).unwrap_or(0);
         Ui::with_pages_on(pages, first, rm, frozen, now)
     }
@@ -576,7 +618,7 @@ impl Ui {
             press_s: vec![tw(1.0); n],
             appear: vec![-1e9; n],
             addon_gen: crate::addons::gen(),
-            dot: tw((dock_x(first) + DT_W / 2.0) as f64),
+            dot: tw((dock_x_n(n, first) + DT_W / 2.0) as f64),
             ds_t: 0.0,
             ds: 0.0,
             ds_last: now,
@@ -633,6 +675,10 @@ impl Ui {
             switch_shown: None,
             pre: None,
             pre_close_at: None,
+            dock_menu: None,
+            arrange: false,
+            drag: None,
+            slot_dx: vec![tw(0.0); n],
         };
         ui.st.settle_until = now + SETTLE_MS;
         ui.on_t[first].jump(1.0);
@@ -643,6 +689,14 @@ impl Ui {
 
     fn n(&self) -> usize {
         self.pages.len()
+    }
+
+    /// Order 119: the row's one-icon step now (`dock_step`) and an icon's left edge at scroll 0.
+    fn step(&self) -> f32 {
+        dock_step(self.n())
+    }
+    fn dock_x(&self, i: usize) -> f32 {
+        dock_x_n(self.n(), i)
     }
 
     fn legacy(&mut self, tab: usize) -> Option<&mut dyn LegacyPage> {
@@ -658,6 +712,14 @@ impl Ui {
         self.apply_pending(now);
         self.review_poll(now);
         self.sync_addon_tabs(now);
+        // Order 116: an icon held near a faded edge scrolls the row that way (and stays under the pointer)
+        let dir = self.drag_edge_dir();
+        if dir != 0.0 {
+            let to = self.ds_t + dir * dt as f32 * 0.4;
+            self.ds_go(to, false, now);
+            let mx = self.mouse.0;
+            self.drag_icon(mx, now);
+        }
         // the top row follows its target (time-based ease, settles in ~160 ms)
         if (self.ds_t - self.ds).abs() > 0.0 {
             let d = self.ds_t - self.ds;
@@ -823,6 +885,10 @@ impl Ui {
         if self.sb_hold.is_some() || self.tips_busy {
             return true;
         }
+        // Order 116: icons gliding to their places / a held icon scrolling the row
+        if busy(&self.slot_dx) || self.drag_edge_dir() != 0.0 {
+            return true;
+        }
         if let Some(l) = self.pages[self.tab].legacy_ref() {
             return l.busy(now);
         }
@@ -890,6 +956,8 @@ impl Ui {
     /// tab), the page keeps what it had.
     pub fn open(&mut self, now: f64) {
         self.open_t = now;
+        self.end_arrange();
+        self.dock_menu = None;
         self.open_hold = 0.0;
         self.close_t = None;
         // a page switch still running: its old page goes now
@@ -903,7 +971,7 @@ impl Ui {
         for i in 0..self.n() {
             self.on_t[i].jump(if i == tab { 1.0 } else { 0.0 });
         }
-        self.dot.jump((dock_x(tab) + DT_W / 2.0) as f64);
+        self.dot.jump((self.dock_x(tab) + DT_W / 2.0) as f64);
         self.layers.clear();
         self.edges(now, true);
         self.dirty = true;
@@ -917,7 +985,7 @@ impl Ui {
             return;
         }
         self.addon_gen = g;
-        let mut fresh: Vec<Box<dyn Page>> = pages::all().into_iter().filter(|p| crate::addons::tab_visible(p.id())).collect();
+        let mut fresh: Vec<Box<dyn Page>> = ordered_pages();
         let want: Vec<&'static str> = fresh.iter().map(|p| p.id()).collect();
         let have: Vec<&'static str> = self.pages.iter().map(|p| p.id()).collect();
         if want == have {
@@ -961,6 +1029,10 @@ impl Ui {
         self.on_t = remap(&self.on_t, &map, tw(0.0));
         self.press_s = remap(&self.press_s, &map, tw(1.0));
         self.scroll = remap(&self.scroll, &map, tw(0.0));
+        // (Order 116: rearrange mode ends - the indexes change)
+        self.drag = None;
+        self.arrange = false;
+        self.slot_dx = vec![tw(0.0); want.len()];
         self.appear = remap(&self.appear, &map, if self.rm || self.close_t.is_some() { -1e9 } else { now });
         self.pages = pages_new;
         match want.iter().position(|id| *id == cur) {
@@ -989,7 +1061,7 @@ impl Ui {
         for i in 0..self.n() {
             self.on_t[i].jump(if i == tab { 1.0 } else { 0.0 });
         }
-        self.dot.jump((dock_x(tab) + DT_W / 2.0) as f64);
+        self.dot.jump((self.dock_x(tab) + DT_W / 2.0) as f64);
         self.layers.clear();
         self.lbl_i = None;
         self.hover = Hit::None;
@@ -997,6 +1069,160 @@ impl Ui {
         self.review = None;
         self.edges(now, true);
         self.dirty = true;
+    }
+
+    /// Order 116: put the tabs in a new order (`perm[new] = old`): every per-tab value goes with its tab, the shown tab stays
+    /// shown, and each icon glides from where it was drawn to its new place.
+    fn reorder(&mut self, perm: &[usize], now: f64) {
+        let n = self.n();
+        if perm.len() != n {
+            return;
+        }
+        let drawn: Vec<f32> = (0..n).map(|o| match self.drag { Some(d) if d.i == o => d.x, _ => self.dock_x(o) + self.slot_dx[o].value(now) as f32 }).collect();
+        fn take<T: Clone>(v: &[T], perm: &[usize]) -> Vec<T> {
+            perm.iter().map(|&o| v[o].clone()).collect()
+        }
+        self.mag = take(&self.mag, perm);
+        self.bounce = take(&self.bounce, perm);
+        self.ico_h = take(&self.ico_h, perm);
+        self.on_t = take(&self.on_t, perm);
+        self.press_s = take(&self.press_s, perm);
+        self.scroll = take(&self.scroll, perm);
+        self.appear = take(&self.appear, perm);
+        let mut old: Vec<Option<Box<dyn Page>>> = std::mem::take(&mut self.pages).into_iter().map(Some).collect();
+        self.pages = perm.iter().map(|&o| old[o].take().expect("each tab once")).collect();
+        let inv = |o: usize| perm.iter().position(|&p| p == o).unwrap_or(o);
+        self.tab = inv(self.tab);
+        self.layers = std::mem::take(&mut self.layers).into_iter().map(|(k, v)| (inv(k), v)).collect();
+        self.pre = self.pre.map(inv);
+        if let Some((from, t0, dir)) = self.switch {
+            self.switch = Some((inv(from), t0, dir));
+        }
+        if let Some(r) = self.review.as_mut() {
+            r.tab = inv(r.tab);
+        }
+        self.lbl_shown = inv(self.lbl_shown.min(n - 1));
+        self.lbl_i = None;
+        self.dock_icons.clear();
+        self.hover = Hit::None;
+        self.press = Hit::None;
+        let rm = self.rm;
+        self.slot_dx = (0..n)
+            .map(|j| {
+                let mut t = tw((drawn[perm[j]] - self.dock_x(j)) as f64);
+                if rm {
+                    t.jump(0.0);
+                } else {
+                    t.set(now, 0.0, 220.0, anim::EASE);
+                }
+                t
+            })
+            .collect();
+        self.dot.jump((self.dock_x(self.tab) + DT_W / 2.0) as f64);
+        self.edges(now, false);
+        self.dirty = true;
+    }
+
+    /// Order 116: save the row's order (the hidden add-on tabs keep their places between the shown ones).
+    fn save_tab_order(&self) {
+        let ids: Vec<&'static str> = pages::all().iter().map(|p| p.id()).collect();
+        let full = taborder::ordered(&ids, &saved_tab_order());
+        let shown: Vec<&str> = self.pages.iter().map(|p| p.id()).collect();
+        let new = taborder::merge_visible(&full, &shown);
+        crate::services::try_with(|s| s.store.set_list(crate::settings::Scope::App, taborder::KEY, &new));
+    }
+
+    /// Order 116: "Reset order" - the built-in order again (the setting goes).
+    fn reset_tab_order(&mut self, now: f64) {
+        crate::services::try_with(|s| s.store.remove(crate::settings::Scope::App, taborder::KEY));
+        let ids: Vec<&'static str> = pages::all().iter().map(|p| p.id()).collect();
+        let perm: Vec<usize> = taborder::ordered(&ids, &[]).iter().filter_map(|id| self.pages.iter().position(|p| p.id() == id)).collect();
+        if perm.iter().enumerate().any(|(j, &o)| j != o) {
+            self.reorder(&perm, now);
+        }
+    }
+
+    /// Order 116: rearrange mode ends (a click elsewhere, the menu closes); an icon still held goes back to its place.
+    fn end_arrange(&mut self) {
+        self.arrange = false;
+        if self.drag.take().is_some() {
+            for t in self.slot_dx.iter_mut() {
+                t.jump(0.0);
+            }
+            self.dock_icons.clear();
+        }
+        self.dirty = true;
+    }
+
+    /// Order 116: the held icon follows the pointer (window x); the others make room where it would land.
+    fn drag_icon(&mut self, x: f32, now: f64) {
+        let Some(mut d) = self.drag else { return };
+        let n = self.n();
+        let nx = (x - DS_X + self.ds - d.grab).clamp(self.dock_x(0), self.dock_x(n - 1));
+        if (nx - self.dock_x(d.i)).abs() > 3.0 {
+            d.moved = true;
+        }
+        d.x = nx;
+        let to = (((nx - DOCK_PAD) / self.step()).round().max(0.0) as usize).min(n - 1);
+        d.to = to;
+        for j in 0..n {
+            if j == d.i {
+                continue;
+            }
+            let off = if d.i < j && j <= to {
+                -self.step()
+            } else if to <= j && j < d.i {
+                self.step()
+            } else {
+                0.0
+            };
+            if self.rm {
+                self.slot_dx[j].jump(off as f64);
+            } else {
+                self.slot_dx[j].set(now, off as f64, 160.0, anim::EASE);
+            }
+        }
+        let off = (nx - self.dock_x(d.i)) as f64;
+        self.slot_dx[d.i].jump(off);
+        self.drag = Some(d);
+        self.dirty = true;
+    }
+
+    /// Order 116: the held icon is near a faded edge of the row: the row scrolls that way (-1 / 1; 0 = no).
+    fn drag_edge_dir(&self) -> f32 {
+        if self.drag.is_none() || self.ds_max() <= 0.0 {
+            return 0.0;
+        }
+        let x = self.mouse.0;
+        if x < DS_X + SCR_FADE && self.ds_t > 0.0 {
+            -1.0
+        } else if x > DS_X + DS_W - SCR_FADE && self.ds_t < self.ds_max() {
+            1.0
+        } else {
+            0.0
+        }
+    }
+
+    /// Order 116: clicks on the top row's right-click menu.
+    fn dock_menu_event(&mut self, ev: &Ev, now: f64) -> bool {
+        if self.dock_menu.is_none() {
+            return false;
+        }
+        match ev {
+            Ev::Click(k) if *k == el::idx(K_DOCKMENU, 0) => {
+                self.dismiss_popup();
+                self.arrange = true;
+                self.toast = Some(("Drag the icons \u{b7} click anywhere else to finish".to_string(), now));
+            }
+            Ev::Click(k) if *k == el::idx(K_DOCKMENU, 1) => {
+                self.dismiss_popup();
+                self.end_arrange();
+                self.reset_tab_order(now);
+            }
+            Ev::Press(..) | Ev::Release(..) | Ev::Click(..) => {}
+            _ => return false,
+        }
+        true
     }
 
     /// The shown tab's page id (the app remembers it: the next open shows it again - feedback F3).
@@ -1008,6 +1234,7 @@ impl Ui {
         if self.close_t.is_none() {
             self.close_t = Some(now);
             self.drop_pre();
+            self.end_arrange();
             self.dismiss_popup();
             crate::services::try_with(|s| s.stop_listening());
             self.lbl_i = None;
@@ -1067,7 +1294,7 @@ impl Ui {
         self.switch_wait = Some(now);
         self.scroll[i].jump(0.0);
         self.layers.remove(&i);
-        let x = (dock_x(i) + DT_W / 2.0) as f64;
+        let x = (self.dock_x(i) + DT_W / 2.0) as f64;
         if self.rm {
             self.dot.jump(x);
         } else {
@@ -1095,7 +1322,7 @@ impl Ui {
             self.st.settle_until = now + SETTLE_MS;
             self.hold_until = now + HOLD_MS;
             self.scroll[i].jump(0.0);
-            self.dot.jump((dock_x(i) + DT_W / 2.0) as f64);
+            self.dot.jump((self.dock_x(i) + DT_W / 2.0) as f64);
             self.reveal(i, false, now);
             self.dirty = true;
         }
@@ -1116,7 +1343,7 @@ impl Ui {
 
     // ============================================================== the top row's sideways scroll
     fn ds_max(&self) -> f32 {
-        let content = dock_x(self.n() - 1) + DT_W + DOCK_PAD;
+        let content = self.dock_x(self.n() - 1) + DT_W + DOCK_PAD;
         (content - DS_W).max(0.0)
     }
     fn ds_go(&mut self, to: f32, smooth: bool, now: f64) {
@@ -1131,8 +1358,8 @@ impl Ui {
     }
     /// The active icon always in view, clear of the faded edges (the drawing's dockReveal).
     fn reveal(&mut self, i: usize, smooth: bool, now: f64) {
-        let l = dock_x(i) - SCR_FADE - 6.0;
-        let r = dock_x(i) + DT_W + SCR_FADE + 6.0;
+        let l = self.dock_x(i) - SCR_FADE - 6.0;
+        let r = self.dock_x(i) + DT_W + SCR_FADE + 6.0;
         if l < self.ds_t {
             self.ds_go(l, smooth, now);
         } else if r > self.ds_t + DS_W {
@@ -1250,8 +1477,8 @@ impl Ui {
             if x >= DS_X && x < DS_X + DS_W {
                 let lx = x - DS_X + self.ds;
                 for i in 0..self.n() {
-                    let bx = dock_x(i);
-                    if lx >= bx && lx < bx + DT_W && y >= DOCK_Y && y < DOCK_Y + 34.0 {
+                    let bx = self.dock_x(i);
+                    if lx >= bx && lx < bx + DT_W.min(self.step()) && y >= DOCK_Y && y < DOCK_Y + 34.0 {
                         return Hit::Dock(i);
                     }
                 }
@@ -1323,7 +1550,11 @@ impl Ui {
             let r = self.rect_of_key(k, popup, now).unwrap_or((0.0, 0.0, 0.0, 0.0));
             self.page_event(Ev::Drag(k, x, y, r), now);
         }
-        let h = self.hit(x, y, now);
+        // Order 116: an icon held in rearrange mode follows the pointer (the icons it passes do not light up meanwhile)
+        if self.drag.is_some() {
+            self.drag_icon(x, now);
+        }
+        let h = if self.drag.is_some() { Hit::None } else { self.hit(x, y, now) };
         self.set_hover(h, x, y, now);
         // the pointer over the top row: chevrons near a faded edge, magnification
         self.dock_px = if y < 52.0 { Some(x) } else { None };
@@ -1331,8 +1562,15 @@ impl Ui {
         if !self.rm {
             let in_dock = y < 52.0 && x >= DS_X && x < DS_X + DS_W;
             for i in 0..self.n() {
-                let target = if in_dock {
-                    let cxi = DS_X - self.ds + dock_x(i) + DT_W / 2.0;
+                // (Order 116: while an icon is held only it stays raised)
+                let target = if let Some(d) = self.drag {
+                    if d.i == i {
+                        1.12
+                    } else {
+                        1.0
+                    }
+                } else if in_dock {
+                    let cxi = DS_X - self.ds + self.dock_x(i) + DT_W / 2.0;
                     let d = (x - cxi).abs();
                     1.0 + 0.18 * (1.0 - d / 68.0).max(0.0)
                 } else {
@@ -1449,8 +1687,8 @@ impl Ui {
         let tab = self.tab;
         // the page handles it with its own Cx (the painter is only needed for text widths)
         let g = DUMMY_G.with(|g| g.clone());
-        // the frame's own popup (the reset review) takes its clicks first
-        if self.review_event(&ev, now) {
+        // the frame's own popups (the top row's menu, the reset review) take their clicks first
+        if self.dock_menu_event(&ev, now) || self.review_event(&ev, now) {
             self.dirty = true;
             self.mark_stale(tab);
             return true;
@@ -1593,6 +1831,17 @@ impl Ui {
     /// keyed one).
     pub fn context(&mut self, x: f32, y: f32, now: f64) {
         self.mouse = (x, y);
+        // Order 116: the right button on a top-row icon: "Rearrange tabs" / "Reset order" at the mouse
+        if let Hit::Dock(_) = self.hit(x, y, now) {
+            self.dismiss_popup();
+            self.hide_tip(now);
+            self.lbl_i = None;
+            self.dock_menu = Some((x, y));
+            self.dirty = true;
+            let tab = self.tab;
+            self.mark_stale(tab);
+            return;
+        }
         let tab = self.tab;
         if self.legacy(tab).is_some() {
             return;
@@ -1730,6 +1979,7 @@ impl Ui {
 
     fn dismiss_popup(&mut self) {
         self.review = None;
+        self.dock_menu = None;
         // (Order 047: a review still being read is dropped too - it never pops up after the user moved on)
         self.review_bg.reading = None;
         self.modal = false;
@@ -1748,6 +1998,19 @@ impl Ui {
         let h = self.hit(x, y, now);
         self.press = h;
         self.dirty = true;
+        // Order 116: rearrange mode - a press on an icon picks it up; a press anywhere else ends the mode (and goes on as usual)
+        if self.arrange {
+            match h {
+                Hit::Dock(i) => {
+                    let lx = x - DS_X + self.ds;
+                    self.drag = Some(DockDrag { i, grab: lx - self.dock_x(i), x: self.dock_x(i), moved: false, to: i });
+                    self.mag[i].set(now, if self.rm { 1.0 } else { 1.12 }, 120.0, anim::EASE);
+                    return Action::None;
+                }
+                Hit::Chev(_) => {}
+                _ => self.end_arrange(),
+            }
+        }
         match h {
             Hit::CapMin => self.cap_p[0].set(now, 1.0, 120.0, anim::EASE),
             Hit::CapClose => self.cap_p[1].set(now, 1.0, 120.0, anim::EASE),
@@ -1821,6 +2084,25 @@ impl Ui {
     pub fn mouse_up(&mut self, x: f32, y: f32, now: f64) -> Action {
         let pressed = std::mem::replace(&mut self.press, Hit::None);
         self.dirty = true;
+        // Order 116: an icon held in rearrange mode lands where the others made room (no tab switch)
+        if let Some(d) = self.drag {
+            self.drag_icon(x, now);
+            let d = self.drag.unwrap_or(d);
+            let mut perm: Vec<usize> = (0..self.n()).collect();
+            if d.moved {
+                let v = perm.remove(d.i);
+                perm.insert(d.to, v);
+            }
+            self.reorder(&perm, now);
+            self.drag = None;
+            for m in self.mag.iter_mut() {
+                m.set(now, 1.0, 120.0, anim::EASE);
+            }
+            if d.moved && d.to != d.i {
+                self.save_tab_order();
+            }
+            return Action::None;
+        }
         self.cap_p[0].set(now, 0.0, 120.0, anim::EASE);
         self.cap_p[1].set(now, 0.0, 120.0, anim::EASE);
         self.chev_p[0].set(now, 0.0, 120.0, anim::EASE);
@@ -2131,7 +2413,7 @@ impl Ui {
         let (k, arg) = name.split_once(':').unwrap_or((name, ""));
         let i: usize = arg.parse().unwrap_or(0);
         match k {
-            "dock" => return Some((DS_X - self.ds + dock_x(i) + DT_W / 2.0, DOCK_Y + 17.0)),
+            "dock" => return Some((DS_X - self.ds + self.dock_x(i) + DT_W / 2.0, DOCK_Y + 17.0)),
             "close" => return Some((577.0, 26.0)),
             "min" => return Some((531.0, 26.0)),
             "chev" => return Some((if i == 0 { 25.0 } else { WIN_W - 97.0 - 12.0 }, 26.0)),
@@ -2331,7 +2613,7 @@ impl Ui {
             let mut over: Vec<El> = self.pages[tab].overlay(&mut cx).into_iter().collect();
             let pop = self.pages[tab].popup(&mut cx);
             let was_modal = self.modal;
-            self.modal = pop.is_some() || self.review.as_ref().is_some_and(|r| r.tab == tab);
+            self.modal = pop.is_some() || self.review.as_ref().is_some_and(|r| r.tab == tab) || self.dock_menu.is_some();
             // a popup / menu opened: the tip goes (the drawing's tipHide on every menu open)
             if self.modal && !was_modal {
                 let hover = cx.st.hover.clone();
@@ -2357,6 +2639,12 @@ impl Ui {
                     pieces::button::cbtn_sized(&mut cx, el::sub(K_REVIEW, "go"), &r.button_text(), pieces::button::Kind::Red, pieces::button::MCFB, n == 0, 0.0),
                 ];
                 over.push(pieces::reset::review_popup(&mut cx, K_REVIEW, rs.x, rs.y, &r.title(), r.subline(), &lines, buttons));
+            }
+            // Order 116: the top row's right-click menu (the drawing's right-click `.menu` at the mouse)
+            if let Some((x, y)) = self.dock_menu {
+                use pieces::mitems::{It, Place, Row};
+                let rows = [Row::Item(It::icon("arrange", "Rearrange tabs")), Row::Item(It::icon("treset", "Reset order"))];
+                over.push(pieces::mitems::menu(&mut cx, K_DOCKMENU, &rows, Place::At(x, y), 150.0));
             }
             if let Some((t, at)) = &self.toast {
                 over.push(pieces::toast::toast(&mut cx, K_TOAST, t, *at, self.pages[tab].bar_shown()));
@@ -2490,7 +2778,9 @@ impl Ui {
             f(if ap < 420.0 { ap } else { -1.0 });
             let b = now - self.bounce[i];
             f(if b < 420.0 { b } else { -1.0 });
+            f(self.slot_dx[i].value(now));
         }
+        f(self.drag.map_or(-1.0, |d| d.i as f64));
         for p in &self.pages {
             h.write(p.icon().as_bytes());
             h.write(p.name().as_bytes());
@@ -2587,7 +2877,9 @@ impl Ui {
         let strip = sk::Rect::from_xywh(DS_X, 0.0, DS_W, 52.0);
         g.cv().save_layer(&sk::canvas::SaveLayerRec::default().bounds(&strip));
         g.push_clip(DS_X, 0.0, DS_W, 52.0);
-        for i in 0..n {
+        // (Order 116: an icon held in rearrange mode is painted last - above the ones making room)
+        let held = self.drag.map(|d| d.i);
+        for i in (0..n).filter(|&i| Some(i) != held).chain(held) {
             let (mut op, mut sc) = (1.0f32, 1.0f32);
             if opening {
                 let p = ((age - 50.0 - i as f64 * 25.0) / 300.0).clamp(0.0, 1.0);
@@ -2607,7 +2899,7 @@ impl Ui {
             if op <= 0.0 {
                 continue;
             }
-            let bx = DS_X - ds + dock_x(i);
+            let bx = DS_X - ds + self.dock_x(i) + self.slot_dx[i].value(now) as f32;
             if bx + DT_W + 12.0 < DS_X || bx - 12.0 > DS_X + DS_W {
                 continue;
             }
@@ -2703,7 +2995,7 @@ impl Ui {
                 let p = ((age - 50.0 - n as f64 * 25.0) / 260.0).clamp(0.0, 1.0);
                 dop = anim::EASE_OUT_CSS.ease(p) as f32;
             }
-            let dx = DS_X - ds + self.dot.value(now) as f32;
+            let dx = DS_X - ds + self.dot.value(now) as f32 + self.slot_dx.get(self.tab).map_or(0.0, |t| t.value(now) as f32);
             g.fill_circle(dx, DOCK_Y + 34.0 + 3.0 + 2.0, 2.0, ACC().mul_a(dop));
         }
         g.pop_clip();
@@ -2805,7 +3097,7 @@ impl Ui {
             let tw1 = g.text_width(name, F115B);
             let w = tw1 + 18.0;
             let h = 23.0;
-            let icx = DS_X - ds + dock_x(i) + DT_W / 2.0;
+            let icx = DS_X - ds + self.dock_x(i) + DT_W / 2.0;
             let x = (icx - w / 2.0).clamp(8.0, WIN_W - w - 8.0).round();
             let y = 53.0 + 3.0 * (1.0 - t);
             let shs = [sh(0.0, 6.0, 18.0, 0.0, Rgba(0.0, 0.0, 0.0, 0.28)), sh(0.0, 0.0, 0.0, 0.5, Rgba(0.0, 0.0, 0.0, 0.3))];
@@ -3032,10 +3324,77 @@ pub fn hl() -> Rgba {
     Rgba(1.0, 1.0, 1.0, glass_numbers().highlight_alpha)
 }
 
+/// Order 116 (tests only): the menu drawn off-screen into a PNG - the top row, the caption buttons, the page and its popups
+/// over a plain dark fill (no desktop behind: the window's own glass is not part of it) - to LOOK at a change. `setup` drives
+/// the menu (clicks, right-clicks, drags; `ui.update` + `ui.prepare_page` between steps, as frames do) and returns the
+/// moment to draw.
+#[cfg(test)]
+pub(crate) fn test_picture(pages: Vec<Box<dyn Page>>, tab: usize, scale: f32, path: &str, setup: impl FnOnce(&mut Ui, &Gfx, f64) -> f64) {
+    let g = Gfx::new(scale);
+    let icons = Icons::new();
+    let mut ui = Ui::with_pages_on(pages, tab, true, true, 0.0);
+    let now = setup(&mut ui, &g, 10_000.0);
+    ui.update(now);
+    ui.prepare_page(&g, now);
+    let (w, h) = ((WIN_W * scale).round() as i32, (WIN_H * scale).round() as i32);
+    let mut s = crate::gfx::new_surface(w, h).expect("surface");
+    g.begin(s.canvas());
+    g.fill_rr(0.0, 0.0, WIN_W, WIN_H, RADIUS, Rgba::rgb(28, 30, 40));
+    let f = Frame { g: &g, icons: &icons, now };
+    ui.draw_dock(&f);
+    ui.draw_caps(&f);
+    g.push_clip(0.0, PAGE_TOP, WIN_W, PAGE_H);
+    let tab = ui.tab;
+    ui.draw_page(&f, tab, true);
+    g.pop_clip();
+    g.end();
+    let base = s.image_snapshot();
+    g.begin(s.canvas());
+    let f = Frame { g: &g, icons: &icons, now };
+    ui.draw_dock_overlays(&f, &base);
+    if let Some(p) = &ui.popup {
+        p.paint(&g, &icons, 0.0, 0.0, Some(&base));
+    }
+    g.end();
+    let px = crate::png::from_surface(&mut s);
+    if let Some(d) = std::path::Path::new(path).parent() {
+        let _ = std::fs::create_dir_all(d);
+    }
+    unsafe {
+        let _ = windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_MULTITHREADED);
+    }
+    crate::png::save_png(&px, path).expect("save png");
+}
+
+/// Order 116 (tests only): the tabs in the built-in order with one page put in place of its own (a page set up by the test).
+#[cfg(test)]
+pub(crate) fn test_pages_with(page: Box<dyn Page>) -> (Vec<Box<dyn Page>>, usize) {
+    let id = page.id();
+    let mut v: Vec<Box<dyn Page>> = pages::all().into_iter().filter(|p| crate::addons::tab_visible(p.id())).collect();
+    let i = v.iter().position(|p| p.id() == id).expect("a page of the row");
+    v[i] = page;
+    (v, i)
+}
+
+/// Order 116: every tab in the user's order (`taborder`: the saved `tab_order`, new tabs at their built-in place), an add-on's
+/// tab only while it is on (Order 035).
+fn ordered_pages() -> Vec<Box<dyn Page>> {
+    let all = pages::all();
+    let ids: Vec<&'static str> = all.iter().map(|p| p.id()).collect();
+    let order = taborder::ordered(&ids, &saved_tab_order());
+    let mut slots: Vec<Option<Box<dyn Page>>> = all.into_iter().map(Some).collect();
+    order.iter().filter_map(|id| ids.iter().position(|x| x == id)).filter_map(|i| slots[i].take()).filter(|p| crate::addons::tab_visible(p.id())).collect()
+}
+
+/// Order 116: the saved top-row order (none = the built-in one).
+fn saved_tab_order() -> Vec<String> {
+    crate::services::try_with(|s| s.store.get_list(crate::settings::Scope::App, taborder::KEY).map(|l| l.to_vec())).flatten().unwrap_or_default()
+}
+
 /// The tab with this id or name (the test hook's `--tab`), in the top row's order.
 pub fn tab_index(name: &str) -> Option<usize> {
     let n = name.to_lowercase();
-    pages::all().iter().filter(|p| crate::addons::tab_visible(p.id())).position(|p| p.id() == n || p.name().to_lowercase() == n)
+    ordered_pages().iter().position(|p| p.id() == n || p.name().to_lowercase() == n)
 }
 
 /// Warm the painter up before an open (tray hover): every font of the menu loaded, shaped and drawn once off-screen,
@@ -3656,10 +4015,158 @@ mod tests {
             ui.update(t + 16.0 * k as f64);
         }
         let i = ui.pages.iter().position(|p| p.id() == crate::obs::PAGE).expect("the bell joined the row");
-        let x = dock_x(i) - ui.ds;
+        let x = ui.dock_x(i) - ui.ds;
         assert!(x >= 0.0 && x + DT_W <= DS_W, "the bell at {x} of the row's {DS_W} px (scroll {})", ui.ds);
         assert_eq!(ui.tab_id(), "aud", "the shown tab stays");
         crate::addons::set_for("obs", false, true);
         crate::services::shutdown();
+    }
+}
+
+#[cfg(test)]
+mod tests_116 {
+    use super::*;
+
+    fn ids(ui: &Ui) -> Vec<&'static str> {
+        ui.pages.iter().map(|p| p.id()).collect()
+    }
+
+    /// Order 116: right-click an icon > "Rearrange tabs", drag Notes two places to the right: the row's order changes (the
+    /// shown tab stays shown, a plain click on an icon switches nothing), a click elsewhere ends the mode; "Reset order"
+    /// puts the built-in order back.
+    #[test]
+    fn rearrange_tabs_by_dragging_and_reset_the_order() {
+        let g = Gfx::new(1.0);
+        let (pages, tab) = test_pages_with(Box::new(crate::pages::notes::Notes::default()));
+        let mut ui = Ui::with_pages_on(pages, 0, true, true, 0.0);
+        let step = |ui: &mut Ui, t: f64| {
+            ui.update(t);
+            ui.prepare_page(&g, t);
+        };
+        let before = ids(&ui);
+        assert_eq!(&before[tab - 1..=tab + 1], ["shot", "nts", "cur"], "Notes sits between Screenshots and Mouse");
+        step(&mut ui, 1000.0);
+        let (x, y) = ui.target_point(&format!("dock:{tab}")).unwrap();
+        ui.context(x, y, 1000.0);
+        step(&mut ui, 1050.0);
+        assert!(ui.dock_menu.is_some(), "the right button on an icon opens the menu");
+        ui.click(&format!("xy:{},{}", x + 40.0, y + 2.0 + 5.0 + 13.0), 1100.0);
+        assert!(ui.arrange && ui.dock_menu.is_none(), "Rearrange tabs");
+        step(&mut ui, 1150.0);
+        // a plain click on an icon: no tab switch, nothing moves
+        ui.mouse_down(x, y, 1200.0);
+        ui.mouse_up(x + 1.0, y, 1210.0);
+        assert_eq!((ui.tab, ids(&ui)), (0, before.clone()));
+        // drag Notes two places right
+        ui.mouse_down(x, y, 1300.0);
+        ui.mouse_move(x + ui.step(), y, 1320.0);
+        ui.mouse_move(x + 2.0 * ui.step(), y, 1340.0);
+        ui.mouse_up(x + 2.0 * ui.step(), y, 1360.0);
+        let mut want = before.clone();
+        let v = want.remove(tab);
+        want.insert(tab + 2, v);
+        assert_eq!(ids(&ui), want);
+        assert_eq!((ui.tab, ui.pages[ui.tab].id()), (0, "aud"), "the shown tab stays shown");
+        assert!(ui.arrange, "still rearranging until a click elsewhere");
+        step(&mut ui, 2000.0);
+        ui.mouse_down(300.0, 300.0, 2100.0);
+        ui.mouse_up(300.0, 300.0, 2110.0);
+        assert!(!ui.arrange, "a click elsewhere ends it");
+        // Reset order
+        step(&mut ui, 2200.0);
+        let (x0, y0) = ui.target_point("dock:0").unwrap();
+        ui.context(x0, y0, 2200.0);
+        step(&mut ui, 2250.0);
+        ui.click(&format!("xy:{},{}", x0 + 40.0, y0 + 2.0 + 5.0 + 26.0 + 13.0), 2300.0);
+        assert_eq!(ids(&ui), before);
+        assert!(!ui.arrange);
+    }
+
+    /// Order 116: the shown tab moved by a drag keeps its page, its dot and its scroll.
+    #[test]
+    fn dragging_the_shown_tab_keeps_it_shown() {
+        let g = Gfx::new(1.0);
+        let (pages, tab) = test_pages_with(Box::new(crate::pages::notes::Notes::default()));
+        let mut ui = Ui::with_pages_on(pages, tab, true, true, 0.0);
+        ui.update(1000.0);
+        ui.prepare_page(&g, 1000.0);
+        ui.arrange = true;
+        let (x, y) = ui.target_point(&format!("dock:{tab}")).unwrap();
+        ui.mouse_down(x, y, 1100.0);
+        ui.mouse_move(x - 3.0 * ui.step(), y, 1150.0);
+        ui.mouse_up(x - 3.0 * ui.step(), y, 1200.0);
+        assert_eq!(ui.tab, tab - 3);
+        assert_eq!(ui.pages[ui.tab].id(), "nts");
+        assert_eq!(ui.dot.target() as f32, ui.dock_x(tab - 3) + DT_W / 2.0);
+    }
+}
+
+#[cfg(test)]
+mod tests_116_saved {
+    use super::*;
+
+    /// Order 116: the order is saved (app setting `tab_order`) and used at the next start; "Reset order" removes it.
+    #[test]
+    fn the_new_order_is_used_at_the_next_start() {
+        crate::services::init(windows::Win32::Foundation::HWND::default(), true);
+        let g = Gfx::new(1.0);
+        let built_in: Vec<&str> = ordered_pages().iter().map(|p| p.id()).collect();
+        let mut ui = Ui::with_pages_on(ordered_pages(), 0, true, true, 0.0);
+        ui.update(1000.0);
+        ui.prepare_page(&g, 1000.0);
+        ui.arrange = true;
+        let (x, y) = ui.target_point("dock:0").unwrap();
+        ui.mouse_down(x, y, 1100.0);
+        ui.mouse_move(x + 4.0 * ui.step(), y, 1150.0);
+        ui.mouse_up(x + 4.0 * ui.step(), y, 1200.0);
+        let moved: Vec<&str> = ui.pages.iter().map(|p| p.id()).collect();
+        assert_ne!(moved, built_in);
+        // "the next start": a fresh row reads the setting
+        let next: Vec<&str> = ordered_pages().iter().map(|p| p.id()).collect();
+        assert_eq!(next, moved);
+        assert_eq!(tab_index("aud"), Some(4));
+        ui.reset_tab_order(1300.0);
+        let reset: Vec<&str> = ordered_pages().iter().map(|p| p.id()).collect();
+        assert_eq!(reset, built_in);
+        crate::services::shutdown();
+    }
+}
+
+#[cfg(test)]
+mod tests_119 {
+    use super::*;
+
+    /// Order 119: the first 15 icons (through Search) sit whole in the row again - Order 116's Notes icon had pushed Search
+    /// behind the scroll - with an even step, tiles never wider than their step, the last one clear of the right fade, and a click
+    /// on it does not scroll the row; the others (Voice ...) are still behind the scroll, reached as before.
+    #[test]
+    fn the_first_fifteen_icons_fit_the_row_with_an_even_step() {
+        let (pages, _) = test_pages_with(Box::new(crate::pages::notes::Notes::default()));
+        let mut ui = Ui::with_pages_on(pages, 0, true, true, 0.0);
+        let n = ui.n();
+        assert_eq!(ui.pages[DOCK_SHOWN - 1].id(), "srch", "the 15th tab is Search");
+        let xs: Vec<f32> = (0..n).map(|i| ui.target_point(&format!("dock:{i}")).unwrap().0).collect();
+        assert!(xs[0] - 11.0 >= DS_X, "the first icon's 22 px at {}", xs[0]);
+        let last = xs[DOCK_SHOWN - 1];
+        assert!(last + 11.0 <= DS_X + DS_W - SCR_FADE, "Search's icon ends at {} but the fade starts at {}", last + 11.0, DS_X + DS_W - SCR_FADE);
+        for w in xs[..DOCK_SHOWN].windows(2) {
+            assert!((w[1] - w[0] - ui.step()).abs() < 0.01, "even step {}", w[1] - w[0]);
+        }
+        // the icons keep their size: the gap between two 22 px icons is still a real gap
+        assert!(ui.step() - 22.0 >= 8.0, "step {}", ui.step());
+        assert!(ui.ds_max() > 0.0, "the six after Search are still behind the scroll");
+        // choosing Search does not move the row (nothing cut, nothing jumps) - choosing the next one does
+        ui.reveal(DOCK_SHOWN - 1, false, 1.0);
+        assert_eq!(ui.ds_t, 0.0, "Search is clear of the fade: no scroll");
+        ui.reveal(DOCK_SHOWN, false, 2.0);
+        assert!(ui.ds_t > 0.0);
+        // a short row keeps the old step
+        assert_eq!(dock_step(DOCK_SHOWN - 1), DT_W + DT_GAP);
+        // a click on every shown icon's middle finds that icon
+        ui.ds_go(0.0, false, 3.0);
+        for i in 0..DOCK_SHOWN {
+            let (x, y) = ui.target_point(&format!("dock:{i}")).unwrap();
+            assert_eq!(ui.hit(x, y, 3.0), Hit::Dock(i));
+        }
     }
 }

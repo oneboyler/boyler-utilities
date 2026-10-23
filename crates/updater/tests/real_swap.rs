@@ -8,7 +8,11 @@ mod common;
 use bu_updater::*;
 use common::*;
 use std::path::{Path, PathBuf};
+use std::os::windows::process::CommandExt;
 use std::process::Command;
+
+/// Order 118: no test child opens a console window (CREATE_NO_WINDOW).
+const NO_WINDOW: u32 = 0x0800_0000;
 use std::time::Duration;
 
 fn fake_app_exe() -> PathBuf {
@@ -50,6 +54,7 @@ fn world(name: &str, new_tag: &str, digest_override: Option<String>, listed_size
 /// Starts the old app in "update" mode and waits until IT has ended (that is the moment the real app would exit).
 fn run_update_app(w: &World, start_wait_ms: u64) -> i32 {
     let mut child = Command::new(&w.exe)
+        .creation_flags(NO_WINDOW)
         .args(["update", "o/r", &w.server.base(), "1.0.0", &start_wait_ms.to_string()])
         .current_dir(w.dir.path())
         .spawn()
@@ -173,7 +178,7 @@ fn cleanup_after_a_finished_update_leaves_only_the_app() {
 }
 
 fn process_alive(pid: u32) -> bool {
-    let out = Command::new("tasklist").args(["/FI", &format!("PID eq {pid}"), "/NH"]).output().unwrap();
+    let out = Command::new("tasklist").creation_flags(NO_WINDOW).args(["/FI", &format!("PID eq {pid}"), "/NH"]).output().unwrap();
     String::from_utf8_lossy(&out.stdout).contains(&pid.to_string())
 }
 
@@ -199,12 +204,12 @@ fn an_install_step_that_cannot_read_its_plan_starts_the_app_again_and_leaves_a_n
     std::fs::write(&plan, "{ this is not a plan").unwrap();
     let result = dir.join("BoylerUtilities.exe.update-result");
     // the "exiting app": a process that is already gone
-    let mut gone = Command::new("cmd").args(["/C", "exit 0"]).spawn().unwrap();
+    let mut gone = Command::new("cmd").creation_flags(NO_WINDOW).args(["/C", "exit 0"]).spawn().unwrap();
     gone.wait().unwrap();
     let fb = Fallback { target: exe.clone(), result_file: result.clone(), old_pid: gone.id(), exit_wait_ms: 5000 };
     let mut args = vec![HELPER_ARG.to_string(), plan.to_string_lossy().into_owned()];
     args.extend(fb.to_args());
-    let code = Command::new(&helper).args(&args).current_dir(dir.path()).status().unwrap().code();
+    let code = Command::new(&helper).creation_flags(NO_WINDOW).args(&args).current_dir(dir.path()).status().unwrap().code();
     assert_eq!(code, Some(2), "the install step reports that it could not do its job");
 
     assert!(wait_until(Duration::from_secs(20), || !log(dir.path(), "started.log").is_empty()), "the app was not started again");
@@ -228,7 +233,7 @@ fn an_install_step_started_by_an_older_caller_without_fallback_values_just_ends(
     std::fs::write(&helper, app_bytes("old 1.0.0")).unwrap();
     let plan = dir.join("plan.json");
     std::fs::write(&plan, "garbage").unwrap();
-    let code = Command::new(&helper).args([HELPER_ARG, &plan.to_string_lossy()]).current_dir(dir.path()).status().unwrap().code();
+    let code = Command::new(&helper).creation_flags(NO_WINDOW).args([HELPER_ARG, &plan.to_string_lossy()]).current_dir(dir.path()).status().unwrap().code();
     assert_eq!(code, Some(2));
     std::thread::sleep(Duration::from_millis(500));
     assert!(log(dir.path(), "started.log").is_empty(), "nothing is started when the install step knows nothing");

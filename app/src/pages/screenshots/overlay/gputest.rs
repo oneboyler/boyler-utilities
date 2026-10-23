@@ -10,11 +10,32 @@ use windows::Win32::UI::WindowsAndMessaging::*; // (wParam 1 = MK_LBUTTON)
 
 /// One made-up monitor `w` x `h` at (`x`, `y`) (off-screen in a plain test copy) and its frozen picture.
 pub fn frozen(x: i32, y: i32, w: u32, h: u32) -> Frozen {
-    let mut m: Monitor = mon(x, y, w, h, true, false);
-    m.number = 1;
-    let p = pattern(&m, 0);
-    let img = Image { width: p.width, height: p.height, bgra: p.bgra };
-    Frozen { area: Rect::new(x, y, w, h), image: img, monitors: vec![m], color: vec![(0, bu_screenshot::ColorPath::Sdr)], timing: CaptureTiming::default() }
+    frozen_many(&[(x, y, w, h)])
+}
+
+/// Order 117: made-up monitors (the first one primary) and their frozen picture - a multi-monitor desk, measured off-screen.
+pub fn frozen_many(rects: &[(i32, i32, u32, u32)]) -> Frozen {
+    let mons: Vec<Monitor> = rects
+        .iter()
+        .enumerate()
+        .map(|(i, &(x, y, w, h))| {
+            let mut m = mon(x, y, w, h, i == 0, false);
+            m.number = i + 1;
+            m
+        })
+        .collect();
+    let area = mons.iter().skip(1).fold(mons[0].rect, |a, m| a.union(&m.rect));
+    let mut img = Image::black(area.w, area.h);
+    for m in &mons {
+        let p = pattern(m, 0);
+        let (ox, oy, row) = ((m.rect.x - area.x) as usize, (m.rect.y - area.y) as usize, p.width as usize * 4);
+        for y in 0..p.height as usize {
+            let at = ((oy + y) * area.w as usize + ox) * 4;
+            img.bgra[at..at + row].copy_from_slice(&p.bgra[y * row..(y + 1) * row]);
+        }
+    }
+    let color = (0..mons.len()).map(|i| (i, bu_screenshot::ColorPath::Sdr)).collect();
+    Frozen { area, image: img, monitors: mons, color, timing: CaptureTiming::default() }
 }
 
 fn lp(x: i32, y: i32) -> LPARAM {
@@ -42,6 +63,26 @@ pub fn drag(hwnd: HWND, a: (i32, i32), b: (i32, i32), ms: u32, hz: u32) {
             let _ = PostMessageW(Some(hwnd), WM_MOUSEMOVE, WPARAM(1), lp(x, y));
         }
         let _ = PostMessageW(Some(hwnd), WM_LBUTTONUP, WPARAM(0), lp(b.0, b.1));
+    });
+}
+
+/// Order 117: the pointer moving over the overlay with no button held (before a box is drawn) from `a` to `b` (window px) over
+/// `ms`, reporting at `hz` - posted from a helper thread like `drag`.
+pub fn hover(hwnd: HWND, a: (i32, i32), b: (i32, i32), ms: u32, hz: u32) {
+    let h = hwnd.0 as isize;
+    std::thread::spawn(move || unsafe {
+        let hwnd = HWND(h as *mut _);
+        let n = (ms as u64 * hz as u64 / 1000).max(1);
+        let t0 = std::time::Instant::now();
+        for i in 0..=n {
+            let due = std::time::Duration::from_micros(i * 1_000_000 / hz as u64);
+            if let Some(w) = due.checked_sub(t0.elapsed()) {
+                std::thread::sleep(w);
+            }
+            let k = i as f32 / n as f32;
+            let (x, y) = ((a.0 as f32 + (b.0 - a.0) as f32 * k).round() as i32, (a.1 as f32 + (b.1 - a.1) as f32 * k).round() as i32);
+            let _ = PostMessageW(Some(hwnd), WM_MOUSEMOVE, WPARAM(0), lp(x, y));
+        }
     });
 }
 

@@ -99,6 +99,9 @@ pub enum Row<'a> {
     /// padding-top 2px)
     Section(&'a str),
     Item(It<'a>),
+    /// Order 119: a row of round colour choices (the right-click menu of a Notes paper): the colours and the chosen one; choice j
+    /// = `Ev::Click(idx(sub(key, "sw"), j))`
+    Swatches(&'a [Rgba], usize),
 }
 
 const F13: Font = Font::new(13.0, 400);
@@ -109,6 +112,7 @@ fn row_h(r: &Row, first: bool) -> f32 {
         Row::Sep => 1.0 + 8.0,
         Row::Section(_) => (if first { 2.0 } else { 7.0 }) + lh(10.5, 1.35) + 3.0,
         Row::Item(_) => 26.0,
+        Row::Swatches(..) => 30.0,
     }
 }
 
@@ -139,6 +143,7 @@ pub fn rows(cx: &mut Cx, key: Key, rows: &[Row]) -> Vec<El> {
                 .pad(if i == 0 { 2.0 } else { 7.0 }, 8.0, 3.0, 8.0)
                 .child(El::text(*t, Font::new(10.5, 600).ls(210), FG3(), lh(10.5, 1.35))),
             Row::Item(it) => item(cx, k, it),
+            Row::Swatches(cols, on) => swatches(cx, key, cols, *on),
         });
     }
     out
@@ -277,6 +282,7 @@ fn menu_size(cx: &mut Cx, list: &[Row], p: Place, min_w: f32) -> (f32, f32, f32)
             Row::Sep => 0.0,
             Row::Section(t) => cx.g.text_box(t, Font::new(10.5, 600).ls(210), 0.0).width + 16.0,
             Row::Item(it) => item_w(cx, it),
+            Row::Swatches(c, _) => c.len() as f32 * 22.0 + (c.len().max(1) - 1) as f32 * 6.0 + 16.0,
         };
         w = w.max(rw);
     }
@@ -389,4 +395,24 @@ mod tests {
         // at the mouse near the bottom-right: left of / above the point, growing from the bottom-right
         assert_eq!(place(Place::At(500.0, 480.0), 214.0, 150.0), (284.0, 328.0, true, true));
     }
+}
+
+/// Order 119: the swatch row - 22 px round choices 6 px apart (a 16 px disc of the colour inside; the chosen one has a 1.5 px ring
+/// in the text colour, the hovered one a fainter ring).
+fn swatches(cx: &mut Cx, key: Key, cols: &[Rgba], on: usize) -> El {
+    let mut r = El::row().center().gap(6.0).h(30.0).pad(0.0, 8.0, 0.0, 8.0);
+    for (j, c) in cols.iter().enumerate() {
+        let k = idx(crate::ui::el::sub(key, "sw"), j);
+        let ring = if j == on { FG() } else if cx.hovered(k) { FG3() } else { Rgba(0.0, 0.0, 0.0, 0.0) };
+        r = r.child(
+            El::block()
+                .size(22.0, 22.0)
+                .none()
+                .radius(11.0)
+                .inset(&[sh(0.0, 0.0, 0.0, 1.5, ring)])
+                .on_click(k)
+                .child(El::block().size(16.0, 16.0).none().radius(8.0).bg(*c).place_center().no_hit()),
+        );
+    }
+    r
 }

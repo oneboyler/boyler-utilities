@@ -21,6 +21,13 @@ pub enum Mode {
     Edit,
 }
 
+/// Order 117: the size tag's two numbers, each typed in its own field.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Side {
+    W,
+    H,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Tool {
     Pen,
@@ -209,8 +216,9 @@ pub struct Model {
     drag: Option<Drag>,
     pub live: bool,
     pub text: Option<TextField>,
-    /// the size tag being typed ("1920 × 1080")
+    /// the size tag's number being typed (Order 117: one number - the width or the height, `size_side`)
     pub size_edit: Option<String>,
+    pub size_side: Side,
     /// the size field's text is still selected (the field opens with it selected: the first key replaces it)
     pub size_selected: bool,
     pub picker: Picker,
@@ -266,6 +274,7 @@ impl Model {
             live: false,
             text: None,
             size_edit: None,
+            size_side: Side::W,
             size_selected: false,
             picker: Picker::default(),
             last: pointer,
@@ -618,24 +627,41 @@ impl Model {
     }
 
     // ------------------------------------------------------------------ the size tag
-    /// A click on the size tag (only while editing): it becomes a field holding "W × H".
-    pub fn size_start(&mut self) {
-        if self.size_edit.is_some() || self.mode != Mode::Edit {
+    /// A click on the size tag's width or height (only while editing): that number alone becomes a small field (Order 117,
+    /// the owner Oct 23: "separate boxes that open depending on what you clicked the height or width not both in one"). A click
+    /// on the other number while one is open applies the open one first.
+    pub fn size_start(&mut self, side: Side) {
+        if self.mode != Mode::Edit {
             return;
+        }
+        if self.size_edit.is_some() {
+            if self.size_side == side {
+                return;
+            }
+            self.size_commit(true);
         }
         let Some(s) = self.sel else { return };
         self.commit_text();
-        self.size_edit = Some(format!("{} × {}", s.w, s.h));
+        self.size_edit = Some(match side {
+            Side::W => s.w,
+            Side::H => s.h,
+        }
+        .to_string());
+        self.size_side = side;
         self.size_selected = true;
     }
 
-    /// Enter / a click away (true) applies the first two numbers typed; Esc (false) cancels.
+    /// Enter / a click away (true) applies the number typed to its side (the other side stays); Esc (false) cancels.
     pub fn size_commit(&mut self, apply: bool) {
         let Some(t) = self.size_edit.take() else { return };
         if !apply {
             return;
         }
-        let (Some((w, h)), Some(s)) = (geom::parse_size(&t), self.sel) else { return };
+        let (Ok(n), Some(s)) = (t.parse::<u32>(), self.sel) else { return };
+        let (w, h) = match self.size_side {
+            Side::W => (n, s.h.max(1) as u32),
+            Side::H => (s.w.max(1) as u32, n),
+        };
         let cur = Rect::new(s.x, s.y, s.w.max(1) as u32, s.h.max(1) as u32);
         self.sel = Some(Sel::of(&geom::fit_typed_size(&cur, w, h, &self.desk)));
     }
@@ -786,11 +812,17 @@ impl Model {
             return;
         }
         if let Some(t) = &mut self.size_edit {
+            // (one number: digits only, at most 5)
+            if !c.is_ascii_digit() {
+                return;
+            }
             if self.size_selected {
                 t.clear();
                 self.size_selected = false;
             }
-            t.push(c);
+            if t.len() < 5 {
+                t.push(c);
+            }
         } else if let Some(t) = &mut self.text {
             t.text.push(c);
         } else if self.picker.open && self.picker.big {
@@ -959,21 +991,50 @@ mod tests {
     #[test]
     fn typed_size_keeps_the_top_left_and_slides_back() {
         let mut m = boxed();
-        m.size_start();
-        assert_eq!(m.size_edit.as_deref(), Some("620 × 400"));
-        for c in "1920x1080".chars() {
+        m.size_start(Side::W);
+        assert_eq!(m.size_edit.as_deref(), Some("620"), "the width alone");
+        for c in "1920".chars() {
             m.char_input(c);
         }
         m.key(0x0D, None, false, false, false, 0.0);
+        assert_eq!(m.sel, Some(Sel { x: 560, y: 300, w: 1920, h: 400 }), "only the width changed");
+        m.size_start(Side::H);
+        assert_eq!(m.size_edit.as_deref(), Some("400"), "the height alone");
+        for c in "10x80".chars() {
+            m.char_input(c);
+        }
+        assert_eq!(m.size_edit.as_deref(), Some("1080"), "digits only");
+        m.key(0x0D, None, false, false, false, 0.0);
         assert_eq!(m.sel, Some(Sel { x: 560, y: 300, w: 1920, h: 1080 }));
-        m.size_start();
-        m.size_edit = Some("9999 x 2".into());
+        m.size_start(Side::W);
+        m.size_edit = Some("9999".into());
+        m.size_commit(true);
+        m.size_start(Side::H);
+        m.size_edit = Some("2".into());
         m.size_commit(true);
         assert_eq!(m.sel, Some(Sel { x: 0, y: 300, w: 4480, h: 4 }), "clamped 4 px .. the desktop, slid back in");
-        m.size_start();
-        m.size_edit = Some("10 10".into());
+        m.size_start(Side::W);
+        m.size_edit = Some("10".into());
         m.key(0x1B, None, false, false, false, 0.0);
         assert_eq!(m.sel.map(|s| s.w), Some(4480), "Esc cancels");
+    }
+
+    #[test]
+    fn the_other_number_applies_the_open_one_first() {
+        let mut m = boxed();
+        m.size_start(Side::W);
+        m.char_input('8');
+        m.char_input('0');
+        m.char_input('0');
+        m.size_start(Side::H);
+        assert_eq!((m.size_side, m.size_edit.as_deref()), (Side::H, Some("400")), "now the height field, alone");
+        assert_eq!(m.sel.map(|s| (s.w, s.h)), Some((800, 400)), "the width typed was applied");
+        for c in "123456".chars() {
+            m.char_input(c);
+        }
+        assert_eq!(m.size_edit.as_deref(), Some("12345"), "at most 5 digits");
+        m.key(0x08, None, false, false, false, 0.0);
+        assert_eq!(m.size_edit.as_deref(), Some("1234"));
     }
 
     #[test]

@@ -410,7 +410,13 @@ mod tests {
     }
 
     fn is_elevated() -> bool {
-        std::process::Command::new("net").arg("session").stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status().map(|s| s.success()).unwrap_or(false)
+        {
+            use std::os::windows::process::CommandExt;
+            let mut c = std::process::Command::new("net");
+            c.creation_flags(0x0800_0000); // CREATE_NO_WINDOW (Order 118)
+            c
+        }
+        .arg("session").stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status().map(|s| s.success()).unwrap_or(false)
     }
 
     #[test]

@@ -831,7 +831,7 @@ fn a_client_that_is_not_the_copy_is_refused() {
     let id = server.id().to_string();
     let t = std::thread::spawn(move || wire::connect(&id));
     // the started "copy" is another process (a short hidden ping); this process connects instead: refused
-    let mut child = std::process::Command::new("ping").args(["-n", "5", "127.0.0.1"]).stdout(std::process::Stdio::null()).spawn().unwrap();
+    let mut child = crate::quiet::command("ping").args(["-n", "5", "127.0.0.1"]).stdout(std::process::Stdio::null()).spawn().unwrap();
     use std::os::windows::io::AsRawHandle;
     let h = windows::Win32::Foundation::HANDLE(child.as_raw_handle());
     let r = server.accept(h, std::time::Duration::from_secs(10), &|| false);
@@ -862,7 +862,7 @@ fn a_restore_path_through_a_link_is_refused() {
     let real = root.join("real");
     let j = root.join("j");
     std::fs::create_dir_all(&real).unwrap();
-    let made = std::process::Command::new("cmd").args(["/c", "mklink", "/J"]).arg(&j).arg(&real).stdout(std::process::Stdio::null()).status().map(|s| s.success()).unwrap_or(false);
+    let made = crate::quiet::command("cmd").args(["/c", "mklink", "/J"]).arg(&j).arg(&real).stdout(std::process::Stdio::null()).status().map(|s| s.success()).unwrap_or(false);
     assert!(made, "the junction could not be made");
     assert!(exec::link_on_the_way(&j.join("x.exe").to_string_lossy()));
     assert!(exec::link_on_the_way(&j.join("deeper").join("x.exe").to_string_lossy()));

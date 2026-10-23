@@ -6,7 +6,8 @@
 //! * [`page`]    — the page while open: one worker thread (Windows' audio service can take 100–1076 ms to answer), a
 //!   snapshot the UI reads without waiting, levels only while asked. Its thread ends when it is dropped (an icon read
 //!   already started on the helper thread may still finish; the read names / icons stay cached, a few KB per app).
-//! * [`keep`] + [`newvol`] + [`engine`] — "Keep my devices" and "New apps volume": pure rules fed with Windows' events.
+//! * [`keep`] + [`newvol`] + [`lock`] + [`engine`] — "Keep my devices", "New apps volume" and the input volume lock (Order 118):
+//!   pure rules fed with Windows' events.
 //! * [`watch`]   — (Windows) the event listener for those two: `IMMNotificationClient` + `IAudioSessionNotification`
 //!   on one sleeping thread — no polling while the menu is closed.
 //!
@@ -18,6 +19,7 @@ pub mod engine;
 mod error;
 pub mod fake;
 pub mod keep;
+pub mod lock;
 pub mod model;
 pub mod newvol;
 mod os;

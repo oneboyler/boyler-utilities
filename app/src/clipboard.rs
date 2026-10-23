@@ -44,6 +44,54 @@ pub fn set_text(text: &str) -> Result<(), String> {
     }
 }
 
+/// Order 116: the clipboard's text (Ctrl+V in a note), line breaks as LF; None = no text on it / another app holds it. A
+/// test copy and `cargo test` read the test clipboard only (never the user's).
+pub fn get_text() -> Option<String> {
+    if cfg!(test) || crate::testmode::on() {
+        return test_clip();
+    }
+    use windows::Win32::System::DataExchange::GetClipboardData;
+    unsafe {
+        let mut open = false;
+        for _ in 0..10 {
+            if OpenClipboard(None).is_ok() {
+                open = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        if !open {
+            return None;
+        }
+        let r = (|| {
+            let h = GetClipboardData(CF_UNICODETEXT.0 as u32).ok()?;
+            let g = windows::Win32::Foundation::HGLOBAL(h.0);
+            let p = GlobalLock(g) as *const u16;
+            if p.is_null() {
+                return None;
+            }
+            let n = windows::Win32::System::Memory::GlobalSize(g) / 2;
+            let mut len = 0usize;
+            while len < n && *p.add(len) != 0 {
+                len += 1;
+            }
+            let s = String::from_utf16_lossy(std::slice::from_raw_parts(p, len));
+            let _ = GlobalUnlock(g);
+            Some(s.replace("\r\n", "\n"))
+        })();
+        let _ = CloseClipboard();
+        r
+    }
+}
+
+/// Test only: what the test clipboard holds (a test copy's / `cargo test`'s `get_text`).
+#[cfg(test)]
+pub fn set_test_clip(text: &str) {
+    if let Ok(mut c) = TEST_CLIP.lock() {
+        *c = Some(text.to_string());
+    }
+}
+
 unsafe fn fill(hwnd: HWND, bytes: &[u8]) -> Result<(), String> {
     // another app may hold the clipboard for a moment: try for up to ~0.5 s
     let mut open = false;

@@ -394,7 +394,7 @@ impl Startup {
             // Explorer opens with the file selected (the user's own click) - Order 047: started off the menu's thread
             let arg = format!("/select,{}", p.display());
             crate::offui::spawn("startup-explorer", move || {
-                let _ = std::process::Command::new("explorer.exe").arg(arg).spawn();
+                let _ = crate::quiet::command("explorer.exe").arg(arg).spawn();
             });
         }
         self.show_toast(format!("Opens Explorer with {f} selected"), now);
@@ -407,7 +407,7 @@ impl Startup {
         if !self.test && !self.real_read {
             // started off the menu's thread, like Explorer above
             crate::offui::spawn("startup-settings", move || {
-                let _ = std::process::Command::new("explorer.exe").arg(uri).spawn();
+                let _ = crate::quiet::command("explorer.exe").arg(uri).spawn();
             });
         }
         self.show_toast(format!("Opens Windows Settings › Apps › Startup · switch {name} there"), now);
@@ -421,7 +421,7 @@ impl Startup {
             // Order 047: started off the menu’s thread
             let u = url.clone();
             crate::offui::spawn("startup-search", move || {
-                let _ = std::process::Command::new("explorer.exe").arg(u).spawn();
+                let _ = crate::quiet::command("explorer.exe").arg(u).spawn();
             });
         }
         self.show_toast(format!("Searches the web for “{}”", e.name), now);

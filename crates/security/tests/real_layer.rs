@@ -4,6 +4,7 @@
 
 use bu_security::real::{looks_like_access_denied, mpcmdrun_path, newest_platform};
 use bu_security::*;
+use std::os::windows::process::CommandExt;
 
 #[test]
 fn newest_platform_folder_is_compared_number_by_number() {
@@ -74,6 +75,7 @@ exit 0
 "#;
     for (name, script, cmd, params) in bu_security::real::change_scripts() {
         let out = std::process::Command::new(&ps)
+            .creation_flags(0x0800_0000) // CREATE_NO_WINDOW (Order 118)
             .args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", check])
             .env("BU_SCRIPT", &script)
             .env("BU_CMD", cmd)

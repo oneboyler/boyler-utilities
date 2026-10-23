@@ -12,7 +12,7 @@ use windows_numerics::Matrix3x2;
 
 use super::emoji;
 use super::ink;
-use super::model::{Ann, Corner, Mode, Model, Pointer, Sel, Tool, COLORS};
+use super::model::{Ann, Corner, Mode, Model, Pointer, Sel, Side, Tool, COLORS};
 use crate::anim::{self, Bezier, EASE, EASE_IN, EASE_OUT, EASE_OUT_CSS};
 use crate::gfx::{sh, Align, CssColor, Font, Gfx, Rgba, Shadow};
 use crate::icons::Icons;
@@ -23,6 +23,9 @@ use crate::ui::lay::Laid;
 // ------------------------------------------------------------------ keys
 pub const K_CAP: Key = key("cap");
 pub const K_SZ: Key = key("cap.sz");
+/// Order 117: the size tag's width and height - each opens its own field
+pub const K_SZW: Key = key("cap.szw");
+pub const K_SZH: Key = key("cap.szh");
 pub const K_MON: Key = key("cap.mon");
 pub const K_LIVE: Key = key("cap.live");
 pub const K_SNAP: Key = key("cap.snap");
@@ -246,6 +249,27 @@ fn chip(cx: &mut Cx, k: Key, glass: &mut Vec<Glass>, hover_bg: bool) -> El {
         .shadow(&[sh(0.0, 2.0, 8.0, 0.0, c(0, 0, 0, 0.25))])
 }
 
+/// Order 117: the small field of one size number - the size field's look (`.csz.ed`: background rgba(14,16,22,.9), inset 1 px
+/// #0a84ff, a 2 px rgba(10,132,255,.45) ring) made the number's own size: 18 px high (the ring reaches the chip's edge), 4 px
+/// side padding, at least 2 digits wide. The text is selected when the field opens: Chromium's selection colours made
+/// translucent (Color::BlendWithWhite): focused = the Windows highlight (white text), unfocused = #c8c8c8 ->
+/// rgba(163,163,163,.6) with #323232 text.
+fn size_field(text: &str, selected: bool, focused: bool) -> El {
+    let (sbg, sfg) = if focused { (highlight().a(0.8), WHITE) } else { (c(163, 163, 163, 0.6), Rgba::rgb(50, 50, 50)) };
+    let inner = if selected && !text.is_empty() { El::row().h(16.0).center().bg(sbg).child(tn(text, 11.5, 600, sfg, 16.0)) } else { tn(text, 11.5, 600, WHITE, 16.0) };
+    El::row()
+        .h(18.0)
+        .min_w(22.0)
+        .center()
+        .justify(JustifyContent::CENTER)
+        .pad(0.0, 4.0, 0.0, 4.0)
+        .radius(4.0)
+        .bg(c(14, 16, 22, 0.9))
+        .inset(&[sh(0.0, 0.0, 0.0, 1.0, ACC)])
+        .shadow(&[sh(0.0, 0.0, 0.0, 2.0, c(10, 132, 255, 0.45))])
+        .child(inner)
+}
+
 /// The key cap (`.ckc`): `inline-flex; height:18px; padding:0 6px; margin-right:-4px; border-radius:4px; background:rgba(255,255,255,.16);
 /// box-shadow:inset 0 0 0 .5px rgba(255,255,255,.14),0 1px 0 rgba(0,0,0,.3); font:600 11px/1`.
 fn keycap(s: &str, h: f32, size: f32, pad: f32, mr: f32, bg: Rgba) -> El {
@@ -268,6 +292,23 @@ const MON_ALL: &str = r#"<svg viewBox="0 0 20 20"><rect x="1.5" y="4.5" width="7
 const X_ICON: &str = r#"<svg viewBox="0 0 10 10"><path d="M.6.6l8.8 8.8M9.4.6L.6 9.4"/></svg>"#;
 /// The crosshair (`.cmk`): a dark 3 px under-stroke, then the white 1 px cross (butt caps).
 const CROSS: &str = r##"<svg viewBox="0 0 25 25"><path d="M12.5 1v8.5M12.5 15.5V24M1 12.5h8.5M15.5 12.5H24" stroke="rgba(0,0,0,.5)" stroke-width="3"/><path d="M12.5 1v8.5M12.5 15.5V24M1 12.5h8.5M15.5 12.5H24" stroke="#fff" stroke-width="1"/></svg>"##;
+
+/// Order 117: the crosshair (`.cmk`, 25 x 25 DIPs) at `scale` as a cursor picture: its side in px, its hot spot (the cross's
+/// centre pixel, where the drawing put the pointer: the box at pointer - 12) and its BGRA pixels, NOT premultiplied (a
+/// colour cursor's bitmap).
+pub fn cross_pixels(scale: f32) -> Option<(i32, i32, Vec<u8>)> {
+    let n = (25.0 * scale).round() as i32;
+    let mut surf = crate::gfx::new_surface(n, n)?;
+    let g = Gfx::new(scale);
+    g.begin(surf.canvas());
+    surf.canvas().clear(sk::Color::TRANSPARENT);
+    paint_svg(&g, CROSS, 0.0, 0.0, 25.0, 1.0, WHITE, true);
+    g.end();
+    let info = sk::ImageInfo::new((n, n), sk::ColorType::BGRA8888, sk::AlphaType::Unpremul, None);
+    let mut px = vec![0u8; (n * n * 4) as usize];
+    surf.read_pixels(&info, &mut px, (n * 4) as usize, (0, 0)).then_some(())?;
+    Some((n, (12.5 * scale).floor() as i32, px))
+}
 
 /// A box in desktop px -> this monitor's DIPs.
 fn to_dip(m: &bu_screenshot::Monitor, s: f32, r: Sel) -> (f32, f32, f32, f32) {
@@ -302,6 +343,8 @@ pub fn scene(m: &Model, cx: &mut Cx, mi: usize, now: f64) -> Scene {
     let mut glass = Vec::new();
     let opened = now - m.opened_at;
     busy |= opened < 400.0;
+    // (Order 117: the dim's fade after a reset - each window is painted only while it reports itself moving)
+    busy |= now - m.opened_at.max(m.reset_at) < 140.0;
 
     // ================================================================ back: dim, the box, the marks
     let mut back = El::block().size(w, h);
@@ -377,32 +420,22 @@ pub fn scene(m: &Model, cx: &mut Cx, mi: usize, now: f64) -> Scene {
         if !top {
             // .csz{display:block;margin-right:2px;padding:0 8px} .csz i{color:rgba(255,255,255,.5);margin:0 3px}
             let sel = m.sel.unwrap_or_default();
+            // Order 117 (the owner Oct 23: "separate boxes that open depending on what you clicked the height or width not both in
+            // one"): the width and the height are two click targets (each the chip's half, the × between them); the clicked
+            // number alone becomes a small field in its place, the other number stays as it is
             let mut sz = chip(cx, K_SZ, &mut glass, ed && m.size_edit.is_none()).margin(0.0, 2.0, 0.0, 0.0).cursor(crate::ui::el::Cursor::Text);
-            if let Some(text) = &m.size_edit {
-                // .csz.ed{background:rgba(14,16,22,.9);box-shadow:0 0 0 2px rgba(10,132,255,.45),inset 0 0 0 1px #0a84ff,0 2px 8px rgba(0,0,0,.25)}
-                // .csz input{width:84px;height:22px;text-align:center} - the text is selected when the field opens
-                // the selected text: Chromium's selection colours made translucent (Color::BlendWithWhite): focused = the
-                // Windows highlight (white text), unfocused = #c8c8c8 -> rgba(163,163,163,.6) with #323232 text
-                let sel_all = m.size_selected;
-                let (sbg, sfg) = if m.focused { (highlight().a(0.8), WHITE) } else { (c(163, 163, 163, 0.6), Rgba::rgb(50, 50, 50)) };
-                let inner = if sel_all {
-                    El::row().h(22.0).center().child(El::row().h(22.0).center().bg(sbg).child(tn(text, 11.5, 600, sfg, 22.0)))
-                } else {
-                    El::row().h(22.0).center().child(tn(text, 11.5, 600, WHITE, 22.0))
+            let part = |side: Side, v: i32, k: Key, l: f32, r: f32| {
+                let inner = match &m.size_edit {
+                    Some(text) if m.size_side == side => size_field(text, m.size_selected, m.focused),
+                    _ => tn(&v.to_string(), 11.5, 600, WHITE, 22.0),
                 };
-                sz = sz
-                    .bg(c(14, 16, 22, 0.9))
-                    .inset(&[sh(0.0, 0.0, 0.0, 1.0, ACC)])
-                    .shadow(&[sh(0.0, 0.0, 0.0, 2.0, c(10, 132, 255, 0.45)), sh(0.0, 2.0, 8.0, 0.0, c(0, 0, 0, 0.25))])
-                    .pad(0.0, 8.0, 0.0, 8.0)
-                    .child(El::row().w(84.0).h(22.0).justify(JustifyContent::CENTER).child(inner));
-            } else {
-                sz = sz.pad(0.0, 8.0, 0.0, 8.0).on_click(K_SZ).children([
-                    tn(&sel.w.to_string(), 11.5, 600, WHITE, 22.0),
-                    tn("×", 11.5, 600, c(255, 255, 255, 0.5), 22.0).margin(0.0, 3.0, 0.0, 3.0),
-                    tn(&sel.h.to_string(), 11.5, 600, WHITE, 22.0),
-                ]);
-            }
+                El::row().h(22.0).center().pad(0.0, r, 0.0, l).on_click(k).cursor(crate::ui::el::Cursor::Text).child(inner)
+            };
+            sz = sz.children([
+                part(Side::W, sel.w, K_SZW, 8.0, 3.0),
+                tn("×", 11.5, 600, c(255, 255, 255, 0.5), 22.0),
+                part(Side::H, sel.h, K_SZH, 3.0, 8.0),
+            ]);
             kids.push(sz);
         }
         if ed || top {
@@ -701,6 +734,8 @@ pub fn scene(m: &Model, cx: &mut Cx, mi: usize, now: f64) -> Scene {
         let op = ease(EASE_OUT_CSS, anim::prog(now, m.opened_at, 0.0, 120.0));
         let mut xh = El::block().abs(0.0, 0.0, f32::NAN, f32::NAN).size(w, h).no_hit().opacity(op);
         match m.pointer() {
+            // Order 117: the cross itself is a real Windows cursor (`cross_pixels`, window.rs) - it moves with the mouse, not a
+            // frame later; only the faint guides are drawn here
             Pointer::Full | Pointer::Cross => {
                 if m.pointer() == Pointer::Full {
                     // .cxl{background:rgba(255,255,255,.2)} .v{left:0;width:1px} .h{top:0;height:1px} (through the pointer)
@@ -709,7 +744,6 @@ pub fn scene(m: &Model, cx: &mut Cx, mi: usize, now: f64) -> Scene {
                         .child(El::block().abs(0.0, py, f32::NAN, f32::NAN).size(w, 1.0).bg(c(255, 255, 255, 0.2)));
                 }
                 // .cmk{left:-12px;top:-12px;width:25px;height:25px}
-                xh = xh.child(svg(CROSS, 25.0, 1.0, WHITE, true).abs(px - 12.0, py - 12.0, f32::NAN, f32::NAN));
             }
             Pointer::Ring => {
                 // .cring{border-radius:50%;border:1.5px solid <colour>;box-shadow:0 0 0 1px rgba(0,0,0,.35),inset 0 0 0 1px rgba(0,0,0,.2)}
@@ -1153,6 +1187,80 @@ fn unused(_: Shadow, _: Rgba) {
 }
 
 #[cfg(test)]
+mod tests_117 {
+    use super::*;
+
+    /// Order 117: the cursor picture is the drawing's cross: 25 DIPs at the monitor's scale, the hot spot on the cross's
+    /// centre pixel, white 1 px arms over a half-dark 3 px under-stroke, the centre empty. With BU_O117_DIR the 1.0 and 1.25
+    /// pictures are saved 8x (looked at).
+    /// Order 117 (end review): after a right-click reset the dim fades in again on EVERY monitor - each window reports itself
+    /// moving until it is done (only moving windows are painted again, so a monitor without the pointer stayed undimmed).
+    #[test]
+    fn the_dim_after_a_reset_keeps_every_monitor_moving() {
+        use bu_screenshot::fake::mon;
+        let mut v = vec![mon(0, 0, 1920, 1080, true, false), mon(1920, 0, 2560, 1440, false, false)];
+        bu_screenshot::geom::number_monitors(&mut v);
+        let mut m = Model::new(v, (500.0, 400.0), 0.0, None);
+        m.press((500.0, 400.0), None, 1000.0);
+        m.moved((900.0, 700.0), false);
+        m.release(1000.0);
+        m.right_press(false, 2000.0);
+        assert!(m.sel.is_none(), "the box went");
+        let g = Gfx::new(1.0);
+        for (t, moving) in [(2050.0, true), (2200.0, false)] {
+            let mut st = crate::ui::cx::State::default();
+            let mut cx = Cx::new(t, false, &g, &mut st);
+            assert_eq!(scene(&m, &mut cx, 1, t).busy, moving, "monitor 2 at {t} ms");
+        }
+    }
+
+    #[test]
+    fn the_cross_cursor_is_the_drawings_cross() {
+        for (s, n, hot) in [(1.0, 25, 12), (1.25, 31, 15), (1.5, 38, 18)] {
+            let (pn, ph, px) = cross_pixels(s).expect("pixels");
+            assert_eq!((pn, ph), (n, hot), "scale {s}");
+            let at = |x: i32, y: i32| {
+                let i = ((y * pn + x) * 4) as usize;
+                (px[i], px[i + 1], px[i + 2], px[i + 3])
+            };
+            let arm = (3.0 * s) as i32;
+            assert_eq!(at(hot, arm), (255, 255, 255, 255), "scale {s}: the upper arm is white");
+            assert_eq!(at(arm, hot), (255, 255, 255, 255), "scale {s}: the left arm is white");
+            assert_eq!(at(hot, hot).3, 0, "scale {s}: the centre is empty (the pointer's pixel shows through)");
+            let (r, _, _, a) = at(hot - 1, arm);
+            assert!(r < 40 && a > 60 && a < 200, "scale {s}: the dark under-stroke beside the arm ({r}, {a})");
+        }
+        if let Ok(dir) = std::env::var("BU_O117_DIR") {
+            unsafe {
+                let _ = windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_MULTITHREADED);
+            }
+            for (s, tag) in [(1.0, "1920x1080"), (1.25, "3440x1440")] {
+                let (n, _, px) = cross_pixels(s).unwrap();
+                // over a mid-grey and a white desktop, 8x
+                let z = 8;
+                let mut out = vec![0u8; (n * z * 2 * n * z * 4) as usize];
+                for half in 0..2 {
+                    let bg = if half == 0 { 128.0 } else { 245.0 };
+                    for y in 0..n * z {
+                        for x in 0..n * z {
+                            let i = (((y / z) * n + x / z) * 4) as usize;
+                            let a = px[i + 3] as f32 / 255.0;
+                            let o = ((y * n * z * 2 + half * n * z + x) * 4) as usize;
+                            for c in 0..3 {
+                                out[o + c] = (px[i + c] as f32 * a + bg * (1.0 - a)).round() as u8;
+                            }
+                            out[o + 3] = 255;
+                        }
+                    }
+                }
+                let p = crate::png::Pixels { w: (n * z * 2) as u32, h: (n * z) as u32, data: out };
+                crate::png::save_png(&p, &format!("{dir}\\117_cross_cursor_{tag}_8x.png")).unwrap();
+            }
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::ui::cx::State;
@@ -1232,7 +1340,7 @@ mod tests {
                 }
             }
         }
-        for k in [K_X, K_SZ, K_LIVE, K_SNAP, K_UNDO, K_COPY, K_SAVE, K_MORE, K_BACK, idx(K_TOOL, 0), idx(K_TOOL, 5), idx(K_MON, 0), idx(K_ETAB, 1)] {
+        for k in [K_X, K_SZW, K_SZH, K_LIVE, K_SNAP, K_UNDO, K_COPY, K_SAVE, K_MORE, K_BACK, idx(K_TOOL, 0), idx(K_TOOL, 5), idx(K_MON, 0), idx(K_ETAB, 1)] {
             assert!(seen.contains(&k), "button {k:#x} never checked");
         }
         assert!(checked > 300, "only {checked} presses checked");

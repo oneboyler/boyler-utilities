@@ -708,7 +708,7 @@ impl Storage {
         let arg = if file { format!("/select,\"{}\"", path.display()) } else { format!("\"{}\"", path.display()) };
         // Order 047: starting a process holds the thread 10-40 ms (more with a busy disk): off the menu's thread
         crate::offui::spawn("sto-explorer", move || {
-            let _ = std::process::Command::new("explorer.exe").raw_arg_compat(&arg).spawn();
+            let _ = crate::quiet::command("explorer.exe").raw_arg_compat(&arg).spawn();
         });
     }
 }

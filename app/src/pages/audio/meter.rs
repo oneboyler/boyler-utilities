@@ -12,7 +12,7 @@ use crate::gfx::{sh, Gfx, Rgba, Shadow};
 use crate::icons::Icons;
 use crate::png::Pixels;
 use crate::ui::el::El;
-use crate::ui::{LVT, VZ1, VZ2, WHITE};
+use crate::ui::{cmix, LVT, RED, VZ1, VZ2, WHITE};
 
 /// One smoothed level with its held peak (the drawing's per-frame constants made frame-rate independent).
 #[derive(Default, Clone, Copy, Debug)]
@@ -111,7 +111,9 @@ pub fn level_bar_live(now: impl Fn() -> (f32, f32, f32) + 'static, c1: Rgba, c2:
 
 /// The device row's canvas (`.dvs .vis`, w x 30): a faint pill, a quiet accent fill up to the knob, the live level
 /// glowing inside that fill (accent -> teal), a thin sheen, the held peak tick. The drawing's drawPill.
-pub fn level_pill(g: &Gfx, (x, y, w, h): (f32, f32, f32, f32), vol: f32, lv: Level) {
+/// `lock` (0 ... 1, Order 118): the Input row while its volume is locked - the fill and the glow turn red.
+pub fn level_pill(g: &Gfx, (x, y, w, h): (f32, f32, f32, f32), vol: f32, lv: Level, lock: f32) {
+    let (vz1, vz2) = (cmix(VZ1(), RED(), lock), cmix(VZ2(), cmix(RED(), WHITE, 0.3), lock));
     let th = 8.0;
     let py = y + (h - th) / 2.0;
     let x0 = x + 2.0;
@@ -124,12 +126,12 @@ pub fn level_pill(g: &Gfx, (x, y, w, h): (f32, f32, f32, f32), vol: f32, lv: Lev
     g.push_clip(cx, cy, cw, ch);
     g.fill_rr(x0, py, w - 4.0, th, th / 2.0, LVT());
     // the drawing's `hexA(--vz1, light ? .2 : .26)` (Order 033)
-    g.fill_rr(x0, py, vw, th, th / 2.0, VZ1().a(if crate::ui::is_light() { 0.2 } else { 0.26 }));
+    g.fill_rr(x0, py, vw, th, th / 2.0, vz1.a(if crate::ui::is_light() { 0.2 } else { 0.26 }));
     if l > 0.004 {
         let alpha = 0.5 + 0.5 * (l * 2.5).min(1.0);
-        let br = g.hgrad(x, 0.0, x + w, 0.0, &[(0.0, VZ1()), (1.0, VZ2())]);
+        let br = g.hgrad(x, 0.0, x + w, 0.0, &[(0.0, vz1), (1.0, vz2)]);
         // canvas 2D: shadowBlur (4 + 12 L) -> sigma half of it; the shadow first, then the gradient pill, both at globalAlpha
-        g.fill_rr_blur(x0, py, fw, th, th / 2.0, VZ2().a(0.18 + 0.5 * l).mul_a(alpha), (4.0 + 12.0 * l) / 2.0);
+        g.fill_rr_blur(x0, py, fw, th, th / 2.0, vz2.a(0.18 + 0.5 * l).mul_a(alpha), (4.0 + 12.0 * l) / 2.0);
         g.fill_rr_shader(x0, py, fw, th, th / 2.0, &br, alpha);
         if fw > 10.0 {
             g.fill_rr(x0 + 3.0, py + 1.5, fw - 6.0, 2.0, 1.0, Rgba(1.0, 1.0, 1.0, 0.1 + 0.12 * l));
@@ -138,7 +140,7 @@ pub fn level_pill(g: &Gfx, (x, y, w, h): (f32, f32, f32, f32), vol: f32, lv: Lev
     let p = lv.pk;
     if p - l > 0.02 {
         let a = ((p - l) * 8.0).min(1.0) * 0.8;
-        g.fill_rr(x0 + vw * p - 1.5, py - 1.0, 3.0, th + 2.0, 1.5, VZ2().a(a));
+        g.fill_rr(x0 + vw * p - 1.5, py - 1.0, 3.0, th + 2.0, 1.5, vz2.a(a));
     }
     g.pop_clip();
 }

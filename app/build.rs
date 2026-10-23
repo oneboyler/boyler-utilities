@@ -17,6 +17,7 @@ fn main() {
     // (a user-writable install folder: a DLL planted next to it must not run inside the app's elevated copy).
     // 0x800 = LOAD_LIBRARY_SEARCH_SYSTEM32; explicit LoadLibrary calls are not affected.
     println!("cargo:rustc-link-arg-bins=/DEPENDENTLOADFLAG:0x800");
+    println!("cargo:rerun-if-changed=Cargo.toml");
     println!("cargo:rerun-if-changed=app.rc");
     println!("cargo:rerun-if-changed=app.manifest");
     println!("cargo:rerun-if-changed=assets/pane_dark.ico");
@@ -34,8 +35,13 @@ fn main() {
         std::fs::write(&p, format!("1 24 \"{}\"\n", m)).unwrap();
         p
     };
+    // Order 118: the file properties follow Cargo.toml's version (app.rc includes this header)
+    let ver = std::env::var("CARGO_PKG_VERSION").unwrap();
+    let mut nums = ver.split(|c: char| !c.is_ascii_digit()).filter(|p| !p.is_empty()).map(|p| p.parse::<u16>().unwrap_or(0));
+    let (a, b, c) = (nums.next().unwrap_or(0), nums.next().unwrap_or(0), nums.next().unwrap_or(0));
+    std::fs::write(out_dir.join("version.h"), format!("#define BU_VER_COMMA {a},{b},{c},0\n#define BU_VER_STR \"{ver}\"\n")).unwrap();
     let rc = find_rc().expect("rc.exe (Windows SDK) not found");
-    let st = std::process::Command::new(rc).current_dir(&dir).args(["/nologo", "/fo"]).arg(&out).arg(&src).status().expect("rc.exe failed to start");
+    let st = std::process::Command::new(rc).current_dir(&dir).args(["/nologo", "/I"]).arg(&out_dir).arg("/fo").arg(&out).arg(&src).status().expect("rc.exe failed to start");
     assert!(st.success(), "rc.exe failed");
     println!("cargo:rustc-link-arg-bins={}", out.display());
 }

@@ -117,13 +117,14 @@ pub fn start_ours(exe: &Path, dir: &Path, drives: &[Drive]) -> Result<Child> {
 pub fn start_client(exe: &Path, dir: &Path, drives: &[Drive]) -> Result<Child> {
     use std::os::windows::process::CommandExt;
     const BELOW_NORMAL_PRIORITY_CLASS: u32 = 0x0000_4000;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     std::fs::create_dir_all(dir).map_err(|e| SearchError::Everything(format!("its folder: {e}")))?;
     let ini = dir.join("Everything.ini");
     let windir = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
     std::fs::write(&ini, self::ini(&windir, ours::PIPE, drives)).map_err(|e| SearchError::Everything(format!("its settings: {e}")))?;
     let db = db_file(dir);
     Command::new(exe)
-        .creation_flags(BELOW_NORMAL_PRIORITY_CLASS)
+        .creation_flags(BELOW_NORMAL_PRIORITY_CLASS | CREATE_NO_WINDOW)
         .arg("-instance")
         .arg(INSTANCE)
         .arg("-startup")
@@ -188,10 +189,11 @@ pub fn stop_ours(exe: Option<&Path>, ours: Ours, wait: Duration) -> bool {
 
 /// [`stop_ours`] for any of our instances (Order 069: Storage's own, `BoylerUtilitiesStorage`).
 pub fn stop_instance(exe: Option<&Path>, instance: &str, ours: Ours, wait: Duration) -> bool {
+    use std::os::windows::process::CommandExt;
     let mut ours = ours;
     let child = &mut ours.child;
     if let Some(exe) = exe {
-        if let Ok(mut c) = Command::new(exe).arg("-instance").arg(instance).arg("-exit").spawn() {
+        if let Ok(mut c) = Command::new(exe).creation_flags(0x0800_0000).arg("-instance").arg(instance).arg("-exit").spawn() {
             // the helper gets 3 s too (never a wait without end: this runs at app exit)
             let until = Instant::now() + Duration::from_secs(3);
             while !matches!(c.try_wait(), Ok(Some(_))) && Instant::now() < until {
@@ -223,7 +225,8 @@ pub fn stop_instance(exe: Option<&Path>, instance: &str, ours: Ours, wait: Durat
 
 /// "Update search" (Order 049 item 8): our running instance makes its file list again (`-reindex`).
 pub fn reindex_ours(exe: &Path) -> Result<()> {
-    let mut c = Command::new(exe).arg("-instance").arg(INSTANCE).arg("-reindex").spawn().map_err(|e| SearchError::Everything(format!("could not ask it: {e}")))?;
+    use std::os::windows::process::CommandExt;
+    let mut c = Command::new(exe).creation_flags(0x0800_0000).arg("-instance").arg(INSTANCE).arg("-reindex").spawn().map_err(|e| SearchError::Everything(format!("could not ask it: {e}")))?;
     let until = Instant::now() + Duration::from_secs(5);
     while !matches!(c.try_wait(), Ok(Some(_))) && Instant::now() < until {
         std::thread::sleep(Duration::from_millis(50));

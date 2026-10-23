@@ -1,5 +1,20 @@
 # Boyler Utilities — What's new
 
+## 1.2.0 (2026-10-24)
+- Audio: right-click the Input slider › "Lock at <value>" keeps the microphone volume there. While it is locked the slider is red with "Locked - Windows can't change it" under it, and any change of the default microphone's volume - by Windows or an app - is put back at once (no polling). It follows a change of default microphone, is saved and holds after a restart. Right-click again › "Unlock". Input only.
+- Mouse tab: the left / right button highlight no longer shows under the scroll wheel.
+- Nothing the app starts (or its tests) opens a console window any more.
+- The file properties of BoylerUtilities.exe (Details tab) now show the real version instead of 1.0.4.
+- New Notes tab (between Screenshots and Mouse): sticky notes you type straight into, in tabs like a browser's - "+" adds a tab, double-click renames it, right-click deletes it (it asks first when the tab has notes). Each note has a title and its text, "+ Note" adds one, right-click a note to delete it. Everything is saved as you type and is still there after a restart (its own file, notes.cfg, next to the settings - "Reset the app's own settings" never touches your notes). Ctrl+V pastes.
+- The eye at the top right of Notes blurs the text of every note (the titles stay readable); click a note to see it until you leave the tab. Right-click the eye: "Blur every time I open this tab".
+- Right-click any icon of the top row: "Rearrange tabs" (drag the icons where you want them, click anywhere else when done) or "Reset order". The order is remembered; tabs that later versions add take their own place in it.
+- Screenshot overlay feels snappier: the crosshair is now a real Windows pointer, so it moves with the mouse instead of a frame behind it; the overlay keeps up with your monitor's refresh rate even while the graphics card idles at its low clocks (it was held to about 220 frames a second on a 360 Hz screen); a monitor the pointer isn't on is no longer redrawn on every mouse move, and nothing is redrawn while nothing moves; and the overlay opens a little sooner (its graphics are prepared while the screen is being grabbed).
+- Screenshot overlay: click the width or the height of the size tag to type just that number in its own small box.
+- Screenshots: the eye left of "Change path" blurs every thumbnail. Right-click it: "Blur every time I open this tab".
+- Notes now look like real sticky notes: square pastel paper (yellow, pink, blue, green - each new note takes the next colour), dark text, a soft shadow and a slight tilt of its own, three to a row, and "+ Note" is a dashed square. The eye still blurs only the text; typing works on the paper as before. Notes made before keep their text and get the colours in turn.
+- Right-click a note: a small row of the four paper colours (the note's own is ringed) above "Delete note" - click one and that paper changes colour at once; it is saved with the note.
+- The top row shows its first 15 icons whole again, through Search (Notes had pushed Search out of sight): the gaps between the icons are a little tighter, the icons themselves are the same size. The rest are still behind the row's scroll. Rearranged rows work the same.
+
 ## 1.1.1 (2026-10-13)
 - Mouse tab: five more settings of the mouse itself, under Lift-off distance - Debounce time (− / +), Motion Sync, Angle Snap, Ripple Control and Turbo Mode. Each mouse shows only the ones its driver can really change: Pulsar, ATK / VXE, Endgame Gear, Lamzu, WLMouse, Lingbao / Attack Shark (GearHub), Corsair, Teevolution, VGN, Ninjutso, Finalmouse, Zaunkoenig, Orbital, RAWM, Delux, ASUS, Incott, WALLHACK, MCHOSE and Keychron M6 (Turbo Mode on Pulsar, Teevolution, VGN and WLMouse); a mouse without them looks as before. Every change is saved on the mouse and read back.
 - Lift-off distance: 0.7 mm on the mice that have it (Pulsar and others).

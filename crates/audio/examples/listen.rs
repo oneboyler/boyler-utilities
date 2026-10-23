@@ -1,6 +1,7 @@
-//! `cargo run -p bu-audio --example audio-listen -- <seconds>` — the Keep my devices / New apps volume listener on
+//! `cargo run -p bu-audio --example audio-listen -- <seconds> [lock-percent]` — the Keep my devices / New apps volume listener on
 //! the REAL PC in READ-ONLY mode (it decides, but the OS layer refuses every change): prints what Windows reported, what
-//! it would have done, and the CPU cycles this process used while listening (for the idle-cost measurement). Default 60 s.
+//! it would have done, and the CPU cycles this process used while listening (for the idle-cost measurement). Default 60 s. With a lock percent (Order 118) the input volume lock is on at that value - read-only, so a volume that differs is
+//! reported as "would put back" and nothing on the PC changes.
 
 use bu_audio::watch::{WatchConfig, Watcher};
 use std::time::{Duration, Instant};
@@ -16,7 +17,8 @@ fn cycles() -> u64 {
 
 fn main() {
     let secs: u64 = std::env::args().nth(1).and_then(|a| a.parse().ok()).unwrap_or(60);
-    let w = Watcher::start(WatchConfig { read_only: true, ..WatchConfig::default() });
+    let lock: Option<f32> = std::env::args().nth(2).and_then(|a| a.parse::<f32>().ok()).map(|p| p / 100.0);
+    let w = Watcher::start(WatchConfig { read_only: true, mic_lock: lock, ..WatchConfig::default() });
     println!("listening {secs} s (read-only), pid {}", std::process::id());
     // settle (start-up registration), then measure the listening only
     std::thread::sleep(Duration::from_secs(2));

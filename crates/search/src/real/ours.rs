@@ -563,7 +563,13 @@ fn make_service(exe: &Path) -> windows::core::Result<()> {
 fn uninstall_v100() -> bool {
     let Some(sys) = system32() else { return false };
     let msiexec = sys.join("msiexec.exe");
-    match std::process::Command::new(msiexec).args(["/x", V100_PRODUCT, "/qn", "/norestart"]).status() {
+    match {
+        use std::os::windows::process::CommandExt;
+        let mut c = std::process::Command::new(msiexec);
+        c.creation_flags(0x0800_0000); // CREATE_NO_WINDOW (Order 118)
+        c
+    }
+    .args(["/x", V100_PRODUCT, "/qn", "/norestart"]).status() {
         Ok(s) => matches!(s.code(), Some(0) | Some(3010) | Some(1605)),
         Err(_) => false,
     }

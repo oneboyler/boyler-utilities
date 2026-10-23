@@ -14,6 +14,7 @@ fn env() -> Env {
 fn page() -> Audio {
     mute::reset_for_test();
     svc::set_rules(svc::Rules::default());
+    svc::set_mic_lock(None);
     let mut a = Audio::new();
     a.open(&env(), 0.0);
     a
@@ -932,4 +933,136 @@ fn proof_092_volume_under_the_switch() {
     drop(cx);
     mute::reset_for_test();
     crate::services::shutdown();
+}
+
+// ------------------------------------------------------------------ Order 118: the input volume lock (right-click the Input slider)
+fn right_click_input(a: &mut Audio, g: &Gfx, st: &mut State) {
+    let mut cx = Cx::new(1000.0, false, g, st).for_page("aud");
+    a.event(&Ev::Context(K_IN_VOL, 300.0, 200.0), &mut cx);
+}
+
+fn lock_row_label(a: &mut Audio, g: &Gfx, st: &mut State) -> Option<String> {
+    let mut cx = Cx::new(1100.0, false, g, st).for_page("aud");
+    let pop = a.popup(&mut cx)?;
+    let l = Laid::new(g, El::block().w(600.0).h(520.0).child(pop), 600.0, Some(520.0));
+    l.nodes.iter().find_map(|n| match &n.el.content {
+        Content::Text(t) if t.s.contains("Lock at") || t.s == "Unlock" => Some(t.s.to_string()),
+        _ => None,
+    })
+}
+
+#[test]
+fn right_click_on_the_input_slider_locks_and_unlocks_it() {
+    let g = Gfx::new(1.0);
+    let mut st = State::default();
+    let mut a = page();
+    assert!(a.describe().contains("miclock=off") && a.describe().contains("invol=90"), "{}", a.describe());
+    // the menu offers the value now on the slider
+    right_click_input(&mut a, &g, &mut st);
+    assert_eq!(lock_row_label(&mut a, &g, &mut st).as_deref(), Some("Lock at 90 %"));
+    click(&mut a, idx(K_LOCK_MENU, 0), &g, &mut st);
+    assert!(a.describe().contains("miclock=90"), "{}", a.describe());
+    assert!(lock_row_label(&mut a, &g, &mut st).is_none(), "the menu closed");
+    // locked: the slider, a typed % and the arrow keys change nothing
+    {
+        let mut cx = Cx::new(1200.0, false, &g, &mut st).for_page("aud");
+        let r = (130.0, 180.0, 162.0, 30.0);
+        a.event(&Ev::Press(K_IN_VOL, 160.0, 195.0, r), &mut cx);
+        a.event(&Ev::Release(K_IN_VOL), &mut cx);
+        a.event(&Ev::Key(K_IN_VOL, 0x25), &mut cx);
+    }
+    click(&mut a, K_IN_PCT, &g, &mut st);
+    {
+        let mut cx = Cx::new(1300.0, false, &g, &mut st).for_page("aud");
+        a.event(&Ev::Char(K_IN_PCT, '5'), &mut cx);
+        a.event(&Ev::Key(K_IN_PCT, 0x0D), &mut cx);
+    }
+    wait(&mut a, 700);
+    let d = a.describe();
+    assert!(d.contains("invol=90") && !d.contains("set_volume mv7"), "{d}");
+    // right-click again: Unlock
+    right_click_input(&mut a, &g, &mut st);
+    assert_eq!(lock_row_label(&mut a, &g, &mut st).as_deref(), Some("Unlock"));
+    click(&mut a, idx(K_LOCK_MENU, 0), &g, &mut st);
+    assert!(a.describe().contains("miclock=off"), "{}", a.describe());
+    // unlocked: the slider moves it again
+    {
+        let mut cx = Cx::new(1400.0, false, &g, &mut st).for_page("aud");
+        let r = (130.0, 180.0, 162.0, 30.0);
+        a.event(&Ev::Press(K_IN_VOL, 211.0, 195.0, r), &mut cx);
+        a.event(&Ev::Release(K_IN_VOL), &mut cx);
+    }
+    wait(&mut a, 700);
+    assert!(a.describe().contains("invol=50"), "{}", a.describe());
+}
+
+#[test]
+fn the_output_slider_has_no_lock_and_a_click_elsewhere_just_closes_the_menu() {
+    let g = Gfx::new(1.0);
+    let mut st = State::default();
+    let mut a = page();
+    {
+        let mut cx = Cx::new(1000.0, false, &g, &mut st).for_page("aud");
+        a.event(&Ev::Context(K_OUT_VOL, 300.0, 150.0), &mut cx);
+    }
+    assert!(lock_row_label(&mut a, &g, &mut st).is_none());
+    right_click_input(&mut a, &g, &mut st);
+    a.popup_dismiss();
+    assert!(lock_row_label(&mut a, &g, &mut st).is_none());
+    assert!(a.describe().contains("miclock=off"));
+}
+
+#[test]
+fn the_lock_is_saved_and_the_apps_reset_lifts_it() {
+    crate::services::init(windows::Win32::Foundation::HWND::default(), true);
+    svc::set_mic_lock(Some(0.62));
+    assert_eq!(svc::mic_lock(), Some(0.62));
+    // as after a restart: nothing in memory, the saved value is read
+    svc::set_mic_lock(None);
+    crate::services::with(|s| {
+        let p = crate::settings::Scope::Page("aud");
+        let _ = s.store.set_bool(p, "mic_lock", true);
+        let _ = s.store.set_f64(p, "mic_lock_vol", 0.62);
+    });
+    assert_eq!(svc::mic_lock(), None);
+    svc::load_rules();
+    assert_eq!(svc::mic_lock(), Some(0.62));
+    reset_app_settings(true);
+    assert_eq!(svc::mic_lock(), None);
+    svc::load_rules();
+    assert_eq!(svc::mic_lock(), None, "and it stays lifted after a restart");
+    crate::services::shutdown();
+}
+
+/// Order 118 picture (`BU_PIC_OUT=<folder> cargo test -p bu-app mic_lock_picture -- --ignored`): the Input row locked, with its
+/// menu open, and unlocked beside it.
+#[test]
+#[ignore]
+fn mic_lock_picture() {
+    if std::env::var("BU_PIC_OUT").is_err() {
+        return;
+    }
+    let g = Gfx::new(1.0);
+    let mut st = State::default();
+    let mut a = page();
+    let shot = |a: &mut Audio, st: &mut State, now: f64, name: &str, scale: f32, menu: bool| {
+        let mut cx = Cx::new(now, false, &g, st).for_page("aud");
+        let kids = a.build(&mut cx);
+        let pop = if menu { a.popup(&mut cx) } else { None };
+        let pg = El::block().abs(0.0, crate::ui::PAGE_TOP, f32::NAN, f32::NAN).w(600.0).pad(2.0, 26.0, 18.0, 26.0).children(kids);
+        let root = El::block().w(600.0).h(crate::ui::WIN_H).child(pg).children(pop);
+        crate::ui::lay::proof_png(root, 600.0, crate::ui::WIN_H, scale, name);
+    };
+    let _ = lay(&mut a, &g, &mut st, 0.0);
+    shot(&mut a, &mut st, 500.0, "118_mic_unlocked_1x.png", 1.0, false);
+    right_click_input(&mut a, &g, &mut st);
+    shot(&mut a, &mut st, 1000.0, "118_mic_menu_1x.png", 1.0, true);
+    click(&mut a, idx(K_LOCK_MENU, 0), &g, &mut st);
+    // a few frames on, the red has faded in
+    for (i, t) in [1100.0, 1300.0, 1600.0].into_iter().enumerate() {
+        let _ = lay(&mut a, &g, &mut st, t);
+        let _ = i;
+    }
+    shot(&mut a, &mut st, 2000.0, "118_mic_locked_1x.png", 1.0, false);
+    shot(&mut a, &mut st, 2100.0, "118_mic_locked_125x.png", 1.25, false);
 }

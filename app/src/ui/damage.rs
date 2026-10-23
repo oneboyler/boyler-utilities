@@ -63,8 +63,8 @@ fn own_sig(e: &El) -> Option<u64> {
     let mut h = H(DefaultHasher::new());
     let _ = write!(
         h,
-        "{:?}|{:?}|{}|{:?}|{:?}|{:?}|{}|{:?}|{}|{}|{}|{}|{}|{}|{:?}",
-        e.style.display, e.bg, e.radius, e.shadows, e.insets, e.border, e.z, e.slim_thumb, e.live, e.backdrop, e.backdrop_sat, e.brightness, e.clip, e.opacity, e.color_filter
+        "{:?}|{:?}|{}|{:?}|{:?}|{:?}|{}|{:?}|{}|{}|{}|{}|{}|{}|{:?}|{}",
+        e.style.display, e.bg, e.radius, e.shadows, e.insets, e.border, e.z, e.slim_thumb, e.live, e.backdrop, e.backdrop_sat, e.brightness, e.clip, e.opacity, e.color_filter, e.blur
     );
     let _ = match &e.content {
         Content::None => write!(h, "N"),
@@ -127,13 +127,17 @@ fn infos(l: &Laid, page_w: f32) -> Vec<Info> {
     let n = l.nodes.len();
     let mut out: Vec<Info> = Vec::with_capacity(n);
     let mut ms: Vec<M> = Vec::with_capacity(n);
+    // Order 116: how far an ancestor's (or its own) `filter: blur()` spreads this box's paint (3 sigma)
+    let mut bpad: Vec<f32> = Vec::with_capacity(n);
     let mut lives: Vec<(f32, f32, f32, f32)> = Vec::new();
     for (i, nd) in l.nodes.iter().enumerate() {
         let e = &nd.el;
-        let (pm, pchain) = match nd.parent {
-            Some(p) if p < i => (ms[p], out[p].chain),
-            _ => (M::ID, 0),
+        let (pm, pchain, pb) = match nd.parent {
+            Some(p) if p < i => (ms[p], out[p].chain, bpad[p]),
+            _ => (M::ID, 0, 0.0),
         };
+        let bp = pb.max((3.0 * e.blur).ceil());
+        bpad.push(bp);
         let m = own_m(e, nd.rect).then(pm);
         // outer shadows reach |offset| + spread + 1.5 x blur (3 sigma, sigma = blur / 2); text and AA a few px more
         let mut pad = 4.0f32;
@@ -144,6 +148,7 @@ fn infos(l: &Laid, page_w: f32) -> Vec<Info> {
         for s in &e.shadows {
             pad = pad.max(s.dx.abs().max(s.dy.abs()) + s.spread.max(0.0) + 1.5 * s.blur + 2.0);
         }
+        pad += bp;
         let (x, y, w, h) = nd.rect;
         let mut ink = m.bounds((x - pad, y - pad, w + 2.0 * pad, h + 2.0 * pad));
         // a text may run past its box (nowrap): the whole width of the page
@@ -153,9 +158,9 @@ fn infos(l: &Laid, page_w: f32) -> Vec<Info> {
         // what this box does to everything inside it: opacity, filters, a clip (its place included)
         let mut h = H(DefaultHasher::new());
         h.0.write_u64(pchain);
-        if e.opacity != 1.0 || !e.color_filter.is_empty() || e.brightness != 1.0 || e.clip {
+        if e.opacity != 1.0 || !e.color_filter.is_empty() || e.brightness != 1.0 || e.clip || e.blur > 0.0 {
             let cb = m.bounds(nd.rect);
-            let _ = write!(h, "{}|{:?}|{}|{}|{:?}", e.opacity, e.color_filter, e.brightness, e.clip, cb);
+            let _ = write!(h, "{}|{:?}|{}|{}|{:?}|{}", e.opacity, e.color_filter, e.brightness, e.clip, cb, e.blur);
         }
         ms.push(m);
         // lay.rs's overlap rule: a box painted over an earlier live box is painted in the live pass too (not in the tiles) -

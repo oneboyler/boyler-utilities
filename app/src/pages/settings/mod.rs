@@ -778,7 +778,7 @@ impl Page for Settings {
                     // Order 047: the program start (10-40 ms) runs off the menu's thread
                     let url = update::page_url(*k == K_NEWS);
                     crate::offui::spawn("set-link", move || {
-                        let _ = std::process::Command::new("explorer").arg(url).spawn();
+                        let _ = crate::quiet::command("explorer").arg(url).spawn();
                     });
                 }
             }

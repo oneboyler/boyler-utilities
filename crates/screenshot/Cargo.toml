@@ -57,3 +57,7 @@ path = "examples/show.rs"
 [[example]]
 name = "screenshot-proof"
 path = "examples/proof.rs"
+
+[[example]]
+name = "screenshot-grabtime"
+path = "examples/grabtime.rs"

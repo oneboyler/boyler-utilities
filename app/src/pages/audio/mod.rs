@@ -26,7 +26,8 @@ use crate::anim::EASE;
 use crate::gfx::{sh, Align, Font, Rgba};
 use crate::pages::{Env, Page};
 use crate::ui::cx::{Cx, Ev};
-use crate::ui::el::{key, lh, sub, Cursor, El, Key, RADIUS_PILL};
+use crate::ui::el::{idx, key, lh, sub, Cursor, El, Key, RADIUS_PILL};
+use crate::ui::pieces::mitems::{self, It, Place, Row};
 use crate::ui::pieces::{self, dropdown, group, link, reset, slider, toast, toggle};
 use crate::ui::{cmix, ACC, ACC_S, CTL, CTL_H, F125, FG, FG2, FG3, HAIR, HOV, ICO, RED, SEL, TRK, WHITE, WIN_H, WIN_W};
 use crate::undo::{DefaultItem, Kind, Resettable, Val};
@@ -53,6 +54,8 @@ const K_RV_CANCEL: Key = key("aud.review.cancel");
 const K_RV_GO: Key = key("aud.review.go");
 const K_DEVM: Key = key("aud.devm");
 const K_TOAST: Key = key("aud.toast");
+/// Order 118: the Input slider's right-click menu (Lock at ... / Unlock)
+const K_LOCK_MENU: Key = key("aud.lockmenu");
 
 fn k_vol(i: usize) -> Key {
     key(&format!("aud.vol.{i}"))
@@ -175,6 +178,8 @@ struct St {
     hold_until: f64,
     edit: Option<Edit>,
     menu: Option<DevMenu>,
+    /// Order 118: the Input slider's right-click menu is open at this point (window DIPs)
+    lock_menu: Option<(f32, f32)>,
     /// the list just closed by a click on its own button: that click must not open it again
     just_closed: Option<Flow>,
     mic: MicMute,
@@ -275,6 +280,8 @@ pub fn reset_app_settings(fake: bool) {
     let old = svc::rules();
     svc::set_rules(svc::Rules::default());
     svc::note_rules(old, svc::Rules::default());
+    // Order 118: the input volume lock is one of the app's own settings: lifted (the watcher lets go of the volume)
+    svc::set_mic_lock(None);
 }
 
 /// Mic mute is switched on (Settings › All shortcuts shows its keys dimmed / "Off" otherwise).
@@ -573,6 +580,10 @@ impl St {
         let v = (v * 100.0).round().clamp(0.0, 100.0) / 100.0;
         if k == K_OUT_VOL || k == K_OUT_PCT || k == K_IN_VOL || k == K_IN_PCT {
             let out = k == K_OUT_VOL || k == K_OUT_PCT;
+            // Order 118: a locked input volume cannot be moved (slider, typed %, arrows) - Windows would not be let either
+            if !out && svc::mic_lock().is_some() {
+                return;
+            }
             let dev = if out { &mut self.out } else { &mut self.inp };
             if let Some((id, vol)) = dev {
                 if (*vol - v).abs() > 1e-4 {
@@ -844,6 +855,9 @@ fn dev_row(cx: &mut Cx, st: &mut St, flow: Flow) -> El {
     let src = st.live.clone();
     // `.vis.mut{opacity:.35}` (transition .3 s) - the Input's pill while the mic is muted
     let vis_op = cx.tr(kv, 9, if is_muted { 0.35 } else { 1.0 }, 300.0, EASE);
+    // Order 118: a locked input volume - the pill turns red (it fades in and out)
+    let locked = !out && svc::mic_lock().is_some();
+    let lock_t = cx.tr(kv, 10, if locked { 1.0 } else { 0.0 }, 200.0, EASE);
     let vis = El::paint(move |g, r| {
         let lv = {
             let s = src.borrow();
@@ -853,7 +867,7 @@ fn dev_row(cx: &mut Cx, st: &mut St, flow: Flow) -> El {
                 s.vi
             }
         };
-        meter::level_pill(g, r, vol, lv)
+        meter::level_pill(g, r, vol, lv, lock_t)
     })
     .abs(0.0, 0.0, 0.0, 0.0)
     .opacity(vis_op)
@@ -861,7 +875,15 @@ fn dev_row(cx: &mut Cx, st: &mut St, flow: Flow) -> El {
     .no_hit();
     let look = slider::Look { track_h: 8.0, fill: Rgba(0.0, 0.0, 0.0, 0.0), track: Rgba(0.0, 0.0, 0.0, 0.0), thumb: WHITE };
     let rng = slider::slider(cx, kv, vol, 0.0, 30.0, look).w_pct(100.0).abs(0.0, 0.0, f32::NAN, f32::NAN);
-    let dvs = El::block().flex1().h(30.0).child(vis).child(rng);
+    let dvs = El::block().h(30.0).child(vis).child(rng);
+    // Order 118: locked - a small red line under the slider. The row grows by that line and the same space above the slider, so
+    // the slider stays centred on the mic icon; unlocked there is nothing of it (no space kept)
+    let dvs = if locked || lock_t > 0.001 {
+        let msg = El::text("Locked - Windows can't change it", Font::new(10.0, 400), RED().mul_a(lock_t), lh(10.0, 1.1)).margin(0.0, 0.0, 0.0, 2.0);
+        El::col().flex1().items(AlignItems::STRETCH).child(El::block().h(11.0)).child(dvs).child(msg)
+    } else {
+        dvs.flex1()
+    };
     // `.dvr .sv{flex:none;font-size:12.5px;margin-left:-2px}`
     let pct = pct(cx, st, kp, vol, FG2()).margin(0.0, 0.0, 0.0, -2.0);
     let pu = dropdown::dropdown(cx, kk, &name, Some(196.0));
@@ -1099,6 +1121,7 @@ impl Page for Audio {
             hold_until: 0.0,
             edit: None,
             menu: None,
+            lock_menu: None,
             just_closed: None,
             mic,
             mic_read: Default::default(),
@@ -1360,7 +1383,14 @@ impl Page for Audio {
                 }
             }
             Ev::Click(k) => click(st, *k, now),
-            Ev::Context(..) | Ev::Drop(..) | Ev::Wheel(..) | Ev::DragOver(..) => {}
+            // Order 118: right-click on the Input slider - Lock at <value> / Unlock
+            Ev::Context(k, x, y) => {
+                if *k == K_IN_VOL && (st.inp.is_some() || svc::mic_lock().is_some()) {
+                    st.edit = None;
+                    st.lock_menu = Some((*x, *y));
+                }
+            }
+            Ev::Drop(..) | Ev::Wheel(..) | Ev::DragOver(..) => {}
         }
         // Order 036: this event's changes into the change log; a reset link opens the frame's shared review
         for (item, label, old, new) in std::mem::take(&mut st.recs) {
@@ -1378,6 +1408,12 @@ impl Page for Audio {
         }
         let main = if let Some(m) = st.mute.as_mut() {
             Some(m.popup(cx))
+        } else if let Some((x, y)) = st.lock_menu {
+            let label = match svc::mic_lock() {
+                Some(_) => "Unlock".to_string(),
+                None => format!("Lock at {} %", (st.inp.as_ref().map(|d| d.1).unwrap_or(0.0) * 100.0).round() as i32),
+            };
+            Some(mitems::menu(cx, K_LOCK_MENU, &[Row::Item(It::icon("lock", &label))], Place::At(x, y), 160.0))
         } else if let Some(m) = st.menu.take() {
             let e = dev_menu(cx, st, &m);
             st.menu = Some(m);
@@ -1429,6 +1465,7 @@ impl Page for Audio {
     }
     fn popup_dismiss(&mut self) {
         let Some(st) = self.st.as_mut() else { return };
+        st.lock_menu = None;
         if let Some(m) = &mut st.mute {
             if !m.dismiss() {
                 st.mute = None;
@@ -1463,6 +1500,7 @@ impl Page for Audio {
             st.review.as_ref().map(|r| if r.win { "win" } else { "pc" }).unwrap_or("none"),
             st.out_muted
         );
+        s += &format!(" miclock={}", svc::mic_lock().map(|v| ((v * 100.0).round() as i32).to_string()).unwrap_or_else(|| "off".into()));
         for a in &st.apps {
             s += &format!("\napp {} vol={} muted={}", a.name, (a.vol * 100.0).round(), a.muted);
         }
@@ -1486,6 +1524,21 @@ fn is_slider(st: &St, k: Key) -> bool {
 
 fn click(st: &mut St, k: Key, now: f64) {
     let just = st.just_closed.take();
+    // Order 118: the lock menu's one row
+    if st.lock_menu.is_some() {
+        st.lock_menu = None;
+        if k == idx(K_LOCK_MENU, 0) {
+            match svc::mic_lock() {
+                Some(_) => svc::set_mic_lock(None),
+                None => {
+                    if let Some((_, v)) = st.inp {
+                        svc::set_mic_lock(Some(v));
+                    }
+                }
+            }
+        }
+        return;
+    }
     // the device list
     if let Some(m) = &st.menu {
         let flow = m.flow;

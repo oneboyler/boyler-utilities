@@ -29,7 +29,7 @@ use bu_screenshot::{Monitor, Screenshots};
 use super::capture::{Capture, Done, Step};
 use super::watchdog;
 use super::worker::{self, Job, Res, Tag};
-use super::model::{Corner, Finish, Keep, Mode, Out, Pointer, Tool, COLORS};
+use super::model::{Corner, Finish, Keep, Mode, Out, Pointer, Side, Tool, COLORS};
 use super::toast;
 use super::view::{self, *};
 use crate::gfx::Gfx;
@@ -89,7 +89,7 @@ pub(crate) struct Layer {
 }
 
 /// Order 051: a monitor window's GPU output - the swap chain (paced by its frame-latency waitable: the compositor's clock of
-/// that monitor) and the DirectComposition visual showing it (its opacity = the fade).
+/// that monitor; Order 117: up to 2 frames queued) and the DirectComposition visual showing it (its opacity = the fade).
 pub(crate) struct GpuOut {
     chain: crate::gpu::GpuChain,
     dev: IDCompositionDesktopDevice,
@@ -102,6 +102,8 @@ pub(crate) struct GpuOut {
     want: bool,
     /// when it was last painted (ms): a window whose waitable stays silent for 100 ms is painted anyway (`overdue`)
     painted_at: f64,
+    /// Order 117: since when it waits for its waitable (`overdue` counts from here: an idle window's `painted_at` is old)
+    wait_since: f64,
 }
 
 impl Layer {
@@ -136,14 +138,20 @@ impl Layer {
             let hwnd = CreateWindowExW(ex, CLASS, w!("Boyler Utilities capture"), WS_POPUP, x, y, w, h, None, None, Some(inst.into()), None)?;
             let made = (|| -> Result<GpuOut> {
                 let _ = SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE);
-                let chain = crate::gpu::GpuChain::new(gpu, w.max(1) as u32, h.max(1) as u32)?;
+                // Order 117: 3 buffers, 2 frames in flight - at the GPU's idle clocks a frame takes ~4 ms to finish (any
+                // content, measured), so with one in flight the pointer's window was capped near 220 frames a second on a
+                // 360 Hz screen (and a drag at ~105); two in flight keep the monitor's pace
+                let chain = crate::gpu::GpuChain::with_depth(gpu, w.max(1) as u32, h.max(1) as u32, 3, 2)?;
                 let dev: IDCompositionDesktopDevice = DCompositionCreateDevice2(None)?;
                 let target = dev.CreateTargetForHwnd(hwnd, true)?;
                 let visual = dev.CreateVisual()?;
                 visual.SetContent(&chain.swap)?;
                 target.SetRoot(&visual)?;
                 dev.Commit()?;
-                Ok(GpuOut { chain, dev, _target: target, visual, alpha: 1.0, slot: true, want: true, painted_at: crate::timing::now() })
+                // (the first frame takes the room the new chain has - counted, so never more frames are queued than it has
+                // buffers for)
+                let slot = windows::Win32::System::Threading::WaitForSingleObject(chain.waitable, 0) == WAIT_OBJECT_0;
+                Ok(GpuOut { chain, dev, _target: target, visual, alpha: 1.0, slot, want: true, painted_at: crate::timing::now(), wait_since: crate::timing::now() })
             })();
             match made {
                 Ok(g) => Ok(Layer { hwnd, x, y, w: w.max(1), h: h.max(1), dc: HDC::default(), bmp: HBITMAP::default(), old: HGDIOBJ::default(), bits: std::ptr::null_mut(), gpu: Some(g) }),
@@ -269,6 +277,15 @@ struct MonWin {
     /// Order 045: the shared tip bubble (the drawing's `title` hover names: Live, Snap, ×, Copy / Save, the emojis), run like the
     /// menu's (`ui.rs` `update_tips` / `draw_popup`)
     tips: crate::ui::pieces::tip::Tips,
+    /// Order 117: what this window shows changed since it was last painted (only such a window is painted - a pointer moving
+    /// over one monitor no longer repaints the others)
+    dirty: bool,
+    /// its last frame was still moving (an animation, a tip on its way): the timer marks it dirty again
+    busy: bool,
+    /// the pointer was on this monitor in its last frame (its crosshair must go when the pointer leaves)
+    ptr: bool,
+    /// when its hover tip is due to show (ms; the timer paints it then)
+    due: Option<f64>,
 }
 
 struct Session {
@@ -350,6 +367,49 @@ thread_local! {
     static NEXT_ID: RefCell<u64> = const { RefCell::new(0) };
     /// a hidden message-only window of the overlay's class: the workers' results come to it (WM_JOB_DONE)
     static MSG_WIN: RefCell<HWND> = RefCell::new(HWND::default());
+    /// Order 117: the crosshair as a real cursor, per monitor scale (x1000) - made on first use, gone when the overlay closes
+    static CROSS_CURSORS: RefCell<Vec<(u32, HCURSOR)>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Order 117 (the owner Oct 23: "the laggy part ... is when u haven't selected an area yet"): before a box is drawn the Windows
+/// pointer was hidden and the crosshair drawn into the overlay's frames, so it could only follow the mouse a frame or more
+/// late (paint -> the compositor's next refresh -> the screen; later still when the PC is busy). As a cursor of its own
+/// (the same picture, `view::cross_pixels`) Windows moves it with the mouse itself. None = it could not be made (the
+/// system's cross is shown instead).
+fn cross_cursor(scale: f32) -> Option<HCURSOR> {
+    let k = (scale * 1000.0).round() as u32;
+    if let Some(c) = CROSS_CURSORS.with(|v| v.borrow().iter().find(|(s, _)| *s == k).map(|(_, c)| *c)) {
+        return Some(c);
+    }
+    let (n, hot, px) = view::cross_pixels(scale)?;
+    let c = unsafe {
+        let bi = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER { biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32, biWidth: n, biHeight: -n, biPlanes: 1, biBitCount: 32, biCompression: BI_RGB.0, ..Default::default() },
+            ..Default::default()
+        };
+        let mut bits: *mut core::ffi::c_void = std::ptr::null_mut();
+        let color = CreateDIBSection(None, &bi, DIB_RGB_COLORS, &mut bits, None, 0).ok()?;
+        std::ptr::copy_nonoverlapping(px.as_ptr(), bits as *mut u8, px.len());
+        // (the AND mask all 0: the colour bitmap's alpha decides)
+        let mask_bits = vec![0u8; (((n + 15) / 16) * 2 * n) as usize];
+        let mask = CreateBitmap(n, n, 1, 1, Some(mask_bits.as_ptr() as *const _));
+        let ii = ICONINFO { fIcon: FALSE, xHotspot: hot as u32, yHotspot: hot as u32, hbmMask: mask, hbmColor: color };
+        let c = CreateIconIndirect(&ii);
+        let _ = DeleteObject(color.into());
+        let _ = DeleteObject(mask.into());
+        HCURSOR(c.ok()?.0)
+    };
+    CROSS_CURSORS.with(|v| v.borrow_mut().push((k, c)));
+    Some(c)
+}
+
+/// The overlay closed: its cursors go.
+fn drop_cross_cursors() {
+    for (_, c) in CROSS_CURSORS.with(|v| std::mem::take(&mut *v.borrow_mut())) {
+        unsafe {
+            let _ = DestroyCursor(c);
+        }
+    }
 }
 
 /// The overlay's message window (made once, never on screen).
@@ -417,6 +477,9 @@ pub fn start(hooks: Hooks) -> std::result::Result<(), String> {
     let st = Starting { id, hooks: Rc::new(hooks), pointer: (p.x as f32, p.y as f32), data_dir: dir.clone() };
     STARTING.with(|c| *c.borrow_mut() = Some(st));
     worker::spawn(Tag { session: id, seq: 0 }, dir, Job::Grab, notify);
+    // Order 117: the GPU device the overlay draws on is made now, while the worker grabs the screen (it took ~200 ms after
+    // the picture landed, measured) - `open_session` takes it (`gpu::get`); a failed grab lets it go again
+    crate::gpu::warm(Some(unsafe { MonitorFromPoint(p, MONITOR_DEFAULTTOPRIMARY) }));
     Ok(())
 }
 
@@ -432,7 +495,11 @@ fn opened(tag: Tag, r: bu_screenshot::Result<bu_screenshot::Frozen>) {
     });
     let Some(st) = st else { return };
     let hooks = st.hooks;
-    let fail = |msg: String| (hooks.on_error)(&msg);
+    let fail = |msg: String| {
+        // (the device made at the key press for this overlay - Order 117)
+        crate::gpu::cool_down();
+        (hooks.on_error)(&msg)
+    };
     let frozen = match r {
         Ok(f) => f,
         Err(e) => return fail(format!("Screenshot failed: {e}")),
@@ -448,14 +515,16 @@ fn opened(tag: Tag, r: bu_screenshot::Result<bu_screenshot::Frozen>) {
 
 /// Order 051, test copies only: the overlay over a made-up picture on one made-up monitor (`gputest`) - never a grab of the
 /// screen; the engine runs on the read-only OS layer (Copy / Save / Snap are refused) and the windows never take the focus.
-pub fn start_test(x: i32, y: i32, w: u32, h: u32) -> std::result::Result<(), String> {
+/// Order 117: `rects` = one or more made-up monitors (the pointer starts on the first).
+pub fn start_test(rects: &[(i32, i32, u32, u32)]) -> std::result::Result<(), String> {
     if !crate::testmode::on() {
         return Err("test copies only".into());
     }
     if is_open() {
         return Ok(());
     }
-    let frozen = super::gputest::frozen(x, y, w, h);
+    let Some(&(x, y, w, h)) = rects.first() else { return Err("no monitor".into()) };
+    let frozen = super::gputest::frozen_many(rects);
     let dir = std::env::temp_dir().join("BoylerUtilities-test").join("overlay");
     let svc = Screenshots::new(RealOs::read_only(), dir.clone());
     let p = POINT { x: x + w as i32 / 2, y: y + h as i32 / 2 };
@@ -541,7 +610,7 @@ fn open_session(cap: Capture<RealOs>, hooks: Rc<Hooks>, p: POINT, test: bool, id
                 Layer::new(m.rect.x, m.rect.y, m.rect.w as i32, m.rect.h as i32, false).map_err(|e| e.to_string())?
             }
         };
-        wins.push(MonWin { mi, layer, g: Gfx::new(m.dpi as f32 / 96.0), st: State::default(), front: None, bg: None, tips: Default::default() });
+        wins.push(MonWin { mi, layer, g: Gfx::new(m.dpi as f32 / 96.0), st: State::default(), front: None, bg: None, tips: Default::default(), dirty: true, busy: false, ptr: false, due: None });
     }
     let mut s = Session {
         cap,
@@ -620,13 +689,21 @@ fn tick_timer(on: bool) {
     });
 }
 
-/// Paint every monitor's window; true while something moves. Order 051: a window drawn on the GPU is painted only when its
-/// swap chain has room (its monitor's next refresh) - else it is marked and painted at that moment (`on_waitable`).
+/// Paint every monitor's window that changed (`dirty`); true while something moves. Order 051: a window drawn on the GPU is
+/// painted only when its swap chain has room (its monitor's next refresh) - else it is marked and painted at that moment
+/// (`on_waitable`).
 fn paint_all() -> bool {
     paint_wins(None)
 }
 
-/// `only` = the one GPU window whose waitable just fired (None = every window: an input or the timer).
+/// Order 117: every window has something new (a click, a key, a new picture): all of them are painted.
+fn dirty_all(s: &mut Session) {
+    for w in &mut s.wins {
+        w.dirty = true;
+    }
+}
+
+/// `only` = the one GPU window whose waitable just fired (None = every dirty window: an input or the timer).
 fn paint_wins(only: Option<usize>) -> bool {
     let busy = SESSION.with(|c| {
         let Ok(mut b) = c.try_borrow_mut() else { return false };
@@ -644,13 +721,21 @@ fn paint_wins(only: Option<usize>) -> bool {
             if only.is_some_and(|o| o != i) {
                 continue;
             }
+            // (the fade changes every window)
+            w.dirty |= closing;
             if let Some(g) = &mut w.layer.gpu {
                 // a removed device never fires its waitable again: the fallback must not wait for a failed present
                 if g.chain.gpu.lost() {
                     LOST.with(|l| l.set(true));
                     continue;
                 }
-                if only.is_none() {
+                // Order 117: only a window with something new waits for its next refresh (was: every window, on every
+                // input and timer tick - the pointer's moves repainted every monitor, and the timer repainted them all ~64
+                // times a second while nothing moved)
+                if w.dirty {
+                    if !g.want {
+                        g.wait_since = now();
+                    }
                     g.want = true;
                 }
                 if !g.want || !g.slot {
@@ -658,13 +743,22 @@ fn paint_wins(only: Option<usize>) -> bool {
                     continue;
                 }
                 g.slot = false;
+            } else if !w.dirty {
+                continue;
             }
             let wbusy = paint_win(w, &s.icons, &s.cap.model, t, fade, live);
+            w.dirty = false;
+            w.busy = wbusy;
+            w.due = w.tips.due();
             if let Some(g) = &mut w.layer.gpu {
                 g.want = wbusy || closing;
                 g.painted_at = now();
             }
             busy |= wbusy;
+        }
+        // (a tip waiting for its delay keeps the timer going)
+        for w in &s.wins {
+            busy |= w.due.is_some();
         }
         busy || closing
     });
@@ -708,6 +802,7 @@ fn cpu_fallback() {
         // the frozen pictures back on the CPU (the GPU textures are gone with the device)
         s.gpu = None;
         slice_frozen(s);
+        dirty_all(s);
     });
     if failed {
         drop(old);
@@ -742,7 +837,13 @@ pub fn overdue() {
         let mut v = Vec::new();
         for (i, w) in s.wins.iter_mut().enumerate() {
             if let Some(g) = &mut w.layer.gpu {
-                if g.want && !g.slot && (t - g.painted_at > 100.0 || g.chain.gpu.lost()) {
+                if !g.want || g.slot {
+                    continue;
+                }
+                // Order 117: its waitable fired while the main loop took another window's - counted, not forced; forced
+                // only after 100 ms of waiting (from when it started waiting: an idle window's last paint is old)
+                let fired = unsafe { windows::Win32::System::Threading::WaitForSingleObject(g.chain.waitable, 0) } == WAIT_OBJECT_0;
+                if fired || t - g.painted_at.max(g.wait_since) > 100.0 || g.chain.gpu.lost() {
                     g.slot = true;
                     v.push(i);
                 }
@@ -803,6 +904,7 @@ thread_local! {
 
 fn paint_win_inner(w: &mut MonWin, icons: &Icons, model: &super::model::Model, t: f64, fade: f32, live: bool) -> bool {
     let mut busy = false;
+    w.ptr = model.monitors[w.mi].rect.contains(model.last.0.floor() as i32, model.last.1.floor() as i32);
     {
         {
             let mut cx = Cx::new(t, false, &w.g, &mut w.st);
@@ -874,8 +976,8 @@ fn click(s: &mut Session, k: Key, t: f64) -> Out {
     if k == K_X {
         return Out::Close;
     }
-    if k == K_SZ {
-        m.size_start();
+    if k == K_SZW || k == K_SZH {
+        m.size_start(if k == K_SZW { Side::W } else { Side::H });
         return Out::Nothing;
     }
     if k == K_LIVE {
@@ -1028,6 +1130,7 @@ fn job_done() {
                         Ok(f) => {
                             s.cap.frozen = f;
                             slice_frozen(s);
+                            dirty_all(s);
                             None
                         }
                         Err(e) => Some(After::Error(format!("Screenshot failed: {e}"))),
@@ -1102,6 +1205,7 @@ fn close(done: Option<Done>) {
     let Some(s) = s else { return };
     // nothing to watch any more (Order 048)
     watchdog::close();
+    drop_cross_cursors();
     KEEP.with(|k| *k.borrow_mut() = Some(s.cap.model.keep()));
     let hooks = s.hooks.clone();
     let home = s.cap.model.monitors[view::bars_monitor(&s.cap.model)].clone();
@@ -1286,9 +1390,17 @@ fn paint_toast() -> bool {
 fn set_cursor(s: &Session, w: usize, d: (f32, f32)) {
     let m = &s.cap.model;
     let (_, click, _) = hit(&s.wins[w], d);
+    // Order 117: the crosshair (`Pointer::Full` / `Cross`) is a cursor of its own
+    let cross = (click.is_none() && super::view::handle_at(m, s.wins[w].mi, d.0, d.1).is_none() && matches!(m.pointer(), Pointer::Full | Pointer::Cross)).then(|| cross_cursor(s.wins[w].g.scale));
+    if let Some(c) = cross {
+        unsafe {
+            let _ = SetCursor(Some(c.unwrap_or_else(|| LoadCursorW(None, IDC_CROSS).unwrap_or_default())));
+        }
+        return;
+    }
     let id = if let Some(c) = super::view::handle_at(m, s.wins[w].mi, d.0, d.1) {
         Some(if matches!(c, Corner::Tl | Corner::Br) { IDC_SIZENWSE } else { IDC_SIZENESW })
-    } else if click == Some(K_SZ) && m.mode == Mode::Edit {
+    } else if matches!(click, Some(K_SZW) | Some(K_SZH)) && m.mode == Mode::Edit {
         Some(IDC_IBEAM)
     } else if click.is_some() {
         Some(IDC_HAND)
@@ -1338,6 +1450,17 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
             return LRESULT(0);
         }
         if msg == WM_TIMER && wp.0 == TIMER {
+            // Order 117: the timer only moves what is moving (an animation, a tip on its way; the fade: `paint_wins`)
+            SESSION.with(|c| {
+                if let Ok(mut b) = c.try_borrow_mut() {
+                    if let Some(s) = b.as_mut() {
+                        let t = now();
+                        for w in &mut s.wins {
+                            w.dirty |= w.busy || w.due.is_some_and(|d| d <= t);
+                        }
+                    }
+                }
+            });
             let a = paint_all();
             let b = paint_flash();
             let c = paint_toast();
@@ -1392,6 +1515,15 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
                     let over = !keys.is_empty() && keys.iter().any(|k| *k != K_HD);
                     s.cap.model.moved(p, over);
                     let omi = s.wins[ow].mi;
+                    // Order 117: a move changes the window the pointer is on, the one it just left (its crosshair goes) and
+                    // any whose hover changed; while a box / mark is dragged, every window (the box may reach any monitor)
+                    let dragging = s.cap.model.dragging();
+                    let on = win_at(s, p);
+                    let none = Vec::new();
+                    for (i, win) in s.wins.iter_mut().enumerate() {
+                        let hv = if win.mi == omi { &keys } else { &none };
+                        win.dirty |= dragging || on == Some(i) || win.ptr || win.st.hover != *hv;
+                    }
                     for win in &mut s.wins {
                         win.st.hover = if win.mi == omi { keys.clone() } else { Vec::new() };
                         for k in &win.st.hover {
@@ -1498,6 +1630,16 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
             return DefWindowProcW(hwnd, msg, wp, lp);
         }
         let closing = !matches!(after, After::None);
+        // Order 117: anything but a move (a click, a key, the wheel, the focus) may change every window
+        if repaint && msg != WM_MOUSEMOVE {
+            SESSION.with(|c| {
+                if let Ok(mut b) = c.try_borrow_mut() {
+                    if let Some(s) = b.as_mut() {
+                        dirty_all(s);
+                    }
+                }
+            });
+        }
         finish_after(after);
         if repaint && !closing && paint_all() {
             let _ = SetTimer(Some(hwnd), TIMER, 15, None);
@@ -1516,6 +1658,24 @@ fn click_key(s: &mut Session, k: Key, t: f64) -> Out {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Order 117: Windows takes the crosshair as a cursor (one per scale, kept until the overlay closes).
+    #[test]
+    fn the_crosshair_becomes_a_windows_cursor() {
+        let a = cross_cursor(1.0).expect("a cursor");
+        assert_eq!(cross_cursor(1.0), Some(a), "made once per scale");
+        let b = cross_cursor(1.25).expect("a cursor at 1.25");
+        assert_ne!(a, b);
+        unsafe {
+            let mut ii = ICONINFO::default();
+            assert!(GetIconInfo(HICON(b.0), &mut ii).is_ok());
+            assert_eq!((ii.xHotspot, ii.yHotspot, ii.fIcon.as_bool()), (15, 15, false));
+            let _ = DeleteObject(ii.hbmColor.into());
+            let _ = DeleteObject(ii.hbmMask.into());
+        }
+        drop_cross_cursors();
+        assert!(CROSS_CURSORS.with(|v| v.borrow().is_empty()));
+    }
 
     #[test]
     fn a_test_copy_never_opens_the_overlay() {

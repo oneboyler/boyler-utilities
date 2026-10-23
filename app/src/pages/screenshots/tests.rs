@@ -756,3 +756,102 @@ fn the_screenshot_key_works_while_a_game_is_in_front() {
     let src = include_str!("key.rs");
     assert!(!src.contains(concat!("game_", "in_front()")), "key.rs must not call the game check again");
 }
+
+/// Order 117: the privacy eye is the header's first control (left of "Change path"); a click blurs every thumbnail (and only
+/// them), a second click shows them again; right-click = the one-row menu.
+#[test]
+fn the_eye_blurs_every_thumbnail_and_only_them() {
+    let mut p = page(0.0);
+    wait_thumbs(&mut p);
+    let l = build(&mut p, 0.0);
+    let (ex, ey, ew, eh) = l.rect_of(K_EYE).expect("the eye is in the header");
+    let (px, py, _, _) = l.rect_of(K_PATH).expect("Change path");
+    assert!(ex + ew <= px && (ey + eh / 2.0 - py).abs() < 20.0, "the eye sits left of Change path, on its line");
+    // the thumbnails painted: the sharpest step between neighbouring pixels inside each picture (a blurred one has none)
+    let sharp = |p: &mut Screenshots, now: f64| -> Vec<u32> {
+        let l = build(p, now);
+        let g = Gfx::new(1.0);
+        let icons = crate::icons::Icons::new();
+        let mut s = crate::gfx::new_surface(600, l.height.ceil() as i32).unwrap();
+        g.begin(s.canvas());
+        l.paint(&g, &icons, 0.0, 0.0, None);
+        g.end();
+        let px = crate::png::from_surface(&mut s);
+        p.order()
+            .iter()
+            .map(|id| {
+                let (x, y, w, h) = l.rect_of(sub(sub(K_SHOT, &id.to_string()), "th")).unwrap();
+                let (x0, y0, x1, y1) = (x as u32 + 10, y as u32 + 10, (x + w) as u32 - 10, (y + h) as u32 - 10);
+                let at = |x: u32, y: u32| px.data[((y * px.w + x) * 4 + 1) as usize] as i32;
+                (y0..y1).flat_map(|y| (x0..x1 - 1).map(move |x| (x, y))).map(|(x, y)| (at(x, y) - at(x + 1, y)).unsigned_abs()).max().unwrap_or(0)
+            })
+            .collect()
+    };
+    let before = sharp(&mut p, 0.0);
+    ev(&mut p, Ev::Click(K_EYE), 10.0);
+    let after = sharp(&mut p, 20.0);
+    for (i, (b, a)) in before.iter().zip(&after).enumerate() {
+        assert!(*a * 3 < *b, "thumbnail {i} blurred: sharpest step {b} -> {a}");
+    }
+    ev(&mut p, Ev::Click(K_EYE), 30.0);
+    assert_eq!(sharp(&mut p, 40.0), before, "shown again, exactly as before");
+    ev(&mut p, Ev::Context(K_EYE, ex, ey + eh), 50.0);
+    {
+        let g = Gfx::new(1.0);
+        let mut st = State::default();
+        let mut cx = Cx::new(60.0, false, &g, &mut st);
+        assert!(p.popup(&mut cx).is_some(), "the right-click menu shows");
+    }
+    p.popup_dismiss();
+    p.close();
+    p.open(&Env { test: true, frozen: true, ..Env::default() }, 70.0);
+    assert!(!p.eye.on(), "closing the tab forgets the click");
+}
+
+/// Order 117: the page with the eye off / on / its right-click menu, painted off-screen at the menu's two sizes (scale 1 on
+/// a 1920 x 1080 screen, 1.25 on the 3440 x 1440 one). `set BU_O117_DIR=<dir> && cargo test -p bu-app o117_eye_pictures --
+/// --ignored`.
+#[test]
+#[ignore]
+fn o117_eye_pictures() {
+    let Ok(dir) = std::env::var("BU_O117_DIR") else { return };
+    unsafe {
+        let _ = windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_MULTITHREADED);
+    }
+    let icons = crate::icons::Icons::new();
+    for (tag, scale) in [("1920x1080", 1.0f32), ("3440x1440", 1.25)] {
+        for state in ["off", "on", "menu"] {
+            let mut p = page(0.0);
+            wait_thumbs(&mut p);
+            let g = Gfx::new(scale);
+            let mut st = State::default();
+            let lay = |p: &mut Screenshots, st: &mut State, now: f64| {
+                let mut cx = Cx::new(now, false, &g, st);
+                let kids = p.build(&mut cx);
+                let pop = p.popup(&mut cx);
+                (Laid::new(&g, El::block().w(600.0).pad(2.0, 26.0, 18.0, 26.0).children(kids), 600.0, None), pop)
+            };
+            let (l, _) = lay(&mut p, &mut st, 0.0);
+            if state != "off" {
+                ev(&mut p, Ev::Click(K_EYE), 100.0);
+            }
+            if state == "menu" {
+                let (x, y, _, h) = l.rect_of(K_EYE).unwrap();
+                ev(&mut p, Ev::Context(K_EYE, x + 10.0, y + h - 4.0), 100.0);
+            }
+            let _ = lay(&mut p, &mut st, 200.0);
+            let (l, pop) = lay(&mut p, &mut st, 5000.0);
+            let h = l.height.max(520.0);
+            let mut surf = crate::gfx::new_surface((600.0 * scale).ceil() as i32, (h * scale).ceil() as i32).unwrap();
+            g.begin(surf.canvas());
+            g.fill_rect(0.0, 0.0, 600.0, h, Rgba::rgb(28, 30, 38));
+            l.paint(&g, &icons, 0.0, 0.0, None);
+            if let Some(pop) = pop {
+                Laid::new(&g, pop, 600.0, Some(h)).paint(&g, &icons, 0.0, 0.0, None);
+            }
+            g.end();
+            let px = crate::png::from_surface(&mut surf);
+            crate::png::save_png(&px, &format!("{dir}\\117_eye_{state}_{tag}.png")).unwrap();
+        }
+    }
+}

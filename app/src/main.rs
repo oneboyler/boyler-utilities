@@ -11,6 +11,7 @@
 #![windows_subsystem = "windows"]
 
 mod anchor;
+mod quiet;
 mod anim;
 mod appicon;
 mod appinfo;
@@ -234,6 +235,8 @@ extern "system" fn wndproc(h: HWND, m: u32, w: WPARAM, l: LPARAM) -> LRESULT {
             // thread now; the process ends right after this message)
             WM_ENDSESSION if w.0 != 0 && !is_menu => {
                 services::try_with(|s| s.store.wait_written(std::time::Duration::from_secs(2)));
+                // Order 116: and the notes' newest text
+                pages::notes::flush();
                 wait_broadcasts();
                 return LRESULT(0);
             }
@@ -925,11 +928,28 @@ impl App {
             }
             // test-only (Order 051): the capture overlay over a made-up picture - ovtest:<x>,<y>,<w>,<h> (one made-up monitor),
             // ovdrag:<x0>,<y0>,<x1>,<y1>,<ms>[,<hz>] (a box dragged with posted mouse messages), ovstate, ovlose, ovclose
+            // (Order 117: several made-up monitors = `;` between them)
             "ovtest" => {
-                let v: Vec<i32> = arg.split(',').filter_map(|x| x.trim().parse().ok()).collect();
-                let (x, y, w, h) = if v.len() == 4 { (v[0], v[1], v[2].max(1) as u32, v[3].max(1) as u32) } else { (-20000, 0, 1920, 1080) };
-                let r = pages::screenshots::overlay::window::start_test(x, y, w, h);
+                let mut rects: Vec<(i32, i32, u32, u32)> = arg
+                    .split(';')
+                    .filter_map(|r| {
+                        let v: Vec<i32> = r.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+                        (v.len() == 4).then(|| (v[0], v[1], v[2].max(1) as u32, v[3].max(1) as u32))
+                    })
+                    .collect();
+                if rects.is_empty() {
+                    rects.push((-20000, 0, 1920, 1080));
+                }
+                let r = pages::screenshots::overlay::window::start_test(&rects);
                 timing::note(&format!("ovtest {:?}", r));
+            }
+            // Order 117: ovhover:<x0>,<y0>,<x1>,<y1>,<ms>[,<hz>] = the pointer moving with no button held (before a box is drawn)
+            "ovhover" => {
+                let v: Vec<i32> = arg.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+                if let (Some((hwnd, _)), true) = (pages::screenshots::overlay::window::test_window(), v.len() >= 5) {
+                    let hz = v.get(5).copied().unwrap_or(1000).max(1) as u32;
+                    pages::screenshots::overlay::gputest::hover(hwnd, (v[0], v[1]), (v[2], v[3]), v[4].max(1) as u32, hz);
+                }
             }
             "ovdrag" => {
                 let v: Vec<i32> = arg.split(',').filter_map(|x| x.trim().parse().ok()).collect();
@@ -1734,6 +1754,8 @@ fn main() {
         timing::open_log(p);
     }
     let _ = run(opts);
+    // Order 116: the notes' newest text is on disk before the app ends
+    pages::notes::flush();
     services::shutdown();
     wait_broadcasts();
     drop(mutex);

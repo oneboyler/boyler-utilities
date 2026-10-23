@@ -39,6 +39,8 @@ use gallery::{Mods, Sel};
 pub const KEY_ACTION: &str = "shot.key";
 
 const K_PATH: Key = key("shot.path");
+/// Order 117: the privacy eye (left of "Change path"): the thumbnails blur
+const K_EYE: Key = key("shot.eye");
 const K_KEY: Key = key("shot.key");
 const K_SHOT: Key = key("shot.item");
 const K_GAL: Key = key("shot.gal");
@@ -298,6 +300,9 @@ fn double_click_ms() -> f64 {
 pub struct Screenshots {
     /// the keys manager's last refusal for the Screenshot key ("Already used by Mic mute") and since when it shows
     key_err: Option<(String, f64)>,
+    /// Order 117 (the owner Oct 23: "a small toggle up here for privacy"): the eye blurs every thumbnail (Order 116's piece;
+    /// right-click = "Blur every time I open this tab"); `close` forgets it with the rest of the page
+    eye: pieces::eye::Eye,
 
     svc: Option<Box<dyn Api>>,
     /// the fake engine's OS (test copies): what a test looks at, and the drawing's picker answers
@@ -916,11 +921,20 @@ impl Screenshots {
         // overflow clip, the <canvas> (replaced content) and the ::after ring - so they are painted here on that box
         let tint = Rgba(10.0 / 255.0, 132.0 / 255.0, 1.0, 0.13 * st);
         let ring_w = 1.0 + st;
+        // Order 117: the privacy eye blurs the picture ("blurred, let's say 40 %" - the eye piece's strength) inside its own
+        // rounded box: edges clamped (no glow out of the box, no dark rim in it); the ring and the selection tint stay sharp
+        let blur = if self.eye.on() { pieces::eye::BLUR } else { 0.0 };
         let pic = El::paint(move |g, (x, y, w, h)| {
             let (x, y, w, h) = g.snap(x, y, w, h);
             g.push_clip_rr4(x, y, w, h, [8.0; 4]);
             g.fill_rect(x, y, w, h, THUMB_BG);
             if let Some(m) = &img {
+                if blur > 0.0 {
+                    let mut p = sk::Paint::default();
+                    p.set_image_filter(sk::image_filters::blur((blur, blur), sk::TileMode::Clamp, None, None));
+                    let r = sk::Rect::from_xywh(x, y, w, h);
+                    g.cv().save_layer(&sk::canvas::SaveLayerRec::default().bounds(&r).paint(&p));
+                }
                 if fill && (iw, ih) == (w, h) {
                     // already the box's size (the sample pictures): pixel for pixel
                     g.draw_image(m, x, y, 1.0);
@@ -930,6 +944,9 @@ impl Screenshots {
                     let s = (w / iw).min(h / ih);
                     let (dw, dh) = (iw * s, ih * s);
                     g.draw_image_rect(m, x + (w - dw) / 2.0, y + (h - dh) / 2.0, dw, dh);
+                }
+                if blur > 0.0 {
+                    g.cv().restore();
                 }
             }
             // ::after is a child of the overflow:hidden box: its tint and ring are clipped by the same rounded clip
@@ -1191,10 +1208,13 @@ impl Page for Screenshots {
             *f = std::mem::take(f).title("Click to change");
         }
         // .phr{display:flex;align-items:center;gap:10px} .phr .gxs{margin:0}
+        // Order 117: the privacy eye first, left of "Change path" (the owner Oct 23)
+        self.eye.load(cx);
         let phr = El::row()
             .center()
             .gap(10.0)
             .none()
+            .child(self.eye.button(cx, K_EYE))
             // Order 045: `cpLnk.title='Where screenshots are saved'`
             .child(link::link(cx, K_PATH, "Change path", 12.0).title("Where screenshots are saved"))
             .child(pieces::separator(0.0))
@@ -1234,6 +1254,10 @@ impl Page for Screenshots {
         kids
     }
     fn event(&mut self, ev: &Ev, cx: &mut Cx) {
+        // Order 117: the privacy eye's click / right-click / menu row
+        if self.eye.event(ev, cx, K_EYE) {
+            return;
+        }
         let now = cx.now;
         // Order 045: Space / Enter close the lightbox too (`if(lbIt&&(e.key==='Escape'||e.key===' '||e.key==='Enter'))
         // {e.preventDefault();closeLB();return;}`, L7961) - whatever has the focus
@@ -1364,6 +1388,11 @@ impl Page for Screenshots {
     fn popup(&mut self, cx: &mut Cx) -> Option<El> {
         let mut layer = El::block().abs(0.0, 0.0, f32::NAN, f32::NAN).size(WIN_W, WIN_H).no_hit();
         let mut any = false;
+        // Order 117: the eye's right-click menu ("Blur every time I open this tab")
+        if let Some(m) = self.eye.popup(cx, K_EYE) {
+            layer = layer.child(m);
+            any = true;
+        }
         if let Some(t) = self.dlg {
             layer = layer.child(self.folder_window(cx, t));
             any = true;
@@ -1386,6 +1415,7 @@ impl Page for Screenshots {
         any.then_some(layer)
     }
     fn popup_dismiss(&mut self) {
+        self.eye.dismiss();
         if self.lb_up {
             lbhost::close();
         }

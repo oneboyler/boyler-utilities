@@ -91,7 +91,7 @@ pub fn states() -> Vec<(&'static str, Model)> {
     }
     {
         let mut m = sel(fire());
-        m.size_start();
+        m.size_start(super::model::Side::W);
         // the reference window is off-screen and never focused: Chromium shows the inactive selection colours
         m.focused = false;
         v.push(("size", m));
@@ -234,4 +234,66 @@ fn overlay_proof_toast() {
     view::paint(&g, &icons, &mut surf, &sc, Some(&bg));
     let px = crate::png::from_surface(&mut surf);
     crate::png::save_png(&px, &format!("{dir}\\toast_app.png")).expect("save");
+}
+
+/// Order 117: the size tag with its width field, its height field and neither, painted off-screen over a made-up desktop (a
+/// sample screenshot stretched) on a 1920 x 1080 and a 3440 x 1440 screen - the whole screen and the bar 3x enlarged. Run:
+/// `set BU_O117_DIR=<dir> && cargo test -p bu-app o117_size_fields -- --ignored`.
+#[test]
+#[ignore]
+fn o117_size_fields() {
+    use super::model::Side;
+    let Ok(dir) = std::env::var("BU_O117_DIR") else { return };
+    unsafe {
+        let _ = windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_MULTITHREADED);
+    }
+    let g = Gfx::new(1.0);
+    let icons = Icons::new();
+    let sample = crate::png::load_png(concat!(env!("CARGO_MANIFEST_DIR"), "/src/pages/screenshots/sample/thumb2.png")).expect("sample");
+    let sample = crate::png::to_image(&sample).expect("sample image");
+    for (sw, sh) in [(1920i32, 1080i32), (3440, 1440)] {
+        let mut v = vec![mon(0, 0, sw as u32, sh as u32, true, false)];
+        geom::number_monitors(&mut v);
+        // the made-up desktop
+        let mut desk = crate::gfx::new_surface(sw, sh).expect("surface");
+        desk.canvas().draw_image_rect(&sample, None, skia_safe::Rect::from_wh(sw as f32, sh as f32), &skia_safe::Paint::default());
+        let bg = desk.image_snapshot();
+        for (name, side) in [("tag", None), ("w", Some(Side::W)), ("h", Some(Side::H))] {
+            let mut m = Model::new(v.clone(), (560.0, 300.0), 0.0, None);
+            drag(&mut m, &[(560.0, 300.0), (700.0, 420.0), (900.0, 560.0), (1180.0, 700.0)], 10.0);
+            m.moved((1500.0, 200.0), false);
+            m.focused = true;
+            if let Some(sd) = side {
+                m.size_start(sd);
+                // the first key typed replaces the selected number
+                for c in "25".chars() {
+                    m.char_input(c);
+                }
+            }
+            let mut st = State::default();
+            for _ in 0..2 {
+                let mut cx = Cx::new(T * 10.0, false, &g, &mut st);
+                let _ = view::scene(&m, &mut cx, 0, T * 10.0);
+            }
+            let mut cx = Cx::new(T * 10.0, false, &g, &mut st);
+            let sc = view::scene(&m, &mut cx, 0, T * 10.0);
+            let mut surf = crate::gfx::new_surface(sw, sh).expect("surface");
+            view::paint(&g, &icons, &mut surf, &sc, Some(&bg));
+            let px = crate::png::from_surface(&mut surf);
+            crate::png::save_png(&px, &format!("{dir}\\117_size_{name}_{sw}x{sh}.png")).expect("save");
+            // the bar above the box, 3x
+            let img = surf.image_snapshot();
+            let (cx0, cy0, cw, ch) = (540.0, 250.0, 420.0, 60.0);
+            let mut z = crate::gfx::new_surface((cw * 3.0) as i32, (ch * 3.0) as i32).expect("zoom");
+            z.canvas().draw_image_rect_with_sampling_options(
+                &img,
+                Some((&skia_safe::Rect::from_xywh(cx0, cy0, cw, ch), skia_safe::canvas::SrcRectConstraint::Strict)),
+                skia_safe::Rect::from_wh(cw * 3.0, ch * 3.0),
+                skia_safe::SamplingOptions::new(skia_safe::FilterMode::Nearest, skia_safe::MipmapMode::None),
+                &skia_safe::Paint::default(),
+            );
+            let zp = crate::png::from_surface(&mut z);
+            crate::png::save_png(&zp, &format!("{dir}\\117_size_{name}_{sw}x{sh}_bar3x.png")).expect("save");
+        }
+    }
 }

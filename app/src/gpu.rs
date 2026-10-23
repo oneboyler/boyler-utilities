@@ -286,6 +286,13 @@ pub struct GpuChain {
 
 impl GpuChain {
     pub fn new(gpu: &Rc<Gpu>, w: u32, h: u32) -> Result<GpuChain> {
+        Self::with_depth(gpu, w, h, 2, 1)
+    }
+
+    /// Order 117: a chain of `buffers` buffers with up to `latency` frames queued (`new` = 2 / 1). The capture overlay takes
+    /// 3 / 2: at the GPU's idle clocks a frame takes ~4 ms to finish (measured, any content), so with one frame in flight its
+    /// pace was capped near 220 frames a second on a 360 Hz screen.
+    pub fn with_depth(gpu: &Rc<Gpu>, w: u32, h: u32, buffers: u32, latency: u32) -> Result<GpuChain> {
         unsafe {
             let desc = DXGI_SWAP_CHAIN_DESC1 {
                 Width: w.max(1),
@@ -294,7 +301,7 @@ impl GpuChain {
                 Stereo: false.into(),
                 SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
                 BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
-                BufferCount: 2,
+                BufferCount: buffers,
                 Scaling: DXGI_SCALING_STRETCH,
                 SwapEffect: DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL,
                 AlphaMode: DXGI_ALPHA_MODE_PREMULTIPLIED,
@@ -303,7 +310,7 @@ impl GpuChain {
             let sc1 = gpu.factory.CreateSwapChainForComposition(&gpu.queue, &desc, None)?;
             let swap: IDXGISwapChain2 = sc1.cast()?;
             let swap3: IDXGISwapChain3 = sc1.cast()?;
-            swap.SetMaximumFrameLatency(1)?;
+            swap.SetMaximumFrameLatency(latency)?;
             let waitable = swap.GetFrameLatencyWaitableObject();
             let mut surfs = Vec::new();
             for i in 0..desc.BufferCount {

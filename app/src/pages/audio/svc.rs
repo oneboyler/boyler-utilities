@@ -459,12 +459,37 @@ impl Default for Rules {
 
 thread_local! {
     static RULES: RefCell<Rules> = RefCell::new(Rules::default());
+    /// Order 118: the locked input volume (0.0 ... 1.0), None = not locked
+    static MIC_LOCK: RefCell<Option<f32>> = const { RefCell::new(None) };
     #[cfg(windows)]
     static WATCH: RefCell<Option<bu_audio::watch::Watcher>> = const { RefCell::new(None) };
 }
 
 pub fn rules() -> Rules {
     RULES.with(|r| *r.borrow())
+}
+
+/// Order 118: the input volume Windows is not allowed to change (None = not locked).
+pub fn mic_lock() -> Option<f32> {
+    MIC_LOCK.with(|l| *l.borrow())
+}
+
+/// Order 118: locks the default input device at `v` (a whole percent) / unlocks (None): kept, saved (it holds after a restart)
+/// and handed to the running watcher, which puts the volume back at once and whenever it changes.
+pub fn set_mic_lock(v: Option<f32>) {
+    let v = v.map(|v| (v * 100.0).round().clamp(0.0, 100.0) / 100.0);
+    crate::services::try_with(|s| {
+        let p = crate::settings::Scope::Page("aud");
+        let _ = s.store.set_bool(p, "mic_lock", v.is_some());
+        let _ = s.store.set_f64(p, "mic_lock_vol", v.unwrap_or(0.0) as f64);
+    });
+    MIC_LOCK.with(|l| *l.borrow_mut() = v);
+    #[cfg(windows)]
+    WATCH.with(|w| {
+        if let Some(w) = w.borrow().as_ref() {
+            w.set_mic_lock(v);
+        }
+    });
 }
 
 /// The saved switches (settings.cfg, page "aud"), read once at app start (`Page::background`).
@@ -476,6 +501,13 @@ pub fn load_rules() {
     });
     if let Some(r) = r {
         RULES.with(|x| *x.borrow_mut() = r);
+    }
+    let l = crate::services::with(|s| {
+        let p = crate::settings::Scope::Page("aud");
+        s.store.bool_or(p, "mic_lock", false).then(|| s.store.f64_or(p, "mic_lock_vol", 1.0).clamp(0.0, 1.0) as f32)
+    });
+    if let Some(l) = l {
+        MIC_LOCK.with(|x| *x.borrow_mut() = l);
     }
 }
 
@@ -530,6 +562,7 @@ pub fn ensure_watcher(test: bool, read_only: bool) {
                 keep_devices: r.keep,
                 new_apps: r.new_on,
                 new_apps_volume: r.new_vol,
+                mic_lock: mic_lock(),
                 read_only,
             }));
         }

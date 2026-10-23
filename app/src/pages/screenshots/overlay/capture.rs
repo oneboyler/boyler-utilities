@@ -209,8 +209,10 @@ mod tests {
     fn a_typed_size_and_a_monitor_button_capture_exactly_that() {
         let (os, mut c) = cap();
         boxed(&mut c);
-        c.model.size_start();
-        c.model.size_edit = Some("640x360".into());
+        c.model.size_start(super::super::model::Side::W);
+        c.model.size_edit = Some("640".into());
+        c.model.size_start(super::super::model::Side::H);
+        c.model.size_edit = Some("360".into());
         c.model.size_commit(true);
         let Step::Shot(d) = c.apply(Out::Finish(Finish::Copy)).unwrap() else { panic!() };
         assert_eq!((d.image.width, d.image.height), (640, 360));

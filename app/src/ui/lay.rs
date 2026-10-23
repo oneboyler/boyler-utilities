@@ -347,6 +347,17 @@ impl Laid {
         if let Some(f) = filter {
             g.push_filter_in(f, self.subtree_ink(g, i));
         }
+        // Order 116: CSS `filter: blur()` - the box and its subtree into one layer, blurred (bounds = their ink + 3 sigma)
+        let blurred = e.blur > 0.0;
+        if blurred {
+            let ink = self.subtree_ink(g, i);
+            let e3 = (3.0 * e.blur).ceil();
+            let b = sk::Rect::from_ltrb(ink.left - e3, ink.top - e3, ink.right + e3, ink.bottom + e3);
+            match sk::image_filters::blur((e.blur, e.blur), sk::TileMode::Decal, None, None) {
+                Some(f) => g.push_filter_in(f, b),
+                None => g.push_layer_in(1.0, b),
+            }
+        }
         // CSS applies `filter` first, then `opacity`: the filter layer sits inside the opacity layer
         let filtered = !filtered_w && (e.brightness - 1.0).abs() > 1e-4;
         if filtered {
@@ -441,11 +452,15 @@ impl Laid {
                 self.paint_slim_thumb(g, i, &st);
             }
         }
-        if filtered_w {
-            g.pop_filter();
-        }
+        // (the layers close in the reverse order they were opened: brightness, blur, colour filters, opacity)
         if filtered {
             g.pop_layer();
+        }
+        if blurred {
+            g.pop_filter();
+        }
+        if filtered_w {
+            g.pop_filter();
         }
         if layer {
             g.pop_layer();

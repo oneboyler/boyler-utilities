@@ -171,6 +171,12 @@ impl RealOs {
         self.eps.get(id).ok_or_else(|| AudioError::NotFound(id.into()))
     }
 
+    /// A fresh volume control of one device (the watcher registers its volume callback on it; not the cached one).
+    pub(crate) fn endpoint_volume(&self, id: &str) -> Result<IAudioEndpointVolume> {
+        let d = self.device(id)?;
+        unsafe { d.Activate::<IAudioEndpointVolume>(CLSCTX_ALL, None) }.map_err(|e| os_err("IAudioEndpointVolume", e))
+    }
+
     fn policy(&self) -> Result<IPolicyConfig> {
         unsafe { CoCreateInstance(&CLSID_POLICY_CONFIG_CLIENT, None, CLSCTX_ALL) }.map_err(|e| os_err("PolicyConfig", e))
     }

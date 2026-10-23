@@ -39,7 +39,13 @@ impl Scratch {
 
     fn junction(&mut self, link: &Path, target: &Path) {
         assert!(link.starts_with(&self.root) && target.starts_with(&self.root));
-        let st = std::process::Command::new("cmd").args(["/C", "mklink", "/J"]).arg(link).arg(target).output().unwrap();
+        let st = {
+            use std::os::windows::process::CommandExt;
+            let mut c = std::process::Command::new("cmd");
+            c.creation_flags(0x0800_0000);
+            c
+        }
+        .args(["/C", "mklink", "/J"]).arg(link).arg(target).output().unwrap();
         assert!(st.status.success(), "mklink failed: {}", String::from_utf8_lossy(&st.stderr));
         self.links.push(link.to_path_buf());
     }

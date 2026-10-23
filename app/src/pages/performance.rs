@@ -106,7 +106,7 @@ fn gbf(bytes: u64) -> String {
 /// (PIECES_WANTED); only on the user's click.
 fn to_clipboard(text: &str) -> bool {
     use std::io::Write;
-    let Ok(mut c) = std::process::Command::new("clip.exe").stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::null()).spawn() else {
+    let Ok(mut c) = crate::quiet::command("clip.exe").stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::null()).spawn() else {
         return false;
     };
     let mut bytes = vec![0xFF, 0xFE];

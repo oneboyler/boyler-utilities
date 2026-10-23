@@ -2448,7 +2448,7 @@ impl Mouse {
                     let (exe, dir) = (d.join("rawaccel.exe"), d.to_path_buf());
                     crate::offui::spawn("mouse-rawaccel", move || {
                         if exe.is_file() {
-                            let _ = std::process::Command::new(exe).current_dir(dir).spawn();
+                            let _ = crate::quiet::command(exe).current_dir(dir).spawn();
                         }
                     });
                 }
@@ -2577,7 +2577,7 @@ fn open_url(url: &str, test: bool) {
     // Order 047: starting a process holds the thread 10-40 ms: off the menu's thread
     let u = url.to_string();
     crate::offui::spawn("mouse-url", move || {
-        let _ = std::process::Command::new("explorer").arg(u).spawn();
+        let _ = crate::quiet::command("explorer").arg(u).spawn();
     });
 }
 

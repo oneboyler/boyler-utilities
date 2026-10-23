@@ -81,6 +81,7 @@ fn err(what: &str) -> StorageError {
 fn start(exe: PathBuf, dir: PathBuf, drive: ours::Drive, ctl: &ScanControl) -> Result<EverythingListing> {
     use std::os::windows::process::CommandExt;
     const BELOW_NORMAL_PRIORITY_CLASS: u32 = 0x0000_4000;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     // wait for our turn (a Stop ends the wait)
     let turn = loop {
         match SESSION.try_lock() {
@@ -110,7 +111,7 @@ fn start(exe: PathBuf, dir: PathBuf, drive: ours::Drive, ctl: &ScanControl) -> R
         return Err(err(&e.to_string()));
     }
     let spawned = std::process::Command::new(&exe)
-        .creation_flags(BELOW_NORMAL_PRIORITY_CLASS)
+        .creation_flags(BELOW_NORMAL_PRIORITY_CLASS | CREATE_NO_WINDOW)
         .arg("-instance")
         .arg(host::STORAGE_INSTANCE)
         .arg("-startup")

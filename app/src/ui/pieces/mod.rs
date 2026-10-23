@@ -18,6 +18,7 @@ pub mod button;
 pub mod card;
 pub mod dialog;
 pub mod dropdown;
+pub mod eye;
 pub mod fold;
 pub mod group;
 pub mod ibtn;
