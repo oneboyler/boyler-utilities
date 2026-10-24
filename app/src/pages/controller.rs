@@ -127,6 +127,9 @@ enum AW {
 enum Conv {
     /// % shown, Steam's 0-32767 radius written
     Radius,
+    /// % shown, 0..max written: a stick's dead zone / full at on Steam's own scale for its mode (Order 122: 0-32000 for
+    /// joystick modes, `bu_controller::settings::stick_dz_max`) - the % is then the number Steam's Deadzones panel shows
+    Scale(i64),
     /// the number itself
     Raw,
     /// shown / 100 (custom curve shape 1.92 = 192)
@@ -1186,10 +1189,20 @@ impl Open {
 
     /// One value from a control.
     fn put(&mut self, w: W, v: Option<i64>, now: f64) {
-        match Self::layout_change(w, v) {
-            Some(c) => self.write(vec![c], now),
-            None => self.acting = None,
+        let Some(c) = Self::layout_change(w, v) else {
+            self.acting = None;
+            return;
+        };
+        let mut cs = vec![c];
+        // Steam uses (and its panel shows) a stick's dead zone / full at only with Source = Custom; its own default is "this
+        // controller's own" (Order 122) - a number set here turns Custom on in the same write (one undo step)
+        if let W::Stick(side, StickSetting::DeadZone | StickSetting::FullAt) = w {
+            let src = self.view.as_ref().and_then(|v| v.sticks.iter().find(|s| s.side == side)).and_then(|s| sv(&s.settings, StickSetting::DeadZoneSource));
+            if src != Some(2) {
+                cs.extend(Self::layout_change(W::Stick(side, StickSetting::DeadZoneSource), Some(2)));
+            }
         }
+        self.write(cs, now)
     }
 
     fn act_change(w: AW, a: Action) -> Change {
@@ -2200,7 +2213,9 @@ impl Open {
                     if dk == target {
                         let k = &target;
                         if let Some(Ctl::Slider { def, conv, w, step, .. }) = self.ctl.get(k).cloned() {
-                            let raw = if (v - def).abs() < step / 2.0 { None } else { Some(to_raw(v, conv)) };
+                            // the default = no line in the file (Steam's own), except a stick's dead zone / full at: always the
+                            // number itself (Order 122 - with the line gone Steam kept showing its old number)
+                            let raw = if (v - def).abs() < step / 2.0 && !matches!(conv, Conv::Scale(_)) { None } else { Some(to_raw(v, conv)) };
                             self.acting = self.rows.get(k).cloned();
                             self.put(w, raw, now);
                         }
@@ -2362,9 +2377,9 @@ impl Open {
             Ctl::DriftUse(side, dz) => {
                 self.drift = None;
                 self.acting = self.rows.get(&Self::k(&format!("{}.dz", stick_id(side)))).cloned();
-                // like the slider: the default (8 %) = no value in the file
-                let raw = if (dz - 8.0).abs() < 0.5 { None } else { Some(bu_controller::settings::pct_to_radius(dz)) };
-                self.put(W::Stick(side, StickSetting::DeadZone), raw, now);
+                // like the slider: always the number itself, on Steam's scale for the stick's mode (Order 122)
+                let max = self.view.as_ref().and_then(|v| v.sticks.iter().find(|s| s.side == side)).map(|s| bu_controller::settings::stick_dz_max(&s.mode)).unwrap_or(32000);
+                self.put(W::Stick(side, StickSetting::DeadZone), Some(bu_controller::settings::pct_to_dz(dz, max)), now);
             }
             Ctl::Menu { .. } => {
                 self.acting = None;
@@ -2890,9 +2905,20 @@ fn raw_in(v: &PadView, w: W) -> Option<Option<i64>> {
     })
 }
 
-/// A stick's dead zone (inner, outer) in % (Steam's default when not in the file: the drawing's 8 / 100).
+/// A stick's dead zone (inner, outer) in % - the numbers Steam's Deadzones panel shows (Order 122: Steam's own scale for the
+/// stick's mode, and Steam's own values when the file has no line: 0 / 88 % for a joystick, not the drawing's 8 / 100).
 fn stick_dz(s: &StickView) -> (f64, f64) {
-    (sv(&s.settings, StickSetting::DeadZone).map(radius_to_pct).unwrap_or(8.0), sv(&s.settings, StickSetting::FullAt).map(radius_to_pct).unwrap_or(100.0))
+    let max = bu_controller::settings::stick_dz_max(&s.mode);
+    let (di, do_) = bu_controller::settings::stick_dz_default(&s.mode);
+    let pc = |x: StickSetting, d: i64| bu_controller::settings::dz_to_pct(sv(&s.settings, x).unwrap_or(d), max);
+    (pc(StickSetting::DeadZone, di), pc(StickSetting::FullAt, do_))
+}
+
+/// The slider conversion + Steam's own % (dead zone, full at) for a stick's dead zone rows.
+fn stick_dz_conv(s: &StickView) -> (Conv, f64, f64) {
+    let max = bu_controller::settings::stick_dz_max(&s.mode);
+    let (di, do_) = bu_controller::settings::stick_dz_default(&s.mode);
+    (Conv::Scale(max), bu_controller::settings::dz_to_pct(di, max), bu_controller::settings::dz_to_pct(do_, max))
 }
 
 /// `at(e)`: the pointer's distance from the circle's centre in % of its radius (viewBox 136 x 118, centre 68 / 59, R 48).
@@ -2917,6 +2943,7 @@ fn snap(v: f64, step: f64) -> f64 {
 fn to_raw(v: f64, c: Conv) -> i64 {
     match c {
         Conv::Radius => bu_controller::settings::pct_to_radius(v),
+        Conv::Scale(max) => bu_controller::settings::pct_to_dz(v, max),
         Conv::Raw => v.round() as i64,
         Conv::Div100 => (v * 100.0).round() as i64,
         Conv::Unit => v.round() as i64,
@@ -2926,6 +2953,7 @@ fn to_raw(v: f64, c: Conv) -> i64 {
 fn from_raw(r: i64, c: Conv) -> f64 {
     match c {
         Conv::Radius => radius_to_pct(r),
+        Conv::Scale(max) => bu_controller::settings::dz_to_pct(r, max),
         Conv::Raw | Conv::Unit => r as f64,
         Conv::Div100 => r as f64 / 100.0,
     }

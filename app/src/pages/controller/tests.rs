@@ -201,7 +201,7 @@ fn a_slider_writes_once_on_release() {
     t.slide("ls.dz", 0.5);
     let after: Vec<String> = t.writes()[before..].iter().filter(|w| w.contains(r"Steam\steamapps")).cloned().collect();
     assert_eq!(after.len(), 1, "one write of the layout for one drag: {after:?}");
-    let want = bu_controller::settings::pct_to_radius(30.0);
+    let want = bu_controller::settings::pct_to_dz(30.0, 32000);
     assert!(t.rl().contains(&format!("\"deadzone_inner_radius\"\t\t\"{want}\"")), "{}", t.rl());
 }
 
@@ -516,12 +516,12 @@ fn dragging_the_dead_zone_rings() {
     t.ev(Ev::Press(k, 68.0 + 48.0 * 0.77, 59.0, r));
     t.ev(Ev::Drag(k, 68.0 + 48.0 * 0.9, 59.0, r));
     t.ev(Ev::Release(k));
-    let want = bu_controller::settings::pct_to_radius(90.0);
+    let want = bu_controller::settings::pct_to_dz(90.0, 32000);
     assert!(t.rl().contains(&format!("\"deadzone_outer_radius\"		\"{want}\"")), "{}", t.rl());
     // press at the centre: the inner ring (10 %) moves to 4 %
     t.ev(Ev::Press(k, 68.0 + 48.0 * 0.04, 59.0, r));
     t.ev(Ev::Release(k));
-    let want = bu_controller::settings::pct_to_radius(4.0);
+    let want = bu_controller::settings::pct_to_dz(4.0, 32000);
     assert!(t.rl().contains(&format!("\"deadzone_inner_radius\"		\"{want}\"")), "{}", t.rl());
 }
 
@@ -563,10 +563,10 @@ fn a_stick_mode_the_list_doesnt_have_is_never_rewritten() {
 #[test]
 fn the_dead_zone_stays_under_full_at() {
     let mut t = T::new();
-    t.click_part(Pid::Stick(Side::Left)); // dead zone 10 %, full at 78 %
+    t.click_part(Pid::Stick(Side::Left)); // dead zone 10 %, full at 80 % (Steam's numbers for 3357 / 25602)
     t.slide("ls.full", 0.0); // the slider's bottom: 40 %
-    t.slide("ls.dz", 1.0); // 60 % wanted, kept at "full at" - 5 (full at as read back from the file: 13107 = 40.0006 %)
-    let want = bu_controller::settings::pct_to_radius(bu_controller::settings::radius_to_pct(13107) - 5.0);
+    t.slide("ls.dz", 1.0); // 60 % wanted, kept at "full at" - 5 (Steam's scale, Order 122: 40 % = 12800 exactly)
+    let want = bu_controller::settings::pct_to_dz(35.0, 32000);
     assert!(t.rl().contains(&format!("\"deadzone_inner_radius\"\t\t\"{want}\"")), "{}", t.rl());
 }
 
@@ -1145,7 +1145,7 @@ fn check_stick_drift_with_a_made_up_drift() {
     // "Use it": a normal dead-zone change, undoable
     let before = t.left_stick();
     t.click(Open::k("ls.drift.use"));
-    let want = bu_controller::settings::pct_to_radius(6.0);
+    let want = bu_controller::settings::pct_to_dz(6.0, 32000);
     assert!(t.rl().contains(&format!("\"deadzone_inner_radius\"\t\t\"{want}\"")), "{}", t.rl());
     assert!(t.o().drift.is_none());
     assert!(matches!(t.o().ctl.get(&sub(Open::k("ls.dz"), "undo")), Some(Ctl::Undo)), "Undo next to the dead zone");
@@ -1733,7 +1733,7 @@ fn controller_settings_dead_zones_write_the_shown_games_layout_with_a_backup() {
     let before = t.writes().len();
     // 0..60 %: half the track = 30 %
     t.slide("pf.lsdz", 0.5);
-    let want = bu_controller::settings::pct_to_radius(30.0);
+    let want = bu_controller::settings::pct_to_dz(30.0, 32000);
     assert_eq!(t.stick_dz(Side::Left), Some(want), "the left stick's dead zone in the layout");
     assert_eq!(t.stick_dz(Side::Right), r0, "the right stick is untouched");
     assert_ne!(l0, Some(want));
@@ -1744,7 +1744,7 @@ fn controller_settings_dead_zones_write_the_shown_games_layout_with_a_backup() {
     assert_eq!(t.o().svc_do(|s| s.fake_text(&last)).unwrap().as_deref(), Some(orig.as_str()));
     // the right stick has its own row
     t.slide("pf.rsdz", 0.25);
-    assert_eq!(t.stick_dz(Side::Right), Some(bu_controller::settings::pct_to_radius(15.0)));
+    assert_eq!(t.stick_dz(Side::Right), Some(bu_controller::settings::pct_to_dz(15.0, 32000)));
     assert_eq!(t.stick_dz(Side::Left), Some(want));
     // the same change is in the stick's own window (one value, two places) and is undoable with its words
     t.undo();
@@ -1914,4 +1914,141 @@ fn put_mine_back_in_another_action_set_is_refused() {
     assert_eq!(t.writes().len(), n, "nothing written");
     assert!(t.toast().starts_with("Switch back to"), "{}", t.toast());
     assert!(t.o().chk.is_some(), "the watch stays");
+}
+
+// ------------------------------------------------------------------------------------------------ Order 122: = Steam's panel
+
+/// Every text the part's window (the popup layer) draws.
+fn page_texts(t: &mut T) -> Vec<String> {
+    t.popup_laid().debug_boxes().into_iter().filter_map(|b| b.4.strip_prefix("text:").map(str::to_string)).collect()
+}
+
+/// His friend: "the numbers he was changing inside of boyler utilities for deadzone weren't matching the one inside his steam
+/// settings". Steam's panel shows round(value / 32000 x 100) for a joystick, and its own 0 / 88 % when the file has no line.
+#[test]
+fn the_stick_window_shows_steams_numbers() {
+    let mut t = T::new();
+    // the sample: left 3357 / 25602 (Steam: 10 / 80 %, the old scale said 10 / 78), right 3395 and no full at (Steam: 11 / 88)
+    t.click_part(Pid::Stick(Side::Left));
+    let tx = page_texts(&mut t);
+    assert!(tx.iter().any(|s| s == "80 %") && !tx.iter().any(|s| s == "78 %"), "{tx:?}");
+    t.click_part(Pid::Stick(Side::Right));
+    let tx = page_texts(&mut t);
+    assert!(tx.iter().any(|s| s == "11 %") && tx.iter().any(|s| s == "88 %"), "{tx:?}");
+    let right = |t: &mut T| t.o().view.as_ref().unwrap().sticks.iter().find(|s| s.side == Side::Right).unwrap().clone();
+    let (i, o) = stick_dz(&right(&mut t));
+    assert_eq!((i.round(), o.round()), (11.0, 88.0), "no full at line = Steam's own 88 %, not 100");
+    // no dead zone line at all: Steam's own 0 %
+    steam_writes(&mut t, vec![Change::StickSetting { side: Side::Right, setting: StickSetting::DeadZone, value: None }]);
+    assert_eq!(stick_dz(&right(&mut t)).0, 0.0);
+}
+
+/// A number set here is the number Steam shows: written on Steam's scale, always as a number (the old 8 % "default" removed
+/// the line and Steam kept its own 16), with Source = Custom (Steam ignores the numbers otherwise).
+#[test]
+fn a_dead_zone_set_here_is_the_number_steam_shows() {
+    let mut t = T::new();
+    steam_writes(&mut t, vec![Change::StickSetting { side: Side::Right, setting: StickSetting::DeadZoneSource, value: None }]);
+    t.click_part(Pid::Stick(Side::Right));
+    let rs = |t: &mut T| t.o().view.as_ref().unwrap().sticks.iter().find(|s| s.side == Side::Right).unwrap().clone();
+    let g = |s: &bu_controller::settings::StickView, k| sv(&s.settings, k);
+    for frac in [0.0f32, 0.4 / 3.0, 0.8 / 3.0, 0.5] {
+        // 0..60 %: 0 / 8 / 16 / 30 %
+        t.slide("rs.dz", frac);
+        let p = (60.0 * frac as f64).round();
+        let s = rs(&mut t);
+        let raw = g(&s, StickSetting::DeadZone).expect("always a number in the file");
+        assert_eq!((raw as f64 / 32000.0 * 100.0).round(), p, "Steam shows {p} %");
+        assert_eq!(g(&s, StickSetting::DeadZoneSource), Some(2), "Custom");
+    }
+    // full at 88 % (Steam's own) is still written as a number
+    t.slide("rs.full", 0.8);
+    let s = rs(&mut t);
+    assert_eq!(g(&s, StickSetting::FullAt), Some(28160), "88 % = 28160 / 32000");
+}
+
+#[test]
+fn the_dead_zone_picture_follows_shape_and_source() {
+    let w = |shp, src| panel::Wells { inner: 16.0, outer: 88.0, curve: 0, shape: 1.0, sens: 100.0, anti: 0.0, shp, src, own: Some(5.0) };
+    // Circle: a disc; Cross / Square: only where both bars cross is there no output at all
+    assert!(w(1, 2).in_dead(0.1, 0.1) && !w(1, 2).in_dead(0.15, 0.15));
+    assert!(w(2, 2).in_dead(0.15, 0.15) && !w(2, 2).in_dead(0.15, 0.5));
+    assert!(w(0, 2).in_dead(0.15, 0.15) && !w(0, 2).in_dead(0.5, 0.0));
+    // the controller's own dead zone (Source 1) and none (0)
+    assert!(w(1, 1).in_dead(0.04, 0.0) && !w(1, 1).in_dead(0.1, 0.0));
+    assert!(!w(1, 0).in_dead(0.01, 0.0));
+}
+
+/// Source "this controller's own": the stick's dead zone from the controller's file; -1 (his DualSense Edge's, Oct 24) =
+/// Steam's default for the type, drawn like Steam's picture on the 0-32000 scale (10000 = 31.25 %), not 0.
+#[test]
+fn the_controllers_own_dead_zone_is_steams_for_minus_one() {
+    let p = |l: &str, r: &str| {
+        let text = format!("\"ControllerPersonalization\"
+{{
+	\"stick_left_deadzone\"		\"{l}\"
+	\"stick_right_deadzone\"		\"{r}\"
+}}
+");
+        bu_controller::Prefs::parse("X", &text).unwrap()
+    };
+    let both = p("-1", "3072");
+    assert_eq!(panel::own_dz(Some(&both), Side::Left, PadKind::DualSenseEdge), Some(31.25));
+    assert_eq!(panel::own_dz(Some(&both), Side::Left, PadKind::DualShock4), Some(4096.0 * 100.0 / 32000.0));
+    assert_eq!(panel::own_dz(Some(&both), Side::Right, PadKind::DualSenseEdge), Some(9.6));
+    assert_eq!(panel::own_dz(None, Side::Left, PadKind::DualSense), None, "no file: none (Steam: 0)");
+    // the response follows the dead zone the stick really has (Source), like the picture
+    let w = |src| panel::Wells { inner: 18.0, outer: 88.0, curve: 0, shape: 1.0, sens: 100.0, anti: 0.0, shp: 1, src, own: Some(5.0) };
+    assert_eq!(panel::curve_f(&w(2))(10.0), 0.0, "Custom: 18 % dead");
+    assert!(panel::curve_f(&w(1))(10.0) > 0.0, "the controller's own 5 %");
+    assert!(panel::curve_f(&w(0))(1.0) > 0.0, "none");
+}
+
+/// Pictures to LOOK at (BU_PIC_OUT): the stick window at dead zone 16 % / full at 88 % for Circle, Cross and Square
+/// (Steam's screenshot: Custom 16 / 88), at 1x and 2x, + Source "this controller's own".
+#[test]
+fn order122_pictures() {
+    let Ok(dir) = std::env::var("BU_PIC_OUT") else { return };
+    unsafe {
+        let _ = windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_MULTITHREADED);
+    }
+    let icons = crate::icons::Icons::new();
+    let shot = |t: &mut T, name: &str, scale: f32| {
+        t.now += 2000.0;
+        t.g = Gfx::new(scale);
+        let mut cx = Cx::new(t.now, false, &t.g, &mut t.st).for_page("pad");
+        let kids = t.p.build(&mut cx);
+        let pop = t.p.popup(&mut cx);
+        drop(cx);
+        let page = crate::ui::lay::Laid::new(&t.g, El::block().w(WIN_W).pad(2.0, 26.0, 18.0, 26.0).children(kids), WIN_W, None);
+        let (w, h) = (WIN_W, crate::ui::WIN_H);
+        let mut s = crate::gfx::new_surface((w * scale) as i32, (h * scale) as i32).unwrap();
+        t.g.begin(s.canvas());
+        t.g.fill_rect(0.0, 0.0, w, h, crate::gfx::Rgba::rgb(28, 30, 38));
+        page.paint(&t.g, &icons, 0.0, crate::ui::PAGE_TOP, None);
+        if let Some(p) = pop {
+            let l = crate::ui::lay::Laid::new(&t.g, El::block().w(w).h(h).child(p), w, Some(h));
+            l.paint(&t.g, &icons, 0.0, 0.0, None);
+        }
+        t.g.end();
+        let px = crate::png::from_surface(&mut s);
+        crate::png::save_png(&px, &format!("{dir}/{name}.png")).expect("save");
+    };
+    for (shape, name) in [(1, "circle"), (0, "cross"), (2, "square")] {
+        let mut t = T::new();
+        steam_writes(&mut t, vec![
+            Change::StickSetting { side: Side::Left, setting: StickSetting::DeadZone, value: Some(5120) },
+            Change::StickSetting { side: Side::Left, setting: StickSetting::FullAt, value: Some(28160) },
+            Change::StickSetting { side: Side::Left, setting: StickSetting::DeadZoneShape, value: Some(shape) },
+            Change::StickSetting { side: Side::Left, setting: StickSetting::DeadZoneSource, value: Some(2) },
+        ]);
+        t.click_part(Pid::Stick(Side::Left));
+        t.o().lv.borrow_mut().ls = (0.5, -0.3);
+        shot(&mut t, &format!("122_{name}_16_88_1x"), 1.0);
+        shot(&mut t, &format!("122_{name}_16_88_2x"), 2.0);
+    }
+    let mut t = T::new();
+    steam_writes(&mut t, vec![Change::StickSetting { side: Side::Left, setting: StickSetting::DeadZoneSource, value: Some(1) }]);
+    t.click_part(Pid::Stick(Side::Left));
+    shot(&mut t, "122_controllers_own_2x", 2.0);
 }

@@ -10,7 +10,7 @@
 fn main() {
     use bu_controller::os::{PadOs, PadSource};
     use bu_controller::real::{RealPads, RealSteam};
-    use bu_controller::settings::{radius_to_pct, StickSetting};
+    use bu_controller::settings::{dz_to_pct, stick_dz_default, stick_dz_max, StickSetting};
     use bu_controller::{ControllerService, PadKind, Side};
 
     let mask = |s: &str| if s.len() > 4 { format!("{}…{}", &s[..2], &s[s.len() - 2..]) } else { "…".into() };
@@ -53,13 +53,20 @@ fn main() {
                                     let v = o.layout.pad_view(0, kind);
                                     for st in &v.sticks {
                                         let g = |k| st.settings.iter().find(|(x, _)| *x == k).and_then(|(_, v)| *v);
-                                        let pc = |v: Option<i64>| v.map(|r| format!("{:.0} %", radius_to_pct(r))).unwrap_or_else(|| "Steam's".into());
+                                        // the numbers Steam's Deadzones panel shows (Order 122: its own scale and defaults)
+                                        let (max, (d_in, d_out)) = (stick_dz_max(&st.mode), stick_dz_default(&st.mode));
+                                        let pc = |v: Option<i64>, d: i64| match v {
+                                            Some(r) => format!("{:.0} % ({r})", dz_to_pct(r, max).round()),
+                                            None => format!("{:.0} % (Steam's own, {d})", dz_to_pct(d, max).round()),
+                                        };
                                         println!(
-                                            "      {} stick: {} · dead zone {} · full at {}",
+                                            "      {} stick: {} · dead zone {} · full at {} · shape {:?} · source {:?}",
                                             if st.side == Side::Left { "left" } else { "right" },
                                             st.mode.label(),
-                                            pc(g(StickSetting::DeadZone)),
-                                            pc(g(StickSetting::FullAt))
+                                            pc(g(StickSetting::DeadZone), d_in),
+                                            pc(g(StickSetting::FullAt), d_out),
+                                            g(StickSetting::DeadZoneShape),
+                                            g(StickSetting::DeadZoneSource)
                                         );
                                     }
                                     let remapped: Vec<String> = v

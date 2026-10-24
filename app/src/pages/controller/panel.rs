@@ -14,13 +14,13 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use bu_controller::layout::Press;
-use bu_controller::settings::{radius_to_pct, CURVES, DZ_SHAPES, DZ_SOURCES, FLICK_SNAPS, GYRO_AXES, GYRO_BUTTONS, HAPTICS, HAPTICS_GROUP};
-use bu_controller::{Action, ButtonId, GyroSetting, PressSetting, Side, StickMode, StickSetting, TouchMode, TouchSetting, TriggerSetting};
+use bu_controller::settings::{radius_to_pct, CURVES, DZ_SHAPES, DZ_SHAPE_DEFAULT, DZ_SOURCES, DZ_SOURCE_DEFAULT, TRIGGER_DZ_DEFAULT, FLICK_SNAPS, GYRO_AXES, GYRO_BUTTONS, HAPTICS, HAPTICS_GROUP};
+use bu_controller::{Action, ButtonId, GyroSetting, PrefSetting, PressSetting, Side, StickMode, StickSetting, TouchMode, TouchSetting, TriggerSetting};
 use taffy::style::AlignItems;
 
 use super::look::{self, ActShow};
 use super::pic::Pid;
-use super::{fmt, from_raw, gyro_mode_v, show, stick_dz, sv, touch_mode_v, Back, Conv, Ctl, Drift, Fmt, Lv, Open, AW, DRIFT_MS, LW, PANEL_IN, W};
+use super::{fmt, from_raw, gyro_mode_v, show, stick_dz, stick_dz_conv, sv, touch_mode_v, Back, Conv, Ctl, Drift, Fmt, Lv, Open, AW, DRIFT_MS, LW, PANEL_IN, W};
 use crate::gfx::{Font, Rgba};
 use crate::ui::cx::Cx;
 use crate::ui::el::{idx, lh, sub, El, Key};
@@ -366,16 +366,20 @@ impl Open {
         let shape = s(StickSetting::CurveShape).map(|r| r as f64 / 100.0).unwrap_or(1.0);
         let sens = s(StickSetting::Sensitivity).map(|r| r as f64).unwrap_or(100.0);
         let anti = s(StickSetting::AntiDeadZone).map(radius_to_pct).unwrap_or(0.0);
-        let shp = s(StickSetting::DeadZoneShape).unwrap_or(1);
+        // Steam's own shape / source when the file has none: Circle, this controller's own (Order 122)
+        let shp = s(StickSetting::DeadZoneShape).unwrap_or(DZ_SHAPE_DEFAULT);
+        let src_v = s(StickSetting::DeadZoneSource).unwrap_or(DZ_SOURCE_DEFAULT);
+        let (conv, def_in, def_out) = stick_dz_conv(&v);
+        let own = own_dz(self.pref(), side, self.kind);
         let live = !self.frozen && (self.fake || self.live.is_some());
         let wk = Self::k(&format!("{n}.well"));
         self.reg(wk, Ctl::Well { inner: ik, outer: ok, at: (inner, outer) });
-        let wells = wells(cx, wk, Wells { inner, outer, curve, shape, sens, anti, shp }, self.lv.clone(), side, live);
-        let dz = self.r_slider_in(cx, PANEL, &format!("{n}.dz"), "Dead zone", (0.0, 60.0, 1.0), 8.0, Conv::Radius, Fmt::Pct, W::Stick(side, StickSetting::DeadZone), s(StickSetting::DeadZone), false, (0.0, outer - 5.0));
-        let full = self.r_slider_in(cx, PANEL, &format!("{n}.full"), "Full at", (40.0, 100.0, 1.0), 100.0, Conv::Radius, Fmt::Pct, W::Stick(side, StickSetting::FullAt), s(StickSetting::FullAt), false, (inner + 5.0, 100.0));
-        let shape_of = |r: Option<i64>| DZ_SHAPES.iter().position(|(v, _)| *v == r.unwrap_or(1));
+        let wells = wells(cx, wk, Wells { inner, outer, curve, shape, sens, anti, shp, src: src_v, own }, self.lv.clone(), side, live);
+        let dz = self.r_slider_in(cx, PANEL, &format!("{n}.dz"), "Dead zone", (0.0, 60.0, 1.0), def_in, conv, Fmt::Pct, W::Stick(side, StickSetting::DeadZone), s(StickSetting::DeadZone), false, (0.0, outer - 5.0));
+        let full = self.r_slider_in(cx, PANEL, &format!("{n}.full"), "Full at", (40.0, 100.0, 1.0), def_out, conv, Fmt::Pct, W::Stick(side, StickSetting::FullAt), s(StickSetting::FullAt), false, (inner + 5.0, 100.0));
+        let shape_of = |r: Option<i64>| DZ_SHAPES.iter().position(|(v, _)| *v == r.unwrap_or(DZ_SHAPE_DEFAULT));
         let shp_row = self.r_seg(cx, PANEL, &format!("{n}.shape"), "Shape", &["Circle", "Cross", "Square"], &[Some(1), Some(0), Some(2)], s(StickSetting::DeadZoneShape), &shape_of, W::Stick(side, StickSetting::DeadZoneShape), false);
-        let src = self.r_menu(cx, PANEL, &format!("{n}.src"), "Source", Self::choice(DZ_SOURCES), s(StickSetting::DeadZoneSource), Some(2), W::Stick(side, StickSetting::DeadZoneSource), 170.0, false);
+        let src = self.r_menu(cx, PANEL, &format!("{n}.src"), "Source", Self::choice(DZ_SOURCES), s(StickSetting::DeadZoneSource), Some(DZ_SOURCE_DEFAULT), W::Stick(side, StickSetting::DeadZoneSource), 170.0, false);
         let drift = self.r_drift(cx, side, stick_dz(&v).0.round());
         let dz_sec = look::psec("Dead zone", 0.0, vec![wells, dz, full, shp_row, src, drift]);
         let adz = vec![
@@ -453,8 +457,8 @@ impl Open {
         let pull_sec = look::psec_first("Pull", vec![mode, at_row, bar, click, soft]);
         let curves: Vec<(i64, &str)> = CURVES.iter().filter(|(v, _)| *v != 5).cloned().collect();
         let dz = vec![
-            self.r_slider(cx, PANEL, &format!("{n}.dz"), "Dead zone", (0.0, 40.0, 1.0), 0.0, Conv::Radius, Fmt::Pct, W::Trig(side, TriggerSetting::DeadZone), s(TriggerSetting::DeadZone), false),
-            self.r_slider(cx, PANEL, &format!("{n}.full"), "Full at", (50.0, 100.0, 1.0), 100.0, Conv::Radius, Fmt::Pct, W::Trig(side, TriggerSetting::FullAt), s(TriggerSetting::FullAt), false),
+            self.r_slider(cx, PANEL, &format!("{n}.dz"), "Dead zone", (0.0, 40.0, 1.0), radius_to_pct(TRIGGER_DZ_DEFAULT.0), Conv::Radius, Fmt::Pct, W::Trig(side, TriggerSetting::DeadZone), s(TriggerSetting::DeadZone), false),
+            self.r_slider(cx, PANEL, &format!("{n}.full"), "Full at", (50.0, 100.0, 1.0), radius_to_pct(TRIGGER_DZ_DEFAULT.1), Conv::Radius, Fmt::Pct, W::Trig(side, TriggerSetting::FullAt), s(TriggerSetting::FullAt), false),
             self.r_menu(cx, PANEL, &format!("{n}.curve"), "Curve", Self::choice(&curves), s(TriggerSetting::Curve), Some(0), W::Trig(side, TriggerSetting::Curve), 120.0, false),
         ];
         let dz = Self::r_sec("Dead zone & curve", dz);
@@ -545,11 +549,45 @@ pub(super) struct Wells {
     pub sens: f64,
     pub anti: f64,
     pub shp: i64,
+    /// Steam's "Source" (`deadzone_enable_type`): 2 Custom, 1 this controller's own, 0 none
+    pub src: i64,
+    /// the controller's own dead zone in % (Source 1): its file's value or Steam's default for -1 ([`own_dz`])
+    pub own: Option<f64>,
+}
+
+impl Wells {
+    /// The dead zone the stick really has (%): Custom = the layout's, the controller's own = its file's (unknown = 0), none = 0.
+    fn dead(&self) -> f64 {
+        match self.src {
+            2 => self.inner,
+            1 => self.own.unwrap_or(0.0),
+            _ => 0.0,
+        }
+    }
+
+    /// No output at all at stick position (x, y) (-1..1): inside the circle (Circle), inside both bars (Cross / Square).
+    pub(super) fn in_dead(&self, x: f64, y: f64) -> bool {
+        let d = self.dead() / 100.0;
+        match self.shp {
+            0 | 2 => x.abs() <= d && y.abs() <= d,
+            _ => x.hypot(y) <= d,
+        }
+    }
+}
+
+/// The controller's own dead zone of a stick in % of the reach (Source "this controller's own"), as Steam's picture draws it:
+/// its `preferences_<serial>.vdf` value on the joystick's 0-32000 scale whatever the stick's mode (Steam only draws it for the
+/// joystick modes), -1 = Steam's default for the controller type (Order 122); no file / no line = none.
+pub(super) fn own_dz(p: Option<&bu_controller::Prefs>, side: Side, kind: bu_controller::PadKind) -> Option<f64> {
+    use bu_controller::settings::{dz_to_pct, own_dz_default, stick_dz_max};
+    let k = if side == Side::Left { PrefSetting::LeftStickDeadZone } else { PrefSetting::RightStickDeadZone };
+    let raw: i64 = p?.get(k)?.trim().parse().ok()?;
+    Some(dz_to_pct(if raw < 0 { own_dz_default(kind) } else { raw }, stick_dz_max(&StickMode::Joystick)))
 }
 
 /// `curveF(s)`: the output % for a push % (Steam's curve ids: Linear 0, Aggressive 1, Relaxed 2, Wide 3, Extra wide 4, Custom 5
 /// with the drawing's exponents `CEXP{linear:1,relaxed:1.5,aggr:.6,wide:2,xwide:2.6}`).
-fn curve_f(w: &Wells) -> impl Fn(f64) -> f64 + '_ {
+pub(super) fn curve_f(w: &Wells) -> impl Fn(f64) -> f64 + '_ {
     let e = match w.curve {
         1 => 0.6,
         2 => 1.5,
@@ -558,11 +596,13 @@ fn curve_f(w: &Wells) -> impl Fn(f64) -> f64 + '_ {
         5 => w.shape,
         _ => 1.0,
     };
+    // the dead zone the stick really has (its Source, Order 122), like the picture
+    let inner = w.dead();
     move |x: f64| {
-        if x <= w.inner {
+        if x <= inner {
             return 0.0;
         }
-        let t = ((x - w.inner) / (w.outer - w.inner).max(1.0)).clamp(0.0, 1.0);
+        let t = ((x - inner) / (w.outer - inner).max(1.0)).clamp(0.0, 1.0);
         (w.anti + (100.0 - w.anti) * t.powf(e) * w.sens / 100.0).min(100.0)
     }
 }
@@ -584,37 +624,51 @@ pub(super) fn wells(cx: &mut Cx, key: Key, w: Wells, src: Rc<RefCell<Lv>>, side:
     let (inner, outer, shp) = (w.inner as f32, w.outer as f32, w.shp);
     let (src_dz, src_cv, src_cap) = (src.clone(), src.clone(), src);
     let well = |e: El| e.size(col_w, h).radius(9.0).bg(WELL()).inset(&[sh(0.0, 0.0, 0.0, 0.5, HAIR())]).clip();
-    // the dead zone circle (W 136, H 118, centre 68 / 59, R 48)
+    // the dead zone picture = Steam's Deadzones picture (Order 122; its UI code, read-only): dark blue = full output (the
+    // whole reach), light blue = the output ramp (up to "Full at"), grey = no output (the dead zone) - drawn in that order.
+    // Circle: three discs. Square: the two blue areas are squares and the dead zone is a cross reaching the square's edge.
+    // Cross: blue discs, the dead zone a cross cut to the disc. Source "this controller's own": no ramp, the controller's own
+    // dead zone (Steam's "default" picture); "none": the ramp to the edge, no dead zone. (W 136, H 118, centre 68 / 59, R 48)
     let mut dz = El::paint(move |g, (x, y, _, _)| {
+        use skia_safe as sk;
         let lp = src_dz.borrow().stick(side);
-        let inside = (lp.0 as f64).hypot(lp.1 as f64) * 100.0 <= w.inner;
+        let inside = w.in_dead(lp.0 as f64, lp.1 as f64);
         let t0 = g.transform();
         g.set_transform(&(windows_numerics::Matrix3x2 { M11: s, M12: 0.0, M21: 0.0, M22: s, M31: x, M32: y } * t0));
         let (cx0, cy0, rr) = (68.0f32, 59.0f32, 48.0f32);
-        g.line(cx0 - rr, cy0, cx0 + rr, cy0, 1.0, HAIR(), false);
-        g.line(cx0, cy0 - rr, cx0, cy0 + rr, 1.0, HAIR(), false);
-        g.stroke_geom_ex(&skia_safe::Path::circle((cx0, cy0), rr, None), 1.0, DASH(), false, true, 1.0);
-        // the outer ring (dashed --acc)
-        let ro = rr * outer / 100.0;
-        {
-            use skia_safe as sk;
-            let mut p = sk::Paint::new(ACC().c4(), None);
-            p.set_anti_alias(true).set_style(sk::PaintStyle::Stroke).set_stroke_width(1.2);
-            p.set_path_effect(sk::PathEffect::dash(&[3.0, 3.0], 0.0));
-            g.cv().draw_circle((cx0, cy0), ro, &p);
-        }
-        // the inner shape (.dzi: fill --ctl-h, stroke --fg3)
-        let ri = (rr * inner / 100.0).max(0.01);
-        let path = match shp {
-            2 => g.rr_path(cx0 - ri, cy0 - ri, 2.0 * ri, 2.0 * ri, 2.0),
-            0 => {
-                let d = format!("M{} {}H{}V{}H{}ZM{} {}H{}V{}H{}Z", cx0 - rr, cy0 - ri, cx0 + rr, cy0 + ri, cx0 - rr, cx0 - ri, cy0 - rr, cx0 + ri, cy0 + rr, cx0 - ri);
-                g.path(&d)
-            }
-            _ => skia_safe::Path::circle((cx0, cy0), ri, None),
+        // the grey is Steam's own (`VisualizerColorInnerDZ` #67707b), solid like Steam's - the see-through hover grey read as
+        // a lighter blue over the ramp
+        let (full, ramp, none) = (ACC().mix(Rgba(0.0, 0.0, 0.0, 1.0), 0.42), ACC().mix(Rgba(1.0, 1.0, 1.0, 1.0), 0.38), Rgba::rgb(103, 112, 123));
+        let square = shp == 2;
+        let zone = |r: f32| if square { sk::Path::rect(sk::Rect::from_xywh(cx0 - r, cy0 - r, 2.0 * r, 2.0 * r), None) } else { sk::Path::circle((cx0, cy0), r, None) };
+        g.fill_geom(&zone(rr), full);
+        let (ro, ri) = match w.src {
+            2 => (rr * (outer / 100.0).clamp(0.0, 1.0), rr * (inner / 100.0).clamp(0.0, 1.0)),
+            1 => (0.0, rr * (w.own.unwrap_or(0.0) as f32 / 100.0).clamp(0.0, 1.0)),
+            _ => (rr, 0.0),
         };
-        g.fill_geom(&path, crate::ui::CTL_H());
-        g.stroke_geom_ex(&path, 1.0, FG3(), false, true, 1.0);
+        if ro > 0.0 {
+            g.fill_geom(&zone(ro), ramp);
+        }
+        if ri > 0.0 {
+            let dead = match shp {
+                // Steam's cross: bars `ri` wide each side, reaching the edge
+                0 | 2 => {
+                    let (l, r, t, b) = (cx0 - rr, cx0 + rr, cy0 - rr, cy0 + rr);
+                    let (il, ir, it, ib) = (cx0 - ri, cx0 + ri, cy0 - ri, cy0 + ri);
+                    g.path(&format!("M{l} {it}H{il}V{t}H{ir}V{it}H{r}V{ib}H{ir}V{b}H{il}V{ib}H{l}Z"))
+                }
+                _ => sk::Path::circle((cx0, cy0), ri, None),
+            };
+            g.cv().save();
+            if shp == 0 {
+                g.cv().clip_path(&sk::Path::circle((cx0, cy0), rr, None), sk::ClipOp::Intersect, true);
+            }
+            g.fill_geom(&dead, none);
+            g.cv().restore();
+        }
+        // the reach's edge: one hairline
+        g.stroke_geom_ex(&zone(rr), 1.0, HAIR(), false, true, 1.0);
         // the live stick: line + dot (green outside the dead zone, a ring inside)
         let (dx, dy) = (cx0 + lp.0 * rr, cy0 + lp.1 * rr);
         g.line(cx0, cy0, dx, dy, 1.0, ACC().mul_a(0.45), false);
@@ -646,7 +700,7 @@ pub(super) fn wells(cx: &mut Cx, key: Key, w: Wells, src: Rc<RefCell<Lv>>, side:
     // Order 045: `h('div',{class:'pwl dz','data-tip':'The dot is your stick, live · drag the inner ring = dead zone · …'})`
     let dz_well = well(El::block())
         .key(key)
-        .tip("The dot is your stick, live \u{b7} drag the inner ring = dead zone \u{b7} the dashed ring = where it reaches full")
+        .tip("The dot is your stick, live \u{b7} grey = no output (dead zone) \u{b7} light blue = output ramps up \u{b7} dark blue = full output \u{b7} drag an edge to change it")
         .cursor(crate::ui::el::Cursor::Grab)
         .child(dz)
         .child(live_tag);
@@ -661,7 +715,7 @@ pub(super) fn wells(cx: &mut Cx, key: Key, w: Wells, src: Rc<RefCell<Lv>>, side:
         let pre = "Your stick: ";
         g.text(pre, f105, x, y, cap_lh, FG3(), Align::Left, 0.0);
         g.text(&format!("{} %", (mag.min(1.0) * 100.0).round()), Font::new(10.5, 600).tnum(), x + g.text_width(pre, f105), y, cap_lh, FG2(), Align::Left, 0.0);
-        let right = if mag * 100.0 <= w.inner { "in the dead zone".to_string() } else { format!("out \u{2192} {} %", curve_f(&w)((mag * 100.0).min(100.0)).round()) };
+        let right = if w.in_dead(lp.0 as f64, lp.1 as f64) { "in the dead zone".to_string() } else { format!("out \u{2192} {} %", curve_f(&w)((mag * 100.0).min(100.0)).round()) };
         g.text(&right, f105, x + bw, y, cap_lh, FG3(), Align::Right, 0.0);
     })
     .no_hit()
@@ -786,11 +840,11 @@ pub(super) fn dead_zone_rows(o: &mut Open, cx: &mut Cx) -> Vec<El> {
     for (side, id, label) in [(Side::Left, "pf.lsdz", "Left stick dead zone"), (Side::Right, "pf.rsdz", "Right stick dead zone")] {
         let v = o.view.as_ref().and_then(|v| v.sticks.iter().find(|s| s.side == side)).cloned();
         let dead = v.is_none();
-        let (raw, outer) = match &v {
-            Some(v) => (sv(&v.settings, StickSetting::DeadZone), stick_dz(v).1),
-            None => (None, 100.0),
+        let (raw, outer, (conv, def, _)) = match &v {
+            Some(v) => (sv(&v.settings, StickSetting::DeadZone), stick_dz(v).1, stick_dz_conv(v)),
+            None => (None, 100.0, (Conv::Scale(32000), 0.0, 88.0)),
         };
-        let el = o.r_slider_in(cx, DLG, id, label, (0.0, 60.0, 1.0), 8.0, Conv::Radius, Fmt::Pct, W::Stick(side, StickSetting::DeadZone), raw, dead, (0.0, outer - 5.0));
+        let el = o.r_slider_in(cx, DLG, id, label, (0.0, 60.0, 1.0), def, conv, Fmt::Pct, W::Stick(side, StickSetting::DeadZone), raw, dead, (0.0, outer - 5.0));
         // the change log / undo words of this row
         let k = Open::k(id);
         if let Some(e) = o.rows.get_mut(&k) {

@@ -451,6 +451,54 @@ pub fn pct_to_radius(pct: f64) -> i64 {
     (pct.clamp(0.0, 100.0) * 32767.0 / 100.0).round() as i64
 }
 
+/// Steam's own top value of a stick's "Dead zone" / "Full at" (`deadzone_inner_radius` / `deadzone_outer_radius`) in `mode`.
+/// Measured Oct 24 (Order 122, read-only) in Steam's settings table (steamclient64.dll: every mode declares each setting with
+/// value / default / min / max): the joystick, camera and mouse-joystick classes declare both 0–32000 - NOT 0–32767 - and flick
+/// stick 0–80. Steam's Deadzones panel shows `round(value / max × 100)` (its UI code: the compound slider's label is
+/// `Math.round((v - int_min) / (int_max - int_min) × 100)`, both sliders with the dead zone's `int_max`, `int_min` 0), so 28180
+/// is 86 % of 32767 but Steam's 88 %. Other stick modes don't declare these keys: the joystick range is used (unclear).
+pub fn stick_dz_max(mode: &StickMode) -> i64 {
+    match mode {
+        StickMode::FlickStick => 80,
+        _ => 32000,
+    }
+}
+
+/// Steam's own value when the layout has no line (the same table): joystick / camera / mouse dead zone 0, full at 28000
+/// (= 88 %; 16000 is only for a trackpad acting as a joystick); flick stick 40 / 72.
+pub fn stick_dz_default(mode: &StickMode) -> (i64, i64) {
+    match mode {
+        StickMode::FlickStick => (40, 72),
+        _ => (0, 28000),
+    }
+}
+
+/// The controller's own stick dead zone Steam uses when its `preferences_<serial>.vdf` says `-1` (Steam's default for the
+/// controller type). Measured Oct 24 (Order 122, read-only) in Steam's UI code (steamui `sp.js`, the function its Deadzones
+/// picture and stick test call for -1): PS4 4096; PS5, PS5 Edge, Xbox One / 360, XInput PS4 10000. Drawn like Steam on the
+/// stick's dead zone scale ([`stick_dz_max`]): 10000 / 32000 = 31 %.
+pub fn own_dz_default(kind: PadKind) -> i64 {
+    match kind {
+        PadKind::DualShock4 => 4096,
+        PadKind::DualSense | PadKind::DualSenseEdge | PadKind::Xbox => 10000,
+    }
+}
+
+/// Steam's own trigger dead zone / full at when the layout has no line (its trigger class: 1000 / 32000, range 0–32767).
+pub const TRIGGER_DZ_DEFAULT: (i64, i64) = (1000, 32000);
+/// Steam's own dead zone shape (Circle) and source ("This controller's own") when the layout has no line (the same table).
+pub const DZ_SHAPE_DEFAULT: i64 = 1;
+pub const DZ_SOURCE_DEFAULT: i64 = 1;
+
+/// A stick dead zone value → the % Steam's panel shows for it (`max` = [`stick_dz_max`]).
+pub fn dz_to_pct(raw: i64, max: i64) -> f64 {
+    raw as f64 * 100.0 / max.max(1) as f64
+}
+/// % → the value Steam's panel shows as that % (rounded; 0–100 % only).
+pub fn pct_to_dz(pct: f64, max: i64) -> i64 {
+    (pct.clamp(0.0, 100.0) * max as f64 / 100.0).round() as i64
+}
+
 fn int(v: Option<String>) -> Option<i64> {
     v.and_then(|s| s.trim().parse::<i64>().ok())
 }

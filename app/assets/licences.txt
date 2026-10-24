@@ -23,13 +23,15 @@ P	Rust standard library and crates	byteorder	1.5.0	Unlicense OR MIT	MIT
 C	MIT	Copyright (c) 2015 Andrew Gallant
 P	Rust standard library and crates	cfg-if	1.0.5	MIT OR Apache-2.0	MIT
 C	MIT	Copyright (c) 2014 Alex Crichton
-P	Rust standard library and crates	crc32fast	1.5.2	MIT OR Apache-2.0	MIT
+P	Rust standard library and crates	crc32fast	1.5.3	MIT OR Apache-2.0	MIT
 C	MIT	Copyright (c) 2018 Sam Rijs, Alex Crichton and contributors
-P	Rust standard library and crates	equivalent	1.0.2	Apache-2.0 OR MIT	MIT
+P	Rust standard library and crates	equivalent	1.0.3	Apache-2.0 OR MIT	MIT
 C	MIT	Copyright (c) 2016--2023
 P	Rust standard library and crates	fdeflate	0.3.7	MIT OR Apache-2.0	MIT
 P	Rust standard library and crates	flate2	1.1.10	MIT OR Apache-2.0	MIT
 C	MIT	Copyright (c) 2014-2026 Alex Crichton
+P	Rust standard library and crates	foldhash	0.2.0	Zlib	Zlib
+C	Zlib	Copyright (c) 2024 Orson Peters
 P	Rust standard library and crates	hashbrown	0.17.1	MIT OR Apache-2.0	MIT
 C	MIT	Copyright (c) 2016 Amanieu d'Antras
 P	Rust standard library and crates	indexmap	2.14.2	Apache-2.0 OR MIT	MIT
@@ -60,7 +62,7 @@ P	Rust standard library and crates	quote	1.0.47	MIT OR Apache-2.0	MIT
 P	Rust standard library and crates	serde	1.0.229	MIT OR Apache-2.0	MIT
 P	Rust standard library and crates	serde_core	1.0.229	MIT OR Apache-2.0	MIT
 P	Rust standard library and crates	serde_derive	1.0.229	MIT OR Apache-2.0	MIT
-P	Rust standard library and crates	serde_json	1.0.151	MIT OR Apache-2.0	MIT
+P	Rust standard library and crates	serde_json	1.0.154	MIT OR Apache-2.0	MIT
 P	Rust standard library and crates	simd-adler32	0.3.10	MIT	MIT
 C	MIT	Copyright (c) [2021] [Marvin Countryman]
 P	Rust standard library and crates	skia-bindings	0.153.3	MIT	MIT
@@ -71,17 +73,17 @@ C	MIT	Copyright (c) 2019 LongYinan & Armin Sander
 C	MIT	Copyright (c) 2019 rust-skia Contributors
 P	Rust standard library and crates	slotmap	1.1.1	Zlib	Zlib
 C	Zlib	Copyright (c) 2021 Orson Peters <orsonpeters@gmail.com>
-P	Rust standard library and crates	smallvec	1.16.2	MIT OR Apache-2.0	MIT
+P	Rust standard library and crates	smallvec	1.16.4	MIT OR Apache-2.0	MIT
 C	MIT	Copyright (c) 2018 The Servo Project Developers
 P	Rust standard library and crates	syn	2.0.119	MIT OR Apache-2.0	MIT
-P	Rust standard library and crates	syn	3.0.6	MIT OR Apache-2.0	MIT
+P	Rust standard library and crates	syn	3.0.9	MIT OR Apache-2.0	MIT
 P	Rust standard library and crates	taffy	0.14.0	MIT	MIT
 C	MIT	Copyright (c) 2018 Visly Inc.
 C	MIT	Copyright (c) 2026 Taffy Authors
 P	Rust standard library and crates	thiserror	2.0.21	MIT OR Apache-2.0	MIT
 P	Rust standard library and crates	thiserror-impl	2.0.21	MIT OR Apache-2.0	MIT
 P	Rust standard library and crates	tinyvec	1.13.3	Zlib OR Apache-2.0 OR MIT	MIT
-P	Rust standard library and crates	unicode-ident	1.0.26	(MIT OR Apache-2.0) AND Unicode-3.0	MIT,Unicode-3.0
+P	Rust standard library and crates	unicode-ident	1.0.27	(MIT OR Apache-2.0) AND Unicode-3.0	MIT,Unicode-3.0
 C	Unicode-3.0	Copyright © 1991-2023 Unicode, Inc.
 P	Rust standard library and crates	windows	0.62.2	MIT OR Apache-2.0	MIT~3
 C	MIT~3	Copyright (c) Microsoft Corporation.
@@ -1554,6 +1556,24 @@ T	Unicode-3.0	Unicode License v3
 |not be used in advertising or otherwise to promote the sale, use or other
 |dealings in these Data Files or Software without prior written
 |authorization of the copyright holder.
+T	Zlib	zlib License
+|This software is provided 'as-is', without any express or implied warranty. In
+|no event will the authors be held liable for any damages arising from the use of
+|this software.
+|
+|Permission is granted to anyone to use this software for any purpose, including
+|commercial applications, and to alter it and redistribute it freely, subject to
+|the following restrictions:
+|
+|1. The origin of this software must not be misrepresented; you must not claim
+|    that you wrote the original software. If you use this software in a product,
+|    an acknowledgment in the product documentation would be appreciated but is
+|    not required.
+|
+|2. Altered source versions must be plainly marked as such, and must not be
+|    misrepresented as being the original software.
+|
+|3. This notice may not be removed or altered from any source distribution.
 T	MIT~2	MIT License (lewton)
 |Licensed under MIT or Apache License 2.0,
 |at your option.
@@ -1795,24 +1815,6 @@ T	BSD-3-Clause~2	BSD 3-Clause License (ogg)
 |THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
 |(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 |OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
-T	Zlib	zlib License
-|This software is provided 'as-is', without any express or implied warranty. In
-|no event will the authors be held liable for any damages arising from the use of
-|this software.
-|
-|Permission is granted to anyone to use this software for any purpose, including
-|commercial applications, and to alter it and redistribute it freely, subject to
-|the following restrictions:
-|
-| 1. The origin of this software must not be misrepresented; you must not claim
-|    that you wrote the original software. If you use this software in a product,
-|    an acknowledgment in the product documentation would be appreciated but is
-|    not required.
-|
-| 2. Altered source versions must be plainly marked as such, and must not be
-|    misrepresented as being the original software.
-|
-| 3. This notice may not be removed or altered from any source distribution.
 T	MIT~3	MIT License (windows)
 |Permission is hereby granted, free of charge, to any person obtaining a copy
 |of this software and associated documentation files (the "Software"), to deal

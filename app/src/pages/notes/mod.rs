@@ -42,6 +42,16 @@ const K_CONF: Key = key("nts.conf");
 
 const VK_ESCAPE: u16 = 0x1B;
 const VK_V: u16 = 0x56;
+const VK_A: u16 = 0x41;
+const VK_C: u16 = 0x43;
+const VK_X: u16 = 0x58;
+/// the note menu's rows (`mitems::rows`: row i = `idx(K_MENU, i)`): colours, line, Copy, Paste, line, Delete
+const MENU_COPY: usize = 2;
+const MENU_PASTE: usize = 3;
+const MENU_DELETE: usize = 5;
+/// Order 121: the selection colour - the app's own text boxes' (`tinput`): blue with white letters shows on every paper
+const SEL_BG: Rgba = Rgba(0.0, 65.0 / 255.0, 198.0 / 255.0, 0.8);
+const SEL_FG: Rgba = Rgba::rgb(255, 255, 255);
 
 /// the page's content width (600 - 2 x 26) and the grid: three columns, 12 px apart; a paper note is a square (at least)
 const CONTENT_W: f32 = 548.0;
@@ -56,6 +66,14 @@ const INK: Rgba = Rgba::rgb(0x2a, 0x2a, 0x2a);
 /// each note's tilt in degrees (option A: -1.5 .. 1.4): fixed by the note, so a note never moves while it is drawn
 const TILTS: [f32; 8] = [-1.5, 1.0, -0.6, 1.4, 0.5, -1.1, 0.8, -0.3];
 
+/// The seed of a note's fake letters: this run's own random salt + the note + its words, so the same words look the same until
+/// they change, nothing can be worked back from them, and the next run draws a new set.
+fn fake_seed(id: u64, text: &str) -> u64 {
+    use std::hash::BuildHasher;
+    static SALT: std::sync::OnceLock<std::collections::hash_map::RandomState> = std::sync::OnceLock::new();
+    SALT.get_or_init(std::collections::hash_map::RandomState::new).hash_one((id, text))
+}
+
 fn tilt(id: u64) -> f32 {
     TILTS[(id % TILTS.len() as u64) as usize]
 }
@@ -66,6 +84,9 @@ const LH_TITLE: f32 = 18.0;
 const LH_TEXT: f32 = 18.0;
 /// a note's text box is at least this many lines tall (it fills a square note: a click on the empty paper types)
 const MIN_LINES: usize = 7;
+/// Order 121: how much a blurred note's fake letters blur (the eye's own `eye::BLUR` read nothing at all; the owner Oct 24: "you can
+/// see that some text is there just very blurred ... blurs a bit less")
+const NOTE_BLUR: f32 = 2.2;
 /// the chip text (`.apc{font-size:12px}`)
 const F_CHIP: Font = Font::new(12.0, 400);
 /// Windows' default double-click time
@@ -95,8 +116,9 @@ pub fn flush() {
 enum Menu {
     /// "Delete <tab>?" for the tab (its index) at (x, y)
     Tab(usize, f32, f32),
-    /// "Delete note" for the note (its id) at (x, y)
-    Note(u64, f32, f32),
+    /// the note menu (colours, Copy, Paste, Delete) for the note (its id) at (x, y): the field right-clicked (1 title, 2 text)
+    /// and its selection (lo, hi) - the caret when lo == hi - as they were (the menu takes the focus, and the selection goes)
+    Note(u64, f32, f32, u8, usize, usize),
 }
 
 #[derive(Default)]
@@ -111,6 +133,13 @@ pub struct Notes {
     /// the caret of the field that has the focus (a char index) and when it last moved (its blink)
     caret: usize,
     caret_at: f64,
+    /// Order 121: the selection's fixed end (the caret is the moving end) and the field it is in
+    anchor: usize,
+    sel_key: Option<Key>,
+    /// the last press on a note field (a second one soon after = double-click: the word)
+    last_press: Option<(Key, f64)>,
+    /// the word a double-click selected: a pointer that stays inside it keeps the word selected (no shrinking by jitter)
+    word_sel: Option<(usize, usize)>,
     /// a tab being renamed: its index, the name so far, the caret
     rename: Option<(usize, String, usize)>,
     /// the last click on a tab (double-click = rename)
@@ -186,6 +215,38 @@ impl Notes {
         }
     }
 
+    /// The chosen letters (lo, hi) of the field `k`, while it holds the selection.
+    fn sel_of(&self, k: Key) -> Option<(usize, usize)> {
+        (self.sel_key == Some(k) && self.anchor != self.caret).then(|| (self.anchor.min(self.caret), self.anchor.max(self.caret)))
+    }
+
+    /// The caret of field `k` goes to `at`; `extend` keeps the selection's fixed end (Shift, a drag), else the selection goes.
+    fn set_caret(&mut self, k: Key, at: usize, extend: bool, now: f64) {
+        if !(extend && self.sel_key == Some(k)) {
+            self.anchor = at;
+        }
+        self.sel_key = Some(k);
+        self.caret = at;
+        self.caret_at = now;
+    }
+
+    /// The words of a note's title (part 1) or text (part 2).
+    fn field(&self, id: u64, part: u8) -> Option<String> {
+        let n = self.n.as_ref()?;
+        let x = n.books.get(n.cur)?.notes.iter().find(|x| x.id == id)?;
+        Some(if part == 1 { x.title.clone() } else { x.text.clone() })
+    }
+
+    /// Take the letters lo..hi out of a field; the caret goes there (a cut, Delete / Backspace on a selection).
+    fn cut(&mut self, k: Key, lo: usize, hi: usize, now: f64) {
+        let Some((id, part)) = self.note_of(k) else { return };
+        let mut at = lo;
+        let Some(note) = self.n.as_mut().and_then(|n| n.note_mut(id)) else { return };
+        edit::remove(if part == 1 { &mut note.title } else { &mut note.text }, &mut at, lo, hi);
+        self.set_caret(k, at, false, now);
+        self.save();
+    }
+
     /// Typed text for the focused field `k`.
     fn type_in(&mut self, k: Key, s: &str, cx: &mut Cx) {
         if k == K_REN {
@@ -197,25 +258,113 @@ impl Notes {
             return;
         }
         let Some((id, part)) = self.note_of(k) else { return };
+        // typing over a selection replaces it
+        let sel = self.sel_of(k);
         let mut at = self.caret;
         let Some(note) = self.n.as_mut().and_then(|n| n.note_mut(id)) else { return };
         match part {
             1 => {
+                if let Some((lo, hi)) = sel {
+                    edit::remove(&mut note.title, &mut at, lo, hi);
+                }
                 let room = TITLE_MAX.saturating_sub(note.title.chars().count());
                 let s: String = s.chars().map(|c| if c == '\n' || c == '\t' { ' ' } else { c }).filter(|c| !c.is_control()).take(room).collect();
                 edit::insert(&mut note.title, &mut at, &s);
             }
             2 => {
+                if let Some((lo, hi)) = sel {
+                    edit::remove(&mut note.text, &mut at, lo, hi);
+                }
                 let room = TEXT_MAX.saturating_sub(note.text.chars().count());
                 let s: String = s.chars().map(|c| if c == '\t' { ' ' } else { c }).filter(|c| *c == '\n' || !c.is_control()).take(room).collect();
                 edit::insert(&mut note.text, &mut at, &s);
             }
             _ => return,
         }
-        self.caret = at;
-        self.caret_at = cx.now;
+        self.set_caret(k, at, false, cx.now);
         self.revealed.insert(id);
         self.save();
+    }
+
+    /// Where a pointer at (x, y) puts the caret in a note's title / text, whose box is `r`.
+    fn pos_at(&self, g: &crate::gfx::Gfx, id: u64, part: u8, x: f32, y: f32, r: (f32, f32, f32, f32)) -> usize {
+        let Some(t) = self.field(id, part) else { return 0 };
+        let c: Vec<char> = t.chars().collect();
+        if part == 1 {
+            edit::at_x(&c, &[(0, c.len())], 0, x - r.0, &|s: &str| g.text_width(s, F_TITLE))
+        } else {
+            let w = |s: &str| g.text_width(s, F_TEXT);
+            let ls = edit::lines(&c, TEXT_W, &w);
+            let line = (((y - r.1) / LH_TEXT).floor().max(0.0) as usize).min(ls.len() - 1);
+            edit::at_x(&c, &ls, line, x - r.0, &w)
+        }
+    }
+
+    /// A key in a note's title / text: select all, copy, cut, the arrows (with Shift: extend the selection; with Ctrl: by word),
+    /// Backspace / Delete (a selection goes first), the rest as `edit::key`.
+    fn note_key(&mut self, k: Key, vk: u16, cx: &mut Cx) {
+        let Some((id, part)) = self.note_of(k) else { return };
+        let (ctrl, shift, now, g) = (cx.mods.ctrl, cx.mods.shift, cx.now, cx.g);
+        let Some(text) = self.field(id, part) else { return };
+        let all: Vec<char> = text.chars().collect();
+        let len = all.len();
+        let at = self.caret.min(len);
+        let sel = self.sel_of(k).map(|(a, b)| (a.min(len), b.min(len))).filter(|(a, b)| a < b);
+        let (font, maxw) = if part == 1 { (F_TITLE, f32::MAX) } else { (F_TEXT, TEXT_W) };
+        let w = |s: &str| g.text_width(s, font);
+        match vk {
+            VK_A if ctrl => {
+                self.anchor = 0;
+                self.sel_key = Some(k);
+                self.caret = len;
+                self.caret_at = now;
+            }
+            VK_C | VK_X if ctrl => {
+                if let Some((lo, hi)) = sel {
+                    let _ = cx.copy_text(&edit::slice(&text, lo, hi));
+                    if vk == VK_X {
+                        self.cut(k, lo, hi, now);
+                    }
+                }
+            }
+            edit::VK_BACK | edit::VK_DELETE if sel.is_some() => {
+                let (lo, hi) = sel.unwrap_or((0, 0));
+                self.cut(k, lo, hi, now);
+            }
+            edit::VK_BACK if ctrl && at > 0 => self.cut(k, edit::word_left(&all, at), at, now),
+            edit::VK_DELETE if ctrl && at < len => self.cut(k, at, edit::word_right(&all, at), now),
+            edit::VK_LEFT | edit::VK_RIGHT | edit::VK_UP | edit::VK_DOWN | edit::VK_HOME | edit::VK_END => {
+                let to = match (vk, sel) {
+                    (edit::VK_LEFT, Some((lo, _))) if !shift && !ctrl => lo,
+                    (edit::VK_RIGHT, Some((_, hi))) if !shift && !ctrl => hi,
+                    (edit::VK_LEFT, _) if ctrl => edit::word_left(&all, at),
+                    (edit::VK_RIGHT, _) if ctrl => edit::word_right(&all, at),
+                    (edit::VK_HOME, _) if ctrl => 0,
+                    (edit::VK_END, _) if ctrl => len,
+                    _ => {
+                        let (mut t, mut a) = (text.clone(), at);
+                        edit::key(&mut t, &mut a, vk, maxw, &w);
+                        a
+                    }
+                };
+                self.set_caret(k, to, shift, now);
+            }
+            _ => {
+                let mut at = at;
+                let changed = match self.n.as_mut().and_then(|n| n.note_mut(id)) {
+                    Some(note) if part == 1 => edit::key(&mut note.title, &mut at, vk, maxw, &w),
+                    Some(note) => edit::key(&mut note.text, &mut at, vk, maxw, &w),
+                    None => false,
+                };
+                // (a key that neither moved the caret nor changed the text - Ctrl, Shift, a letter before its character - keeps the selection)
+                if changed || at != self.caret {
+                    self.set_caret(k, at, false, now);
+                }
+                if changed {
+                    self.save();
+                }
+            }
+        }
     }
 
     /// A note's text lines (kept while its text stays the same).
@@ -287,10 +436,18 @@ impl Notes {
         let i = note.id as usize;
         let (kt, kx) = (idx(K_TITLE, i), idx(K_TEXT, i));
         let blink = ((cx.now - self.caret_at) % 1060.0) < 530.0;
-        // the title (one line; "Title" while empty)
+        // the title (one line; "Title" while empty): drawn as one painted line while it has the focus (selection + caret)
         let tf = cx.focused(kt);
         let title = if tf {
-            line_with_caret(&note.title, self.caret, F_TITLE, INK, LH_TITLE, blink).clip()
+            let c: Vec<char> = note.title.chars().collect();
+            let sel = self.sel_of(kt).map(|(a, b)| (a.min(c.len()), b.min(c.len())));
+            let caret = blink.then_some(self.caret.min(c.len()));
+            let ls = vec![(0, c.len())];
+            El::paint(move |g, (x, y, _, _)| draw_field(g, F_TITLE, LH_TITLE, x, y, &c, &ls, caret, sel))
+                .sig((&note.title, caret, sel, tf))
+                .h(LH_TITLE)
+                .no_hit()
+                .clip()
         } else if note.title.is_empty() {
             El::text("Title", F_TITLE, INK.mul_a(0.45), LH_TITLE).no_hit()
         } else {
@@ -303,28 +460,31 @@ impl Notes {
         let ls = self.lines_of(cx.g, note.id, &note.text);
         let h = ls.len().max(MIN_LINES) as f32 * LH_TEXT;
         let caret = (xf && blink).then_some(self.caret.min(chars.len()));
+        let sel = if xf { self.sel_of(kx).map(|(a, b)| (a.min(chars.len()), b.min(chars.len()))) } else { None };
         let empty = chars.is_empty();
-        let (c2, l2) = (chars.clone(), ls.clone());
+        // Order 121 (A_121_01): a blurred note draws FAKE letters (the real ones never reach the screen), the same lines and
+        // spaces, fixed for the note until its text changes - blurred less than before, so it still reads as text
+        let hidden = self.blurred(note.id) && !xf;
+        let mut shown = chars.clone();
+        if hidden {
+            shown = edit::fake(&chars, fake_seed(note.id, &note.text));
+            edit::fit(&mut shown, &ls, TEXT_W - 1.0, &|s: &str| cx.g.text_width(s, F_TEXT));
+        }
+        let shown_s: String = if hidden { shown.iter().collect() } else { note.text.clone() };
+        let (c2, l2) = (shown, ls.clone());
         let paint = El::paint(move |g, (x, y, _, _)| {
             if empty && caret.is_none() && !xf {
                 g.text("Type here", F_TEXT, x, y, LH_TEXT, INK.mul_a(0.45), Align::Left, 0.0);
             }
-            for (k, (s, n)) in l2.iter().enumerate() {
-                let t: String = c2[*s..s + n].iter().collect();
-                g.text(&t, F_TEXT, x, y + k as f32 * LH_TEXT, LH_TEXT, INK, Align::Left, 0.0);
-            }
-            if let Some(at) = caret {
-                let (k, cxp) = edit::caret_at(&c2, &l2, at, &|s: &str| g.text_width(s, F_TEXT));
-                g.fill_rect(x + cxp, y + k as f32 * LH_TEXT + 2.0, 1.0, LH_TEXT - 4.0, INK);
-            }
+            draw_field(g, F_TEXT, LH_TEXT, x, y, &c2, &l2, caret, sel);
         })
-        .sig((&note.text, caret, xf, TEXT_W.to_bits()))
+        .sig((&shown_s, caret, sel, xf, TEXT_W.to_bits()))
         .h(h)
         .no_hit();
         let mut text = El::block().h(h).margin(6.0, 0.0, 0.0, 0.0).child(paint).key(kx).cursor(Cursor::Text);
         // the eye: the TEXT blurs, the title stays readable; a click shows the note
-        if self.blurred(note.id) && !xf {
-            text = text.blur(eye::BLUR).cursor(Cursor::Hand);
+        if hidden {
+            text = text.blur(NOTE_BLUR).cursor(Cursor::Hand);
         }
         // Order 119, option A: square pastel paper (`border-radius:4px; box-shadow:0 6px 14px rgba(0,0,0,.45)`), tilted
         El::block()
@@ -378,6 +538,32 @@ impl Notes {
             .child(outline)
             .child(El::icon("dplus", 14.0, 1.6, ICO_ON()).no_hit())
             .child(El::text("Note", pieces::btn_font(12.5, 600), ICO_ON(), lh(12.5, 1.35)).none().no_hit())
+    }
+}
+
+/// One field's drawing at (x, y): its lines in the ink, the selection as a blue box with the chosen letters white (as the
+/// app's own text boxes), the caret as a 1 px bar. `ls` = the drawn lines (first char, chars).
+#[allow(clippy::too_many_arguments)]
+fn draw_field(g: &crate::gfx::Gfx, f: Font, lh_: f32, x: f32, y: f32, all: &[char], ls: &[(usize, usize)], caret: Option<usize>, sel: Option<(usize, usize)>) {
+    let part = |a: usize, b: usize| all[a..b].iter().collect::<String>();
+    for (k, (s, n)) in ls.iter().enumerate() {
+        let (ly, e) = (y + k as f32 * lh_, s + n);
+        let (lo, hi) = sel.map_or((0, 0), |(a, b)| (a.max(*s), b.min(e)));
+        if lo < hi {
+            let (x0, x1) = (g.text_width(&part(*s, lo), f), g.text_width(&part(*s, hi), f));
+            g.fill_rect(x + x0, ly, x1 - x0, lh_, SEL_BG);
+            for (a, b, c, dx) in [(*s, lo, INK, 0.0), (lo, hi, SEL_FG, x0), (hi, e, INK, x1)] {
+                if a < b {
+                    g.text(&part(a, b), f, x + dx, ly, lh_, c, Align::Left, 0.0);
+                }
+            }
+        } else if e > *s {
+            g.text(&part(*s, e), f, x, ly, lh_, INK, Align::Left, 0.0);
+        }
+    }
+    if let Some(at) = caret {
+        let (k, cxp) = edit::caret_at(all, ls, at, &|s: &str| g.text_width(s, f));
+        g.fill_rect(x + cxp, y + k as f32 * lh_ + 2.0, 1.0, lh_ - 4.0, INK);
     }
 }
 
@@ -447,6 +633,10 @@ impl Page for Notes {
         self.eye.reset();
         self.revealed.clear();
         self.menu = None;
+        self.anchor = 0;
+        self.sel_key = None;
+        self.last_press = None;
+        self.word_sel = None;
         self.last_click = None;
     }
 
@@ -561,15 +751,14 @@ impl Page for Notes {
                 let id = self.n.as_mut().map(|n| n.add_note());
                 if let Some(id) = id {
                     self.revealed.insert(id);
-                    self.caret = 0;
-                    self.caret_at = now;
+                    self.set_caret(idx(K_TITLE, id as usize), 0, false, now);
                     cx.focus(Some(idx(K_TITLE, id as usize)));
                     cx.scroll_to(idx(K_CARD, id as usize));
                 }
                 self.save();
             }
             Ev::Context(k, x, y) if self.note_of(*k).is_some() => {
-                let (id, _) = self.note_of(*k).unwrap_or((0, 0));
+                let (id, part) = self.note_of(*k).unwrap_or((0, 0));
                 let empty = self.n.as_ref().and_then(|n| n.books.get(cur)?.notes.iter().find(|x| x.id == id).map(|x| x.title.trim().is_empty() && x.text.trim().is_empty())).unwrap_or(false);
                 if empty {
                     if let Some(n) = self.n.as_mut() {
@@ -577,7 +766,12 @@ impl Page for Notes {
                     }
                     self.save();
                 } else {
-                    self.menu = Some(Menu::Note(id, *x, *y));
+                    // the field right-clicked (the paper = the text) and its selection / caret now
+                    let part = if part == 1 { 1 } else { 2 };
+                    let fk = idx(if part == 1 { K_TITLE } else { K_TEXT }, id as usize);
+                    let len = self.field(id, part).map_or(0, |t| t.chars().count());
+                    let (lo, hi) = if self.sel_key == Some(fk) { (self.anchor.min(self.caret).min(len), self.anchor.max(self.caret).min(len)) } else { (len, len) };
+                    self.menu = Some(Menu::Note(id, *x, *y, part, lo, hi));
                 }
             }
             // Order 119: a colour in the note's menu: the paper takes it at once (saved per note)
@@ -590,7 +784,29 @@ impl Page for Notes {
                     self.save();
                 }
             }
-            Ev::Click(k) if *k == idx(K_MENU, 2) => {
+            Ev::Click(k) if *k == idx(K_MENU, MENU_COPY) && matches!(self.menu, Some(Menu::Note(..))) => {
+                if let Some(Menu::Note(id, _, _, part, lo, hi)) = self.menu.take() {
+                    if let Some(t) = self.field(id, part) {
+                        // the selection, else the whole field (the title, or the text)
+                        let s = if lo < hi { edit::slice(&t, lo, hi) } else { t };
+                        let _ = cx.copy_text(&s);
+                    }
+                }
+            }
+            Ev::Click(k) if *k == idx(K_MENU, MENU_PASTE) && matches!(self.menu, Some(Menu::Note(..))) => {
+                if let Some(Menu::Note(id, _, _, part, lo, hi)) = self.menu.take() {
+                    if let Some(t) = crate::clipboard::get_text() {
+                        // into the field right-clicked, over its selection / at its caret, which has the focus again
+                        let fk = idx(if part == 1 { K_TITLE } else { K_TEXT }, id as usize);
+                        self.anchor = lo;
+                        self.caret = hi;
+                        self.sel_key = Some(fk);
+                        cx.focus(Some(fk));
+                        self.type_in(fk, &t, cx);
+                    }
+                }
+            }
+            Ev::Click(k) if *k == idx(K_MENU, MENU_DELETE) && matches!(self.menu, Some(Menu::Note(..))) => {
                 if let Some(Menu::Note(id, ..)) = self.menu.take() {
                     if let Some(n) = self.n.as_mut() {
                         n.delete_note(id);
@@ -602,23 +818,41 @@ impl Page for Notes {
             Ev::Press(k, x, y, r) if self.note_of(*k).is_some() => {
                 let (id, part) = self.note_of(*k).unwrap_or((0, 0));
                 self.revealed.insert(id);
-                let Some((title, text)) = self.n.as_ref().and_then(|n| n.books.get(cur)?.notes.iter().find(|x| x.id == id).map(|x| (x.title.clone(), x.text.clone()))) else { return };
-                let g = cx.g;
-                match part {
-                    1 => {
-                        let c: Vec<char> = title.chars().collect();
-                        self.caret = edit::at_x(&c, &[(0, c.len())], 0, x - r.0, &|s: &str| g.text_width(s, F_TITLE));
-                    }
-                    2 => {
-                        let c: Vec<char> = text.chars().collect();
-                        let w = |s: &str| g.text_width(s, F_TEXT);
-                        let ls = edit::lines(&c, TEXT_W, &w);
-                        let line = (((y - r.1) / LH_TEXT).floor().max(0.0) as usize).min(ls.len() - 1);
-                        self.caret = edit::at_x(&c, &ls, line, x - r.0, &w);
-                    }
-                    _ => {}
+                if part == 0 {
+                    return;
                 }
-                self.caret_at = now;
+                // the caret goes where it was clicked; Shift extends the selection; a second press soon after selects the word
+                let pos = self.pos_at(cx.g, id, part, *x, *y, *r);
+                let dbl = self.last_press.is_some_and(|(lk, t)| lk == *k && now - t < DBL_MS);
+                if dbl {
+                    let c: Vec<char> = self.field(id, part).unwrap_or_default().chars().collect();
+                    let (a, b) = edit::word_at(&c, pos);
+                    self.anchor = a;
+                    self.sel_key = Some(*k);
+                    self.caret = b;
+                    self.caret_at = now;
+                    self.last_press = None;
+                    self.word_sel = Some((a, b));
+                } else {
+                    self.word_sel = None;
+                    self.set_caret(*k, pos, cx.mods.shift, now);
+                    self.last_press = Some((*k, now));
+                }
+            }
+            // dragging on a title / text: the caret follows the pointer, the selection grows from where it went down
+            Ev::Drag(k, x, y, r) if self.note_of(*k).is_some_and(|x| x.1 > 0) => {
+                let (id, part) = self.note_of(*k).unwrap_or((0, 0));
+                let pos = self.pos_at(cx.g, id, part, *x, *y, *r);
+                if let Some((a, b)) = self.word_sel {
+                    if (a..=b).contains(&pos) {
+                        return;
+                    }
+                    self.word_sel = None;
+                    if pos < a {
+                        self.anchor = b;
+                    }
+                }
+                self.set_caret(*k, pos, true, now);
             }
             Ev::Press(k, x, _, r) if *k == K_REN => {
                 if let Some((_, name, at)) = self.rename.as_mut() {
@@ -638,8 +872,7 @@ impl Page for Notes {
                     }
                     ('\r', _, Some(1)) => {
                         let (id, _) = self.note_of(k).unwrap_or((0, 0));
-                        self.caret = 0;
-                        self.caret_at = now;
+                        self.set_caret(idx(K_TEXT, id as usize), 0, false, now);
                         cx.focus(Some(idx(K_TEXT, id as usize)));
                     }
                     ('\r', _, Some(2)) => self.type_in(k, "\n", cx),
@@ -659,21 +892,9 @@ impl Page for Notes {
                     self.caret_at = now;
                 }
             }
-            Ev::Key(k, vk) if self.note_of(*k).is_some_and(|x| x.1 > 0) => {
-                let (id, part) = self.note_of(*k).unwrap_or((0, 0));
-                let g = cx.g;
-                let mut at = self.caret;
-                let changed = match self.n.as_mut().and_then(|n| n.note_mut(id)) {
-                    Some(note) if part == 1 => edit::key(&mut note.title, &mut at, *vk, f32::MAX, &|s: &str| g.text_width(s, F_TITLE)),
-                    Some(note) => edit::key(&mut note.text, &mut at, *vk, TEXT_W, &|s: &str| g.text_width(s, F_TEXT)),
-                    None => false,
-                };
-                self.caret = at;
-                self.caret_at = now;
-                if changed {
-                    self.save();
-                }
-            }
+            Ev::Key(k, vk) if self.note_of(*k).is_some_and(|x| x.1 > 0) => self.note_key(*k, *vk, cx),
+            // a field lost the focus: its selection goes (the caret stays for a Paste from the menu)
+            Ev::Blur(k) if self.note_of(*k).is_some_and(|x| x.1 > 0) => self.anchor = self.caret,
             Ev::Blur(k) if *k == K_REN => self.commit_rename(),
             _ => {}
         }
@@ -691,10 +912,11 @@ impl Page for Notes {
                 let text = if k == 1 { "Its note goes too.".to_string() } else { format!("Its {k} notes go too.") };
                 Some(mitems::confirm(cx, K_CONF, &format!("Delete {}?", b.name), &text, "Cancel", "Delete", button::Kind::Red, Place::At(x, y), 260.0))
             }
-            Menu::Note(id, x, y) => {
-                // Order 119: the four paper colours (the note's own marked), then Delete
+            Menu::Note(id, x, y, ..) => {
+                // Order 119: the four paper colours (the note's own marked), then (Order 121) Copy and Paste, then Delete
                 let on = n.books.get(n.cur)?.notes.iter().find(|q| q.id == id)?.colour as usize;
-                Some(mitems::menu(cx, K_MENU, &[Row::Swatches(&PAPER, on), Row::Sep, Row::Item(It::icon("trash", "Delete note").danger())], Place::At(x, y), 150.0))
+                let rows = [Row::Swatches(&PAPER, on), Row::Sep, Row::Item(It::icon("copy", "Copy")), Row::Item(It::icon("paste", "Paste")), Row::Sep, Row::Item(It::icon("trash", "Delete note").danger())];
+                Some(mitems::menu(cx, K_MENU, &rows, Place::At(x, y), 150.0))
             }
         }
     }

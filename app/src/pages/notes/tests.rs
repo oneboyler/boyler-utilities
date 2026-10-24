@@ -3,6 +3,7 @@
 use super::*;
 use crate::gfx::Gfx;
 use crate::ui::cx::State;
+use std::sync::Mutex;
 
 fn page() -> (Notes, Gfx, State) {
     let mut p = Notes::default();
@@ -14,6 +15,17 @@ fn ev(p: &mut Notes, g: &Gfx, st: &mut State, e: Ev, now: f64) {
     let mut cx = Cx::new(now, false, g, st);
     p.event(&e, &mut cx);
 }
+
+/// `ev` with the modifier keys held (Ctrl / Shift).
+fn evm(p: &mut Notes, g: &Gfx, st: &mut State, e: Ev, now: f64, ctrl: bool, shift: bool) {
+    let mut cx = Cx::new(now, false, g, st);
+    cx.mods.ctrl = ctrl;
+    cx.mods.shift = shift;
+    p.event(&e, &mut cx);
+}
+
+/// the clipboard is one static for every test: the tests that use it take turns
+static CLIP: Mutex<()> = Mutex::new(());
 
 fn build(p: &mut Notes, g: &Gfx, st: &mut State, now: f64) -> Vec<El> {
     let mut cx = Cx::new(now, false, g, st);
@@ -68,6 +80,7 @@ fn ctrl_v_pastes_the_clipboards_text() {
     let id = p.n.as_ref().unwrap().books[0].notes[0].id;
     let kx = idx(K_TEXT, id as usize);
     st.focus = Some(kx);
+    let _l = CLIP.lock().unwrap_or_else(|e| e.into_inner());
     crate::clipboard::set_test_clip("a\nb");
     let mut cx = Cx::new(1.0, false, &g, &mut st);
     cx.mods.ctrl = true;
@@ -86,7 +99,7 @@ fn the_eye_blurs_the_text_not_the_title_and_a_click_shows_the_note() {
     assert_eq!(find(&els, idx(K_TEXT, id)).unwrap().blur, 0.0, "not blurred while the eye is off");
     ev(&mut p, &g, &mut st, Ev::Click(K_EYE), 3.0);
     let els = build(&mut p, &g, &mut st, 4.0);
-    assert_eq!(find(&els, idx(K_TEXT, id)).unwrap().blur, eye::BLUR, "the text blurs");
+    assert_eq!(find(&els, idx(K_TEXT, id)).unwrap().blur, NOTE_BLUR, "the text blurs");
     assert_eq!(find(&els, idx(K_TITLE, id)).unwrap().blur, 0.0, "the title stays readable");
     // a click on the note shows it - until the tab is left
     ev(&mut p, &g, &mut st, Ev::Press(idx(K_CARD, id), 10.0, 10.0, (0.0, 0.0, 100.0, 100.0)), 5.0);
@@ -157,7 +170,7 @@ fn right_click_a_note_deletes_it_an_empty_one_at_once() {
     type_str(&mut p, &g, &mut st, idx(K_TEXT, ids[1] as usize), "keep?");
     ev(&mut p, &g, &mut st, Ev::Context(idx(K_TEXT, ids[1] as usize), 10.0, 10.0), 3.0);
     assert!(matches!(p.menu, Some(Menu::Note(..))));
-    ev(&mut p, &g, &mut st, Ev::Click(idx(K_MENU, 2)), 4.0);
+    ev(&mut p, &g, &mut st, Ev::Click(idx(K_MENU, MENU_DELETE)), 4.0);
     assert!(p.n.as_ref().unwrap().books[0].notes.is_empty());
 }
 
@@ -289,6 +302,7 @@ fn a_huge_paste_is_cut_to_the_limit() {
     let id = p.n.as_ref().unwrap().books[0].notes[0].id;
     let kx = idx(K_TEXT, id as usize);
     st.focus = Some(kx);
+    let _l = CLIP.lock().unwrap_or_else(|e| e.into_inner());
     crate::clipboard::set_test_clip(&"x".repeat(TEXT_MAX + 500));
     let mut cx = Cx::new(1.0, false, &g, &mut st);
     cx.mods.ctrl = true;
@@ -380,4 +394,222 @@ fn picture_119_colour_menu() {
             now + 500.0
         });
     }
+}
+
+// ---------------------------------------------------------------- Order 121: select + copy
+
+
+/// A note with `title` / `text` typed in; (page, gfx, state, title key, text key). The text field has the focus, the caret
+/// at its end.
+fn note_with(title: &str, text: &str) -> (Notes, Gfx, State, Key, Key) {
+    let (mut p, g, mut st) = page();
+    ev(&mut p, &g, &mut st, Ev::Click(K_ADD), 1.0);
+    let id = p.n.as_ref().unwrap().books[0].notes[0].id;
+    let (kt, kx) = (idx(K_TITLE, id as usize), idx(K_TEXT, id as usize));
+    type_str(&mut p, &g, &mut st, kt, title);
+    st.focus = Some(kx);
+    p.caret = 0;
+    type_str(&mut p, &g, &mut st, kx, text);
+    (p, g, st, kt, kx)
+}
+
+fn copied(p: &mut Notes, g: &Gfx, st: &mut State, k: Key) -> String {
+    crate::clipboard::set_test_clip("<untouched>");
+    evm(p, g, st, Ev::Key(k, VK_C), 2.0, true, false);
+    crate::clipboard::test_clip().unwrap_or_default()
+}
+
+/// the text box as the frame reports it to a press: (left, top, width, height)
+fn boxr() -> (f32, f32, f32, f32) {
+    (100.0, 200.0, TEXT_W, 126.0)
+}
+
+#[test]
+fn ctrl_a_ctrl_c_copies_the_whole_text_and_ctrl_x_cuts_it() {
+    let _l = CLIP.lock().unwrap_or_else(|e| e.into_inner());
+    let (mut p, g, mut st, _, kx) = note_with("IP", "192.168.1.107");
+    evm(&mut p, &g, &mut st, Ev::Key(kx, VK_A), 2.0, true, false);
+    assert_eq!(copied(&mut p, &g, &mut st, kx), "192.168.1.107");
+    evm(&mut p, &g, &mut st, Ev::Key(kx, VK_X), 3.0, true, false);
+    assert_eq!(crate::clipboard::test_clip().as_deref(), Some("192.168.1.107"));
+    assert_eq!(p.n.as_ref().unwrap().books[0].notes[0].text, "", "cut takes it out of the note");
+}
+
+#[test]
+fn dragging_with_the_mouse_selects_and_typing_replaces_the_selection() {
+    let _l = CLIP.lock().unwrap_or_else(|e| e.into_inner());
+    let (mut p, g, mut st, _, kx) = note_with("", "milk\reggs");
+    let r = boxr();
+    ev(&mut p, &g, &mut st, Ev::Press(kx, r.0, r.1 + 2.0, r), 2.0);
+    ev(&mut p, &g, &mut st, Ev::Drag(kx, r.0 + 500.0, r.1 + 2.0, r), 2.1);
+    assert_eq!(copied(&mut p, &g, &mut st, kx), "milk", "the first line");
+    ev(&mut p, &g, &mut st, Ev::Drag(kx, r.0 + 500.0, r.1 + LH_TEXT + 2.0, r), 2.2);
+    assert_eq!(copied(&mut p, &g, &mut st, kx), "milk\neggs", "dragged down to the second line");
+    ev(&mut p, &g, &mut st, Ev::Release(kx), 2.3);
+    type_str(&mut p, &g, &mut st, kx, "x");
+    assert_eq!(p.n.as_ref().unwrap().books[0].notes[0].text, "x");
+}
+
+#[test]
+fn double_click_selects_a_word_and_shift_arrows_extend_from_the_caret() {
+    let _l = CLIP.lock().unwrap_or_else(|e| e.into_inner());
+    let (mut p, g, mut st, _, kx) = note_with("", "milk eggs");
+    let r = boxr();
+    let x = r.0 + g.text_width("milk ", F_TEXT) + 4.0;
+    ev(&mut p, &g, &mut st, Ev::Press(kx, x, r.1 + 2.0, r), 10.0);
+    ev(&mut p, &g, &mut st, Ev::Release(kx), 10.05);
+    ev(&mut p, &g, &mut st, Ev::Press(kx, x, r.1 + 2.0, r), 10.1);
+    assert_eq!(copied(&mut p, &g, &mut st, kx), "eggs");
+    // shift + Left twice from the end of the text
+    ev(&mut p, &g, &mut st, Ev::Key(kx, edit::VK_END), 3.0);
+    evm(&mut p, &g, &mut st, Ev::Key(kx, edit::VK_LEFT), 3.1, false, true);
+    evm(&mut p, &g, &mut st, Ev::Key(kx, edit::VK_LEFT), 3.2, false, true);
+    assert_eq!(copied(&mut p, &g, &mut st, kx), "gs");
+    type_str(&mut p, &g, &mut st, kx, "X");
+    assert_eq!(p.n.as_ref().unwrap().books[0].notes[0].text, "milk egX");
+}
+
+#[test]
+fn a_title_selects_and_copies_too() {
+    let _l = CLIP.lock().unwrap_or_else(|e| e.into_inner());
+    let (mut p, g, mut st, kt, _) = note_with("Router", "x");
+    st.focus = Some(kt);
+    evm(&mut p, &g, &mut st, Ev::Key(kt, VK_A), 2.0, true, false);
+    assert_eq!(copied(&mut p, &g, &mut st, kt), "Router");
+}
+
+#[test]
+fn the_note_menu_has_copy_and_paste() {
+    let _l = CLIP.lock().unwrap_or_else(|e| e.into_inner());
+    let (mut p, g, mut st, _, kx) = note_with("T", "milk eggs");
+    evm(&mut p, &g, &mut st, Ev::Key(kx, VK_A), 2.0, true, false);
+    ev(&mut p, &g, &mut st, Ev::Context(kx, 10.0, 10.0), 3.0);
+    // the menu takes the focus (the frame blurs the field): the copy still has the selection
+    ev(&mut p, &g, &mut st, Ev::Blur(kx), 3.1);
+    crate::clipboard::set_test_clip("<untouched>");
+    ev(&mut p, &g, &mut st, Ev::Click(idx(K_MENU, MENU_COPY)), 4.0);
+    assert_eq!(crate::clipboard::test_clip().as_deref(), Some("milk eggs"));
+    assert!(p.menu.is_none());
+    ev(&mut p, &g, &mut st, Ev::Context(kx, 10.0, 10.0), 5.0);
+    crate::clipboard::set_test_clip("!");
+    ev(&mut p, &g, &mut st, Ev::Click(idx(K_MENU, MENU_PASTE)), 6.0);
+    assert!(p.n.as_ref().unwrap().books[0].notes[0].text.contains('!'), "pasted into the note");
+}
+
+/// Order 121 (A_121_01): the blurred text box paints fake letters - the same picture every build until the words change.
+#[test]
+fn a_blurred_note_paints_fake_letters_that_stay_until_the_text_changes() {
+    let (mut p, g, mut st, _, kx) = note_with("IP", "192.168.1.107");
+    let id = p.n.as_ref().unwrap().books[0].notes[0].id as usize;
+    st.focus = None;
+    p.revealed.clear();
+    let sig = |els: &[El]| find(els, idx(K_TEXT, id)).unwrap().children[0].paint_sig;
+    let sharp = sig(&build(&mut p, &g, &mut st, 1.0));
+    ev(&mut p, &g, &mut st, Ev::Click(K_EYE), 2.0);
+    let (a, b) = (sig(&build(&mut p, &g, &mut st, 3.0)), sig(&build(&mut p, &g, &mut st, 900.0)));
+    assert_ne!(a, sharp, "not the real letters");
+    assert_eq!(a, b, "no flicker from one build to the next");
+    // new words (typed after the note was shown again) = a new set
+    ev(&mut p, &g, &mut st, Ev::Press(idx(K_CARD, id), 10.0, 10.0, (0.0, 0.0, 100.0, 100.0)), 4.0);
+    st.focus = Some(kx);
+    type_str(&mut p, &g, &mut st, kx, "x");
+    st.focus = None;
+    p.revealed.clear();
+    assert_ne!(sig(&build(&mut p, &g, &mut st, 5.0)), a);
+}
+
+const PICS_121: &str = r"C:\BoylerUtilities-scratch\121";
+
+/// Order 121's pictures (looked at before DONE): a dragged selection over two lines of the yellow note, a double-clicked word
+/// on the blue note, the right-click menu with Copy / Paste, and the blurred notes (fake letters; one note clicked open).
+#[test]
+#[ignore]
+fn pictures_121() {
+    for (scale, size) in [(1.0f32, "1920x1080"), (1.25, "3440x1440")] {
+        let shot = |name: &str, pg: Notes, act: fn(&mut crate::ui::Ui, &crate::gfx::Gfx, f64) -> f64| {
+            let (pages, tab) = crate::ui::test_pages_with(Box::new(pg));
+            crate::ui::test_picture(pages, tab, scale, &format!(r"{PICS_121}\121_{name}_{size}.png"), |ui, g, now| {
+                ui.update(now + 50.0);
+                ui.prepare_page(g, now + 50.0);
+                act(ui, g, now + 100.0)
+            });
+        };
+        // one input step, then the page is rebuilt as a frame would
+        fn step(ui: &mut crate::ui::Ui, g: &crate::gfx::Gfx, now: f64) {
+            ui.update(now);
+            ui.prepare_page(g, now);
+        }
+        // drag from "Milk" to the middle of "Coffee"
+        fn drag(ui: &mut crate::ui::Ui, g: &crate::gfx::Gfx, now: f64) -> f64 {
+            ui.mouse_move(40.0, 183.0, now);
+            step(ui, g, now);
+            ui.mouse_down(40.0, 183.0, now + 10.0);
+            step(ui, g, now + 10.0);
+            ui.mouse_move(90.0, 190.0, now + 20.0);
+            step(ui, g, now + 20.0);
+            ui.mouse_move(88.0, 201.0, now + 30.0);
+            step(ui, g, now + 30.0);
+            ui.mouse_up(88.0, 201.0, now + 40.0);
+            step(ui, g, now + 40.0);
+            now + 600.0
+        }
+        shot("selection", demo(), drag);
+        // double-click "sticky" on the blue note
+        shot("word", demo(), |ui, g, now| {
+            for t in [0.0, 120.0] {
+                ui.mouse_move(440.0, 183.0, now + t);
+                step(ui, g, now + t);
+                ui.mouse_down(440.0, 183.0, now + t + 10.0);
+                step(ui, g, now + t + 10.0);
+                ui.mouse_up(440.0, 183.0, now + t + 20.0);
+                step(ui, g, now + t + 20.0);
+            }
+            now + 700.0
+        });
+        // the menu over the selection
+        shot("menu", demo(), |ui, g, now| {
+            let t = drag(ui, g, now);
+            ui.context(60.0, 190.0, t);
+            step(ui, g, t);
+            t + 400.0
+        });
+        let mut d = demo();
+        d.eye.load_with(true);
+        let open = d.n.as_ref().unwrap().books[0].notes[1].id;
+        d.revealed.insert(open);
+        shot("blurred", d, |_, _, now| now);
+    }
+}
+
+/// Order 121 end review: the keydown of Ctrl / Shift / a letter comes before the copy or the character - it must not drop the
+/// selection (else Ctrl+C copies nothing and a typed letter does not replace the selection).
+#[test]
+fn a_modifier_or_letter_keydown_keeps_the_selection() {
+    let _l = CLIP.lock().unwrap_or_else(|e| e.into_inner());
+    let (mut p, g, mut st, _, kx) = note_with("", "milk eggs");
+    evm(&mut p, &g, &mut st, Ev::Key(kx, VK_A), 2.0, true, false);
+    for vk in [0x11u16, 0x10, 0x58] {
+        ev(&mut p, &g, &mut st, Ev::Key(kx, vk), 2.1);
+    }
+    assert_eq!(copied(&mut p, &g, &mut st, kx), "milk eggs", "still selected after Ctrl / Shift / X keydowns");
+    type_str(&mut p, &g, &mut st, kx, "x");
+    assert_eq!(p.n.as_ref().unwrap().books[0].notes[0].text, "x", "the letter replaces the selection");
+}
+
+/// Order 121 end review: a double-clicked word stays whole when the pointer jitters inside it.
+#[test]
+fn a_double_clicked_word_survives_pointer_jitter() {
+    let _l = CLIP.lock().unwrap_or_else(|e| e.into_inner());
+    let (mut p, g, mut st, _, kx) = note_with("", "milk bread");
+    let r = boxr();
+    let x = r.0 + g.text_width("milk br", F_TEXT) + 2.0;
+    ev(&mut p, &g, &mut st, Ev::Press(kx, x, r.1 + 2.0, r), 10.0);
+    ev(&mut p, &g, &mut st, Ev::Release(kx), 10.05);
+    ev(&mut p, &g, &mut st, Ev::Press(kx, x, r.1 + 2.0, r), 10.1);
+    ev(&mut p, &g, &mut st, Ev::Drag(kx, x + 1.0, r.1 + 2.0, r), 10.12);
+    ev(&mut p, &g, &mut st, Ev::Drag(kx, x - 1.0, r.1 + 3.0, r), 10.14);
+    assert_eq!(copied(&mut p, &g, &mut st, kx), "bread");
+    // dragged out of the word to the left it grows over "milk "
+    ev(&mut p, &g, &mut st, Ev::Drag(kx, r.0 + 1.0, r.1 + 2.0, r), 10.2);
+    assert_eq!(copied(&mut p, &g, &mut st, kx), "milk bread");
 }

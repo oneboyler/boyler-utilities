@@ -74,6 +74,8 @@ pub fn source(name: &str) -> String {
         "noise" => r#"<svg viewBox="0 0 20 20"><path d="M2.5 10h1.8l1.2-3.2 1.5 6.6 1.6-9.4 1.6 11.8 1.5-8.4 1.4 4.6 1.2-2h3.2"/></svg>"#,
         // Order 116: the Notes tab's icon (a sticky note with a turned-up corner) and the privacy eye (open / struck through)
         "stick" => r#"<svg viewBox="0 0 20 20"><path d="M4.5 3.5h11A1.5 1.5 0 0 1 17 5v7.2L12.2 17H4.5A1.5 1.5 0 0 1 3 15.5V5a1.5 1.5 0 0 1 1.5-1.5z"/><path d="M17 12.2h-3.3a1.5 1.5 0 0 0-1.5 1.5V17"/><path d="M6.5 7.5h7M6.5 10.5h4.5" stroke-width="1.3" opacity=".55"/></svg>"#,
+        // Order 121: Paste in the note menu (a clipboard)
+        "paste" => r#"<svg viewBox="0 0 20 20"><rect x="4.5" y="4.5" width="11" height="12.5" rx="2"/><path d="M7.5 4.5V4a1.5 1.5 0 0 1 1.5-1.5h2A1.5 1.5 0 0 1 12.5 4v.5M7.5 9.5h5M7.5 12.5h3.5"/></svg>"#,
         // Order 116: the top row's "Rearrange tabs" (two arrows passing each other)
         "arrange" => r#"<svg viewBox="0 0 20 20"><path d="M3.5 7h12M12.5 4l3 3-3 3M16.5 13h-12M7.5 10l-3 3 3 3"/></svg>"#,
         "eye" => r#"<svg viewBox="0 0 20 20"><path d="M2.2 10c1.9-3.4 4.5-5.2 7.8-5.2s5.9 1.8 7.8 5.2c-1.9 3.4-4.5 5.2-7.8 5.2S4.1 13.4 2.2 10z"/><circle cx="10" cy="10" r="2.6"/></svg>"#,

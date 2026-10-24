@@ -110,6 +110,122 @@ pub fn insert(text: &mut String, at: &mut usize, add: &str) {
     *at = i + n;
 }
 
+/// Order 121: a letter / digit - and a `.` `:` `'` between two of them ("192.168.1.107", "don't") - belongs to a word.
+fn word_char(all: &[char], i: usize) -> bool {
+    let c = all[i];
+    c.is_alphanumeric() || c == '_' || (matches!(c, '.' | ':' | '\'') && i > 0 && i + 1 < all.len() && all[i - 1].is_alphanumeric() && all[i + 1].is_alphanumeric())
+}
+
+/// The run double-click selects at char index `at` (the char right of the caret, else the one left of it): a word, a run of
+/// blanks, or a single other mark.
+pub fn word_at(all: &[char], at: usize) -> (usize, usize) {
+    if all.is_empty() {
+        return (0, 0);
+    }
+    let mut i = at.min(all.len() - 1);
+    // a click between a word and the mark / blank after it chose the word
+    if i > 0 && !word_char(all, i) && word_char(all, i - 1) {
+        i -= 1;
+    }
+    let same = |a: usize, b: usize| {
+        let (x, y) = (all[a], all[b]);
+        if x == '\n' || y == '\n' {
+            return false;
+        }
+        if word_char(all, a) {
+            return word_char(all, b);
+        }
+        x.is_whitespace() && y.is_whitespace()
+    };
+    if !word_char(all, i) && !all[i].is_whitespace() {
+        return (i, i + 1);
+    }
+    let (mut a, mut b) = (i, i + 1);
+    while a > 0 && same(a - 1, i) {
+        a -= 1;
+    }
+    while b < all.len() && same(b, i) {
+        b += 1;
+    }
+    (a, b)
+}
+
+/// Ctrl+Left: the start of the word before `at` (blanks before the caret are skipped).
+pub fn word_left(all: &[char], at: usize) -> usize {
+    let mut i = at.min(all.len());
+    while i > 0 && !word_char(all, i - 1) && all[i - 1] != '\n' {
+        i -= 1;
+    }
+    if i > 0 && all[i - 1] == '\n' && i == at {
+        return i - 1;
+    }
+    while i > 0 && word_char(all, i - 1) {
+        i -= 1;
+    }
+    i
+}
+
+/// Ctrl+Right: the start of the word after the one the caret is in.
+pub fn word_right(all: &[char], at: usize) -> usize {
+    let mut i = at.min(all.len());
+    if i < all.len() && all[i] == '\n' {
+        return i + 1;
+    }
+    while i < all.len() && word_char(all, i) {
+        i += 1;
+    }
+    while i < all.len() && !word_char(all, i) && all[i] != '\n' {
+        i += 1;
+    }
+    i
+}
+
+/// Order 121: stand-in letters for a blurred note: every letter / digit / mark becomes a random letter or digit (narrow
+/// and wide letters are left out, so a word is about as wide as before), blanks and line breaks stay.
+pub fn fake(all: &[char], seed: u64) -> Vec<char> {
+    const POOL: &[u8] = b"abcdeghknopqsuvxyz0123456789";
+    let mut x = seed;
+    all.iter()
+        .map(|&c| {
+            if c.is_whitespace() {
+                return c;
+            }
+            // splitmix64
+            x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = x;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            POOL[((z ^ (z >> 31)) >> 16) as usize % POOL.len()] as char
+        })
+        .collect()
+}
+
+/// Make each drawn line (first char, chars) of `all` at most `maxw` wide: the last letters of a line that is too wide turn
+/// into blanks (the fake letters are not the real ones' widths).
+pub fn fit(all: &mut [char], ls: &[(usize, usize)], maxw: f32, w: &dyn Fn(&str) -> f32) {
+    for (s, n) in ls {
+        while let Some(last) = (*s..s + n).rev().find(|&i| !all[i].is_whitespace()) {
+            if w(all[*s..s + n].iter().collect::<String>().trim_end()) <= maxw {
+                break;
+            }
+            all[last] = ' ';
+        }
+    }
+}
+
+/// The chars `lo..hi` as text.
+pub fn slice(text: &str, lo: usize, hi: usize) -> String {
+    text.chars().skip(lo).take(hi.saturating_sub(lo)).collect()
+}
+
+/// Take the chars `lo..hi` out; the caret goes to `lo`.
+pub fn remove(text: &mut String, at: &mut usize, lo: usize, hi: usize) {
+    let v: Vec<char> = text.chars().collect();
+    let (lo, hi) = (lo.min(v.len()), hi.min(v.len()));
+    *text = v[..lo].iter().chain(v[hi.max(lo)..].iter()).collect();
+    *at = lo;
+}
+
 /// A key at the caret. `maxw` = the field's line width (Up / Down / Home / End go by the drawn lines). true = the words
 /// changed (save them).
 pub fn key(text: &mut String, at: &mut usize, vk: u16, maxw: f32, w: &dyn Fn(&str) -> f32) -> bool {
@@ -183,6 +299,56 @@ mod tests {
         assert_eq!((t.as_str(), at), ("čaj\nmk", 4));
     }
 
+
+    #[test]
+    fn words_blanks_and_marks_for_double_click_and_ctrl_arrows() {
+        let c = ch("ip 192.168.1.107, don't");
+        assert_eq!(word_at(&c, 4), (3, 16), "an IP address is one word");
+        assert_eq!(word_at(&c, 2), (0, 2), "between a word and a blank: the word");
+        assert_eq!(word_at(&c, 17), (17, 18), "a blank alone");
+        assert_eq!(word_at(&c, 16), (3, 16), "between a word and the comma: the word");
+        assert_eq!(word_at(&ch("a , b"), 2), (2, 3), "a mark alone");
+        assert_eq!(word_at(&c, 20), (18, 23), "an apostrophe inside a word");
+        assert_eq!(word_at(&c, 99), (18, 23), "past the end: the last word");
+        assert_eq!(word_at(&ch("a\n\nb"), 2), (2, 3), "a line break is its own");
+        assert_eq!(word_at(&[], 0), (0, 0));
+        let c = ch("milk eggs\nbread");
+        assert_eq!(word_right(&c, 0), 5);
+        assert_eq!(word_right(&c, 5), 9);
+        assert_eq!(word_right(&c, 9), 10, "over the line break");
+        assert_eq!(word_left(&c, 15), 10);
+        assert_eq!(word_left(&c, 10), 9, "back over the line break");
+        assert_eq!(word_left(&c, 7), 5);
+        assert_eq!(word_left(&c, 5), 0, "blanks before the caret are skipped");
+    }
+
+    #[test]
+    fn fake_letters_keep_the_shape_and_hide_the_words() {
+        let c = ch("milk eggs\n192.168.1.107");
+        let f = fake(&c, 7);
+        assert_eq!(f.len(), c.len());
+        for (a, b) in c.iter().zip(&f) {
+            assert_eq!(a.is_whitespace(), b.is_whitespace(), "blanks and breaks stay");
+            assert!(a.is_whitespace() || b.is_ascii_alphanumeric());
+        }
+        assert_eq!(f, fake(&c, 7), "the same seed: the same letters");
+        assert_ne!(f, fake(&c, 8), "another seed: others");
+        assert_ne!(f, c);
+        // a line too wide loses its last letters (10 px a char, 50 px wide)
+        let mut v = ch("abcdefgh ij");
+        fit(&mut v, &[(0, 11)], 50.0, &w);
+        assert_eq!(v.iter().collect::<String>().trim_end(), "abcde");
+    }
+
+    #[test]
+    fn slice_and_remove_count_chars_not_bytes() {
+        let (mut t, mut at) = (String::from("čaj milk"), 8);
+        assert_eq!(slice(&t, 0, 3), "čaj");
+        remove(&mut t, &mut at, 3, 8);
+        assert_eq!((t.as_str(), at), ("čaj", 3));
+        remove(&mut t, &mut at, 1, 99);
+        assert_eq!((t.as_str(), at), ("č", 1));
+    }
     #[test]
     fn up_down_home_end_follow_the_drawn_lines() {
         // "milk eggs " / "bread"; caret after "br" (index 12)
