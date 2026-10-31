@@ -1,0 +1,42 @@
+[package]
+name = "bu-gpudriver"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "Boyler Utilities - the NVIDIA graphics driver behind the Display tab's driver card (detect, look up, download, check, install the driver only). No UI."
+
+[dependencies]
+thiserror = "2"
+serde_json = "1"
+# Order 125: NVIDIA's lookups + the download go through the updater's small WinHTTP GET (and its fake in tests)
+bu-updater = { path = "../updater" }
+# Order 125: NVIDIA's driver .exe is a 7-Zip self-extractor (LZMA2 + BCJ2); only the driver parts are read out of it.
+# Windows 10's own tar.exe has no LZMA, so a pure-Rust reader instead of an outside program.
+sevenz-rust2 = { version = "0.24.2", default-features = false }
+
+[target.'cfg(windows)'.dependencies.windows]
+version = "0.62"
+features = [
+    "Win32_Foundation",
+    "Win32_Devices_DeviceAndDriverInstallation",
+    "Win32_System_Registry",
+    "Win32_System_Power",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Security_Cryptography",
+    "Win32_Security_Cryptography_Catalog",
+    "Win32_Security_Cryptography_Sip",
+    "Win32_Security_WinTrust",
+    "Win32_Storage_FileSystem",
+]
+
+[dev-dependencies]
+# the tests make tiny stand-in driver packages
+sevenz-rust2 = { version = "0.24.2", default-features = false, features = ["compress"] }
+
+[[example]]
+name = "gpudriver-show"
+path = "examples/show.rs"

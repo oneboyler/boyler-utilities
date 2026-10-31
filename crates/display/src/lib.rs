@@ -5,10 +5,12 @@
 //! - Change (all undoable): apply W × H × Hz + scaling with a 10 s keep / revert, main display, Windows scaling %,
 //!   brightness / contrast, vibrance.
 //! - Presets and per-app automatic switching (event-driven app watcher, no polling).
+//! - Brightness lock: a locked monitor's brightness put back after sleep / display-off / unlock / reconnect (Order 124).
 //!
 //! The OS sits behind [`DisplayOs`]: [`win::WinDisplayOs`] is the real one, [`fake::FakeDisplayOs`] the test one.
 
 pub mod autoswitch;
+pub mod brightlock;
 pub mod error;
 pub mod fake;
 pub mod fields;

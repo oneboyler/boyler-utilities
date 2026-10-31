@@ -35,6 +35,10 @@ windows = { version = "0.62", features = [
     "Win32_System_Variant",
     "Win32_System_Wmi",
     "Win32_System_Rpc",
+    # Order 124: the brightness lock's wake events (win/power.rs)
+    "Win32_System_Power",
+    "Win32_System_RemoteDesktop",
+    "Win32_System_SystemServices",
 ] }
 
 [dev-dependencies]
@@ -60,3 +64,7 @@ path = "examples/trigger.rs"
 [[example]]
 name = "display-bricon"
 path = "examples/bricon.rs"
+
+[[example]]
+name = "display-blkcheck"
+path = "examples/blkcheck.rs"

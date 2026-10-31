@@ -47,12 +47,14 @@ pub enum Purpose {
     Storage,
     /// The Keyboard tab's key remap: Windows' Scancode Map (Order 058).
     Keyboard,
+    /// The Display tab's NVIDIA driver card: install the driver only (Order 125).
+    GpuDriver,
     /// "Back to how your PC was" / "Windows defaults" / the uninstaller's undo: every op that puts a setting back.
     Reset,
 }
 
 impl Purpose {
-    pub const ALL: [Purpose; 10] = [
+    pub const ALL: [Purpose; 11] = [
         Purpose::Tweaks,
         Purpose::Network,
         Purpose::Startup,
@@ -62,6 +64,7 @@ impl Purpose {
         Purpose::RestorePoint,
         Purpose::Storage,
         Purpose::Keyboard,
+        Purpose::GpuDriver,
         Purpose::Reset,
     ];
 
@@ -76,6 +79,7 @@ impl Purpose {
             Purpose::RestorePoint => "restore-point",
             Purpose::Storage => "storage",
             Purpose::Keyboard => "keyboard",
+            Purpose::GpuDriver => "gpu-driver",
             Purpose::Reset => "reset",
         }
     }
@@ -99,6 +103,7 @@ impl Purpose {
             Purpose::RestorePoint => matches!(op, RestoreStatus | RestorePoint { .. }),
             Purpose::Storage => matches!(op, CleanWindowsTemp | DiskHealth(_)),
             Purpose::Keyboard => matches!(op, ScancodeMap { .. }),
+            Purpose::GpuDriver => matches!(op, GpuDriver { .. }),
             Purpose::Reset => matches!(
                 op,
                 RegSet { .. }
@@ -228,6 +233,10 @@ pub enum Op {
     /// Windows' Scancode Map (HKLM `Keyboard Layout`): exactly these remaps; none = remove the map. Checked with the
     /// Keyboard crate's own rules (each key once, never onto itself, at most 64).
     ScancodeMap { maps: Vec<bu_keysound::remap::Mapping> },
+    /// Install NVIDIA driver `version` (driver only) from the package the normal app downloaded to `file`. The file is
+    /// only a source: the copy copies it into its own admin-only folder and runs nothing that is not NVIDIA-signed, of
+    /// exactly that version (bu_gpudriver::install).
+    GpuDriver { version: bu_gpudriver::DriverVersion, file: String },
 }
 
 /// Longest text field (a registry path, a task path, a file path).
@@ -393,6 +402,7 @@ impl Op {
                 "scancode-map".into(),
                 if maps.is_empty() { "-".into() } else { maps.iter().map(|m| format!("{:x}:{:x}", m.from, m.to)).collect::<Vec<_>>().join(",") },
             ],
+            Op::GpuDriver { version, file } => vec!["gpu-driver".into(), version.to_string(), file.clone()],
         }
     }
 
@@ -554,10 +564,30 @@ impl Op {
                 want(1)?;
                 Op::ScancodeMap { maps: parse_maps(&f[1])? }
             }
+            "gpu-driver" => {
+                want(2)?;
+                let version = bu_gpudriver::DriverVersion::parse(&f[1]).filter(|v| v.to_string() == f[1]).ok_or("bad driver version")?;
+                check_driver_file(&f[2], version)?;
+                Op::GpuDriver { version, file: f[2].clone() }
+            }
             other => return Err(format!("unknown action {:?}", other.chars().take(40).collect::<String>())),
         };
         Ok(op)
     }
+}
+
+/// The downloaded driver package: a full `X:\…\<version>.exe` path, no `..`, no device / UNC path.
+pub fn check_driver_file(s: &str, version: bu_gpudriver::DriverVersion) -> Result<(), String> {
+    check_text(s, "file")?;
+    let b = s.as_bytes();
+    let drive = b.len() > 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && b[2] == b'\\';
+    if !drive || s.len() > 260 || s.contains('/') || s.split('\\').any(|p| p.is_empty() || p == "." || p == "..") {
+        return Err("bad driver file path".into());
+    }
+    if !s.to_ascii_lowercase().ends_with(&format!("\\{version}.exe")) {
+        return Err("not that version's package".into());
+    }
+    Ok(())
 }
 
 /// "3a:1,e038:e01d" (hex scancode pairs, from:to) or "-" (none) -> checked remaps.

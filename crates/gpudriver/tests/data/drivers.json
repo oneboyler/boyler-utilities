@@ -1,0 +1,264 @@
+{
+ "Success": "3",
+ "IDS": [
+  {
+   "downloadInfo": {
+    "Success": "1",
+    "ID": "282412",
+    "DownloadTypeID": "1",
+    "DownloadStatusID": "3",
+    "Name": "GeForce%20Game%20Ready%20Driver",
+    "NameLocalized": "GeForce%20Game%20Ready%20Driver",
+    "ShortDescription": "GeForce%20Game%20Ready%20Driver",
+    "DeviceToProductFamilyName": "",
+    "Release": "620",
+    "Version": "621.01",
+    "DisplayVersion": "",
+    "GFE_DisplayVersion": "11.0.9.565",
+    "CDKitUSBEmitterDriverVersion": "",
+    "CDKitGPUDriverVersion": "",
+    "IsBeta": "0",
+    "IsWHQL": "1",
+    "IsRecommended": "0",
+    "IsFeaturePreview": "0",
+    "IsNewest": "0",
+    "IsDC": "1",
+    "IsCRD": "0",
+    "HasNetInst": "0",
+    "CudaToolkitVersion": "",
+    "IsArchive": "0",
+    "IsActive": "1",
+    "IsEmailRequired": "0",
+    "ReleaseDateTime": "Wed Oct 21, 2026",
+    "DetailsURL": "https://www.nvidia.com/en-us/drivers/details/282412/",
+    "DownloadURL": "https://us.download.nvidia.com/Windows/621.01/621.01-desktop-win10-win11-64bit-international-dch-whql.exe",
+    "EMAN_REVRES_BD": "12-lqssm-lswfg-a2wsu-drp",
+    "EMITR_BD": "memCache:1%20rTime:1%20sTime:0",
+    "DownloadURLFileSize": "1.04 GB",
+    "BannerURL": "https://www.nvidia.com/en-us/geforce/billboards/displaydriver/standalone/eve-std-game-ready-driver-2026-banners/",
+    "BannerURLGfe": "https://www.nvidia.com/en-us/geforce/billboards/displaydriver/gfe/eve-gfe-game-ready-driver-2026-banners/",
+    "ReleaseNotes": "%3Cb%3EGame%20Ready%3C/b%3E",
+    "OtherNotes": "",
+    "InstallationNotes": "",
+    "Overview": "",
+    "LanguageName": "English%20(US)",
+    "OSName": "Windows%2011",
+    "OsCode": "10.0",
+    "OSList": [
+     {
+      "OSName": "Windows%2010%2064-bit",
+      "OsCode": "10.0"
+     },
+     {
+      "OSName": "Windows%2011",
+      "OsCode": "10.0"
+     }
+    ],
+    "Is64Bit": "1",
+    "Messaging": [
+     {
+      "MessageCode": "DownloadIDDetailsFound",
+      "MessageValue": "The Driver DownloadID details found"
+     }
+    ],
+    "series": [
+     {
+      "seriesname": "GeForce%20RTX%2050%20Series",
+      "products": [
+       {
+        "productName": "NVIDIA%20GeForce%20RTX%205090%20D%20v2"
+       },
+       {
+        "productName": "NVIDIA%20GeForce%20RTX%205090%20D"
+       }
+      ]
+     }
+    ]
+   }
+  },
+  {
+   "downloadInfo": {
+    "Success": "1",
+    "ID": "280103",
+    "DownloadTypeID": "1",
+    "DownloadStatusID": "3",
+    "Name": "GeForce%20Game%20Ready%20Driver",
+    "NameLocalized": "GeForce%20Game%20Ready%20Driver",
+    "ShortDescription": "GeForce%20Game%20Ready%20Driver",
+    "DeviceToProductFamilyName": "",
+    "Release": "615",
+    "Version": "617.42",
+    "DisplayVersion": "",
+    "GFE_DisplayVersion": "11.0.8.299",
+    "CDKitUSBEmitterDriverVersion": "",
+    "CDKitGPUDriverVersion": "",
+    "IsBeta": "0",
+    "IsWHQL": "1",
+    "IsRecommended": "0",
+    "IsFeaturePreview": "0",
+    "IsNewest": "0",
+    "IsDC": "1",
+    "IsCRD": "0",
+    "HasNetInst": "0",
+    "CudaToolkitVersion": "",
+    "IsArchive": "0",
+    "IsActive": "1",
+    "IsEmailRequired": "0",
+    "ReleaseDateTime": "Tue Oct 06, 2026",
+    "DetailsURL": "https://www.nvidia.com/en-us/drivers/details/280103/",
+    "DownloadURL": "https://us.download.nvidia.com/Windows/617.42/617.42-desktop-win10-win11-64bit-international-dch-whql.exe",
+    "EMAN_REVRES_BD": "71-lqssm-lswfg-a2wsu-drp",
+    "EMITR_BD": "memCache:1%20rTime:1%20sTime:0",
+    "DownloadURLFileSize": "990.85 MB",
+    "BannerURL": "https://www.nvidia.com/en-us/geforce/billboards/displaydriver/standalone/eve-std-game-ready-driver-2026-banners/",
+    "BannerURLGfe": "https://www.nvidia.com/en-us/geforce/billboards/displaydriver/gfe/eve-gfe-game-ready-driver-2026-banners/",
+    "ReleaseNotes": "%3Cb%3EGame%20Ready%3C/b%3E",
+    "OtherNotes": "",
+    "InstallationNotes": "",
+    "Overview": "",
+    "LanguageName": "English%20(US)",
+    "OSName": "Windows%2011",
+    "OsCode": "10.0",
+    "OSList": [
+     {
+      "OSName": "Windows%2010%2064-bit",
+      "OsCode": "10.0"
+     },
+     {
+      "OSName": "Windows%2011",
+      "OsCode": "10.0"
+     }
+    ],
+    "Is64Bit": "1",
+    "Messaging": [
+     {
+      "MessageCode": "DownloadIDDetailsFound",
+      "MessageValue": "The Driver DownloadID details found"
+     }
+    ],
+    "series": [
+     {
+      "seriesname": "GeForce%20RTX%2050%20Series",
+      "products": [
+       {
+        "productName": "NVIDIA%20GeForce%20RTX%205090%20D%20v2"
+       },
+       {
+        "productName": "NVIDIA%20GeForce%20RTX%205090%20D"
+       }
+      ]
+     }
+    ]
+   }
+  },
+  {
+   "downloadInfo": {
+    "Success": "1",
+    "ID": "274383",
+    "DownloadTypeID": "1",
+    "DownloadStatusID": "3",
+    "Name": "GeForce%20Game%20Ready%20Driver",
+    "NameLocalized": "GeForce%20Game%20Ready%20Driver",
+    "ShortDescription": "GeForce%20Game%20Ready%20Driver",
+    "DeviceToProductFamilyName": "",
+    "Release": "610",
+    "Version": "610.88",
+    "DisplayVersion": "",
+    "GFE_DisplayVersion": "11.0.8.299",
+    "CDKitUSBEmitterDriverVersion": "",
+    "CDKitGPUDriverVersion": "",
+    "IsBeta": "0",
+    "IsWHQL": "1",
+    "IsRecommended": "0",
+    "IsFeaturePreview": "0",
+    "IsNewest": "0",
+    "IsDC": "1",
+    "IsCRD": "0",
+    "HasNetInst": "0",
+    "CudaToolkitVersion": "",
+    "IsArchive": "0",
+    "IsActive": "1",
+    "IsEmailRequired": "0",
+    "ReleaseDateTime": "Tue Jul 28, 2026",
+    "DetailsURL": "https://www.nvidia.com/en-us/drivers/details/274383/",
+    "DownloadURL": "https://us.download.nvidia.com/Windows/610.88/610.88-desktop-win10-win11-64bit-international-dch-whql.exe",
+    "EMAN_REVRES_BD": "81-lqssm-lswfg-b2wsu-drp",
+    "EMITR_BD": "memCache:1%20rTime:1%20sTime:0",
+    "DownloadURLFileSize": "979.65 MB",
+    "BannerURL": "https://www.nvidia.com/en-us/geforce/billboards/displaydriver/standalone/eve-std-game-ready-driver-2026-banners/",
+    "BannerURLGfe": "https://www.nvidia.com/en-us/geforce/billboards/displaydriver/gfe/eve-gfe-game-ready-driver-2026-banners/",
+    "ReleaseNotes": "%3Cb%3EGame%20Ready%3C/b%3E",
+    "OtherNotes": "",
+    "InstallationNotes": "",
+    "Overview": "",
+    "LanguageName": "English%20(US)",
+    "OSName": "Windows%2011",
+    "OsCode": "10.0",
+    "OSList": [
+     {
+      "OSName": "Windows%2010%2064-bit",
+      "OsCode": "10.0"
+     },
+     {
+      "OSName": "Windows%2011",
+      "OsCode": "10.0"
+     }
+    ],
+    "Is64Bit": "1",
+    "Messaging": [
+     {
+      "MessageCode": "DownloadIDDetailsFound",
+      "MessageValue": "The Driver DownloadID details found"
+     }
+    ],
+    "series": [
+     {
+      "seriesname": "GeForce%20RTX%2050%20Series",
+      "products": [
+       {
+        "productName": "NVIDIA%20GeForce%20RTX%205090%20D%20v2"
+       },
+       {
+        "productName": "NVIDIA%20GeForce%20RTX%205090%20D"
+       }
+      ]
+     }
+    ]
+   }
+  }
+ ],
+ "spcall": "EXEC NDL_usp_Download_select_by_matrix_values null,995,127,null,135,null,0, null,1033,-1,null,0,null,null,null,null,0,null,null,0,null,10,0,0,0,null,null,null,null,null,null,null,null,null,null,null,null,null,1,0",
+ "Request": [
+  {
+   "downloadID": "null",
+   "pfid": "995",
+   "psid": "127",
+   "deviceID": "null",
+   "osID": "135",
+   "osCode": "null",
+   "is64bit": "0",
+   "languageID": "null",
+   "languageCode": "1033",
+   "dltype": "-1",
+   "isArchive": "null",
+   "beta": "0",
+   "includebeta": "null",
+   "gtversion": "null",
+   "version": "null",
+   "release": "null",
+   "isWHQL": "0",
+   "isNewest": "null",
+   "locationID": "null",
+   "sort1": "0",
+   "sort2": "null",
+   "numberOfResults": "10",
+   "isNewFeature": "0",
+   "gfeExclusive": "0",
+   "webExclusive": "0",
+   "null,null,null,null,null,null,null,null,null,null,null,null,": "",
+   "cudaToolkitID": "null",
+   "theSystemIsDc": "1",
+   "theUserRequestedCRD": "0"
+  }
+ ]
+}

@@ -197,6 +197,9 @@ def crate_file(d, lic, name):
                 return os.path.join(d, f)
             if lic == 'Zlib' and "provided 'as-is'" in t:
                 return os.path.join(d, f)
+            # Order 125: sevenz-rust2 / lzma-rust2 (Apache-2.0 only) ship it as plain LICENSE
+            if lic == 'Apache-2.0' and 'Apache License' in t and 'Version 2.0' in t:
+                return os.path.join(d, f)
     if name in CRATE_FILES:
         return os.path.join(EXTRA, CRATE_FILES[name])
     sys.exit(f'no {lic} licence file for {name} in {d}')

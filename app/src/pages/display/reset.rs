@@ -6,6 +6,7 @@
 //! - `main` "Main display" - the monitor that was main;
 //! - `bri:<monitor>` / `con:<monitor>` "DELL 27″ · brightness / contrast" - the monitor's own DDC/CI value;
 //! - `vib:<monitor>` "DELL 27″ · vibrance" - the driver's level;
+//! - `blk:<monitor>` "DELL 27″ · brightness lock" - "Lock brightness" on / off (Order 124; "Windows defaults" = off);
 //! - `rules` "Switch automatically" - the app's own rules (the drawing lists them): "2 apps → none".
 //!   Rule switches at a game's start go back by themselves when it closes: they are not changes.
 //!   "Windows defaults" = vibrance 50 % (the driver's normal level) on each monitor + no rules.
@@ -58,6 +59,8 @@ pub enum Item {
     Main,
     Ddc(MonitorId, Vcp),
     Vib(MonitorId),
+    /// Order 124: "Lock brightness" on / off
+    Lock(MonitorId),
     Rules,
 }
 
@@ -69,6 +72,7 @@ impl Item {
             Item::Ddc(m, Vcp::Brightness) => format!("bri:{m}"),
             Item::Ddc(m, Vcp::Contrast) => format!("con:{m}"),
             Item::Vib(m) => format!("vib:{m}"),
+            Item::Lock(m) => format!("blk:{m}"),
             Item::Rules => RULES.into(),
         }
     }
@@ -87,6 +91,7 @@ impl Item {
             "bri" => Item::Ddc(m, Vcp::Brightness),
             "con" => Item::Ddc(m, Vcp::Contrast),
             "vib" => Item::Vib(m),
+            "blk" => Item::Lock(m),
             _ => return None,
         })
     }
@@ -99,6 +104,7 @@ impl Item {
             Item::Ddc(_, Vcp::Brightness) => format!("{name} · brightness"),
             Item::Ddc(_, Vcp::Contrast) => format!("{name} · contrast"),
             Item::Vib(_) => format!("{name} · vibrance"),
+            Item::Lock(_) => format!("{name} · brightness lock"),
             Item::Rules => RULES_LABEL.into(),
         }
     }
@@ -122,6 +128,15 @@ pub fn ddc_val(v: VcpValue) -> Val {
 /// Vibrance: raw = the driver's level, shown in % (50 = normal).
 pub fn vib_val(v: &VibranceRaw) -> Val {
     Val::new(&v.current.to_string(), &format!("{} %", vibrance_percent(v)))
+}
+
+/// Order 124: "Lock brightness": raw on / off (the locked value is the monitor's brightness, its own line).
+pub fn lock_val(on: bool) -> Val {
+    if on {
+        Val::new("on", "On")
+    } else {
+        Val::new("off", "Off")
+    }
 }
 
 /// The rules: raw = all rows, shown "2 apps" (the ones switched on) / "none".
@@ -187,6 +202,7 @@ fn current_of(rt: &Rt, item: &str) -> Option<Val> {
             Some(main_val(&mons, &main))
         }
         Item::Vib(id) => rt.svc.lock().ok()?.os_mut().vibrance_get(&id).ok().map(|v| vib_val(&v)),
+        Item::Lock(id) => Some(lock_val(rt.brightness_lock(&id).is_some())),
         Item::Ddc(..) => None,
     }
 }
@@ -206,6 +222,16 @@ fn defaults_of(rt: &Rt) -> Vec<DefaultItem> {
     if let Ok(st) = rt.store.lock() {
         out.push(DefaultItem { item: RULES.into(), label: RULES_LABEL.into(), now: rules_val(&st), default: Val::new(NO_RULES, "none") });
     }
+    // Order 124: every brightness lock that is on goes off (the app came with none)
+    let locked = rt.brightness_locks();
+    if !locked.is_empty() {
+        let mons = rt.svc.lock().ok().and_then(|s| s.monitors().ok()).unwrap_or_default();
+        for (id, _) in locked {
+            let name = mons.iter().find(|m| m.id == id).map(mon_name).unwrap_or_else(|| "Monitor".into());
+            let it = Item::Lock(id);
+            out.push(DefaultItem { item: it.id(), label: it.label(&name), now: lock_val(true), default: lock_val(false) });
+        }
+    }
     out
 }
 
@@ -219,12 +245,37 @@ fn apply_to(rt: &Arc<Rt>, item: &str, to: &Val) -> Result<(), String> {
         Item::Rules => {
             {
                 let mut st = rt.store.lock().map_err(|e| e.to_string())?;
-                let Store { presets, rules } = &mut *st;
+                let Store { presets, rules, .. } = &mut *st;
                 rules.set_rules_raw(&to.raw, presets).map_err(|e| e.to_string())?;
             }
             rt.save();
             // rules may have gone: the watcher follows (no rules = no watcher)
             rt.sync_watcher_soon();
+        }
+        Item::Lock(id) => {
+            // Order 124: on = locked at the monitor's brightness now (read from it)
+            let pct = match to.raw.as_str() {
+                "on" => {
+                    let b = rt.svc.lock().map_err(|e| e.to_string())?.picture(&id).map_err(|e| e.to_string())?.brightness;
+                    Some(b.ok_or_else(|| bu_display::DisplayError::DdcNoAnswer.to_string())?.percent())
+                }
+                "off" => None,
+                _ => return Err("Not a lock setting".into()),
+            };
+            rt.set_brightness_lock(&id, pct);
+        }
+        Item::Ddc(id, Vcp::Brightness) if rt.brightness_lock(&id).is_some() => {
+            // Order 124: a locked monitor's brightness put back = its locked value (store before svc: the lock first)
+            let v = to.raw.parse::<u32>().map_err(|_| "Not a monitor value")?;
+            if bu_display::picture::ddc_excluded(&id) {
+                return Err(bu_display::DisplayError::DdcExcludedModel.to_string());
+            }
+            let max = rt.svc.lock().map_err(|e| e.to_string())?.os_mut().ddc_get(&id, Vcp::Brightness).map_err(|e| e.to_string())?.max;
+            // the locked value first, then the write (end review: the lock thread never puts the old value back over it)
+            if rt.user_brightness(&id, VcpValue { current: v, max }.percent()) {
+                rt.save();
+            }
+            rt.svc.lock().map_err(|e| e.to_string())?.os_mut().ddc_set(&id, Vcp::Brightness, v).map_err(|e| e.to_string())?;
         }
         it => {
             let mut s = rt.svc.lock().map_err(|e| e.to_string())?;
@@ -249,7 +300,7 @@ fn apply_to(rt: &Arc<Rt>, item: &str, to: &Val) -> Result<(), String> {
                     let v = to.raw.parse::<i32>().map_err(|_| "Not a vibrance level")?;
                     s.os_mut().vibrance_set(&id, v)
                 }
-                Item::Rules => Ok(()),
+                Item::Rules | Item::Lock(_) => Ok(()),
             };
             r.map_err(|e| e.to_string())?;
         }
@@ -298,7 +349,8 @@ impl Resettable for Away {
 impl Display {
     /// An open page shows what is on the PC now (its picture values and monitors read again).
     fn after_reset(&mut self) {
-        if self.rt.is_some() {
+        if let Some(rt) = &self.rt {
+            self.locks = rt.brightness_locks();
             self.pic = vec![None; self.mons.len()];
             self.pic_rx = None;
             // (Order 047: the monitors are read on the page's worker; the page shows them when they land)

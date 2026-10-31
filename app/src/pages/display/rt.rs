@@ -10,7 +10,10 @@
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 
+use std::time::Duration;
+
 use bu_display::autoswitch::AppEvent;
+use bu_display::brightlock::{LockWatch, Restore, WakeEvent, RETRY_AT};
 use bu_display::fake::FakeDisplayOs;
 use bu_display::keep::{self, KeepTimer};
 use bu_display::store::{Store, FILE_NAME};
@@ -82,6 +85,16 @@ pub struct Rt {
     notes: Arc<Mutex<Vec<String>>>,
     #[cfg(windows)]
     watcher: Mutex<Option<bu_display::win::watch::AppWatcher>>,
+    /// Order 124: "Lock brightness" - the one sleeping thread that puts a locked brightness back after a wake event (only
+    /// while a lock is on), and (real runs) the hidden window that hears those events from Windows
+    lock: Mutex<Option<LockWatch>>,
+    #[cfg(windows)]
+    power: Mutex<Option<bu_display::win::power::PowerEvents>>,
+    /// when the lock's tries run after an event (fake runtimes: short)
+    lock_retry: Vec<Duration>,
+    /// bumped by every brightness change of the user's (after the locked value moved, before the monitor is written): a
+    /// try of the lock thread running meanwhile writes nothing (end review)
+    moved: Arc<std::sync::atomic::AtomicU64>,
     pub fake: bool,
     /// bumped by every change made off the page (a picked exe, a rule switching): the page reads again
     epoch: std::sync::atomic::AtomicU64,
@@ -103,6 +116,11 @@ impl Rt {
             notes: Arc::new(Mutex::new(Vec::new())),
             #[cfg(windows)]
             watcher: Mutex::new(None),
+            lock: Mutex::new(None),
+            #[cfg(windows)]
+            power: Mutex::new(None),
+            lock_retry: if fake { vec![Duration::from_millis(20), Duration::from_millis(60), Duration::from_millis(120)] } else { RETRY_AT.to_vec() },
+            moved: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             fake,
             epoch: std::sync::atomic::AtomicU64::new(0),
         }
@@ -155,6 +173,7 @@ impl Rt {
             let rt = Arc::new(Rt::new(AnyOs::Win(os), store, path, false));
             if !real_read {
                 rt.sync_watcher_soon();
+                rt.sync_lock();
             }
             rt
         })
@@ -163,11 +182,13 @@ impl Rt {
 
     /// The runtime of this app run is made once; the per-game rules must work with the menu closed, so the watcher starts at
     /// app start - not only when the tab was opened (Order 063: "VALORANT 1440x1080 does nothing until I open Display").
-    /// No rules saved = nothing is made (no runtime, no watcher, no thread). Real runs only.
+    /// No rules and no brightness lock saved = nothing is made (no runtime, no watcher, no thread). Real runs only.
+    /// (Order 124: a saved "Lock brightness" works from the app's start too.)
     #[cfg(windows)]
     pub fn start_background() {
         let Some(dir) = std::env::var_os("APPDATA").map(|a| PathBuf::from(a).join("Boyler Utilities")) else { return };
-        if Store::load(&dir.join(FILE_NAME)).rules.watched_names().is_empty() {
+        let st = Store::load(&dir.join(FILE_NAME));
+        if st.rules.watched_names().is_empty() && st.bright_locks.is_empty() {
             return;
         }
         let _ = Rt::shared(false);
@@ -272,11 +293,112 @@ impl Rt {
         });
     }
 
+    /// Order 124: the monitor's locked brightness %, if it is locked.
+    pub fn brightness_lock(&self, id: &MonitorId) -> Option<u8> {
+        self.store.lock().ok().and_then(|s| s.brightness_lock(id))
+    }
+
+    /// Order 124: every locked monitor with its brightness %.
+    /// Order 124 (end review): the user sets a brightness (slider, change-log put-back). Call it BEFORE the monitor is
+    /// written: a locked monitor's locked value moves to `pct`, and the lock thread hears of it, so a try running
+    /// meanwhile never puts the old value back. True when the locked value changed (the caller saves).
+    pub fn user_brightness(&self, id: &MonitorId, pct: u8) -> bool {
+        let changed = self.store.lock().is_ok_and(|mut st| {
+            let move_it = st.brightness_lock(id).is_some_and(|l| l != pct);
+            if move_it {
+                st.lock_brightness(id, Some(pct));
+            }
+            move_it
+        });
+        self.moved.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        changed
+    }
+
+    /// How many brightness changes of the user's the lock thread was told of (tests).
+    pub fn brightness_moves(&self) -> u64 {
+        self.moved.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub fn brightness_locks(&self) -> Vec<(MonitorId, u8)> {
+        self.store.lock().map(|s| s.brightness_locks()).unwrap_or_default()
+    }
+
+    /// Order 124: "Lock brightness" on (at `pct`; a new value replaces the old one) / off (`None`): saved (it holds after
+    /// a restart) and the lock thread follows (started with the first lock, ended with the last).
+    pub fn set_brightness_lock(self: &Arc<Self>, id: &MonitorId, pct: Option<u8>) {
+        let changed = self.store.lock().map(|mut s| {
+            let before = s.brightness_lock(id);
+            s.lock_brightness(id, pct);
+            before != s.brightness_lock(id)
+        });
+        if changed.unwrap_or(false) {
+            self.save();
+            self.sync_lock();
+        }
+    }
+
+    /// Order 124: a lock on = the lock thread runs (+ in real runs the hidden window for Windows' wake events); no lock =
+    /// neither exists (0 CPU, no thread). Never in the uninstaller's undo with no window, never in a --real-read copy.
+    pub fn sync_lock(self: &Arc<Self>) {
+        let any = self.store.lock().map(|s| !s.bright_locks.is_empty()).unwrap_or(false);
+        if !any || (!self.fake && (self.path.is_none() || crate::undo::headless())) {
+            // the window first, dropped outside every lock: its thread may be in `wake` (which takes `lock`) and is joined
+            #[cfg(windows)]
+            {
+                let p = self.power.lock().unwrap_or_else(|e| e.into_inner()).take();
+                drop(p);
+            }
+            let l = self.lock.lock().unwrap_or_else(|e| e.into_inner()).take();
+            drop(l);
+            return;
+        }
+        let mut lock = self.lock.lock().unwrap_or_else(|e| e.into_inner());
+        if lock.is_none() {
+            let store = self.store.clone();
+            let weak = Arc::downgrade(self);
+            *lock = Some(LockWatch::start(
+                self.svc.clone(),
+                move || store.lock().map(|s| s.brightness_locks()).unwrap_or_default(),
+                self.moved.clone(),
+                self.lock_retry.clone(),
+                move |r: &[(MonitorId, Restore)]| {
+                    // an open page shows the value put back
+                    if r.iter().any(|(_, x)| matches!(x, Restore::Written { .. })) {
+                        if let Some(rt) = weak.upgrade() {
+                            rt.bump();
+                        }
+                    }
+                },
+            ));
+        }
+        drop(lock);
+        #[cfg(windows)]
+        if !self.fake {
+            let mut p = self.power.lock().unwrap_or_else(|e| e.into_inner());
+            if p.is_none() {
+                let weak = Arc::downgrade(self);
+                *p = bu_display::win::power::PowerEvents::start(Arc::new(move |ev| {
+                    if let Some(rt) = weak.upgrade() {
+                        rt.wake(ev);
+                    }
+                }))
+                .ok();
+            }
+        }
+    }
+
+    /// Order 124: Windows said a monitor may have lost its brightness (the power window; tests call it the same way).
+    pub fn wake(&self, ev: WakeEvent) {
+        if let Some(l) = self.lock.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+            l.wake(ev);
+        }
+    }
+
     /// A watched game started / stopped: the rules switch (no prompt, no keep bar); their notes wait for the page.
     pub fn on_app_event(&self, ev: &AppEvent) {
         let Ok(mut st) = self.store.lock() else { return };
         let Ok(mut svc) = self.svc.lock() else { return };
-        let Store { presets, rules } = &mut *st;
+        let Store { presets, rules, .. } = &mut *st;
         let _ = rules.run(ev, presets, &mut svc);
         let notes = rules.take_notes();
         drop(svc);

@@ -6,6 +6,7 @@
 //! the page reads them on open and drops everything on close. Tests: the FAKE runtime with the drawing's sample.
 
 mod apps;
+pub mod driver;
 pub mod identify;
 mod reset;
 pub mod rt;
@@ -24,11 +25,11 @@ use crate::anim::{Bezier, EASE, EASE_OUT};
 use crate::gfx::{sh, Align, Font, Gfx, Rgba};
 use crate::pages::{Env, Page};
 use crate::ui::cx::{Cx, Ev};
-use crate::ui::el::{idx, key, lh, sub, Cursor, El, Key};
+use crate::ui::el::{idx, key, lh, sub, Cursor, El, Key, RADIUS_PILL};
 use crate::ui::pieces::mitems::{self, It, Lead, Place, Row};
 use crate::ui::pieces::segx::{self, Label};
 use crate::ui::pieces::{self, bits, button, group, nbox, rowbits, seg, slider, tip, toast, toggle};
-use crate::ui::{cmix, ACC, ACC_S, CTL, CTL_H, DASH, FG, FG2, FG3, GRP, HAIR, HL, HOV, ICO_ON, MENU, RED, SEL, TRK, WHITE};
+use crate::ui::{cmix, ACC, ACC_S, CTL, CTL_H, DASH, FG, FG2, FG3, GRP, HAIR, HL, HOV, ICO, ICO_ON, MENU, RED, SEL, TRK, WHITE};
 
 use rt::Rt;
 
@@ -44,6 +45,14 @@ const K_MAIN: Key = key("dsp.main");
 const K_BRI: Key = key("dsp.bri");
 const K_CON: Key = key("dsp.con");
 const K_VIB: Key = key("dsp.vib");
+/// Order 124: "Lock brightness" (the selected monitor's)
+const K_BLK: Key = key("dsp.blk");
+/// Order 126: the lock's two icons (the app's `lock` glyph, 12 x 12; open = the shackle lifted off). Order 129: back to
+/// this small glyph at 14 px (the owner: "i said just have a round thing around it, relative to its size, not make the lock huge")
+const LOCK_ON: &str = r#"<svg viewBox="0 0 12 12"><rect x="2.5" y="5.2" width="7" height="5.3" rx="1.2"/><path d="M4.2 5.2V3.9a1.8 1.8 0 0 1 3.6 0v1.3"/></svg>"#;
+const LOCK_OFF: &str = r#"<svg viewBox="0 0 12 12"><rect x="2.5" y="5.2" width="7" height="5.3" rx="1.2"/><path d="M4.2 5.2V3.9a1.8 1.8 0 0 1 3.4-.7"/></svg>"#;
+/// Order 129: the lock's round hover - 18 px around the 14 px glyph (its drawn part ~8 x 10 px): ~4-5 px past it each side
+const LOCK_D: f32 = 18.0;
 const K_PST: Key = key("dsp.pst");
 const K_PNEW: Key = key("dsp.pnew");
 const K_RULE: Key = key("dsp.rule");
@@ -137,6 +146,7 @@ impl PicJobs {
     /// first change → its last), noted when the queue is empty (a drag is one change, not fifty file writes).
     fn run(&self, rt: &Rt) {
         let mut log: Vec<(MonitorId, u8, String, crate::undo::Val, crate::undo::Val)> = Vec::new();
+        let mut lock_moved = false;
         loop {
             let (id, which, pct, label) = {
                 let mut g = self.slot.lock().unwrap_or_else(|e| e.into_inner());
@@ -146,6 +156,11 @@ impl PicJobs {
                 }
                 g.0.remove(0)
             };
+            // Order 124: the brightness slider moved while locked: the locked value follows - BEFORE the monitor is written,
+            // so the lock thread never puts the old one back over it (end review); saved once, at the end
+            if which == 0 && rt.user_brightness(&id, pct) {
+                lock_moved = true;
+            }
             let Ok(mut s) = rt.svc.lock() else { continue };
             let changed = match which {
                 0 | 1 => {
@@ -161,6 +176,9 @@ impl PicJobs {
                     None => log.push((id, which, label, old, new)),
                 }
             }
+        }
+        if lock_moved {
+            rt.save();
         }
         for (id, which, label, old, new) in log {
             let it = match which {
@@ -300,6 +318,10 @@ pub struct Display {
     /// the monitor whose values `pic_rx` brings
     pic_at: usize,
     pic_jobs: Option<Arc<PicJobs>>,
+    /// Order 124: the locked monitors and their brightness % (as last read from the runtime / set here)
+    locks: Vec<(MonitorId, u8)>,
+    /// Order 125: the NVIDIA driver card (shown only with an NVIDIA card)
+    drv: driver::Card,
     menu: Option<Menu>,
     /// the list the frame closed on this press (a press beside it) - read by the press that follows
     dismissed: Option<MenuKind>,
@@ -527,6 +549,8 @@ impl Display {
             std::thread::sleep(std::time::Duration::from_millis(2));
         }
         assert!(self.jobs == 0, "a Display job never answered");
+        // Order 125: the driver card's read is in too
+        self.drv.settle();
     }
 
     fn fields_from_monitor(&mut self) {
@@ -1030,6 +1054,11 @@ impl Display {
     // ---------------------------------------------------------------- picture
     fn set_picture(&mut self, which: u8, pct: u8) {
         let (Some(rt), Some(id)) = (self.rt.clone(), self.sel_id()) else { return };
+        if which == 0 {
+            if let Some(l) = self.locks.iter_mut().find(|(m, _)| *m == id) {
+                l.1 = pct;
+            }
+        }
         if let Some(Some(p)) = self.pic.get_mut(self.sel) {
             match which {
                 0 => p.brightness = p.brightness.map(|v| bu_display::VcpValue { current: bu_display::picture::ddc_value_for_percent(v.max, pct), ..v }),
@@ -1218,12 +1247,19 @@ impl Display {
             El::row().center().gap(10.0).none().child(slider::slider(cx, k, v as f32 / 100.0, 168.0, 20.0, look)).child(slider::value_label(&format!("{v} %")).min_w(50.0))
         };
         let mut rows = Vec::new();
+        // Order 127: the lock icon sits right after the word "Brightness" (Order 129: its round hover 3 px from the word); the sliders and values are where they were before Order 126
+        let lock_ok = ok && p.is_some_and(|p| p.brightness.is_some());
         for (i, (k, name, v)) in [(K_BRI, "Brightness", b), (K_CON, "Contrast", c)].into_iter().enumerate() {
-            let mut r = group::row_ex(i == 0, 14.0, vec![group::lbl(name, None), group::ctl(vec![msl(cx, k, v, !ok)])]).pad(7.0, 14.0, 7.0, 14.0);
-            if !ok {
-                r = r.opacity(0.4).no_hit();
-            }
-            rows.push(r);
+            let r = if i == 0 {
+                // the label and the slider grey out with the monitor; the lock decides for itself (a lock that is on can always be turned off)
+                let (lab, sl) = (El::text(name, Font::new(13.0, 400), FG(), lh(13.0, 1.35)).ellipsis(), msl(cx, k, v, !ok));
+                let (lab, sl) = if ok { (lab, sl) } else { (lab.opacity(0.4).no_hit(), sl.opacity(0.4).no_hit()) };
+                group::row_ex(true, 14.0, vec![El::row().center().gap(3.0).flex1().child(lab).child(self.lock_btn(cx, lock_ok)), group::ctl(vec![sl])])
+            } else {
+                let r = group::row_ex(false, 14.0, vec![group::lbl(name, None), group::ctl(vec![msl(cx, k, v, !ok)])]);
+                if ok { r } else { r.opacity(0.4).no_hit() }
+            };
+            rows.push(r.pad(7.0, 14.0, 7.0, 14.0));
         }
         if vib.is_some() || p.is_none() {
             let vendor = match p.and_then(|p| p.vibrance_vendor) {
@@ -1241,6 +1277,51 @@ impl Display {
             }
         }
         out
+    }
+
+    /// Order 126 (the owner: "brightness one should just be a toggle in the same row as brightness and hovering over it explains
+    /// what it is"): the lock is a small icon button right after the word Brightness (Order 127: moved there from after the value) - open lock grey = off, closed lock in the
+    /// accent = on - with the app's hover tip. Greyed when the monitor doesn't answer DDC/CI - unless it is on (Order 124's
+    /// end review: a lock can always be turned off).
+    fn lock_btn(&self, cx: &mut Cx, ok: bool) -> El {
+        let on = self.sel_id().is_some_and(|id| self.locks.iter().any(|(m, _)| *m == id));
+        // Order 128 (the owner: "why is the icon hover so big, it should be like for mic speaker etc"): the Audio page's mute icons'
+        // feel (`audio::dev_row`): round hover in CTL_H, ICO → FG on hover, press scale .9, the plain `title` tip. Order 129:
+        // the glyph small again (14 px, 1.3 stroke) and the round hover sized to it (LOCK_D), not to the Audio icons
+        let hv = cx.hover_t(K_BLK, 150.0, EASE);
+        let pr = cx.active_t(K_BLK, 120.0, EASE);
+        let col = if on { ACC() } else { cmix(ICO(), FG(), hv) };
+        let b = El::grid()
+            .size(LOCK_D, LOCK_D)
+            .none()
+            .radius(RADIUS_PILL)
+            .bg(CTL_H().mul_a(hv))
+            .place_center()
+            .scale(1.0 - 0.1 * pr)
+            .on_click(K_BLK)
+            .cursor(Cursor::Hand)
+            .title("Lock brightness - set back after sleep, unlock or reconnect")
+            .child(El::icon_svg(if on { LOCK_ON } else { LOCK_OFF }, 14.0, 1.3, col).no_hit());
+        if ok || on { b } else { b.opacity(0.4).no_hit() }
+    }
+
+    /// Order 124: the switch clicked - on = locked at the slider's value (the monitor must answer); off always works.
+    /// One change-log line per switch.
+    fn toggle_lock(&mut self) {
+        let (Some(rt), Some(id)) = (self.rt.clone(), self.sel_id()) else { return };
+        let was = self.locks.iter().any(|(m, _)| *m == id);
+        let to = if was {
+            None
+        } else {
+            let p = self.pic.get(self.sel).copied().flatten();
+            let Some(b) = p.filter(|p| p.ddc == DdcState::Answers).and_then(|p| p.brightness) else { return };
+            Some(b.percent())
+        };
+        rt.set_brightness_lock(&id, to);
+        self.locks = rt.brightness_locks();
+        let name = self.mons.get(self.sel).map(reset::mon_name).unwrap_or_else(|| "Monitor".into());
+        let it = reset::Item::Lock(id);
+        reset::rec(&it.id(), &it.label(&name), &reset::lock_val(was), &reset::lock_val(!was));
     }
 
     fn preset_card(&self, cx: &mut Cx, p: &Preset, on: bool) -> El {
@@ -1743,6 +1824,20 @@ impl Page for Display {
                 self.epoch = rt.epoch();
                 // (its answer draws)
                 self.read_again(How::KeepFields);
+                // Order 124: the lock may have put a brightness back meanwhile: the picked monitor's values again
+                self.locks = rt.brightness_locks();
+                if self.pic_rx.is_none() {
+                    if let Some(slot) = self.pic.get_mut(self.sel) {
+                        let old = slot.take();
+                        self.read_picture(self.sel);
+                        // (a real read lands later: the old values stay on show until then)
+                        if let Some(slot) = self.pic.get_mut(self.sel) {
+                            if slot.is_none() && self.pic_rx.is_some() {
+                                *slot = old;
+                            }
+                        }
+                    }
+                }
             }
             let notes = rt.take_notes();
             if !notes.is_empty() {
@@ -1755,6 +1850,9 @@ impl Page for Display {
                 }
                 busy = true;
             }
+        }
+        if self.drv.tick() {
+            busy = true;
         }
         self.nudges.retain(|(_, t)| now - t < 340.0);
         if !self.nudges.is_empty() {
@@ -1800,6 +1898,9 @@ impl Page for Display {
         v.push(El::block().child(group::gh("Presets")).child(self.presets_grid(cx)));
         let gh = group::gh("Switch automatically").child(El::text("while an app is running", Font::new(11.0, 400), FG3(), lh(11.0, 1.35)));
         v.push(El::block().child(gh).child(self.rules_grp(cx)));
+        if let Some(card) = self.drv.build(cx) {
+            v.push(card);
+        }
         v.push(pieces::reset::reset_line(cx, K_RESET, Some("Windows defaults")));
         v
     }
@@ -1818,6 +1919,10 @@ impl Page for Display {
                 any = true;
             }
         }
+        if let Some(win) = self.drv.popup(cx) {
+            layer = layer.child(win);
+            any = true;
+        }
         if let Some((t, at)) = self.toast.clone() {
             if cx.now - at < toast::SHOW_MS + 300.0 {
                 layer = layer.child(toast::toast(cx, K_TOAST, &t, at, false));
@@ -1833,6 +1938,7 @@ impl Page for Display {
 
     fn popup_dismiss(&mut self) {
         self.dismissed = self.menu.take().map(|m| m.kind);
+        self.drv.dismiss();
     }
 
     fn event(&mut self, ev: &Ev, cx: &mut Cx) {
@@ -1965,6 +2071,7 @@ impl Display {
         self.now = now;
         self.frozen = env.frozen;
         self.rt = Some(rt.clone());
+        self.locks = rt.brightness_locks();
         self.memo = env.keep.clone();
         let (work, ans) = start_worker(rt.clone(), self.slow);
         self.work = Some(work);
@@ -1978,6 +2085,8 @@ impl Display {
         self.read_again(How::Open);
         // rules made before the change log existed get their line ("none" before the app)
         reset::seed_rules(&rt);
+        // Order 125: the NVIDIA card + driver and NVIDIA's list, read once now (off the menu's thread)
+        self.drv.open(env);
         // test copies only: a state for the pixel proofs (the test hook's click can't reach El pages yet - PIECES_WANTED),
         // put once the open read is in
         if env.test {
@@ -2016,6 +2125,9 @@ impl Display {
     }
 
     fn click(&mut self, k: Key, cx: &mut Cx) {
+        if self.drv.click(k, cx.now) {
+            return;
+        }
         for i in 0..self.mons.len() {
             if k == idx(K_MON, i) {
                 let mut sorted: Vec<usize> = (0..self.mons.len()).collect();
@@ -2053,6 +2165,10 @@ impl Display {
         }
         if k == K_MAIN {
             self.set_main();
+            return;
+        }
+        if k == K_BLK {
+            self.toggle_lock();
             return;
         }
         if k == K_PNEW {

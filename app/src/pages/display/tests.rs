@@ -821,3 +821,280 @@ fn a_mode_click_during_a_mode_change_is_sent_after_it() {
     assert_eq!((t.fields().w, t.fields().sc), (1440, GpuScaling::Stretch));
     assert!(t.p.cfm_on.is_some() && t.p.next.is_none());
 }
+
+// ---------------------------------------------------------------- Order 124: Lock brightness
+
+fn brightness_writes(t: &T) -> Vec<u32> {
+    t.calls().iter().filter_map(|c| if let FakeCall::DdcSet(_, Vcp::Brightness, v) = c { Some(*v) } else { None }).collect()
+}
+
+/// The fake monitor's brightness now (as if it changed by itself: the monitor woke at another value).
+fn set_fake_brightness(rt: &Rt, id: &str, v: u32) {
+    let mut s = rt.svc.lock().unwrap();
+    if let AnyOs::Fake(f) = s.os_mut() {
+        let m = f.monitors.iter_mut().find(|m| m.info.id.0 == id).unwrap();
+        m.ddc.as_mut().unwrap().insert(Vcp::Brightness, bu_display::VcpValue { current: v, max: 100 });
+    }
+}
+
+fn fake_brightness(rt: &Rt, id: &str) -> u32 {
+    rt.svc.lock().unwrap().picture(&MonitorId(id.into())).unwrap().brightness.unwrap().current
+}
+
+/// The fake runtime's tries run within ~0.2 s of an event.
+fn after_tries() {
+    std::thread::sleep(Duration::from_millis(400));
+}
+
+#[test]
+fn lock_brightness_has_no_row_of_its_own_and_is_off_by_default() {
+    let mut t = T::new();
+    let s = page_text(&mut t);
+    assert!(!s.contains("Lock brightness"), "Order 126: no separate row: {s}");
+    assert_eq!(t.rt().brightness_lock(&MonitorId(DELL.into())), None, "off by default");
+}
+
+#[test]
+fn locking_keeps_the_slider_value_and_the_slider_moves_the_locked_value() {
+    let mut t = T::new();
+    let dell = MonitorId(DELL.into());
+    t.click(K_BLK);
+    assert_eq!(t.rt().brightness_lock(&dell), Some(70), "the slider's value is the locked one");
+    assert!(brightness_writes(&t).is_empty(), "the switch itself writes nothing");
+    // a drag to 100 % while locked: the locked value follows
+    t.ev(Ev::Press(K_BRI, 340.0, 0.0, (332.0, 0.0, 168.0, 20.0)));
+    t.ev(Ev::Drag(K_BRI, 500.0, 0.0, (332.0, 0.0, 168.0, 20.0)));
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(t.rt().brightness_lock(&dell), Some(100));
+    // off again: unlocked, the monitor keeps its value
+    t.click(K_BLK);
+    assert_eq!(t.rt().brightness_lock(&dell), None);
+    assert_eq!(brightness_writes(&t).last(), Some(&100), "the monitor keeps the dragged value");
+}
+
+#[test]
+fn a_monitor_without_ddc_has_its_lock_icon_greyed() {
+    let mut t = T::new();
+    t.click(idx(K_MON, 1));
+    let s = page_text(&mut t);
+    assert!(s.contains("turn on DDC/CI"), "{s}");
+    // a click on the greyed icon locks nothing
+    t.click(K_BLK);
+    assert_eq!(t.rt().brightness_lock(&MonitorId(LG.into())), None);
+}
+
+#[test]
+fn the_lock_puts_brightness_back_after_a_wake_with_the_menu_closed() {
+    let rt = Rt::fake_sample();
+    {
+        let mut t = T::with(rt.clone());
+        t.click(K_BLK);
+        // the menu closes: the page is dropped, the runtime lives on
+        t.p.close();
+    }
+    set_fake_brightness(&rt, DELL, 0);
+    rt.wake(bu_display::brightlock::WakeEvent::DisplayOn);
+    after_tries();
+    assert_eq!(fake_brightness(&rt, DELL), 70);
+    // already there: the next event reads and writes nothing
+    let writes = |rt: &Rt| {
+        let s = rt.svc.lock().unwrap();
+        match s.os() {
+            AnyOs::Fake(f) => f.calls.iter().filter(|c| matches!(c, FakeCall::DdcSet(_, Vcp::Brightness, _))).count(),
+            #[allow(unreachable_patterns)]
+            _ => 0,
+        }
+    };
+    assert_eq!(writes(&rt), 1);
+    rt.wake(bu_display::brightlock::WakeEvent::Unlock);
+    after_tries();
+    assert_eq!(writes(&rt), 1, "equal value -> no write");
+    // no event, no write (never fights the user live)
+    set_fake_brightness(&rt, DELL, 30);
+    after_tries();
+    assert_eq!(fake_brightness(&rt, DELL), 30);
+}
+
+#[test]
+fn the_lock_is_kept_in_the_display_store() {
+    let rt = Rt::fake_sample();
+    let dell = MonitorId(DELL.into());
+    rt.set_brightness_lock(&dell, Some(55));
+    let st = rt.store.lock().unwrap().clone();
+    assert_eq!(st.brightness_lock(&dell), Some(55));
+}
+
+#[test]
+fn the_lock_switch_goes_into_the_change_log_and_back() {
+    start_services();
+    let mut t = T::new();
+    let dell = MonitorId(DELL.into());
+    t.click(K_BLK);
+    let r = rec_of(&format!("blk:{DELL}")).expect("the lock's line");
+    assert_eq!((r.label.as_str(), r.was.text.as_str(), r.now.text.as_str()), ("DELL 27″ · brightness lock", "Off", "On"));
+    let rv = review(&t.p, Kind::HowItWas);
+    assert!(rv.lines.iter().any(|l| l.item == format!("blk:{DELL}")), "{:?}", rv.lines.iter().map(|l| l.item.clone()).collect::<Vec<_>>());
+    let res = crate::services::with(|s| rv.apply(&mut s.store, &mut [&mut t.p as &mut dyn Resettable])).unwrap();
+    assert!(res.iter().all(|r| r.outcome == Outcome::Ok), "{res:?}");
+    assert_eq!(t.rt().brightness_lock(&dell), None, "back to off");
+    crate::services::shutdown();
+}
+
+/// Order 127: the lock is an icon right after the word "Brightness" (no row of its own, with the app's hover tip); the
+/// sliders and values are where they were before Order 126 - Contrast's row never changed, so Brightness lines up with it.
+#[test]
+fn the_lock_is_an_icon_after_the_word_brightness_and_the_sliders_stay_put() {
+    let mut t = T::new();
+    let kids = t.build();
+    let root = El::block().w(600.0).child(El::block().w(600.0).children(kids));
+    let l = crate::ui::lay::Laid::new(&t.g, root, 600.0, None);
+    let (lock, bri, con) = (l.rect_of(K_BLK).expect("lock"), l.rect_of(K_BRI).expect("bri"), l.rect_of(K_CON).expect("con"));
+    assert_eq!((lock.2, lock.3), (18.0, 18.0), "Order 129: the small lock's own 18 px round hover, not the Audio icons' 30 px");
+    assert_eq!(bri.0, con.0, "the sliders line up");
+    assert_eq!(bri.2, con.2, "the slider keeps its width");
+    assert!(lock.0 + lock.2 < bri.0, "the lock is left of the slider, in the label's part of the row");
+    assert!(l.rect_of(K_VIB).is_none_or(|v| v.0 == bri.0), "Vibrance lines up too");
+    let tip = l.tip_in(&[K_BLK]).map(|t| t.1.to_string());
+    assert!(l.tip_in(&[K_BLK]).is_some_and(|t| t.3), "a plain title tip, like the Audio mute icons");
+    assert_eq!(tip.as_deref(), Some("Lock brightness - set back after sleep, unlock or reconnect"));
+    // the lock rests at the Brightness row's height: no extra row
+    assert!((lock.1 - bri.1).abs() < 14.0, "same row");
+}
+
+/// Order 126 pictures (Order 129: small lock, round hover; `BU_PIC_OUT=<folder> cargo test -p bu-app lock_icon_pictures -- --ignored`): the Picture part with the
+/// lock off, on, off + hovered (with the tip) and greyed (LG doesn't answer DDC/CI), at 1920x1080 (1.0) and 3440x1440 (1.25).
+#[test]
+#[ignore]
+fn lock_icon_pictures() {
+    if std::env::var("BU_PIC_OUT").is_err() {
+        return;
+    }
+    let mut t = T::new();
+    let shot = |t: &mut T, name: &str, tip: bool| {
+        for (scale, size) in [(1.0f32, "1920x1080"), (1.25, "3440x1440")] {
+            let kids = t.build();
+            let pg = El::block().abs(0.0, 0.0, f32::NAN, f32::NAN).w(600.0).pad(2.0, 26.0, 18.0, 26.0).children(kids);
+            let mut root = El::block().w(600.0).h(640.0).child(pg);
+            if tip {
+                let l = crate::ui::lay::Laid::new(&t.g, root.clone(), 600.0, Some(640.0));
+                let a = l.rect_of(K_BLK).expect("lock");
+                let mut cx = Cx::new(t.now, false, &t.g, &mut t.st);
+                root = root.child(tip::bubble(&mut cx, K_BLK, "Lock brightness - set back after sleep, unlock or reconnect", a, 600.0, true));
+            }
+            crate::ui::lay::proof_png(root, 600.0, 640.0, scale, &format!("129_{name}_{size}.png"));
+        }
+    };
+    shot(&mut t, "lock_off", false);
+    t.st.hover = vec![K_BLK];
+    for _ in 0..30 {
+        t.build();
+    }
+    shot(&mut t, "lock_hover_tip", true);
+    t.st.hover = vec![];
+    t.click(K_BLK);
+    for _ in 0..30 {
+        t.build();
+    }
+    shot(&mut t, "lock_on", false);
+    t.click(idx(K_MON, 1));
+    for _ in 0..30 {
+        t.build();
+    }
+    shot(&mut t, "lock_no_ddc", false);
+}
+
+/// End review (Order 124): a lock on a monitor that stopped answering DDC/CI can still be turned off (only turning it ON
+/// needs the monitor's value).
+#[test]
+fn a_lock_can_be_turned_off_when_the_monitor_stopped_answering() {
+    let rt = Rt::fake_sample();
+    let lg = MonitorId(LG.into());
+    rt.set_brightness_lock(&lg, Some(60));
+    let mut t = T::with(rt.clone());
+    t.click(idx(K_MON, 1));
+    t.click(K_BLK);
+    assert_eq!(rt.brightness_lock(&lg), None);
+}
+
+/// End review (Order 124): a slider move moves the locked value BEFORE the monitor is written (and says so to the lock
+/// thread), so a try running meanwhile never puts the old value back.
+#[test]
+fn a_slider_move_while_locked_moves_the_lock_before_the_write() {
+    let rt = Rt::fake_sample();
+    let dell = MonitorId(DELL.into());
+    rt.set_brightness_lock(&dell, Some(70));
+    let before = rt.brightness_moves();
+    let mut t = T::with(rt.clone());
+    t.ev(Ev::Press(K_BRI, 500.0, 0.0, (332.0, 0.0, 168.0, 20.0)));
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(rt.brightness_lock(&dell), Some(100));
+    assert!(rt.brightness_moves() > before, "the lock thread was told");
+}
+
+/// Order 129 end review: the frame's dismiss (Esc, a tab switch, the menu closing) closes the driver version window.
+#[test]
+fn the_frame_closing_popups_closes_the_driver_window() {
+    let mut t = T::new();
+    t.p.drv.settle();
+    t.p.drv.click(driver::K_CHOOSE, t.now);
+    let open = |t: &mut T| t.p.popup(&mut Cx::new(t.now, false, &t.g, &mut t.st)).is_some();
+    assert!(open(&mut t), "Choose opened it");
+    t.p.popup_dismiss();
+    assert!(!open(&mut t));
+}
+
+/// Order 125 pictures, Order 129's card (`BU_PIC_OUT=<folder> cargo test -p bu-app driver_card_pictures -- --ignored`): the
+/// Display tab scrolled to its end with the Graphics driver card - a new driver available, on the newest, installing - the
+/// version window (Choose) with its list and with a line downloading, and a PC without an NVIDIA card (no card), at
+/// 1920x1080 (1.0) and 3440x1440 (1.25).
+#[test]
+#[ignore]
+fn driver_card_pictures() {
+    if std::env::var("BU_PIC_OUT").is_err() {
+        return;
+    }
+    // the menu window's own height: the version window keeps inside it as it does on screen
+    const H: f32 = crate::ui::WIN_H;
+    for state in ["available", "newest", "installing", "window", "window_downloading", "none"] {
+        let mut t = T::new();
+        let dir = std::env::temp_dir().join(format!("bu-drvpic-{}-{state}", std::process::id()));
+        let job = driver::Shared::default();
+        let installed = if state == "newest" { "621.01" } else { "610.88" };
+        let be = driver::Backend::fake(installed, state != "none", 1000, dir, Arc::default());
+        t.p.drv = driver::Card::default();
+        t.p.drv.open_with(Arc::new(be), job.clone());
+        t.p.settle(t.now);
+        let rel = bu_gpudriver::lookup::parse_drivers(bu_gpudriver::fake::SAMPLE_DRIVERS).unwrap()[0].clone();
+        match state {
+            "window_downloading" => *job.lock().unwrap() = Some(driver::Job { release: rel, phase: driver::Phase::Downloading { done: 446_000_000, total: Some(1_040_000_000) }, seq: 1 }),
+            "installing" => *job.lock().unwrap() = Some(driver::Job { release: rel, phase: driver::Phase::Installing, seq: 1 }),
+            _ => {}
+        }
+        t.p.tick(t.now);
+        if state.starts_with("window") {
+            // NVIDIA's real list is 50 long: the window scrolls
+            t.p.drv.add_old_releases(12);
+            t.p.drv.click(driver::K_CHOOSE, t.now - 10_000.0);
+        }
+        // the page scrolled to its end: its last H px
+        let page = |t: &mut T| {
+            let kids = t.build();
+            El::block().w(600.0).pad(2.0, 26.0, 18.0, 26.0).children(kids)
+        };
+        let measured = page(&mut t);
+        let tall = crate::ui::lay::Laid::new(&t.g, measured, 600.0, None).nodes[0].rect.3;
+        let top = (H - tall).min(0.0);
+        for _ in 0..20 {
+            t.build();
+        }
+        for (scale, size) in [(1.0f32, "1920x1080"), (1.25, "3440x1440")] {
+            t.now += 16.0;
+            let mut cx = Cx::new(t.now, false, &t.g, &mut t.st);
+            let kids = t.p.build(&mut cx);
+            let pop = t.p.popup(&mut cx);
+            let pg = El::block().abs(0.0, top, f32::NAN, f32::NAN).w(600.0).pad(2.0, 26.0, 18.0, 26.0).children(kids);
+            let root = El::block().w(600.0).h(H).child(pg).children(pop);
+            crate::ui::lay::proof_png(root, 600.0, H, scale, &format!("129_driver_{state}_{size}.png"));
+        }
+    }
+}

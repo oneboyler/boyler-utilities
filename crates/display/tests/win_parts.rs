@@ -252,3 +252,22 @@ fn a_process_already_gone_is_reported_stopped_at_once() {
     assert!(matches!(rx.recv_timeout(Duration::from_secs(60)).unwrap(), AppEvent::Started { .. }));
     assert_eq!(rx.recv_timeout(Duration::from_secs(60)).unwrap(), AppEvent::Stopped { pid });
 }
+
+/// Order 124: the display power state turns into the lock's event only on "on" after "off" - the state Windows sends
+/// right after registering is not one, and dimmed is not off.
+#[test]
+fn display_on_after_off_is_the_one_power_event() {
+    use bu_display::brightlock::WakeEvent;
+    use bu_display::win::power::display_state_event;
+    let mut s = None;
+    assert_eq!(display_state_event(&mut s, 1), None, "the state sent at registration");
+    assert_eq!(display_state_event(&mut s, 2), None, "dimmed");
+    assert_eq!(display_state_event(&mut s, 1), None, "dimmed -> on: it never went off");
+    assert_eq!(display_state_event(&mut s, 0), None, "off");
+    assert_eq!(display_state_event(&mut s, 2), None, "off -> dimmed");
+    assert_eq!(display_state_event(&mut s, 1), Some(WakeEvent::DisplayOn), "back on after off");
+    assert_eq!(display_state_event(&mut s, 1), None, "on again without off");
+    let mut first_off = None;
+    assert_eq!(display_state_event(&mut first_off, 0), None);
+    assert_eq!(display_state_event(&mut first_off, 1), Some(WakeEvent::DisplayOn));
+}

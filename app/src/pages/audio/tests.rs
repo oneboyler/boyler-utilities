@@ -902,6 +902,32 @@ fn speaker_muted_picture() {
     crate::ui::lay::proof_png(root, 600.0, 300.0, 2.0, "audio_speaker_muted.png");
 }
 
+/// Order 128 picture (`BU_PIC_OUT=<folder> cargo test -p bu-app speaker_hover_picture -- --ignored`): the Output speaker icon
+/// hovered with its tip - what the Display page's lock icon must match (`lock_icon_pictures`, same scale).
+#[test]
+#[ignore]
+fn speaker_hover_picture() {
+    if std::env::var("BU_PIC_OUT").is_err() {
+        return;
+    }
+    let mut a = page();
+    let g = Gfx::new(1.0);
+    let mut st = State::default();
+    let _ = lay(&mut a, &g, &mut st, 0.0);
+    st.hover = vec![K_SPK];
+    for i in 0..30 {
+        let mut cx = Cx::new(1000.0 + i as f64 * 16.0, false, &g, &mut st);
+        let _ = a.build(&mut cx);
+    }
+    let mut cx = Cx::new(2000.0, false, &g, &mut st);
+    let kids = a.build(&mut cx);
+    let mut root = El::block().w(600.0).h(300.0).pad(2.0, 26.0, 18.0, 26.0).children(kids);
+    let l = crate::ui::lay::Laid::new(&g, root.clone(), 600.0, Some(300.0));
+    let a = l.rect_of(K_SPK).expect("speaker");
+    root = root.child(crate::ui::pieces::tip::bubble(&mut cx, K_SPK, "Mute speakers", a, 600.0, true));
+    crate::ui::lay::proof_png(root, 600.0, 300.0, 1.0, "129_audio_speaker_hover_1920x1080.png");
+}
+
 /// Order 092 picture (`BU_PIC_OUT=<folder> cargo test -p bu-app proof_092 -- --ignored`): Mute settings with the mute sound
 /// switched on - the Volume slider sits right under the switch, "Change" still closed.
 #[test]

@@ -52,3 +52,26 @@ fn the_drawing_sample_is_the_drawings_monitors() {
     assert_eq!((m[1].number, m[1].name.as_str(), m[1].diagonal_inches), (2, "LG 24GL600F", Some(24.0)));
     assert_eq!((m[0].current.width, m[0].current.height, m[0].current.refresh.hz()), (1920, 1080, 164.95));
 }
+
+/// Order 124: "Lock brightness" is saved per monitor (the page's monitor id) and survives a restart; a file from before
+/// the lock existed loads with no locks.
+#[test]
+fn brightness_locks_survive_a_restart() {
+    let dir = scratch("brightlock");
+    let path = dir.join("display.json");
+    let mut s = Store::default();
+    let id = MonitorId(r"\?\DISPLAY#DELD1A8#5&abc&0&UID1#{e6f07b5f-ee97-4a90-b076-33f57bf4eaa7}".into());
+    s.lock_brightness(&id, Some(70));
+    s.save(&path).unwrap();
+    let back = Store::load(&path);
+    assert_eq!(back.brightness_lock(&id), Some(70));
+    assert_eq!(back.brightness_lock(&MonitorId("fake-lg".into())), None);
+    assert_eq!(back.brightness_locks(), vec![(id.clone(), 70)]);
+    let mut back = back;
+    back.lock_brightness(&id, None);
+    assert!(back.brightness_locks().is_empty());
+    std::fs::write(&path, "{}").unwrap();
+    assert!(Store::load(&path).brightness_locks().is_empty(), "an old file: no locks");
+    assert!(!dir.join("display.bad").exists(), "an old file is not broken");
+    let _ = std::fs::remove_dir_all(&dir);
+}

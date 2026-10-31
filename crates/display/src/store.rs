@@ -1,4 +1,5 @@
-//! What the Display tab keeps between runs (Order 019): the presets and the "Switch automatically" rules, in one small
+//! What the Display tab keeps between runs (Order 019): the presets and the "Switch automatically" rules (and, Order
+//! 124, each monitor's "Lock brightness"), in one small
 //! JSON file in the app's settings folder. Written whole to a `.tmp` file and renamed over the old one, so a crash in the
 //! middle never leaves half a file. A missing file = no presets, no rules; an unreadable one is kept as `.bad` and the tab
 //! starts empty (nothing on the PC depends on it).
@@ -7,7 +8,9 @@
 use crate::autoswitch::AutoSwitcher;
 use crate::error::{DisplayError, Result};
 use crate::presets::PresetList;
+use crate::types::MonitorId;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 
@@ -20,6 +23,9 @@ pub struct Store {
     pub presets: PresetList,
     #[serde(default)]
     pub rules: AutoSwitcher,
+    /// Order 124: "Lock brightness" per monitor (the page's monitor id) → the locked brightness %; missing = not locked.
+    #[serde(default)]
+    pub bright_locks: BTreeMap<MonitorId, u8>,
 }
 
 impl Store {
@@ -34,6 +40,28 @@ impl Store {
                 Store::default()
             }
         }
+    }
+
+    /// Order 124: the monitor's locked brightness %, if it is locked.
+    pub fn brightness_lock(&self, id: &MonitorId) -> Option<u8> {
+        self.bright_locks.get(id).copied()
+    }
+
+    /// Order 124: locks a monitor's brightness at `pct` (a new value replaces the old one) / unlocks it (`None`).
+    pub fn lock_brightness(&mut self, id: &MonitorId, pct: Option<u8>) {
+        match pct {
+            Some(p) => {
+                self.bright_locks.insert(id.clone(), p.min(100));
+            }
+            None => {
+                self.bright_locks.remove(id);
+            }
+        }
+    }
+
+    /// Order 124: every locked monitor with its brightness %.
+    pub fn brightness_locks(&self) -> Vec<(MonitorId, u8)> {
+        self.bright_locks.iter().map(|(id, p)| (id.clone(), *p)).collect()
     }
 
     /// Writes the whole store (tmp file + rename).

@@ -338,6 +338,19 @@ impl<O: DisplayOs> DisplayService<O> {
         Ok(Some((cur, VcpValue { current: value, max: cur.max })))
     }
 
+    /// Order 124: a locked brightness put back after a wake event (brightlock.rs). Reads first and writes only when the
+    /// monitor shows another value: `Some((before, after))` when written, `None` when it already was there. No undo
+    /// entry (not a change of the user's: the lock keeps the value they set).
+    pub fn restore_brightness(&mut self, id: &MonitorId, percent: u8) -> Result<Option<(VcpValue, VcpValue)>> {
+        let cur = self.ddc_get(id, Vcp::Brightness)?;
+        let value = ddc_value_for_percent(cur.max, percent);
+        if value == cur.current {
+            return Ok(None);
+        }
+        self.os.ddc_set(id, Vcp::Brightness, value)?;
+        Ok(Some((cur, VcpValue { current: value, max: cur.max })))
+    }
+
     /// Vibrance slider (0–100 %, 50 = normal), applied live through the GPU driver.
     pub fn set_vibrance_percent(&mut self, id: &MonitorId, percent: u8) -> Result<()> {
         self.set_vibrance_percent_change(id, percent).map(|_| ())

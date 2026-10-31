@@ -129,6 +129,8 @@ pub(crate) struct FakeSys {
     pub(crate) sto: Arc<bu_storage::FakeOs>,
     pub(crate) temp_cleans: Arc<AtomicUsize>,
     pub(crate) scancode: Arc<Mutex<Vec<bu_keysound::remap::Mapping>>>,
+    /// the driver installs the copy was asked for (version, file) - nothing is installed
+    pub(crate) gpu: Arc<Mutex<Vec<(String, String)>>>,
 }
 
 struct AudRef(Arc<Mutex<bu_audio::FakeOs>>);
@@ -210,6 +212,10 @@ impl Sys for CopySys {
         *self.w.scancode.lock().unwrap() = maps.to_vec();
         Ok(())
     }
+    fn gpu_driver(&mut self, version: bu_gpudriver::DriverVersion, file: &std::path::Path) -> bu_gpudriver::Result<bu_gpudriver::Installed> {
+        self.w.gpu.lock().unwrap().push((version.to_string(), file.to_string_lossy().into_owned()));
+        Ok(bu_gpudriver::Installed::Done)
+    }
 }
 
 pub(crate) fn world() -> FakeSys {
@@ -267,7 +273,7 @@ pub(crate) fn world() -> FakeSys {
             ..Default::default()
         },
     );
-    FakeSys { t, net, st: Arc::new(st), sec, aud: Arc::new(Mutex::new(a)), fix, sto: Arc::new(sto), temp_cleans: Arc::new(AtomicUsize::new(0)), scancode: Arc::new(Mutex::new(Vec::new())) }
+    FakeSys { t, net, st: Arc::new(st), sec, aud: Arc::new(Mutex::new(a)), fix, sto: Arc::new(sto), temp_cleans: Arc::new(AtomicUsize::new(0)), scancode: Arc::new(Mutex::new(Vec::new())), gpu: Arc::default() }
 }
 
 fn raw_service(name: &str, start: bu_startup::ServiceStart) -> bu_startup::os::RawService {
@@ -338,6 +344,7 @@ fn every_op() -> Vec<Op> {
             ],
         },
         Op::ScancodeMap { maps: vec![] },
+        Op::GpuDriver { version: bu_gpudriver::DriverVersion::parse("621.01").unwrap(), file: r"C:\Users\u\AppData\Local\Temp\BoylerUtilities-gpudriver\621.01.exe".into() },
     ]
 }
 
@@ -409,6 +416,19 @@ fn bad_input_is_refused() {
         s(&["scancode-map", "3a:12345"]),
         s(&["scancode-map", "3a:1,"]),
         s(&["scancode-map", "-", "extra"]),
+        s(&["gpu-driver", "621.01"]),
+        s(&["gpu-driver", "621.1", r"C:\T\621.1.exe"]),
+        s(&["gpu-driver", "0621.01", r"C:\T\0621.01.exe"]),
+        s(&["gpu-driver", "621.01", r"C:\T\617.42.exe"]),
+        s(&["gpu-driver", "621.01", r"C:\T\621.01.exe.lnk"]),
+        s(&["gpu-driver", "621.01", r"621.01.exe"]),
+        s(&["gpu-driver", "621.01", r"\\server\share\621.01.exe"]),
+        s(&["gpu-driver", "621.01", r"\\?\C:\T\621.01.exe"]),
+        s(&["gpu-driver", "621.01", r"C:\T\..\Windows\621.01.exe"]),
+        s(&["gpu-driver", "621.01", r"C:\T\\621.01.exe"]),
+        s(&["gpu-driver", "621.01", "C:/T/621.01.exe"]),
+        s(&["gpu-driver", "621.01", "C:\\T\\621.01.exe\n"]),
+        s(&["gpu-driver", "621.01", r"C:\T\621.01.exe", "-clean"]),
     ];
     for b in bad {
         assert!(Op::parse(&b).is_err(), "accepted {b:?}");
@@ -424,6 +444,8 @@ fn each_purpose_allows_only_its_ops() {
     assert_eq!(allowed(Purpose::Storage), ["clean-windows-temp", "disk-health"].iter().map(|x| x.to_string()).collect());
     assert_eq!(allowed(Purpose::Keyboard), ["scancode-map"].iter().map(|x| x.to_string()).collect());
     assert_eq!(allowed(Purpose::Network), ["net-adapter", "net-dns"].iter().map(|x| x.to_string()).collect());
+    assert_eq!(allowed(Purpose::GpuDriver), ["gpu-driver"].iter().map(|x| x.to_string()).collect());
+    assert!(!allowed(Purpose::Reset).contains("gpu-driver"));
     // the reset puts settings back - never a scan, a restore, a removal, a program, a clean-up
     let reset = allowed(Purpose::Reset);
     for no in ["defender-offline", "defender-restore", "defender-remove-active", "spawn", "kill", "clean-windows-temp", "restore-point", "disk-health"] {
@@ -565,6 +587,26 @@ fn a_copy_refuses_ops_of_another_purpose() {
     let sess = client::Session::new(tx, rx);
     assert!(matches!(sess.call(&Op::NetAdapter { id: ETH.into(), on: true }), Err(AdminError::Refused(m)) if m.contains("not part of tweaks")));
     assert!(matches!(sess.call(&Op::Spawn(Prog::Dism)), Err(AdminError::Refused(_))));
+}
+
+/// Order 125: the copy installs a driver only from a package file that exists; the version and file go through as sent.
+#[test]
+fn the_copy_installs_a_driver_only_from_a_file_that_is_there() {
+    let w = world();
+    let (a, _) = hub(&w, false);
+    let dir = std::env::temp_dir().join(format!("bu-admin-gpu-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("621.01.exe");
+    std::fs::write(&file, b"MZ").unwrap();
+    let v = bu_gpudriver::DriverVersion::parse("621.01").unwrap();
+    let op = |f: &std::path::Path| Op::GpuDriver { version: v, file: f.to_string_lossy().into_owned() };
+    assert_eq!(a.call(Purpose::GpuDriver, op(&file)), Ok(vec!["done".to_string()]));
+    assert_eq!(*w.gpu.lock().unwrap(), vec![("621.01".to_string(), file.to_string_lossy().into_owned())]);
+    assert!(matches!(a.call(Purpose::GpuDriver, op(&dir.join("gone").join("621.01.exe"))), Err(AdminError::NotFound(_))));
+    // another purpose's copy never installs a driver
+    assert!(matches!(a.call(Purpose::Tweaks, op(&file)), Err(AdminError::Refused(_))));
+    assert_eq!(w.gpu.lock().unwrap().len(), 1);
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]

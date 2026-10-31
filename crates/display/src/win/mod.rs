@@ -8,6 +8,7 @@ pub mod dpi;
 pub mod edid;
 pub mod modes;
 pub mod nvapi;
+pub mod power;
 pub mod watch;
 pub mod wmi;
 

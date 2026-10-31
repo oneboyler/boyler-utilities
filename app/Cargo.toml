@@ -1,6 +1,6 @@
 [package]
 name = "bu-app"
-version = "1.2.1"
+version = "1.2.2"
 edition = "2021"
 publish = false
 description = "Boyler Utilities - the tray app (the glass menu)"
@@ -49,6 +49,8 @@ bu-rawin = { path = "../crates/rawin" }
 # the Keyboard tab (Order 058): key sounds + key remap
 bu-keysound = { path = "../crates/keysound" }
 bu-noise = { path = "../crates/noise" }
+# the Display tab's NVIDIA driver card (Order 125): detect, look up, download, install the driver only
+bu-gpudriver = { path = "../crates/gpudriver" }
 
 [dependencies.windows]
 version = "0.62"

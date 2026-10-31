@@ -37,6 +37,8 @@ pub struct FakeDisplayOs {
     pub fail_next_change: Option<String>,
     /// Windows' stored display setting per monitor (what a reboot / crash would come back to). Missing = the start mode.
     pub saved: HashMap<MonitorId, Mode>,
+    /// Order 124: a monitor just woken - this many more DDC/CI calls on it get no answer before it answers again.
+    pub ddc_late: HashMap<MonitorId, u32>,
 }
 
 impl FakeDisplayOs {
@@ -56,6 +58,17 @@ impl FakeDisplayOs {
             return Err(DisplayError::os("fake", e));
         }
         Ok(())
+    }
+
+    /// Order 124: one DDC/CI call on a monitor that answers late (`ddc_late`): no answer while calls are left.
+    fn late(&mut self, id: &MonitorId) -> Result<()> {
+        match self.ddc_late.get_mut(id) {
+            Some(n) if *n > 0 => {
+                *n -= 1;
+                Err(DisplayError::DdcNoAnswer)
+            }
+            _ => Ok(()),
+        }
     }
 
     /// What Windows would come back to after a crash / reboot (for asserts).
@@ -247,11 +260,13 @@ impl DisplayOs for FakeDisplayOs {
 
     fn ddc_get(&mut self, id: &MonitorId, vcp: Vcp) -> Result<VcpValue> {
         let i = self.find(id)?;
+        self.late(id)?;
         self.monitors[i].ddc.as_ref().and_then(|d| d.get(&vcp).copied()).ok_or(DisplayError::DdcNoAnswer)
     }
 
     fn ddc_set(&mut self, id: &MonitorId, vcp: Vcp, value: u32) -> Result<()> {
         let i = self.find(id)?;
+        self.late(id)?;
         self.gate(ChangeKind::Ddc)?;
         let d = self.monitors[i].ddc.as_mut().ok_or(DisplayError::DdcNoAnswer)?;
         let v = d.get_mut(&vcp).ok_or(DisplayError::DdcNoAnswer)?;
