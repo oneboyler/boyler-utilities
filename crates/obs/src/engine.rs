@@ -1,24 +1,26 @@
 //! The state machine (app.c, ported 1:1): OBS connection + obs-websocket v5 requests / events, the popups and sounds for
 //! clip saved / instant replay on-off / recording start-stop / storage / connection, the Save clip key's "press again to
-//! turn instant replay on", any key's "OBS isn't open - press again to start it", the Switch scene key (next scene of the
-//! user's list, the monitor's resolution, instant replay restarted around a video change), "Keep instant replay on at all
-//! times", "Turn off instant replay while recording", applying OBS-side settings (profile keys / clip length / FPS / folder,
+//! turn instant replay on", any key's "OBS isn't open - press again to start it", the Switch scene key (next row of the
+//! user's list, in any scene collection, with the row's own resolution + FPS, instant replay restarted around a change -
+//! Order 132), the Save clip key also pressed through remote control (Order 132), "Keep instant replay on at all
+//! times", "Turn off instant replay while recording", applying OBS-side settings (profile keys / clip length / folder,
 //! OBS closed and reopened when needed), turning OBS's remote control on, "Start OBS with Windows".
 //!
 //! Single-threaded like ClipPing's UI thread: the driver (service.rs) feeds it `Input`s and fires its timers; everything it
 //! does to the world goes through `Host`. Timers behave like Win32 SetTimer (they repeat until killed).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 
 use serde_json::{json, Value};
 
 use crate::cfg::ObsCfg;
+use crate::colls::{self, Coll};
 use crate::ctl;
 use crate::keys::{binding_json, KeyBind};
 use crate::monitors::{self, Mon};
 use crate::os::{find_exe, Found, ObsOs};
-use crate::settings::Settings;
+use crate::settings::{SceneRow, Settings};
 use crate::sound::Sound;
 use crate::ws::WsEvent;
 
@@ -83,7 +85,7 @@ pub enum KeyWhich {
     Switch = 3,
 }
 
-/// The OBS-side settings the page changes (ClipPing's ObsChange). `fps` = whole frames per second.
+/// The OBS-side settings the page changes (ClipPing's ObsChange; the FPS is each scene row's own since Order 132).
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct ObsChange {
     pub keys_changed: bool,
@@ -91,8 +93,6 @@ pub struct ObsChange {
     pub key: [Option<KeyBind>; 3],
     pub cliplen_changed: bool,
     pub cliplen: i32,
-    pub fps_changed: bool,
-    pub fps: i32,
     pub folder_changed: bool,
     pub folder: PathBuf,
     /// turn on OBS remote control (needs OBS closed)
@@ -115,6 +115,48 @@ pub struct SceneView {
     pub name: String,
     /// the monitor number its display capture shows (0 = none)
     pub mon: i32,
+    /// what "Auto" means for it: its monitor's size, else its video source's size as OBS last reported it (a capture
+    /// device's own resolution setting until then); (0, 0) = not known
+    pub auto: (i32, i32),
+}
+
+/// One scene collection and its scenes, in OBS's order.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct CollView {
+    pub name: String,
+    pub scenes: Vec<SceneView>,
+}
+
+/// A scene row's scene: (collection, scene) indexes into `colls` (the open collection first). A row without a collection
+/// (from before Order 132) is the open collection's scene of that name, else the first collection that has one.
+pub fn find_row(colls: &[CollView], r: &SceneRow) -> Option<(usize, usize)> {
+    let at = |ci: usize| colls[ci].scenes.iter().position(|s| s.name == r.name).map(|si| (ci, si));
+    if !r.coll.is_empty() {
+        return colls.iter().position(|c| c.name == r.coll).and_then(at);
+    }
+    (0..colls.len()).find_map(at)
+}
+
+/// FPS in hundredths -> OBS's fraction (5994 = 60000 / 1001, 2997 = 30000 / 1001).
+pub fn fps_frac(f: i32) -> (i32, i32) {
+    if f % 100 == 0 {
+        return (f / 100, 1);
+    }
+    let n = (f as f64 * 1.001 / 100.0).round() as i32;
+    if (n as i64 * 100_000 / 1001 - f as i64).abs() <= 1 {
+        (n * 1000, 1001)
+    } else {
+        (f, 100)
+    }
+}
+
+/// "60", "59.94"
+pub fn fps_text(f: i32) -> String {
+    if f % 100 == 0 {
+        format!("{}", f / 100)
+    } else {
+        format!("{}.{:02}", f / 100, f % 100)
+    }
 }
 
 /// What the page, the status icon and the tray tooltip show (published after every change).
@@ -131,9 +173,12 @@ pub struct View {
     /// ask "Connect to OBS" (remote control off while OBS is open)
     pub ask_connect: bool,
     pub tip: String,
-    pub scenes: Vec<SceneView>,
+    /// every scene collection (the open one first, from OBS; the others from their files)
+    pub colls: Vec<CollView>,
+    /// the open scene collection
+    pub coll: String,
     /// the user's scene list as in use now (may be the default one made from OBS's scenes)
-    pub list: Vec<String>,
+    pub list: Vec<SceneRow>,
     pub cliplen: i32,
     /// hundredths (12000 = 120, 2997 = 29.97)
     pub fps: i32,
@@ -179,8 +224,9 @@ pub trait Host {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Input {
     Ws(WsEvent),
-    /// a key went down / up (vk for the release wait; `mouse` = no release will come)
-    Key { which: KeyWhich, down: bool, mouse: bool },
+    /// a key went down / up (vk for the release wait; `mouse` = no release will come); `mods` = the modifiers held as the
+    /// key went down (MOD_* bits, read the way OBS reads them: GetAsyncKeyState)
+    Key { which: KeyWhich, down: bool, mouse: bool, mods: u8 },
     ObsExited(bool),
     FilesChanged,
     Monitors(Vec<Mon>),
@@ -201,8 +247,8 @@ pub enum T {
     Switch,
     Hello,
     SwRetry,
+    SwUndo,
     Oa,
-    OaRetry,
     Rbe,
     LaWait,
     RaWait,
@@ -219,22 +265,24 @@ enum R {
     Mode,
     RbTime,
     CurScene,
+    Colls,
     Scenes,
     Items,
     InSet,
     Minute,
     SwRec,
     SwVget,
+    SwSrc,
     SwRb,
     SwStop,
+    SwColl,
     SwScene,
     SwVideo,
+    SwUndo,
     OaRec,
     OaStop,
     OaSet,
     OaRbStop,
-    OaFpsRec,
-    OaFps,
     Video,
     RbeStart,
     RbeStat,
@@ -252,6 +300,8 @@ struct Scene {
     input: String,
     mon_id: String,
     ui: i64,
+    /// its video source's size as OBS reports it (0 x 0 = none / no signal)
+    src: (i32, i32),
 }
 
 #[derive(Debug, Clone, Default)]
@@ -286,7 +336,13 @@ struct St {
     /// a "Clip failed" popup was shown and a late "saved" may still replace it
     clip_failed_shown: bool,
     low_warned: bool,
+    /// measured recording rate (kbit/s), 0 = none yet or not believable: the profile's estimate is used
     meas_kbps: i32,
+    /// this recording's first GetRecordStatus (outputBytes, outputDuration ms): OBS's Hybrid MP4 output never resets its
+    /// byte count between recordings (mp4-output.c total_bytes, OBS 32), only the duration restarts
+    rate_base: Option<(f64, f64)>,
+    /// storage checks in a row that came out low on a measured rate (a warning needs two)
+    low_hits: u32,
     quiet_stop: bool,
     quiet_start: bool,
     rb_before_rec: bool,
@@ -300,21 +356,42 @@ struct St {
     sc: Vec<Scene>,
     tsc: Vec<Scene>,
     inputs: Vec<Input2>,
+    /// the open scene collection (GetSceneCollectionList / its change event)
+    coll: String,
+    /// the collection the running scan reads, and the one `sc` belongs to
+    scan_coll: String,
+    sc_coll: String,
+    /// every collection's file (the switch list's other collections)
+    files: Vec<Coll>,
 }
 
+/// One switch (the Switch scene key): GetRecordStatus -> GetVideoSettings -> [the scene's video source size] ->
+/// [instant replay stopped] -> [SetCurrentSceneCollection] -> SetCurrentProgramScene -> [SetVideoSettings: size + FPS in
+/// one change] -> [instant replay started]. Instant replay restarts only when the collection, size or FPS really change.
 #[derive(Default)]
 struct Sw {
     active: bool,
     step: Option<R>,
     was_rb: bool,
+    /// the collection, size or FPS changes: instant replay is restarted around it
     reset: bool,
     rb_stopped: bool,
-    scene_set: bool,
-    w: i32,
-    h: i32,
-    video_t0: u64,
+    /// the row switched to (its collection filled in); `other` = in another collection than the open one
+    target: SceneRow,
+    other: bool,
+    /// where it came from
+    orig_coll: String,
     orig: String,
-    target: String,
+    /// OBS's video before: base w, h, output w, h, fps num, den
+    orig_video: [i32; 6],
+    /// the video it switches to: base w, h, output w, h, fps num, den (a size left as it is keeps OBS's base + output)
+    want: [i32; 6],
+    /// GetSceneItemList asked again: a capture device in a collection that just opened reports 0 x 0 until its first frame
+    src_tries: u32,
+    coll_set: bool,
+    scene_set: bool,
+    video_set: bool,
+    video_t0: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -326,19 +403,15 @@ enum Oa {
     WaitExit,
     RbStop,
     RbStart,
-    FpsRec,
-    Fps,
 }
 
 #[derive(Default)]
 struct OaS {
     step: Oa,
     was_rb: bool,
-    fps_t0: u64,
     c: ObsChange,
     pid: u32,
     path: PathBuf,
-    last_code: i64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -389,6 +462,8 @@ const CLIP_STORAGE_CHECK_MS: u64 = 2000;
 /// no "saved" event this long after the press = the save really failed (a slow save takes seconds)
 const CLIP_GIVE_UP_MS: u64 = 30_000;
 const MAX_REQ: usize = 96;
+/// a collection that just opened: its capture device's size asked for up to this many more times, every 500 ms
+const SW_SRC_TRIES: u32 = 16;
 
 pub struct Engine {
     pub cfg: ObsCfg,
@@ -416,7 +491,17 @@ pub struct Engine {
     ask_connect: bool,
     clip_down: bool,
     clip_mouse: bool,
+    /// the modifiers held as the Save clip key last went down
+    clip_mods: u8,
     last_keys: Option<KeysView>,
+    /// (collection, scene) -> its video source's size as OBS last reported it (kept while other collections are open)
+    src_seen: HashMap<(String, String), (i32, i32)>,
+    /// a failed switch going back: the requests still to send, one after another (obs-websocket answers requests on a
+    /// thread pool, so sent together they could run in any order); then instant replay back on when `undo_rb`
+    undo: VecDeque<(&'static str, Value)>,
+    undo_rb: bool,
+    /// a roll-back request is out (no new switch until it is answered)
+    undo_wait: bool,
 }
 
 fn jb(v: Option<&Value>) -> bool {
@@ -468,7 +553,12 @@ impl Engine {
             ask_connect: false,
             clip_down: false,
             clip_mouse: false,
+            clip_mods: 0,
             last_keys: None,
+            src_seen: HashMap::new(),
+            undo: VecDeque::new(),
+            undo_rb: false,
+            undo_wait: false,
         }
     }
 
@@ -544,10 +634,13 @@ impl Engine {
                     self.on_ws_closed(h, code);
                 }
             }
-            Input::Key { which, down, mouse } => {
+            Input::Key { which, down, mouse, mods } => {
                 if which == KeyWhich::Clip {
                     self.clip_down = down && !mouse;
                     self.clip_mouse = mouse;
+                    if down {
+                        self.clip_mods = mods;
+                    }
                 }
                 if down {
                     self.handle_key(h, which);
@@ -609,6 +702,39 @@ impl Engine {
         }
     }
 
+    /// One scene for the page / the switch: its monitor, else its video source's size (OBS's report, else the file's hint).
+    fn scene_view(&self, coll: &str, name: &str, mon_id: &str, src: (i32, i32), hint: (i32, i32)) -> SceneView {
+        let m = if mon_id.is_empty() { None } else { monitors::find_obs(&self.mons, mon_id) };
+        let auto = match m {
+            Some(i) => (self.mons[i].w, self.mons[i].h),
+            None if src.0 > 0 => src,
+            None => self.src_seen.get(&(coll.to_string(), name.to_string())).copied().unwrap_or(hint),
+        };
+        SceneView { name: name.to_string(), mon: m.map(|i| self.mons[i].num).unwrap_or(0), auto }
+    }
+
+    /// Every scene collection: the open one as OBS reports it, then the others from their files.
+    pub fn colls(&self) -> Vec<CollView> {
+        let mut out = Vec::new();
+        if self.s.scanned {
+            let live = &self.s.sc_coll;
+            let scenes = self.s.sc.iter().map(|s| self.scene_view(live, &s.name, &s.mon_id, s.src, (0, 0))).collect();
+            out.push(CollView { name: live.clone(), scenes });
+        }
+        for c in &self.s.files {
+            if self.s.scanned && c.name == self.s.sc_coll {
+                continue;
+            }
+            let scenes = c.scenes.iter().map(|s| self.scene_view(&c.name, &s.name, &s.mon_id, (0, 0), s.hint)).collect();
+            out.push(CollView { name: c.name.clone(), scenes });
+        }
+        out
+    }
+
+    fn read_files(&mut self, h: &mut dyn Host) {
+        self.s.files = colls::read_all(&h.os().obs_dir());
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn pop(&mut self, h: &mut dyn Host, color: Color, icon: Icon, top: &str, main: &str, title: &str, detail: &str) {
         let m = PopMsg::new(color, icon, top, main, title, detail);
@@ -652,11 +778,8 @@ impl Engine {
             amber: self.s.amber,
             ask_connect: self.ask_connect && self.cfg.ws_json && !self.cfg.ws_enabled,
             tip,
-            scenes: if self.s.scanned {
-                self.s.sc.iter().map(|s| SceneView { name: s.name.clone(), mon: self.scene_mon(Some(s)).map(|i| self.mons[i].num).unwrap_or(0) }).collect()
-            } else {
-                Vec::new()
-            },
+            colls: if self.s.ident { self.colls() } else { Vec::new() },
+            coll: self.s.coll.clone(),
             list: self.set.scenes.clone(),
             cliplen: self.clip_max_sec(),
             fps: self.fps(),
@@ -691,13 +814,36 @@ impl Engine {
             self.cfg.kbps
         }
     }
-    fn minutes_left(&self, h: &mut dyn Host) -> Option<i64> {
+    /// Minutes of recording the free space holds at the current rate (None = no folder / no rate known).
+    pub fn minutes_left(&self, h: &mut dyn Host) -> Option<i64> {
         let f = self.free_bytes(h)?;
         let k = self.rec_kbps();
         if k <= 0 {
             return None;
         }
         Some(f as i64 / (k as i64 * 125) / 60) // kbit/s -> bytes/s = *125
+    }
+    /// One GetRecordStatus of the running recording: the rate is this recording's bytes since its first sample, so
+    /// the bytes of earlier recordings that OBS keeps counting don't count.
+    fn rec_sample(&mut self, bytes: f64, dur: f64) {
+        match self.s.rate_base {
+            Some((b0, d0)) if dur >= d0 && bytes >= b0 => {
+                if dur - d0 > 20000.0 && bytes > b0 {
+                    let k = ((bytes - b0) * 8.0 / (dur - d0)) as i32; // bytes per ms * 8 = kbit/s
+                    self.s.meas_kbps = if self.rate_sane(k) { k } else { 0 };
+                }
+            }
+            // the first sample, or the counters went back (another recording / OBS restarted the output)
+            _ => {
+                self.s.rate_base = Some((bytes, dur));
+                self.s.meas_kbps = 0;
+            }
+        }
+    }
+    /// A measured rate is believed only within 0.25x-4x of the profile's bitrate (when the profile has one).
+    fn rate_sane(&self, k: i32) -> bool {
+        let c = self.cfg.kbps;
+        k > 0 && (c <= 0 || (k >= c / 4 && k <= c.saturating_mul(4)))
     }
     fn storage_low(&self, h: &mut dyn Host) -> bool {
         match self.minutes_left(h) {
@@ -708,14 +854,25 @@ impl Engine {
     fn storage_full(&self, h: &mut dyn Host) -> bool {
         self.free_bytes(h).is_some_and(|f| f < 512 * 1024 * 1024)
     }
-    fn storage_check(&mut self, h: &mut dyn Host) {
+    /// `fresh` = right after a new GetRecordStatus sample (only those count towards a warning from a measured rate)
+    fn storage_check(&mut self, h: &mut dyn Host, fresh: bool) {
         let Some(m) = self.minutes_left(h) else { return };
         if m >= 30 {
             self.s.low_warned = false;
+            self.s.low_hits = 0;
             return;
         }
         if self.s.low_warned {
             return;
+        }
+        if self.s.meas_kbps > 0 {
+            // never from one odd sample: a measured rate has to come out low on two new samples in a row
+            if fresh {
+                self.s.low_hits += 1;
+            }
+            if self.s.low_hits < 2 {
+                return;
+            }
         }
         self.s.low_warned = true;
         let t = if m == 1 { format!("About {m} minute of recording left") } else { format!("About {m} minutes of recording left") };
@@ -789,7 +946,38 @@ impl Engine {
         self.s.scan_id += 1;
         self.s.tsc.clear();
         self.s.inputs.clear();
+        self.s.scan_coll = self.s.coll.clone();
         self.send_req(h, R::Scenes, "GetSceneList", None, "");
+    }
+
+    /// A scene's video source from its GetSceneItemList: the top-most visible capture device (only it, when there is one),
+    /// else the biggest visible source; (0, 0) = none or no signal (OBS reports a capture card without a signal as 0 x 0).
+    fn src_size(items: &[Value]) -> (i32, i32) {
+        let (mut cap, mut big, mut has_cap) = ((0, 0), (0, 0), false);
+        for c in items {
+            if !c.get("sceneItemEnabled").map(|v| jb(Some(v))).unwrap_or(true) {
+                continue;
+            }
+            let t = c.get("sceneItemTransform");
+            let wh = (jn(t.and_then(|t| t.get("sourceWidth")), 0.0) as i32, jn(t.and_then(|t| t.get("sourceHeight")), 0.0) as i32);
+            if colls::CAPTURE_KINDS.contains(&js(c.get("inputKind"), "")) {
+                // the device's own size, also 0 x 0 (no signal): never an overlay's instead
+                cap = if wh.0 > 0 && wh.1 > 0 { wh } else { (0, 0) };
+                has_cap = true;
+                continue;
+            }
+            if wh.0 <= 0 || wh.1 <= 0 {
+                continue;
+            }
+            if wh.0 as i64 * wh.1 as i64 > big.0 as i64 * big.1 as i64 {
+                big = wh;
+            }
+        }
+        if has_cap {
+            cap
+        } else {
+            big
+        }
     }
 
     fn maybe_greet(&mut self, h: &mut dyn Host) {
@@ -811,7 +999,7 @@ impl Engine {
         for num in 1..=self.mons.len() as i32 {
             let Some(m) = monitors::by_num(&self.mons, num) else { continue };
             if let Some(s) = self.s.sc.iter().find(|s| self.scene_mon(Some(s)) == Some(m)) {
-                list.push(s.name.clone());
+                list.push(SceneRow::new(&s.name, ""));
             }
         }
         if list.is_empty() {
@@ -843,6 +1031,10 @@ impl Engine {
                 j -= 1;
             }
             v[j] = t;
+        }
+        self.s.sc_coll = self.s.scan_coll.clone();
+        for s in v.iter().filter(|s| s.src.0 > 0) {
+            self.src_seen.insert((self.s.sc_coll.clone(), s.name.clone()), s.src);
         }
         self.s.sc = v;
         self.s.scanned = true;
@@ -965,55 +1157,130 @@ impl Engine {
 
     // ------------------------------------------------------------------ switching
 
-    /// next scene in the user's list after the current one (wraps)
+    /// next row of the user's list after the current one (wraps) whose scene exists; its collection filled in
     fn sw_pick_target(&mut self) -> bool {
-        let list = &self.set.scenes;
+        let colls = self.colls();
+        let list = self.set.scenes.clone();
         let n = list.len();
-        let cur = list.iter().rposition(|s| *s == self.s.scene);
+        let at = |r: &SceneRow| find_row(&colls, r).map(|(c, s)| (colls[c].name.clone(), colls[c].scenes[s].name.clone()));
+        let here = (self.s.coll.clone(), self.s.scene.clone());
+        let cur = list.iter().rposition(|r| at(r).as_ref() == Some(&here));
         for k in 1..=n {
             let i = match cur {
                 Some(c) => (c + k) % n,
                 None => k - 1,
             };
-            if self.scene_find(&list[i]).is_some() && list[i] != self.s.scene {
-                self.sw.target = list[i].clone();
+            if let Some((c, name)) = at(&list[i]).filter(|t| *t != here) {
+                self.sw.other = c != self.s.coll;
+                self.sw.target = SceneRow { name, coll: c, ..list[i].clone() };
                 return true;
             }
         }
         false
     }
 
+    /// What "Auto" is for the target from what's known without asking OBS: its monitor's size (None = no monitor: its
+    /// video source's size has to come from OBS).
+    fn sw_mon_size(&self) -> Option<(i32, i32)> {
+        let colls = self.colls();
+        let (c, s) = find_row(&colls, &self.sw.target)?;
+        let sv = &colls[c].scenes[s];
+        (sv.mon > 0).then_some(sv.auto)
+    }
+
+    /// The row's own size, or what Auto means; None = Auto with no monitor (OBS is asked for the video source)
+    fn sw_known_size(&self) -> Option<Option<(i32, i32)>> {
+        match self.sw.target.res {
+            Some(r) => Some(Some(r)),
+            None => self.sw_mon_size().map(Some),
+        }
+    }
+
+    /// The video to switch to: the size (None / 0 x 0 = left as it is) and the row's FPS (not set = left as it is).
+    fn sw_set_want(&mut self, size: Option<(i32, i32)>) {
+        let o = self.sw.orig_video;
+        let (n, d) = if self.sw.target.fps > 0 { fps_frac(self.sw.target.fps) } else { (o[4], o[5]) };
+        self.sw.want = match size.filter(|s| s.0 > 0 && s.1 > 0) {
+            Some((w, hh)) => [w, hh, w, hh, n, d],
+            None => [o[0], o[1], o[2], o[3], n, d],
+        };
+    }
+
+    fn sw_video_differs(&self) -> bool {
+        let (o, w) = (self.sw.orig_video, self.sw.want);
+        let fps_differs = w[4] > 0 && w[5] > 0 && (w[4] as i64 * o[5] as i64 != o[4] as i64 * w[5] as i64);
+        w[..4] != o[..4] || fps_differs
+    }
+
     fn sw_fail(&mut self, h: &mut dyn Host, why: &str) {
         h.log(&format!("SWITCH failed: {why}"));
         self.kill(T::Switch);
         self.kill(T::SwRetry);
-        if self.sw.step == Some(R::SwVideo) && self.sw.scene_set {
-            // the resolution couldn't be applied: back to the scene we came from
+        if self.rbe.active && self.rbe.purpose == Rbe::Switch {
+            // timed out while instant replay was being started: that try ends here (a late start must not say "Now clipping")
+            self.rbe.active = false;
+            self.kill(T::Rbe);
+            self.s.quiet_start = false;
+        }
+        // back to the collection, scene and video it came from, one request after another
+        let o = self.sw.orig_video;
+        if self.sw.coll_set && !self.sw.orig_coll.is_empty() {
+            let c = self.sw.orig_coll.clone();
+            self.undo.push_back(("SetCurrentSceneCollection", json!({"sceneCollectionName": c})));
+            self.s.coll = c;
+        }
+        if self.sw.scene_set || self.sw.coll_set {
             let orig = self.sw.orig.clone();
-            self.send_req(h, R::None, "SetCurrentProgramScene", Some(json!({"sceneName": orig})), &orig);
+            self.undo.push_back(("SetCurrentProgramScene", json!({"sceneName": orig})));
             self.s.scene = orig;
         }
-        if (self.sw.was_rb || self.set.keep_rb) && !self.s.rb && self.sw.step != Some(R::RbeStart) {
-            self.rbe_begin(h, Rbe::Restore, 0);
+        if self.sw.video_set {
+            let mut v = json!({"baseWidth": o[0], "baseHeight": o[1], "outputWidth": o[2], "outputHeight": o[3]});
+            if o[4] > 0 && o[5] > 0 {
+                v["fpsNumerator"] = json!(o[4]);
+                v["fpsDenominator"] = json!(o[5]);
+                self.s.fps_num = o[4];
+                self.s.fps_den = o[5];
+            }
+            self.undo.push_back(("SetVideoSettings", v));
         }
+        self.undo_rb = (self.sw.was_rb || self.set.keep_rb) && !self.s.rb && self.sw.step != Some(R::RbeStart);
         self.sw.active = false;
         let top = match self.cur_mon() {
             Some(m) => format!("Still clipping monitor {}", self.mons[m].num),
             None => format!("Still on {}", if self.s.scene.is_empty() { "the same scene" } else { &self.s.scene }),
         };
         self.pop(h, Color::Red, Icon::Bang, &top, "Couldn't switch", "Couldn't switch", "");
+        self.undo_next(h);
         self.state_changed(h);
+    }
+
+    /// the next roll-back request (each waits for the one before); after the last, instant replay back on
+    fn undo_next(&mut self, h: &mut dyn Host) {
+        self.kill(T::SwUndo);
+        self.undo_wait = false;
+        if let Some((ty, data)) = self.undo.pop_front() {
+            self.undo_wait = true;
+            self.send_req(h, R::SwUndo, ty, Some(data), "");
+            self.set_timer(h, T::SwUndo, 60000);
+            return;
+        }
+        if std::mem::take(&mut self.undo_rb) && !self.s.rb {
+            self.rbe_begin(h, Rbe::Restore, 0);
+        }
     }
 
     fn sw_success(&mut self, h: &mut dyn Host) {
         self.kill(T::Switch);
         self.kill(T::SwRetry);
         self.sw.active = false;
-        self.s.scene = self.sw.target.clone();
+        self.s.scene = self.sw.target.name.clone();
         let on = self.s.rb;
-        let top = format!("{}{DOT}instant replay {}", self.mon_label(), if on { "on" } else { "off" });
-        let main = format!("Now clipping {}", self.sw.target);
-        let target = self.sw.target.clone();
+        let [_, _, w, hh, n, d] = self.sw.want;
+        let fps = if n > 0 && d > 0 { format!("{DOT}{} fps", fps_text((n as i64 * 100 / d as i64) as i32)) } else { String::new() };
+        let top = format!("{w} x {hh}{fps}{DOT}instant replay {}", if on { "on" } else { "off" });
+        let target = self.sw.target.name.clone();
+        let main = format!("Now clipping {target}");
         h.log("SWITCH ok");
         self.pop(h, Color::Blue, Icon::Switch, &top, &main, "Now clipping", &target);
         self.state_changed(h);
@@ -1024,17 +1291,71 @@ impl Engine {
         self.set_timer(h, T::Switch, timeout_ms);
     }
 
+    /// GetSceneItemList of the target: its video source's size
+    fn sw_ask_src(&mut self, h: &mut dyn Host) {
+        self.sw_step(h, R::SwSrc, 10000);
+        let t = self.sw.target.name.clone();
+        self.send_req(h, R::SwSrc, "GetSceneItemList", Some(json!({"sceneName": t})), &t);
+    }
+
+    /// the same collection, the video worked out: nothing differs = only the scene (no instant replay restart)
+    fn sw_decide(&mut self, h: &mut dyn Host, size: Option<(i32, i32)>) {
+        self.sw_set_want(size);
+        self.sw.reset = self.sw_video_differs();
+        if !self.sw.reset {
+            self.sw_set_scene(h);
+            return;
+        }
+        self.sw_step(h, R::SwRb, 10000);
+        self.send_req(h, R::SwRb, "GetReplayBufferStatus", None, "");
+    }
+
+    /// instant replay is off (or was never on): the collection first, then the scene
+    fn sw_after_stop(&mut self, h: &mut dyn Host) {
+        if self.sw.other && !self.sw.coll_set {
+            // a collection loads its sources first: wait generously
+            self.sw_step(h, R::SwColl, 60000);
+            let c = self.sw.target.coll.clone();
+            self.send_req(h, R::SwColl, "SetCurrentSceneCollection", Some(json!({"sceneCollectionName": c})), "");
+            return;
+        }
+        self.sw_set_scene(h);
+    }
+
     fn sw_set_scene(&mut self, h: &mut dyn Host) {
         self.sw_step(h, R::SwScene, 15000);
-        let t = self.sw.target.clone();
+        let t = self.sw.target.name.clone();
         self.send_req(h, R::SwScene, "SetCurrentProgramScene", Some(json!({"sceneName": t})), &t);
+    }
+
+    /// the scene is set (after a restart-worthy change): the video if it differs, then instant replay
+    fn sw_video_or_rb(&mut self, h: &mut dyn Host) {
+        if self.sw_video_differs() {
+            self.sw.video_t0 = h.now_ms();
+            self.sw_set_video(h);
+        } else {
+            self.sw_rb_or_done(h);
+        }
     }
 
     fn sw_set_video(&mut self, h: &mut dyn Host) {
         // OBS can freeze for several seconds while it resets video
         self.sw_step(h, R::SwVideo, 40000);
-        let (w, hh) = (self.sw.w, self.sw.h);
-        self.send_req(h, R::SwVideo, "SetVideoSettings", Some(json!({"baseWidth": w, "baseHeight": hh, "outputWidth": w, "outputHeight": hh})), "");
+        let [bw, bh, w, hh, n, d] = self.sw.want;
+        let mut v = json!({"baseWidth": bw, "baseHeight": bh, "outputWidth": w, "outputHeight": hh});
+        if n > 0 && d > 0 {
+            v["fpsNumerator"] = json!(n);
+            v["fpsDenominator"] = json!(d);
+        }
+        self.send_req(h, R::SwVideo, "SetVideoSettings", Some(v), "");
+    }
+
+    fn sw_rb_or_done(&mut self, h: &mut dyn Host) {
+        if self.sw.was_rb || self.set.keep_rb {
+            self.sw_start_rb(h); // keep on at all times: even if it was off before
+        } else {
+            self.sw_success(h);
+        }
     }
 
     fn sw_start_rb(&mut self, h: &mut dyn Host) {
@@ -1046,19 +1367,23 @@ impl Engine {
 
     fn sw_key(&mut self, h: &mut dyn Host) {
         h.log("KEY switch");
-        if self.sw.active {
+        if self.sw.active || self.undo_wait || !self.undo.is_empty() {
             return;
         }
         if !self.s.ident {
             self.pop(h, Color::Red, Icon::Bang, "OBS isn't open", "Couldn't switch", "Couldn't switch", "OBS isn't open");
             return;
         }
-        self.sw = Sw { active: true, orig: self.s.scene.clone(), ..Default::default() };
+        self.sw = Sw { active: true, orig: self.s.scene.clone(), orig_coll: self.s.coll.clone(), ..Default::default() };
         self.sw_step(h, R::SwRec, 10000);
         self.send_req(h, R::SwRec, "GetRecordStatus", None, "");
     }
 
     fn sw_response(&mut self, h: &mut dyn Host, kind: R, ok: bool, r: Option<&Value>, code: i64) {
+        if kind == R::SwUndo {
+            self.undo_next(h);
+            return;
+        }
         if !self.sw.active || Some(kind) != self.sw.step {
             return;
         }
@@ -1075,25 +1400,48 @@ impl Engine {
                     self.sw_fail(h, "no other scene in the list");
                     return;
                 }
-                let m = self.scene_mon(self.scene_find(&self.sw.target));
-                self.sw.w = m.map(|m| self.mons[m].w).unwrap_or(0);
-                self.sw.h = m.map(|m| self.mons[m].h).unwrap_or(0);
-                if self.sw.w == 0 {
-                    self.sw_set_scene(h); // not a monitor scene: the resolution stays
-                    return;
-                }
                 self.sw_step(h, R::SwVget, 10000);
                 self.send_req(h, R::SwVget, "GetVideoSettings", None, "");
             }
             R::SwVget => {
-                let n = |k: &str| jn(g(k), 0.0) as i32;
-                self.sw.reset = !ok || n("baseWidth") != self.sw.w || n("baseHeight") != self.sw.h || n("outputWidth") != self.sw.w || n("outputHeight") != self.sw.h;
-                if !self.sw.reset {
-                    self.sw_set_scene(h); // same size already: no replay restart needed
+                if !ok {
+                    self.sw_fail(h, "GetVideoSettings refused");
                     return;
                 }
-                self.sw_step(h, R::SwRb, 10000);
-                self.send_req(h, R::SwRb, "GetReplayBufferStatus", None, "");
+                let n = |k: &str| jn(g(k), 0.0) as i32;
+                self.sw.orig_video = [n("baseWidth"), n("baseHeight"), n("outputWidth"), n("outputHeight"), n("fpsNumerator"), n("fpsDenominator")];
+                if self.sw.other {
+                    // another collection: instant replay restarts in any case; its video source is asked for once it's open
+                    self.sw.reset = true;
+                    self.sw_step(h, R::SwRb, 10000);
+                    self.send_req(h, R::SwRb, "GetReplayBufferStatus", None, "");
+                    return;
+                }
+                match self.sw_known_size() {
+                    Some(size) => self.sw_decide(h, size),
+                    None => self.sw_ask_src(h),
+                }
+            }
+            R::SwSrc => {
+                let items = g("sceneItems").and_then(|v| v.as_array()).filter(|_| ok).map(|a| Self::src_size(a)).unwrap_or((0, 0));
+                if items.0 > 0 {
+                    self.src_seen.insert((self.sw.target.coll.clone(), self.sw.target.name.clone()), items);
+                }
+                if items.0 == 0 && self.sw.other && self.sw.scene_set && self.sw.src_tries < SW_SRC_TRIES {
+                    // a collection that just opened: its capture device reports 0 x 0 until its first frame - ask again
+                    self.sw.src_tries += 1;
+                    self.set_timer(h, T::SwRetry, 500);
+                    return;
+                }
+                // no signal (0 x 0): the size OBS last reported for it, else the size stays as it is
+                let seen = self.src_seen.get(&(self.sw.target.coll.clone(), self.sw.target.name.clone())).copied();
+                let size = if items.0 > 0 { Some(items) } else if self.sw.other { seen } else { None };
+                if self.sw.scene_set {
+                    self.sw_set_want(size);
+                    self.sw_video_or_rb(h);
+                } else {
+                    self.sw_decide(h, size);
+                }
             }
             R::SwRb => {
                 self.sw.was_rb = ok && jb(g("outputActive"));
@@ -1101,7 +1449,7 @@ impl Engine {
                     self.sw_step(h, R::SwStop, 20000);
                     self.send_req(h, R::SwStop, "StopReplayBuffer", None, "");
                 } else {
-                    self.sw_set_scene(h);
+                    self.sw_after_stop(h);
                 }
             }
             R::SwStop => {
@@ -1110,8 +1458,18 @@ impl Engine {
                     return;
                 }
                 if self.sw.rb_stopped || !self.s.rb {
-                    self.sw_set_scene(h); // else wait for OBS's STOPPED event
+                    self.sw_after_stop(h); // else wait for OBS's STOPPED event
                 }
+            }
+            R::SwColl => {
+                if !ok {
+                    self.sw_fail(h, "SetCurrentSceneCollection refused");
+                    return;
+                }
+                self.sw.coll_set = true;
+                self.s.coll = self.sw.target.coll.clone();
+                self.read_files(h);
+                self.sw_set_scene(h);
             }
             R::SwScene => {
                 if !ok {
@@ -1119,7 +1477,7 @@ impl Engine {
                     return;
                 }
                 self.sw.scene_set = true;
-                self.s.scene = self.sw.target.clone();
+                self.s.scene = self.sw.target.name.clone();
                 if !self.sw.reset {
                     // keep instant replay on: also after a switch that didn't need a restart
                     if self.set.keep_rb && !self.s.rb {
@@ -1130,8 +1488,17 @@ impl Engine {
                     self.sw_success(h);
                     return;
                 }
-                self.sw.video_t0 = h.now_ms();
-                self.sw_set_video(h);
+                if self.sw.other {
+                    // the collection is open now: its scene's size from its monitor, else from OBS
+                    match self.sw_known_size() {
+                        Some(size) => self.sw_set_want(size),
+                        None => {
+                            self.sw_ask_src(h);
+                            return;
+                        }
+                    }
+                }
+                self.sw_video_or_rb(h);
             }
             R::SwVideo => {
                 if !ok {
@@ -1143,11 +1510,13 @@ impl Engine {
                     self.sw_fail(h, "SetVideoSettings refused");
                     return;
                 }
-                if self.sw.was_rb || self.set.keep_rb {
-                    self.sw_start_rb(h); // keep on at all times: even if it was off before
-                } else {
-                    self.sw_success(h);
+                self.sw.video_set = true;
+                let [_, _, _, _, n, d] = self.sw.want;
+                if n > 0 && d > 0 {
+                    self.s.fps_num = n;
+                    self.s.fps_den = d;
                 }
+                self.sw_rb_or_done(h);
             }
             _ => {}
         }
@@ -1214,7 +1583,7 @@ impl Engine {
                         self.pop_replay_on(h);
                     }
                     self.oa_rb_event(h, true);
-                    self.storage_check(h);
+                    self.storage_check(h, false);
                 } else if st == OUT_STOPPED {
                     self.s.rb = false;
                     self.s.rb_start = 0;
@@ -1223,7 +1592,7 @@ impl Engine {
                     if self.sw.active {
                         self.sw.rb_stopped = true;
                         if self.sw.step == Some(R::SwStop) {
-                            self.sw_set_scene(h);
+                            self.sw_after_stop(h);
                         }
                     } else if quiet && self.s.quiet_stop {
                         self.s.quiet_stop = false;
@@ -1245,6 +1614,9 @@ impl Engine {
                     self.s.rec = true;
                     self.s.rec_start = h.now_ms();
                     self.s.meas_kbps = 0;
+                    self.s.rate_base = None;
+                    self.s.low_hits = 0;
+                    self.send_req(h, R::Minute, "GetRecordStatus", None, ""); // the rate's starting point
                     self.s.rb_before_rec = self.s.rb;
                     self.s.rec_paused = false;
                     let lab = self.mon_label();
@@ -1261,7 +1633,7 @@ impl Engine {
                     } else {
                         self.pop(h, Color::Blue, Icon::Rec, &lab, "Recording", "Recording", "");
                     }
-                    self.storage_check(h);
+                    self.storage_check(h, false);
                     self.set_timer(h, T::Minute, 60000);
                 } else if st == OUT_STOPPED {
                     let len = if self.s.rec_start != 0 { h.now_ms() - self.s.rec_start } else { 0 };
@@ -1282,6 +1654,7 @@ impl Engine {
                         self.pop(h, Color::Green, Icon::Check, &top, "Recording saved", "Recording saved", &d);
                     }
                     self.s.meas_kbps = 0;
+                    self.s.rate_base = None;
                 }
                 self.state_changed(h);
             }
@@ -1289,9 +1662,19 @@ impl Engine {
                 self.s.scene = js(g("sceneName"), "").to_string();
                 self.state_changed(h);
             }
+            "CurrentSceneCollectionChanged" => {
+                self.s.coll = js(g("sceneCollectionName"), "").to_string();
+                self.read_files(h);
+                self.set_timer(h, T::Rescan, 500);
+            }
+            "SceneCollectionListChanged" => {
+                self.read_files(h);
+                self.state_changed(h);
+            }
             "SceneListChanged" | "SceneCreated" | "SceneRemoved" | "SceneNameChanged" | "SceneItemCreated" | "SceneItemRemoved"
-            | "SceneItemEnableStateChanged" | "InputSettingsChanged" | "InputCreated" | "InputRemoved" | "InputNameChanged"
-            | "CurrentSceneCollectionChanged" => self.set_timer(h, T::Rescan, 500),
+            | "SceneItemEnableStateChanged" | "InputSettingsChanged" | "InputCreated" | "InputRemoved" | "InputNameChanged" => {
+                self.set_timer(h, T::Rescan, 500)
+            }
             "CurrentProfileChanged" => self.set_timer(h, T::Cfg, 400),
             _ => {}
         }
@@ -1307,7 +1690,7 @@ impl Engine {
         }
         self.cfg = ObsCfg::read(&h.os().obs_dir());
         let c = self.oa.c.clone();
-        if !c.keys_changed && !c.cliplen_changed && !c.fps_changed && !c.folder_changed {
+        if !c.keys_changed && !c.cliplen_changed && !c.folder_changed {
             self.cfg_reload(h);
             return true;
         }
@@ -1331,10 +1714,6 @@ impl Engine {
         let out = if self.cfg.adv { "AdvOut" } else { "SimpleOutput" };
         if c.cliplen_changed {
             put(&mut vals, out, "RecRBTime", c.cliplen.to_string());
-        }
-        if c.fps_changed {
-            put(&mut vals, "Video", "FPSType", "1".into());
-            put(&mut vals, "Video", "FPSInt", c.fps.to_string());
         }
         if c.folder_changed {
             let key = if self.cfg.adv { if self.cfg.ffmpeg_rec { "FFFilePath" } else { "RecFilePath" } } else { "FilePath" };
@@ -1417,34 +1796,19 @@ impl Engine {
         }
     }
 
-    /// FPS: a video reset like a resolution change (OBS may freeze ~8 s), so wait generously
-    fn oa_set_fps(&mut self, h: &mut dyn Host) {
-        self.oa.step = Oa::Fps;
-        if self.oa.fps_t0 == 0 {
-            self.oa.fps_t0 = h.now_ms();
-        }
-        self.set_timer(h, T::Oa, 40000);
-        let f = self.oa.c.fps;
-        self.send_req(h, R::OaFps, "SetVideoSettings", Some(json!({"fpsNumerator": f, "fpsDenominator": 1})), "");
-    }
     fn oa_start_rb(&mut self, h: &mut dyn Host) {
         self.oa.step = Oa::RbStart;
         self.kill(T::Oa); // the restart routine has its own 40 s limit
-        let settle = if self.oa.c.fps_changed { 500 } else { 0 };
-        self.rbe_begin(h, Rbe::Oa, settle);
+        self.rbe_begin(h, Rbe::Oa, 0);
     }
 
-    /// replay-buffer events while applying clip length / folder / FPS
+    /// replay-buffer events while applying clip length / folder
     fn oa_rb_event(&mut self, h: &mut dyn Host, started: bool) {
         if self.oa.step == Oa::Stop && !started {
             self.oa_close_obs(h);
             return;
         }
         if self.oa.step == Oa::RbStop && !started {
-            if self.oa.c.fps_changed {
-                self.oa_set_fps(h);
-                return;
-            }
             self.oa_start_rb(h);
         }
     }
@@ -1474,8 +1838,6 @@ impl Engine {
             self.s.quiet_until = h.now_ms() + 30000;
             self.send_req(h, R::OaRbStop, "StopReplayBuffer", None, "");
             self.set_timer(h, T::Oa, 20000);
-        } else if c.fps_changed {
-            self.oa_set_fps(h);
         } else {
             self.oa_done(h, "applied live");
         }
@@ -1486,14 +1848,12 @@ impl Engine {
             return;
         }
         self.oa.was_rb = self.s.ident && self.s.rb;
-        self.oa.fps_t0 = 0;
         h.log(&format!(
-            "OBSAPPLY keys={} cliplen={} folder={} fps={} ws={}",
-            c.keys_changed as i32, c.cliplen_changed as i32, c.folder_changed as i32, c.fps_changed as i32, c.ws_enable as i32
+            "OBSAPPLY keys={} cliplen={} folder={} ws={}",
+            c.keys_changed as i32, c.cliplen_changed as i32, c.folder_changed as i32, c.ws_enable as i32
         ));
         let ws = c.ws_enable;
         let keys = c.keys_changed;
-        let fps = c.fps_changed;
         self.oa.c = c;
         if !h.os().obs_running() {
             // OBS is closed: it reads the file next time it starts
@@ -1523,14 +1883,6 @@ impl Engine {
             self.oa_fail(h, "Can't reach OBS right now, so this wasn't changed.");
             return;
         }
-        if fps {
-            // a new FPS ends a running recording: ask OBS first
-            self.oa.step = Oa::FpsRec;
-            self.set_timer(h, T::Oa, 10000);
-            self.send_req(h, R::OaFpsRec, "GetRecordStatus", None, "");
-            self.state_changed(h);
-            return;
-        }
         self.oa_apply_live(h);
     }
 
@@ -1556,35 +1908,6 @@ impl Engine {
             }
             R::OaStop if !ok && self.oa.step == Oa::Stop => self.oa_fail(h, "OBS didn't stop instant replay, so nothing was changed."),
             R::OaSet if !ok => h.log("OBSAPPLY a setting was refused by OBS"),
-            R::OaFpsRec if self.oa.step == Oa::FpsRec => {
-                if ok && active {
-                    self.oa.step = Oa::Idle;
-                    self.kill(T::Oa);
-                    h.dialog("Stop recording first \u{2014} changing FPS would end your recording");
-                    self.state_changed(h);
-                    return;
-                }
-                self.oa_apply_live(h);
-            }
-            R::OaFps if self.oa.step == Oa::Fps => {
-                if !ok {
-                    // "output still active" right after the stop: retry shortly, for up to 10 s
-                    if self.oa.last_code == 500 && h.now_ms() - self.oa.fps_t0 < 10000 {
-                        self.set_timer(h, T::OaRetry, 250);
-                        return;
-                    }
-                    self.oa_fail(h, "OBS didn't accept the new FPS, so it wasn't changed.");
-                    return;
-                }
-                self.s.fps_num = self.oa.c.fps;
-                self.s.fps_den = 1;
-                // back on if it was on, or always with "Keep instant replay on at all times"
-                if self.oa.was_rb || self.set.keep_rb {
-                    self.oa_start_rb(h);
-                } else {
-                    self.oa_done(h, "fps set");
-                }
-            }
             _ => {}
         }
     }
@@ -1655,18 +1978,16 @@ impl Engine {
                 if ok && jb(g("outputActive")) {
                     self.s.rec = true;
                     self.s.rec_start = h.now_ms().saturating_sub(jn(g("outputDuration"), 0.0) as u64);
+                    self.s.rate_base = None;
+                    self.rec_sample(jn(g("outputBytes"), 0.0), jn(g("outputDuration"), 0.0));
                     self.set_timer(h, T::Minute, 60000);
                     self.state_changed(h);
                 }
             }
             R::Minute => {
-                if ok && jb(g("outputActive")) {
-                    let bytes = jn(g("outputBytes"), 0.0);
-                    let dur = jn(g("outputDuration"), 0.0);
-                    if dur > 20000.0 && bytes > 0.0 {
-                        self.s.meas_kbps = (bytes * 8.0 / dur) as i32;
-                    }
-                    self.storage_check(h);
+                if ok && jb(g("outputActive")) && self.s.rec {
+                    self.rec_sample(jn(g("outputBytes"), 0.0), jn(g("outputDuration"), 0.0));
+                    self.storage_check(h, true);
                 }
             }
             R::CurScene => {
@@ -1674,6 +1995,19 @@ impl Engine {
                 self.s.scene = n.to_string();
                 self.s.have_scene = true;
                 self.maybe_greet(h);
+            }
+            R::Colls => {
+                if ok {
+                    self.s.coll = js(g("currentSceneCollectionName"), "").to_string();
+                    // the first scan was sent with the collection not known yet: its scenes are the open collection's
+                    if self.s.scan_coll.is_empty() {
+                        self.s.scan_coll = self.s.coll.clone();
+                    }
+                    if self.s.scanned && self.s.sc_coll.is_empty() {
+                        self.s.sc_coll = self.s.coll.clone();
+                    }
+                }
+                self.state_changed(h);
             }
             R::Scenes => {
                 if scan != self.s.scan_id {
@@ -1700,6 +2034,7 @@ impl Engine {
                 }
                 if let Some(items) = g("sceneItems").and_then(|v| v.as_array()).filter(|_| ok) {
                     if let Some(si) = self.s.tsc.iter().rposition(|s| s.name == arg) {
+                        self.s.tsc[si].src = Self::src_size(items);
                         for c in items {
                             // last visible display capture in the list = the top-most one
                             if js(c.get("inputKind"), "") != "monitor_capture" || !c.get("sceneItemEnabled").map(|v| jb(Some(v))).unwrap_or(true) {
@@ -1744,8 +2079,7 @@ impl Engine {
                     self.scan_finish(h);
                 }
             }
-            R::OaRec | R::OaStop | R::OaSet | R::OaRbStop | R::OaFpsRec | R::OaFps => {
-                self.oa.last_code = code;
+            R::OaRec | R::OaStop | R::OaSet | R::OaRbStop => {
                 self.oa_response(h, kind, ok, r);
             }
             _ => self.sw_response(h, kind, ok, r, code),
@@ -1852,6 +2186,8 @@ impl Engine {
         self.send_req(h, R::RecStat, "GetRecordStatus", None, "");
         self.send_req(h, R::CurScene, "GetCurrentProgramScene", None, "");
         self.send_req(h, R::Video, "GetVideoSettings", None, "");
+        self.send_req(h, R::Colls, "GetSceneCollectionList", None, "");
+        self.read_files(h);
         self.scan_start(h);
         self.remember_obs_path(h);
         self.startobs_sync(h);
@@ -1944,10 +2280,13 @@ impl Engine {
         let (seq, scan) = (self.s.seq, self.s.scan_id);
         self.s = St { seq, scan_id: scan, amber, fails, ..Default::default() };
         self.sw = Sw::default();
+        self.undo.clear();
+        self.undo_rb = false;
+        self.undo_wait = false;
         self.rbe = RbeS::default();
         self.ra = RaS::default();
         self.reqs.clear();
-        for t in [T::RaWait, T::RaStart, T::Rbe, T::Clip, T::Minute, T::Switch, T::SwRetry, T::Hello, T::Rescan] {
+        for t in [T::RaWait, T::RaStart, T::Rbe, T::Clip, T::Minute, T::Switch, T::SwRetry, T::SwUndo, T::Hello, T::Rescan] {
             self.kill(t);
         }
         self.state_changed(h);
@@ -2054,12 +2393,33 @@ impl Engine {
             return;
         }
         self.ra.armed = false;
+        // (before the check below: OBS can't have saved for a press it ignored)
+        self.clip_press_obs_key(h);
         if h.now_ms() - self.s.last_saved < 400 {
             return; // OBS already announced this save
         }
         self.s.clip_pending = true;
         self.s.clip_t0 = h.now_ms();
         self.set_timer(h, T::Clip, CLIP_STORAGE_CHECK_MS);
+    }
+
+    /// Order 132: OBS 32 matches hotkey modifiers strictly (libobs/obs.c:1162, obs-hotkey.c `modifiers_match`): Insert
+    /// while Ctrl / Shift is held does nothing in OBS, while the app's listener (extra modifiers allowed) sees the press.
+    /// For exactly that press - the held modifiers (read like OBS reads them) match none of OBS's Save clip bindings - the
+    /// app presses OBS's own binding through obs-websocket (TriggerHotkeyByKeySequence = OBS's `obs_hotkey_inject_event`).
+    /// OBS can't save that press by itself, so it is one save; a press OBS takes itself is left to OBS (pressing it from
+    /// here too could arrive after OBS's own press was over and save twice). OBS's key not known (ClipPing's fallback
+    /// key): nothing is pressed.
+    fn clip_press_obs_key(&mut self, h: &mut dyn Host) {
+        if !self.cfg.clip_known || self.cfg.clip.iter().any(|b| b.mods == self.clip_mods) {
+            return;
+        }
+        for b in self.cfg.clip.clone() {
+            let Some(name) = crate::keys::vk_to_obs_key(b.vk) else { continue };
+            let m = |bit: u8| b.mods & bit != 0;
+            let mods = json!({"shift": m(crate::keys::MOD_S), "control": m(crate::keys::MOD_C), "alt": m(crate::keys::MOD_A), "command": m(crate::keys::MOD_W)});
+            self.send_req(h, R::None, "TriggerHotkeyByKeySequence", Some(json!({"keyId": name, "keyModifiers": mods})), "");
+        }
     }
 
     /// the red "Clip failed" popup (remembered so a late "saved" can take it away)
@@ -2191,15 +2551,13 @@ impl Engine {
                 self.kill(T::SwRetry);
                 if self.sw.active && self.sw.step == Some(R::SwVideo) {
                     self.sw_set_video(h);
+                } else if self.sw.active && self.sw.step == Some(R::SwSrc) {
+                    self.sw_ask_src(h);
                 }
             }
+            // a roll-back request got no answer: on with the next
+            T::SwUndo => self.undo_next(h),
             T::Rbe => self.rbe_tick(h),
-            T::OaRetry => {
-                self.kill(T::OaRetry);
-                if self.oa.step == Oa::Fps {
-                    self.oa_set_fps(h);
-                }
-            }
             T::Oa => {
                 self.kill(T::Oa);
                 if self.oa.step == Oa::RbStart || self.oa.step == Oa::RbStop {
@@ -2250,6 +2608,6 @@ impl Engine {
 /// What a set of OBS-side changes needs confirming (app.c `app_obs_needs`): (OBS restarts, instant replay restarts).
 pub fn needs(c: &ObsChange, obs_running: bool, connected: bool, replay_on: bool) -> (bool, bool) {
     let restart_obs = c.keys_changed && obs_running;
-    let restart_rb = !restart_obs && (c.cliplen_changed || c.folder_changed || c.fps_changed) && connected && replay_on;
+    let restart_rb = !restart_obs && (c.cliplen_changed || c.folder_changed) && connected && replay_on;
     (restart_obs, restart_rb)
 }

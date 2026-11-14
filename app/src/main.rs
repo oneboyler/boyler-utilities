@@ -1050,16 +1050,9 @@ impl App {
             }
             "obssample" => {
                 // test copies: Notifications for OBS with sample settings (scenes, a switch key) for pictures / checks;
-                // obssample:other = NotificationsForOBS.exe pretends to run on its own
-                if arg == "other" {
-                    obs::set_other_for_test(Some(4242));
-                }
-                if let Some(mut s) = obs::settings() {
-                    s.scenes = vec!["16:9".into(), "21:9".into()];
-                    s.scenes_init = true;
-                    s.switch_key = Some(bu_obs::keys::KeyBind::new(0x13, 0));
-                    obs::set_settings(s);
-                }
+                // obssample:other = NotificationsForOBS.exe pretends to run on its own; obssample:scenes = the scene rows of
+                // drawing obs-scenes-v1 with OBS looking connected (Order 132)
+                obs::sample_for_test(arg);
             }
             "winlight" => {
                 // winlight:<0|1> - Windows' app theme as if it had just changed (Match Windows, Order 033; the real one is never touched)

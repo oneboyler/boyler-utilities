@@ -2,18 +2,21 @@
 //! recreated with the menu's shared pieces - every setting, the same groups in the same order: Keys (+ the scene list it
 //! switches through), Recording, Sounds, Popups (+ the preview), and the fullscreen warning line. ClipPing's "Start with
 //! Windows" is the app's own (Settings) and its "Check for updates" too (A_035_01).
-//! OBS-side values (OBS's own keys, clip length, FPS, clips folder) wait in the page until "Apply to OBS" on the bar at the
+//! OBS-side values (OBS's own keys, clip length, clips folder) wait in the page until "Apply to OBS" on the bar at the
 //! bottom (ClipPing's Done, with its one confirmation when OBS or instant replay must restart); everything else applies at
 //! once, and a Popups change shows ONE silent test popup exactly as it will look (ClipPing's rule).
+//! Order 132 (drawing obs-scenes-v1): each row of the Switch scene list has its own Resolution (Auto shows the size it
+//! means) and FPS; "+ Add scene" lists every scene collection's scenes under the collection's name; the single FPS box
+//! next to Clip length is gone.
 //! The tab is in the top row only while the add-on is on (`crate::addons`).
 
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use bu_obs::engine::{needs, ObsChange, PopMsg};
+use bu_obs::engine::{find_row, fps_text, needs, ObsChange, PopMsg, SceneView};
 use bu_obs::keys::KeyBind;
 use bu_obs::popup::{anim_frame, custom_xy, pick_corner};
-use bu_obs::settings::{self as st, Settings};
+use bu_obs::settings::{self as st, SceneRow, Settings};
 use bu_obs::sound::{self, Sound, SOUND_LABELS};
 use skia_safe as sk;
 
@@ -34,7 +37,9 @@ const K_SCENE: Key = key("ntf.scene");
 const K_SDEL: Key = key("ntf.sdel");
 const K_ADD: Key = key("ntf.add");
 const K_CLIP: Key = key("ntf.cliplen");
-const K_FPS: Key = key("ntf.fps");
+/// a scene row's Resolution / FPS box (idx = the row)
+const K_RES: Key = key("ntf.res");
+const K_RFPS: Key = key("ntf.rfps");
 const K_OPEN: Key = key("ntf.open");
 const K_CHANGE: Key = key("ntf.change");
 const K_KEEP: Key = key("ntf.keep");
@@ -62,16 +67,53 @@ const K_OTHER: Key = key("ntf.other");
 
 const CLIPLENS: [i32; 10] = [10, 15, 20, 30, 45, 60, 90, 120, 180, 300];
 const FPSS: [i32; 5] = [3000, 6000, 12000, 14400, 24000];
+/// "+ Add scene": at most this many lines (collection names included)
+const ADD_MAX: usize = 40;
+/// the scene rows' Resolution / FPS boxes (drawing obs-scenes-v1: 158 / 64)
+const RES_W: f32 = 158.0;
+const FPS_W: f32 = 64.0;
 const WARN: &str = "Popups can't show over fullscreen games on the recording monitor. Use borderless / windowed, or pick Other monitor.";
 const CONNECT_TEXT: &str = "Notifications for OBS needs to turn on OBS's built-in remote control. OBS will close and reopen for a few seconds.";
 const CONNECT_NOTE: &str = "This lets Notifications for OBS change OBS settings for you and get notified when clips are saved, recordings start, or instant replay turns on and off. It's password protected, and you can turn it off anytime in OBS under Tools \u{2192} WebSocket Server Settings.";
 
-/// The open dropdown: which one, its anchor, its items (label, value).
+/// One line of an open list: its text, a grey part after it (Auto's size), its value, ticked; `head` = a scene
+/// collection's name above its scenes (not a choice).
+#[derive(Clone, Default)]
+struct MItem {
+    label: String,
+    grey: String,
+    val: i32,
+    ck: bool,
+    head: bool,
+}
+
+fn mi(label: &str, val: i32, ck: bool) -> MItem {
+    MItem { label: label.into(), val, ck, ..Default::default() }
+}
+
+/// The open dropdown: which one, its anchor, its items; "+ Add scene": the (collection, scene) of each value.
 #[derive(Clone)]
 struct Menu {
     of: Key,
     anchor: (f32, f32, f32, f32),
-    items: Vec<(String, i32, bool)>,
+    items: Vec<MItem>,
+    adds: Vec<(String, String)>,
+}
+
+/// A row's scene as OBS / its file has it: (collection, scene).
+fn row_scene<'a>(v: &'a bu_obs::View, r: &SceneRow) -> Option<(&'a str, &'a SceneView)> {
+    let (c, s) = find_row(&v.colls, r)?;
+    Some((v.colls[c].name.as_str(), &v.colls[c].scenes[s]))
+}
+
+/// "3840 x 2160"
+fn res_text((w, h): (i32, i32)) -> String {
+    format!("{w} x {h}")
+}
+
+/// Which row a per-row key belongs to.
+fn row_of(k: Key, base: Key) -> Option<usize> {
+    (0..st::MAX_LIST).find(|i| k == idx(base, *i))
 }
 
 #[derive(Default)]
@@ -79,9 +121,8 @@ pub struct Notifications {
     env: Env,
     menu: Option<Menu>,
     boxes: HashMap<Key, (f32, f32, f32, f32)>,
-    /// OBS-side edits waiting for Apply (ClipPing's M): clip length, FPS (hundredths), folder
+    /// OBS-side edits waiting for Apply (ClipPing's M): clip length, folder
     cliplen: Option<i32>,
-    fps: Option<i32>,
     folder: Option<PathBuf>,
     /// the Apply confirmation (text) under the bar's button
     confirm: Option<String>,
@@ -106,20 +147,37 @@ fn set_now() -> Settings {
     crate::obs::settings().unwrap_or_default()
 }
 
-fn fps_text(v: i32) -> String {
-    if v % 100 == 0 {
-        format!("{}", v / 100)
-    } else {
-        format!("{}.{:02}", v / 100, v % 100)
+/// A list of values with the current one put in its place when it isn't one of them (ClipPing's clip length / FPS lists).
+fn value_list(list: &[i32], cur: i32, text: impl Fn(i32) -> String) -> Vec<MItem> {
+    let mut items = Vec::new();
+    let mut placed = false;
+    for c in list.iter().copied() {
+        if !placed && cur < c && cur > 0 {
+            items.push(mi(&text(cur), cur, true));
+            placed = true;
+        }
+        if c == cur {
+            placed = true;
+        }
+        items.push(mi(&text(c), c, c == cur));
     }
+    if !placed && cur > 0 {
+        items.push(mi(&text(cur), cur, true));
+    }
+    items
 }
 
 impl Notifications {
     fn cliplen(&self, v: &bu_obs::View) -> i32 {
         self.cliplen.unwrap_or(v.cliplen)
     }
-    fn fps(&self, v: &bu_obs::View) -> i32 {
-        self.fps.unwrap_or(v.fps)
+    /// a row's FPS as the box shows it: its own, else the FPS OBS has now
+    fn row_fps(r: &SceneRow, v: &bu_obs::View) -> i32 {
+        if r.fps > 0 {
+            r.fps
+        } else {
+            v.fps
+        }
     }
     fn folder(&self, v: &bu_obs::View) -> PathBuf {
         self.folder.clone().unwrap_or_else(|| v.folder.clone())
@@ -139,7 +197,7 @@ impl Notifications {
     }
 
     fn pending(&self, v: &bu_obs::View) -> bool {
-        !v.applying && (!self.key_edits().is_empty() || self.cliplen.is_some_and(|c| c != v.cliplen) || self.fps.is_some_and(|f| f != v.fps) || self.folder.as_ref().is_some_and(|f| *f != v.folder))
+        !v.applying && (!self.key_edits().is_empty() || self.cliplen.is_some_and(|c| c != v.cliplen) || self.folder.as_ref().is_some_and(|f| *f != v.folder))
     }
 
     fn change(&self, v: &bu_obs::View) -> ObsChange {
@@ -157,9 +215,6 @@ impl Notifications {
         let cl = self.cliplen(v);
         c.cliplen = cl;
         c.cliplen_changed = cl != v.cliplen && cl > 0;
-        let f = self.fps(v);
-        c.fps = f / 100;
-        c.fps_changed = f != v.fps && f > 0;
         let fo = self.folder(v);
         c.folder_changed = !fo.as_os_str().is_empty() && !fo.to_string_lossy().eq_ignore_ascii_case(&v.folder.to_string_lossy());
         c.folder = fo;
@@ -178,64 +233,45 @@ impl Notifications {
             }
         });
         self.cliplen = None;
-        self.fps = None;
         self.folder = None;
         self.confirm = None;
     }
 
     fn apply(&mut self, v: &bu_obs::View) {
         let c = self.change(v);
-        if c.keys_changed || c.cliplen_changed || c.folder_changed || c.fps_changed {
+        if c.keys_changed || c.cliplen_changed || c.folder_changed {
             crate::obs::apply(c);
         }
         self.cliplen = None;
-        self.fps = None;
         self.folder = None;
         self.confirm = None;
     }
 
     fn open_menu(&mut self, of: Key, set: &Settings, v: &bu_obs::View) {
         let anchor = self.boxes.get(&of).copied().unwrap_or((0.0, 0.0, 120.0, 24.0));
-        let mut items: Vec<(String, i32, bool)> = Vec::new();
-        let mk = |names: &[&str], sel: i32| -> Vec<(String, i32, bool)> { names.iter().enumerate().map(|(i, n)| (n.to_string(), i as i32, i as i32 == sel)).collect() };
+        let mut items: Vec<MItem> = Vec::new();
+        let mut adds = Vec::new();
+        let mk = |names: &[&str], sel: i32| -> Vec<MItem> { names.iter().enumerate().map(|(i, n)| mi(n, i as i32, i as i32 == sel)).collect() };
         if of == K_CLIP {
-            let cur = self.cliplen(v);
-            let mut placed = false;
-            for c in CLIPLENS {
-                if !placed && cur < c && cur > 0 {
-                    items.push((format!("{cur} sec"), cur, true));
-                    placed = true;
-                }
-                if c == cur {
-                    placed = true;
-                }
-                items.push((format!("{c} sec"), c, c == cur));
+            items = value_list(&CLIPLENS, self.cliplen(v), |c| format!("{c} sec"));
+        } else if let Some(r) = row_of(of, K_RES).and_then(|i| set.scenes.get(i)) {
+            // Auto (with the size it means), then the drawing's sizes; a size of the row's own that isn't one of them
+            let auto = row_scene(v, r).map(|(_, s)| s.auto).filter(|a| a.0 > 0);
+            items.push(MItem { grey: auto.map(|a| format!("\u{00B7} {}", res_text(a))).unwrap_or_default(), ..mi("Auto", 0, r.res.is_none()) });
+            for (k, wh) in st::RES_LIST.iter().enumerate() {
+                items.push(mi(&res_text(*wh), k as i32 + 1, r.res == Some(*wh)));
             }
-            if !placed && cur > 0 {
-                items.push((format!("{cur} sec"), cur, true));
+            if let Some(own) = r.res.filter(|o| !st::RES_LIST.contains(o)) {
+                items.push(mi(&res_text(own), -2, true));
             }
-        } else if of == K_FPS {
-            let cur = self.fps(v);
-            let mut placed = false;
-            for f in FPSS {
-                if !placed && cur < f && cur > 0 {
-                    items.push((fps_text(cur), cur, true));
-                    placed = true;
-                }
-                if f == cur {
-                    placed = true;
-                }
-                items.push((fps_text(f), f, f == cur));
-            }
-            if !placed && cur > 0 {
-                items.push((fps_text(cur), cur, true));
-            }
+        } else if let Some(r) = row_of(of, K_RFPS).and_then(|i| set.scenes.get(i)) {
+            items = value_list(&FPSS, Self::row_fps(r, v), fps_text);
         } else if of == K_WHERE {
             items = mk(&st::WHERE_NAMES, set.where_);
         } else if of == K_POS {
             items = mk(&st::POS_NAMES, set.pos);
         } else if of == K_STYLE {
-            items = st::STYLE_ORDER.iter().map(|s| (st::style_name(*s).to_string(), *s, *s == set.style)).collect();
+            items = st::STYLE_ORDER.iter().map(|s| mi(st::style_name(*s), *s, *s == set.style)).collect();
         } else if of == K_BG {
             items = mk(&st::BG_NAMES, set.bg);
         } else if of == K_ANIM {
@@ -243,34 +279,51 @@ impl Notifications {
         } else if of == K_STATUS {
             items = mk(&st::STATUS_NAMES, set.status);
         } else if of == K_ADD {
-            for s in &v.scenes {
-                if !set.scenes.contains(&s.name) && items.len() < 20 {
-                    items.push((s.name.clone(), items.len() as i32, false));
+            // every collection's scenes under its name (the open one first), the ones already in the list left out
+            let taken: Vec<(String, String)> = set.scenes.iter().filter_map(|r| row_scene(v, r)).map(|(c, s)| (c.to_string(), s.name.clone())).collect();
+            for c in &v.colls {
+                let free: Vec<&SceneView> = c.scenes.iter().filter(|s| !taken.contains(&(c.name.clone(), s.name.clone()))).collect();
+                if free.is_empty() || items.len() + 2 > ADD_MAX {
+                    continue;
+                }
+                items.push(MItem { head: true, val: -1, ..mi(&c.name, -1, false) });
+                for s in free.into_iter().take(ADD_MAX - items.len()) {
+                    items.push(mi(&s.name, adds.len() as i32, false));
+                    adds.push((c.name.clone(), s.name.clone()));
                 }
             }
             if items.is_empty() {
-                items.push((if v.connected { "(no other scenes)" } else { "(OBS not connected)" }.to_string(), -1, false));
+                items.push(mi(if v.connected { "(no other scenes)" } else { "(OBS not connected)" }, -1, false));
             }
         } else if let Some(e) = (0..4).find(|e| of == idx(K_SND, *e)) {
             let ev = [Sound::Saved, Sound::Failed, Sound::Changed, Sound::Warning][e];
-            items.push(("None".into(), 0, set.snd[e] == 0));
+            items.push(mi("None", 0, set.snd[e] == 0));
             for i in 1..=sound::opt_count(ev) as i32 {
-                items.push((sound::opt_name(ev, i).to_string(), i, set.snd[e] == i));
+                items.push(mi(sound::opt_name(ev, i), i, set.snd[e] == i));
             }
-            items.push(("Custom file\u{2026}".into(), st::SND_CUSTOM, set.snd[e] == st::SND_CUSTOM));
+            items.push(mi("Custom file\u{2026}", st::SND_CUSTOM, set.snd[e] == st::SND_CUSTOM));
         }
-        self.menu = Some(Menu { of, anchor, items });
+        self.menu = Some(Menu { of, anchor, items, adds });
     }
 
     fn choose(&mut self, i: usize, cx: &mut Cx) {
         let Some(m) = self.menu.take() else { return };
-        let Some((label, v, _)) = m.items.get(i).cloned() else { return };
+        let Some(it) = m.items.get(i).cloned() else { return };
+        let v = it.val;
         let mut set = set_now();
         let of = m.of;
         if of == K_CLIP {
             self.cliplen = Some(v);
-        } else if of == K_FPS {
-            self.fps = Some(v);
+        } else if let Some(r) = row_of(of, K_RES) {
+            if v >= 0 && r < set.scenes.len() {
+                set.scenes[r].res = if v == 0 { None } else { st::RES_LIST.get(v as usize - 1).copied() };
+                self.save_row(&mut set, r);
+            }
+        } else if let Some(r) = row_of(of, K_RFPS) {
+            if v > 0 && r < set.scenes.len() {
+                set.scenes[r].fps = v;
+                self.save_row(&mut set, r);
+            }
         } else if of == K_WHERE {
             set.where_ = v;
             crate::obs::popups_changed(set);
@@ -303,8 +356,8 @@ impl Notifications {
             set.status = v;
             crate::obs::set_settings(set);
         } else if of == K_ADD {
-            if v >= 0 && set.scenes.len() < st::MAX_LIST {
-                set.scenes.push(label);
+            if let Some((c, s)) = m.adds.get(v.max(0) as usize).filter(|_| v >= 0 && set.scenes.len() < st::MAX_LIST) {
+                set.scenes.push(SceneRow::new(s, c));
                 set.scenes_init = true;
                 crate::obs::set_settings(set);
             }
@@ -321,13 +374,21 @@ impl Notifications {
         }
     }
 
+    /// A row's own value changed: it remembers its collection from now on (a row from before Order 132 is found by name)
+    /// and is saved at once.
+    fn save_row(&self, set: &mut Settings, r: usize) {
+        if set.scenes[r].coll.is_empty() {
+            if let Some((c, _)) = crate::obs::view().as_ref().and_then(|v| row_scene(v, &set.scenes[r]).map(|(c, s)| (c.to_string(), s.name.clone()))) {
+                set.scenes[r].coll = c;
+            }
+        }
+        set.scenes_init = true;
+        crate::obs::set_settings(set.clone());
+    }
+
     fn combo_text(&self, of: Key, set: &Settings, v: &bu_obs::View) -> String {
         if of == K_CLIP {
             return format!("{} sec", self.cliplen(v));
-        }
-        if of == K_FPS {
-            let f = self.fps(v);
-            return if f > 0 { fps_text(f) } else { String::new() };
         }
         if of == K_WHERE {
             return st::WHERE_NAMES[set.where_.clamp(0, 4) as usize].into();
@@ -634,15 +695,37 @@ impl Page for Notifications {
         out.push(group::grp(rows));
         out.push(group::gf("Switches between these scenes, in this order"));
         let mut srows = Vec::new();
-        for (i, s) in set.scenes.iter().enumerate() {
-            let mon = v.scenes.iter().find(|x| x.name == *s).map(|x| x.mon).unwrap_or(0);
+        for (i, r) in set.scenes.iter().enumerate() {
+            let found = row_scene(&v, r);
+            // the small grey tag: its monitor, else (no monitor) its collection; nothing while OBS isn't connected
+            let tag = match found {
+                Some((_, s)) if s.mon > 0 => format!("monitor {}", s.mon),
+                Some((c, _)) => c.to_string(),
+                None => String::new(),
+            };
             let rk = idx(K_SCENE, i);
-            let hv = cx.hovered(rk) || cx.hovered(idx(K_SDEL, i));
-            let mut l = El::row().center().gap(8.0).flex1().child(El::text(s.clone(), Font::new(13.0, 400), FG(), lh(13.0, 1.35)).ellipsis().shrink(1.0).min_w(0.0));
-            if mon > 0 {
-                l = l.child(El::text(format!("monitor {mon}"), Font::new(11.0, 400), FG3(), lh(11.0, 1.35)).none());
+            let hv = cx.hovered(rk) || cx.hovered(idx(K_SDEL, i)) || cx.hovered(idx(K_RES, i)) || cx.hovered(idx(K_RFPS, i));
+            let mut l = El::row().center().gap(8.0).flex1().child(El::text(r.name.clone(), Font::new(13.0, 400), FG(), lh(13.0, 1.35)).ellipsis().shrink(1.0).min_w(0.0));
+            if !tag.is_empty() {
+                l = l.child(El::text(tag, Font::new(11.0, 400), FG3(), lh(11.0, 1.35)).ellipsis().shrink(2.0).min_w(0.0));
             }
-            srows.push(group::row(i == 0, vec![l, group::ctl(vec![rowbits::rdel(cx, idx(K_SDEL, i), hv)])]).key(rk));
+            // Resolution: "Auto · 3440 x 1440" (the size in grey) or the row's own size
+            let auto = found.map(|(_, s)| s.auto).filter(|a| a.0 > 0);
+            let res_kids = match r.res {
+                Some(wh) => vec![El::text(res_text(wh), Font::new(13.0, 400), FG(), lh(13.0, 1.35)).ellipsis()],
+                None => {
+                    let mut k = vec![El::text("Auto", Font::new(13.0, 400), FG(), lh(13.0, 1.35)).none()];
+                    if let Some(a) = auto {
+                        k.push(El::text(format!("\u{00B7} {}", res_text(a)), Font::new(13.0, 400), FG2(), lh(13.0, 1.35)).ellipsis().shrink(1.0).min_w(0.0));
+                    }
+                    k
+                }
+            };
+            let res = dropdown::dropdown_with(cx, idx(K_RES, i), vec![El::row().center().gap(5.0).flex1().min_w(0.0).children(res_kids)], 10.0, 6.0).w(RES_W);
+            let f = Self::row_fps(r, &v);
+            let fps = dropdown::dropdown(cx, idx(K_RFPS, i), &if f > 0 { fps_text(f) } else { String::new() }, Some(FPS_W));
+            let unit = El::text("fps", Font::new(12.0, 400), FG2(), lh(12.0, 1.35)).none().margin(0.0, 0.0, 0.0, -2.0);
+            srows.push(group::row(i == 0, vec![l, group::ctl(vec![res, fps, unit, rowbits::rdel(cx, idx(K_SDEL, i), hv)])]).key(rk));
         }
         let add = El::text("+ Add scene", Font::new(13.0, 400), crate::ui::ACC(), lh(13.0, 1.35)).no_hit();
         srows.push(group::row(set.scenes.is_empty(), vec![El::row().flex1().child(add)]).on_click(K_ADD).cursor(crate::ui::el::Cursor::Hand));
@@ -652,10 +735,9 @@ impl Page for Notifications {
         out.push(group::gh("Recording"));
         let folder = self.folder(&v);
         let ftxt = if folder.as_os_str().is_empty() { "(unknown)".to_string() } else { folder.to_string_lossy().into_owned() };
-        let fps_dd = self.dd(cx, K_FPS, &set, &v, 72.0);
         let clip_dd = self.dd(cx, K_CLIP, &set, &v, 96.0);
         out.push(group::grp(vec![
-            group::row(true, vec![group::lbl("Clip length", None), group::ctl(vec![clip_dd, El::text("FPS", Font::new(13.0, 400), FG2(), lh(13.0, 1.35)).none().margin(0.0, 0.0, 0.0, 6.0), fps_dd])]),
+            group::row(true, vec![group::lbl("Clip length", None), group::ctl(vec![clip_dd])]),
             group::row(
                 false,
                 vec![
@@ -739,7 +821,19 @@ impl Page for Notifications {
                     crate::obs::set_settings(set);
                 }
             }
-            Ev::Click(k) if *k == K_ADD || *k == K_CLIP || *k == K_FPS || *k == K_WHERE || *k == K_POS || *k == K_STYLE || *k == K_BG || *k == K_ANIM || *k == K_STATUS || (0..4).any(|e| *k == idx(K_SND, e)) => {
+            Ev::Click(k)
+                if *k == K_ADD
+                    || *k == K_CLIP
+                    || *k == K_WHERE
+                    || *k == K_POS
+                    || *k == K_STYLE
+                    || *k == K_BG
+                    || *k == K_ANIM
+                    || *k == K_STATUS
+                    || (0..4).any(|e| *k == idx(K_SND, e))
+                    || row_of(*k, K_RES).is_some()
+                    || row_of(*k, K_RFPS).is_some() =>
+            {
                 if Self::disabled(*k, &set) {
                     return;
                 }
@@ -751,7 +845,7 @@ impl Page for Notifications {
             }
             Ev::Click(k) if self.menu.is_some() && (0..64).any(|i| *k == idx(K_MENU, i)) => {
                 let i = (0..64).find(|i| *k == idx(K_MENU, *i)).unwrap_or(0);
-                if self.menu.as_ref().and_then(|m| m.items.get(i)).is_some_and(|it| it.1 >= 0 || m_is_value_list(self.menu.as_ref())) {
+                if self.menu.as_ref().and_then(|m| m.items.get(i)).is_some_and(|it| !it.head && (it.val >= 0 || m_is_value_list(self.menu.as_ref()))) {
                     self.choose(i, cx);
                 }
             }
@@ -859,9 +953,15 @@ impl Page for Notifications {
             return Some(mitems::confirm(cx, K_CF, "Apply to OBS?", &msg, "Cancel", "OK", Kind::Primary, mitems::Place::Under(b.0, b.1, b.2, b.3), 262.0));
         }
         let m = self.menu.clone()?;
-        let items: Vec<Item> = m.items.iter().map(|(l, val, ck)| Item { label: l.clone(), checked: *ck, disabled: *val < 0 && m.of == K_ADD }).collect();
         let (x, y, w, h) = m.anchor;
         let _ = now;
+        if m.items.iter().any(|it| it.head || !it.grey.is_empty()) {
+            // "+ Add scene" (collection names above their scenes) / a Resolution list (Auto's size in grey)
+            let w = if m.of == K_ADD { 230.0 } else { w.max(150.0) };
+            let x = if m.of == K_ADD { x + 8.0 } else { x };
+            return Some(rich_menu(cx, &m.items, x, y + h + 4.0, w));
+        }
+        let items: Vec<Item> = m.items.iter().map(|it| Item { label: it.label.clone(), checked: it.ck, disabled: it.val < 0 && m.of == K_ADD }).collect();
         Some(dropdown::menu(cx, K_MENU, &items, x, y + h + 4.0, w.max(150.0)))
     }
 
@@ -916,6 +1016,48 @@ impl Page for Notifications {
 /// Every item of these lists is a value (the "(no other scenes)" line of Add scene is not).
 fn m_is_value_list(m: Option<&Menu>) -> bool {
     m.is_some_and(|m| m.of != K_ADD)
+}
+
+/// The popup list (`dropdown::menu`'s lines: tick, text) with a grey part after a line's text and collection names as
+/// small grey headings (drawing obs-scenes-v1 panels 2 + 3: `.menu div i{color:#9a9ca3}`, `.menu .mh{height:22px;
+/// font-size:10.5px;font-weight:600}`). A click on line i = `Ev::Click(idx(K_MENU, i))`.
+fn rich_menu(cx: &mut Cx, items: &[MItem], x: f32, y: f32, min_w: f32) -> El {
+    let mut est_h = 10.0;
+    let rows: Vec<El> = items
+        .iter()
+        .enumerate()
+        .map(|(i, it)| {
+            let k = idx(K_MENU, i);
+            if it.head {
+                est_h += 22.0;
+                return El::row()
+                    .center()
+                    .h(22.0)
+                    .pad(2.0, 14.0, 0.0, 26.0)
+                    .key(k)
+                    .child(El::text(it.label.clone(), Font::new(10.5, 600), FG3(), lh(10.5, 1.35)).ellipsis())
+                    .no_hit();
+            }
+            est_h += 26.0;
+            let on = it.val != -1 && cx.hovered(k);
+            let col = if it.val == -1 { FG3() } else if on { crate::ui::WHITE } else { FG() };
+            let grey = if on { crate::ui::WHITE.mul_a(0.75) } else { FG2() };
+            let ck = El::text(if it.ck { "\u{2713}" } else { "" }, Font::new(12.0, 400), col, lh(12.0, 1.35)).w(14.0).none().align(Align::Center);
+            let mut r = El::row().center().gap(6.0).h(26.0).pad(0.0, 14.0, 0.0, 6.0).radius(5.0).child(ck).child(El::text(it.label.clone(), Font::new(13.0, 400), col, lh(13.0, 1.35)));
+            if !it.grey.is_empty() {
+                r = r.child(El::text(it.grey.clone(), Font::new(13.0, 400), grey, lh(13.0, 1.35)));
+            }
+            if on {
+                r = r.bg(crate::ui::ACC());
+            }
+            if it.val == -1 {
+                r.key(k).opacity(0.38).no_hit()
+            } else {
+                r.on_click(k)
+            }
+        })
+        .collect();
+    dropdown::menu_box(cx, K_MENU, x, y, min_w, est_h, 300.0, rows)
 }
 
 #[cfg(test)]

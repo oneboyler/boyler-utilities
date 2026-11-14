@@ -208,7 +208,7 @@ mod tests {
         assert!(crate::obs::running());
         let set = crate::obs::settings().unwrap();
         assert_eq!((set.where_, set.pos, set.vol, set.status), (2, 3, 80, 1));
-        assert_eq!(set.scenes, ["16:9", "21:9"]);
+        assert_eq!(set.scenes.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(), ["16:9", "21:9"]);
         assert_eq!(set.switch_key, Some(bu_obs::keys::KeyBind::new(0x13, 0)));
         crate::addons::set_for("obs", false, true);
         // undo (Settings › Back to how your PC was -> the Startup tab's `apply`: the item and the old value, parsed the same)

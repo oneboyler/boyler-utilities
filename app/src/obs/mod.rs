@@ -127,6 +127,8 @@ struct Feature {
     mouse: Vec<String>,
     /// OBS's keys still to hand to the keys manager (it was busy)
     pending_keys: Option<KeysView>,
+    /// test copies (`sample_for_test`): the page sees this instead of the engine's view
+    view_test: Option<View>,
 }
 
 thread_local! {
@@ -146,7 +148,8 @@ fn with<R>(f: impl FnOnce(&mut Feature) -> R) -> Option<R> {
 
 fn load_settings(s: &crate::services::Services) -> Option<Settings> {
     let pairs = s.store.get_list(SCOPE, "settings")?;
-    let scenes = s.store.get_list(SCOPE, "scenes").map(|v| v.to_vec());
+    // the scene list: its names (every version) + each row's collection / resolution / FPS (Order 132)
+    let scenes = s.store.get_list(SCOPE, "scenes").map(|names| bu_obs::settings::rows_from_store(names, s.store.get_list(SCOPE, "scenerows")));
     let lookup = |k: &str| pairs.iter().find_map(|p| p.split_once('=').filter(|(a, _)| *a == k).map(|(_, v)| v.to_string()));
     Some(Settings::from_lookup(lookup, scenes))
 }
@@ -155,7 +158,10 @@ fn save_settings_store(s: &mut crate::services::Services, set: &Settings) {
     let pairs: Vec<String> = set.to_pairs().into_iter().map(|(k, v)| format!("{k}={v}")).collect();
     let _ = s.store.set_list(SCOPE, "settings", &pairs);
     if set.scenes_init {
-        let _ = s.store.set_list(SCOPE, "scenes", &set.scenes);
+        let names: Vec<String> = set.scenes.iter().map(|r| r.name.clone()).collect();
+        let rows: Vec<String> = set.scenes.iter().map(|r| r.pack()).collect();
+        let _ = s.store.set_list(SCOPE, "scenes", &names);
+        let _ = s.store.set_list(SCOPE, "scenerows", &rows);
     }
 }
 
@@ -337,11 +343,34 @@ fn sync_keys(f: &mut Feature, k: &KeysView) {
 /// What a key of the feature does: the press / release to the engine (`mouse` = a mouse button: no release comes).
 fn handler(id: &'static str, which: KeyWhich) -> impl FnMut(bool) + 'static {
     move |down| {
+        let mods = if down { held_mods() } else { 0 };
         with(|f| {
             let mouse = f.mouse.iter().any(|m| m == id);
-            f.svc.send(Input::Key { which, down, mouse });
+            f.svc.send(Input::Key { which, down, mouse, mods });
         });
     }
+}
+
+/// The modifiers held now, read exactly as OBS's hotkey thread reads them (GetAsyncKeyState: Shift, Ctrl, Alt, either
+/// Windows key) - so the engine knows whether OBS takes this press itself (Order 132).
+fn held_mods() -> u8 {
+    use bu_obs::keys::{MOD_A, MOD_C, MOD_S, MOD_W};
+    use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_CONTROL, VK_LWIN, VK_MENU, VK_RWIN, VK_SHIFT};
+    let down = |vk: windows::Win32::UI::Input::KeyboardAndMouse::VIRTUAL_KEY| unsafe { GetAsyncKeyState(vk.0 as i32) } as u16 & 0x8000 != 0;
+    let mut m = 0;
+    if down(VK_SHIFT) {
+        m |= MOD_S;
+    }
+    if down(VK_CONTROL) {
+        m |= MOD_C;
+    }
+    if down(VK_MENU) {
+        m |= MOD_A;
+    }
+    if down(VK_LWIN) || down(VK_RWIN) {
+        m |= MOD_W;
+    }
+    m
 }
 
 // ---------------------------------------------------------------- the UI-thread window
@@ -507,6 +536,7 @@ pub fn start(test: bool) {
             synced: false,
             mouse: vec![],
             pending_keys: None,
+            view_test: None,
         })
     });
     add_actions(test);
@@ -534,7 +564,7 @@ pub fn stop() {
 // ---------------------------------------------------------------- what the page uses
 
 pub fn view() -> Option<View> {
-    with(|f| f.view.clone())
+    with(|f| f.view_test.clone().unwrap_or_else(|| f.view.clone()))
 }
 pub fn settings() -> Option<Settings> {
     with(|f| f.set.clone())
@@ -718,6 +748,46 @@ pub fn set_other_for_test(pid: Option<u32>) {
     with(|f| {
         if f.test {
             f.other = pid;
+        }
+    });
+}
+
+/// Test copies (`obssample`): sample settings for pictures / checks - the scene list as in the drawing obs-scenes-v1
+/// (21:9 / 16:9 on monitors 1 / 2, PS5 in the "PS5 4K60" collection at 60 fps) and a switch key; `scenes` also makes OBS
+/// look connected with his two collections (the page's Auto sizes, tags and "+ Add scene").
+pub fn sample_for_test(arg: &str) {
+    use bu_obs::engine::{CollView, SceneView};
+    use bu_obs::settings::SceneRow;
+    if arg == "other" {
+        set_other_for_test(Some(4242));
+    }
+    let Some(mut s) = settings() else { return };
+    s.scenes = vec![SceneRow::new("16:9", ""), SceneRow::new("21:9", "")];
+    if arg == "scenes" {
+        s.scenes = vec![SceneRow::new("21:9", "Untitled"), SceneRow::new("16:9", "Untitled"), SceneRow { fps: 6000, ..SceneRow::new("PS5", "PS5 4K60") }];
+    }
+    s.scenes_init = true;
+    s.switch_key = Some(bu_obs::keys::KeyBind::new(0x13, 0));
+    set_settings(s);
+    if arg != "scenes" {
+        return;
+    }
+    let sv = |name: &str, mon: i32, auto: (i32, i32)| SceneView { name: name.into(), mon, auto };
+    let mut v = view().unwrap_or_default();
+    v.connected = true;
+    v.replay = true;
+    v.fps = 12000;
+    v.coll = "Untitled".into();
+    v.colls = vec![
+        CollView {
+            name: "Untitled".into(),
+            scenes: vec![sv("ps5", 0, (3840, 2160)), sv("EONTV2", 0, (2560, 1440)), sv("21:9", 1, (3440, 1440)), sv("21:9 EMPTY", 1, (3440, 1440)), sv("16:9", 2, (1920, 1080)), sv("16:9 empty", 2, (1920, 1080)), sv("1440x1080", 2, (1920, 1080))],
+        },
+        CollView { name: "PS5 4K60".into(), scenes: vec![sv("PS5", 0, (3840, 2160))] },
+    ];
+    with(|f| {
+        if f.test {
+            f.view_test = Some(v);
         }
     });
 }

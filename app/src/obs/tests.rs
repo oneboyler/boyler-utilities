@@ -164,7 +164,7 @@ fn clippings_file_is_found_next_to_its_exe_and_imported() {
     let p = super::clipping_ini(&os).expect("found");
     let s = bu_obs::settings::import_file(&p).unwrap();
     assert_eq!((s.where_, s.vol, s.status, s.style), (bu_obs::settings::W_SAME, 30, bu_obs::settings::SI_REC_MON, ST_GLASS));
-    assert_eq!(s.scenes, vec!["16:9".to_string(), "21:9".to_string()]);
+    assert_eq!(s.scenes.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(), ["16:9", "21:9"]);
     assert_eq!(s.switch_key, Some(bu_obs::keys::KeyBind::new(0x13, 0)));
     // the file itself is untouched (read-only)
     assert_eq!(std::fs::read(d.join("NotificationsForOBS.ini")).unwrap().len(), 2 + text.encode_utf16().count() * 2);

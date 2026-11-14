@@ -63,6 +63,51 @@ pub const BG_NAMES: [&str; 7] = ["Dark grey", "Black", "Deep blue", "Deep purple
 pub const ANIM_NAMES: [&str; 3] = ["Slide in", "Fade", "None"];
 pub const STATUS_NAMES: [&str; 5] = ["Off", "Recording monitor", "Other monitor", "Monitor 1", "Monitor 2"];
 
+/// The Switch scene list's resolutions (Order 132; Auto = None, first).
+pub const RES_LIST: [(i32, i32); 5] = [(3840, 2160), (3440, 1440), (2560, 1440), (1920, 1080), (1280, 720)];
+
+/// One row of the Switch scene list (Order 132): the scene, the scene collection it is in, its own resolution and FPS.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SceneRow {
+    pub name: String,
+    /// the scene collection (empty = a row from before Order 132: the collection that has a scene of that name)
+    pub coll: String,
+    /// None = Auto (the monitor's size, or the video source's size OBS reports)
+    pub res: Option<(i32, i32)>,
+    /// FPS in hundredths; 0 = not set: OBS's FPS stays as it is
+    pub fps: i32,
+}
+
+impl SceneRow {
+    pub fn new(name: &str, coll: &str) -> Self {
+        SceneRow { name: name.into(), coll: coll.into(), res: None, fps: 0 }
+    }
+    /// The store's form: "name \t collection \t width \t height \t fps" (0 x 0 = Auto).
+    pub fn pack(&self) -> String {
+        let (w, h) = self.res.unwrap_or((0, 0));
+        format!("{}\t{}\t{w}\t{h}\t{}", self.name, self.coll, self.fps)
+    }
+    pub fn unpack(s: &str) -> Option<SceneRow> {
+        let p: Vec<&str> = s.split('\t').collect();
+        if p.len() != 5 {
+            return None;
+        }
+        let n = |i: usize| p[i].parse::<i32>().ok();
+        let (w, h, fps) = (n(2)?, n(3)?, n(4)?);
+        Some(SceneRow { name: p[0].into(), coll: p[1].into(), res: (w > 0 && h > 0).then_some((w, h)), fps: fps.max(0) })
+    }
+}
+
+/// The scene list from the store: the names (every version writes them) + the rows' own values (Order 132; a row's values
+/// are used only when they belong to the same name - an older app may have changed the names since).
+pub fn rows_from_store(names: &[String], packed: Option<&[String]>) -> Vec<SceneRow> {
+    names
+        .iter()
+        .enumerate()
+        .map(|(i, n)| packed.and_then(|p| p.get(i)).and_then(|s| SceneRow::unpack(s)).filter(|r| r.name == *n).unwrap_or_else(|| SceneRow::new(n, "")))
+        .collect()
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Settings {
     pub where_: i32,
@@ -82,7 +127,7 @@ pub struct Settings {
     pub cx: i32,
     pub cy: i32,
     pub status: i32,
-    pub scenes: Vec<String>,
+    pub scenes: Vec<SceneRow>,
     /// the scene list is the user's own (ClipPing's [Scenes] Init): no default list is made
     pub scenes_init: bool,
     /// the Switch scene key (ClipPing's own key, not OBS's)
@@ -214,8 +259,8 @@ impl Settings {
         v
     }
 
-    /// The scene list (stored as its own list).
-    pub fn from_lookup(get: impl Fn(&str) -> Option<String>, scenes: Option<Vec<String>>) -> Settings {
+    /// The scene list (stored as its own lists, see `rows_from_store`).
+    pub fn from_lookup(get: impl Fn(&str) -> Option<String>, scenes: Option<Vec<SceneRow>>) -> Settings {
         let d = Settings::default();
         let int = |k: &str, def: i32| get(k).filter(|s| !s.is_empty()).map(|s| parse_int(&s) as i32).unwrap_or(def);
         let key = |k: &str| match get(k).map(|s| parse_int(&s) as u32).unwrap_or(0) {
@@ -300,7 +345,7 @@ pub fn import_clipping(text: &str) -> Settings {
         v => Some(KeyBind::unpack(v)),
     };
     let n = pp_get(text, "Scenes", "Count").map(|v| parse_int(&v)).unwrap_or(0).clamp(0, MAX_LIST as i64) as usize;
-    let scenes = (1..=n).map(|i| pp_get(text, "Scenes", &i.to_string()).unwrap_or_default()).collect();
+    let scenes = (1..=n).map(|i| SceneRow::new(&pp_get(text, "Scenes", &i.to_string()).unwrap_or_default(), "")).collect();
     let mut s = Settings {
         where_: int("PopupWhere", d.where_),
         pos: int("PopupPos", d.pos),
@@ -381,7 +426,7 @@ mod tests {
         assert_eq!(s.style, ST_GLASS);
         assert_eq!(s.status, SI_REC_MON);
         assert_eq!(s.switch_key, Some(KeyBind::new(0x13, 0)));
-        assert_eq!(s.scenes, vec!["A".to_string(), "B".to_string()]);
+        assert_eq!(s.scenes, vec![SceneRow::new("A", ""), SceneRow::new("B", "")]);
         assert!(s.scenes_init && s.keep_rb && s.off_rec && s.start_obs);
         assert_eq!(s.obs_path, "C:\\Program Files\\obs-studio\\bin\\64bit\\obs64.exe");
     }
@@ -397,6 +442,28 @@ mod tests {
         assert_eq!(back, s);
         assert_eq!(parse_int("-1"), -1);
         assert_eq!(parse_int("0x2C2C2A"), 0x2C2C2A);
+    }
+
+    /// Order 132: his old list ("21:9", "16:9") stays as it is - Auto, FPS not set, collection found later; a row's own
+    /// values come back only for the same name.
+    #[test]
+    fn old_scene_lists_carry_over_and_rows_round_trip() {
+        let names = vec!["21:9".to_string(), "16:9".to_string()];
+        assert_eq!(rows_from_store(&names, None), vec![SceneRow::new("21:9", ""), SceneRow::new("16:9", "")]);
+        let ps5 = SceneRow { name: "PS5".into(), coll: "PS5 4K60".into(), res: Some((3840, 2160)), fps: 6000 };
+        let auto = SceneRow { fps: 12000, ..SceneRow::new("21:9", "Untitled") };
+        assert_eq!(SceneRow::unpack(&ps5.pack()), Some(ps5.clone()));
+        assert_eq!(SceneRow::unpack(&auto.pack()), Some(auto.clone()));
+        let packed = vec![auto.pack(), ps5.pack()];
+        let names2 = vec!["21:9".to_string(), "PS5".to_string()];
+        assert_eq!(rows_from_store(&names2, Some(&packed)), vec![auto.clone(), ps5]);
+        // an older app renamed / reordered the list: values that don't match the name are not used
+        let names3 = vec!["16:9".to_string(), "PS5".to_string(), "new".to_string()];
+        let got = rows_from_store(&names3, Some(&packed));
+        assert_eq!(got[0], SceneRow::new("16:9", ""));
+        assert_eq!(got[1].res, Some((3840, 2160)));
+        assert_eq!(got[2], SceneRow::new("new", ""));
+        assert_eq!(SceneRow::unpack("x\ty"), None);
     }
 
     #[test]

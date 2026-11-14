@@ -3,13 +3,15 @@
 //! page, and routes the keys through its keys manager.
 //!
 //! - `ws` obs-websocket transport, `auth` its v5 authentication, `engine` the state machine (app.c), `service` its thread;
-//! - `cfg` OBS's settings files (read-only), `ctl` the safe edits of OBS's profile / WebSocket config, `ini` the text edits;
+//! - `cfg` OBS's settings files (read-only), `colls` its scene collections (read-only), `ctl` the safe edits of OBS's
+//!   profile / WebSocket config, `ini` the text edits;
 //! - `keys` OBS's hotkey names, `monitors` monitor numbering + OBS display-capture matching, `settings` the feature's own
 //!   settings + ClipPing's file import, `sound` the built-in sounds;
 //! - `os` the OS trait: `real` (Windows) / `fake` (tests).
 
 pub mod auth;
 pub mod cfg;
+pub mod colls;
 pub mod ctl;
 pub mod engine;
 pub mod fake;
